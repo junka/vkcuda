@@ -1,19 +1,22 @@
 # VC — A CUDA-like language targeting Vulkan via MLIR/SPIR-V
 
-> Scaffold status: the **frontend** (lexer/parser/AST/Sema) and the
-> **Vulkan runtime** (CUDA-style host API) build and run. The
-> **MLIR dialect / codegen / `vc` compiler driver** require
-> `libmlir-18-dev` to be installed before they can build.
+> The project has **two SPIR-V backends**:
+> - **GLSL backend (working, no MLIR needed)**: `.vc` → AST → GLSL compute
+>   shader → `glslc` → SPIR-V. End-to-end `vector_add` runs and prints PASS.
+> - **MLIR backend (scaffold)**: `.vc` → AST → MLIR (vc dialect) → gpu →
+>   spirv. Requires `libmlir-18-dev`; the vc→gpu lowering pass is a TODO.
 
 ## Architecture
 
 ```
-.vc source ──► Frontend (Lexer+Parser) ──► AST ──► Codegen ──► MLIR (vc dialect)
-                                                                  │  lower: vc→gpu→spirv
-                                                                  ▼
-                                                          SPIR-V binary (.spv)
-                                                                  │
-                                                                  ▼
+.vc source ──► Frontend (Lexer+Parser) ──► AST ──┬─► GLSL ──glslc──► SPIR-V (.spv)
+                                                 │
+                                                 └─► MLIR (vc dialect) ──► gpu ──► spirv
+                                                                              │
+                                                                              ▼
+                                                                      SPIR-V binary
+                                                                              │
+                                                                              ▼
                                           Vulkan Runtime (vcMalloc/vcLaunchKernel/…)
 ```
 
@@ -47,14 +50,15 @@ cmake --build build
 ## Run
 
 ```bash
-# Frontend smoke test (works now):
-./build/tools/vc-dump-ast/vc-dump-ast test/vadd.vc
+# End-to-end via the GLSL backend (works now, no MLIR):
+./build/tools/vc-glsl/vc-glsl test/vadd.vc -emit=ast     # dump AST
+./build/tools/vc-glsl/vc-glsl test/vadd.vc -emit=glsl    # dump GLSL source
+./build/tools/vc-glsl/vc-glsl test/vadd.vc -o build/vadd.spv   # GLSL -> glslc -> .spv
+./build/examples/vector_add build/vadd.spv               # runs on Vulkan -> PASS
 
-# End-to-end (needs MLIR-built `vc`):
-./build/bin/vc test/vadd.vc -emit=ast    # dump AST
-./build/bin/vc test/vadd.vc -emit=mlir   # dump VC-dialect MLIR
+# MLIR backend (needs libmlir-18-dev; vc->gpu lowering still TODO):
+./build/bin/vc test/vadd.vc -emit=mlir
 ./build/bin/vc test/vadd.vc -emit=spirv -o vadd.spv
-./build/examples/vector_add vadd.spv     # runs on Vulkan, prints PASS/FAIL
 ```
 
 ## Layout

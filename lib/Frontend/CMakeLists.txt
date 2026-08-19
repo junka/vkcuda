@@ -1,9 +1,12 @@
 # Frontend library: pure C++ (LLVM support libs only, no MLIR dependency).
+# Also hosts the GLSL codegen backend (AST -> GLSL), which likewise needs no
+# MLIR and lets the compiler produce SPIR-V via glslc without libmlir.
 add_library(VCFrontend STATIC
   Lexer.cpp
   Parser.cpp
   ASTDumper.cpp
   Sema.cpp
+  ../Codegen/ASTToGLSL.cpp
 )
 
 target_include_directories(VCFrontend PUBLIC

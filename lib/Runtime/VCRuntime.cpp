@@ -380,14 +380,31 @@ VCError Runtime::launch(VCKernel &k, unsigned gridDim, unsigned blockDim,
 
   std::vector<VkDescriptorBufferInfo> bufInfos;
   std::vector<VkWriteDescriptorSet> writes;
+  // Temporary buffers backing scalar-by-value arguments (each is bound as
+  // a storage buffer to match the shader's SSBO binding).
+  std::vector<VCBuffer> scalarBufs;
   bufInfos.reserve(argCount);
   writes.reserve(argCount);
   for (int i = 0; i < argCount; ++i) {
     VkDescriptorBufferInfo bi{};
-    VCBuffer *b = reinterpret_cast<VCBuffer *>(const_cast<void *>(args[i].data));
-    bi.buffer = b ? b->buffer : VK_NULL_HANDLE;
-    bi.offset = 0;
-    bi.range = args[i].kind == VCKernelArg::Pointer ? b->size : args[i].size;
+    if (args[i].kind == VCKernelArg::Pointer) {
+      auto *b = reinterpret_cast<VCBuffer *>(const_cast<void *>(args[i].data));
+      bi.buffer = b ? b->buffer : VK_NULL_HANDLE;
+      bi.offset = 0;
+      bi.range = b ? b->size : 0;
+    } else {
+      // Scalar: stage into a small device buffer.
+      scalarBufs.emplace_back();
+      if (mallocBuffer(std::max<size_t>(args[i].size, 4), scalarBufs.back()) !=
+          VCError::Success) {
+        for (auto &sb : scalarBufs) freeBuffer(sb);
+        return VCError::OutOfMemory;
+      }
+      std::memcpy(scalarBufs.back().mapped, args[i].data, args[i].size);
+      bi.buffer = scalarBufs.back().buffer;
+      bi.offset = 0;
+      bi.range = args[i].size;
+    }
     bufInfos.push_back(bi);
     VkWriteDescriptorSet w{};
     w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -407,7 +424,9 @@ VCError Runtime::launch(VCKernel &k, unsigned gridDim, unsigned blockDim,
   vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipelineLayout,
                           0, 1, &set, 0, nullptr);
   vkCmdDispatch(cb, workgroups, 1, 1);
-  endOneTime(cb);
+  endOneTime(cb); // waits for the queue to idle, so scalar buffers are safe
+                 // to release now.
+  for (auto &sb : scalarBufs) freeBuffer(sb);
   return VCError::Success;
 }
 
