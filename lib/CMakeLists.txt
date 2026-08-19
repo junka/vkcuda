@@ -1,0 +1,6 @@
+add_subdirectory(Frontend)
+add_subdirectory(Runtime)
+if(VC_ENABLE_MLIR)
+  add_subdirectory(Dialect/VC)
+  add_subdirectory(Codegen)
+endif()

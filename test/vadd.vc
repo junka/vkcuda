@@ -1,0 +1,10 @@
+// vadd.vc — minimal VC kernel: elementwise float addition.
+//
+// This is the device-side source the `vc` compiler turns into SPIR-V.
+// Host-side launch is in examples/vector_add.cpp.
+__global__ void vadd(float* a, float* b, float* c, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    c[i] = a[i] + b[i];
+  }
+}
