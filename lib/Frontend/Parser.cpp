@@ -192,6 +192,19 @@ NodePtr Parser::parseStatement() {
   case TokKind::kw_return: return parseReturnStmt();
   case TokKind::kw_for: return parseForStmt();
   case TokKind::kw_while: return parseWhileStmt();
+  case TokKind::kw_do: return parseDoStmt();
+  case TokKind::kw_break: {
+    Token t = curTok;
+    advance();
+    expect(TokKind::semi, "';'");
+    return NodePtr(new BreakStmt(toSourceLoc(t)));
+  }
+  case TokKind::kw_continue: {
+    Token t = curTok;
+    advance();
+    expect(TokKind::semi, "';'");
+    return NodePtr(new ContinueStmt(toSourceLoc(t)));
+  }
   case TokKind::kw_if: {
     Token t = curTok;
     advance();
@@ -285,6 +298,21 @@ NodePtr Parser::parseWhileStmt() {
   return NodePtr(ws);
 }
 
+// do body while (cond);
+NodePtr Parser::parseDoStmt() {
+  Token d = curTok;
+  advance();
+  auto *ds = new DoStmt(toSourceLoc(d));
+  ds->body = parseStatement();
+  if (!expect(TokKind::kw_while, "'while'"))
+    return NodePtr(ds);
+  expect(TokKind::l_paren, "'('");
+  ds->cond = parseExpression();
+  expect(TokKind::r_paren, "')'");
+  expect(TokKind::semi, "';'");
+  return NodePtr(ds);
+}
+
 NodePtr Parser::parseDeclOrExprStmt() {
   // If the current token starts a type, parse a declaration.
   Token save = curTok;
@@ -324,7 +352,7 @@ NodePtr Parser::parseDeclOrExprStmt() {
 NodePtr Parser::parseExpression() { return parseAssignment(); }
 
 NodePtr Parser::parseAssignment() {
-  auto lhs = parseLogicalOr();
+  auto lhs = parseConditional();
   if (!lhs) return nullptr;
   if (curTok.is(TokKind::assign)) {
     Token op = curTok;
@@ -333,16 +361,98 @@ NodePtr Parser::parseAssignment() {
     return NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::Assign,
                                   std::move(lhs), std::move(rhs)));
   }
+  // Compound assignment: `a op= b`  ==>  `a = a op b`. We clone the lhs so the
+  // base op and the assign can each own a copy. (Postfix value-semantics of
+  // `a++` as a sub-expression are not modeled; see plan TODO.)
+  static const struct { TokKind tok; BinaryOp base; } compound[] = {
+    {TokKind::plus_equal, BinaryOp::Add},
+    {TokKind::minus_equal, BinaryOp::Sub},
+    {TokKind::star_equal, BinaryOp::Mul},
+    {TokKind::slash_equal, BinaryOp::Div},
+    {TokKind::percent_equal, BinaryOp::Mod},
+    {TokKind::lessless_equal, BinaryOp::Shl},
+    {TokKind::greatergreater_equal, BinaryOp::Shr},
+    {TokKind::amp_equal, BinaryOp::And},
+    {TokKind::pipe_equal, BinaryOp::Or},
+    {TokKind::caret_equal, BinaryOp::Xor},
+  };
+  for (auto &c : compound) {
+    if (curTok.is(c.tok)) {
+      Token op = curTok;
+      advance();
+      auto rhs = parseAssignment();
+      auto lhsCopy = cloneExpr(lhs.get());
+      auto base = NodePtr(new BinaryExpr(toSourceLoc(op), c.base,
+                                         std::move(lhsCopy), std::move(rhs)));
+      return NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::Assign,
+                                    std::move(lhs), std::move(base)));
+    }
+  }
   return lhs;
 }
 
+// C precedence: assignment  <  conditional (?:)  <  logical-or.
+// `cond ? a : b` is right-associative; the else-branch may itself be a
+// conditional, and the then-branch is a full assignment expression.
+NodePtr Parser::parseConditional() {
+  auto cond = parseLogicalOr();
+  if (!cond) return nullptr;
+  if (curTok.is(TokKind::question)) {
+    Token q = curTok;
+    advance();
+    auto thenE = parseAssignment();
+    expect(TokKind::colon, "':' in ?: expression");
+    auto elseE = parseConditional();
+    return NodePtr(new ConditionalExpr(toSourceLoc(q), std::move(cond),
+                                       std::move(thenE), std::move(elseE)));
+  }
+  return cond;
+}
+
 NodePtr Parser::parseLogicalOr() {
-  auto lhs = parseLogicalAnd();
+  auto lhs = parseBitwiseOr();
   while (curTok.is(TokKind::pipe_pipe)) {
     Token op = curTok;
     advance();
-    auto rhs = parseLogicalAnd();
+    auto rhs = parseBitwiseOr();
     lhs = NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::LOr,
+                                 std::move(lhs), std::move(rhs)));
+  }
+  return lhs;
+}
+
+// C precedence: bitwise-OR  <  bitwise-XOR  <  bitwise-AND  <  equality.
+NodePtr Parser::parseBitwiseOr() {
+  auto lhs = parseBitwiseXor();
+  while (curTok.is(TokKind::pipe)) {
+    Token op = curTok;
+    advance();
+    auto rhs = parseBitwiseXor();
+    lhs = NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::Or,
+                                 std::move(lhs), std::move(rhs)));
+  }
+  return lhs;
+}
+
+NodePtr Parser::parseBitwiseXor() {
+  auto lhs = parseBitwiseAnd();
+  while (curTok.is(TokKind::caret)) {
+    Token op = curTok;
+    advance();
+    auto rhs = parseBitwiseAnd();
+    lhs = NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::Xor,
+                                 std::move(lhs), std::move(rhs)));
+  }
+  return lhs;
+}
+
+NodePtr Parser::parseBitwiseAnd() {
+  auto lhs = parseLogicalAnd();
+  while (curTok.is(TokKind::amp)) {
+    Token op = curTok;
+    advance();
+    auto rhs = parseLogicalAnd();
+    lhs = NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::And,
                                  std::move(lhs), std::move(rhs)));
   }
   return lhs;
@@ -373,7 +483,7 @@ NodePtr Parser::parseEquality() {
 }
 
 NodePtr Parser::parseRelational() {
-  auto lhs = parseAdditive();
+  auto lhs = parseShift();
   while (curTok.isOneOf(TokKind::lt, TokKind::gt, TokKind::le, TokKind::ge)) {
     Token op = curTok;
     BinaryOp bop;
@@ -383,6 +493,19 @@ NodePtr Parser::parseRelational() {
     case TokKind::le: bop = BinaryOp::Le; break;
     default: bop = BinaryOp::Ge; break;
     }
+    advance();
+    auto rhs = parseShift();
+    lhs = NodePtr(new BinaryExpr(toSourceLoc(op), bop, std::move(lhs), std::move(rhs)));
+  }
+  return lhs;
+}
+
+// C precedence: relational  <  shift  <  additive.
+NodePtr Parser::parseShift() {
+  auto lhs = parseAdditive();
+  while (curTok.isOneOf(TokKind::lessless, TokKind::greatergreater)) {
+    Token op = curTok;
+    BinaryOp bop = op.is(TokKind::lessless) ? BinaryOp::Shl : BinaryOp::Shr;
     advance();
     auto rhs = parseAdditive();
     lhs = NodePtr(new BinaryExpr(toSourceLoc(op), bop, std::move(lhs), std::move(rhs)));
@@ -410,7 +533,7 @@ NodePtr Parser::parseMultiplicative() {
     switch (curTok.kind) {
     case TokKind::star: bop = BinaryOp::Mul; break;
     case TokKind::slash: bop = BinaryOp::Div; break;
-    default: bop = BinaryOp::Div; break; // percent -> Div placeholder
+    default: bop = BinaryOp::Mod; break; // percent -> real modulo
     }
     advance();
     auto rhs = parseUnary();
@@ -420,13 +543,28 @@ NodePtr Parser::parseMultiplicative() {
 }
 
 NodePtr Parser::parseUnary() {
-  if (curTok.isOneOf(TokKind::minus, TokKind::bang, TokKind::amp, TokKind::star)) {
+  // Prefix ++ / -- : `++a` -> `a = a + 1`, `--a` -> `a = a - 1`.
+  if (curTok.isOneOf(TokKind::plus_plus, TokKind::minus_minus)) {
+    Token op = curTok;
+    BinaryOp base = op.is(TokKind::plus_plus) ? BinaryOp::Add : BinaryOp::Sub;
+    advance();
+    auto operand = parseUnary();
+    auto one = NodePtr(new IntegerLiteral(toSourceLoc(op), 1));
+    auto copy = cloneExpr(operand.get());
+    auto rhs = NodePtr(new BinaryExpr(toSourceLoc(op), base, std::move(copy),
+                                      std::move(one)));
+    return NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::Assign,
+                                  std::move(operand), std::move(rhs)));
+  }
+  if (curTok.isOneOf(TokKind::minus, TokKind::bang, TokKind::amp,
+                     TokKind::star, TokKind::tilde)) {
     Token op = curTok;
     UnaryOp uop;
     switch (curTok.kind) {
     case TokKind::minus: uop = UnaryOp::Neg; break;
     case TokKind::bang: uop = UnaryOp::LNot; break;
     case TokKind::amp: uop = UnaryOp::AddrOf; break;
+    case TokKind::tilde: uop = UnaryOp::Not; break;
     default: uop = UnaryOp::Deref; break;
     }
     advance();
@@ -469,6 +607,19 @@ NodePtr Parser::parsePostfix() {
       }
       expect(TokKind::r_paren, "')'");
       base = NodePtr(call);
+    } else if (curTok.isOneOf(TokKind::plus_plus, TokKind::minus_minus)) {
+      // Postfix ++ / -- : `a++` -> `a = a + 1`. (Value-as-old is not modeled;
+      // the expression yields the new value. Sufficient for `for(...; i++)`
+      // and standalone statement use. See plan TODO.)
+      Token op = curTok;
+      BinaryOp bop = op.is(TokKind::plus_plus) ? BinaryOp::Add : BinaryOp::Sub;
+      advance();
+      auto one = NodePtr(new IntegerLiteral(toSourceLoc(op), 1));
+      auto copy = cloneExpr(base.get());
+      auto rhs = NodePtr(new BinaryExpr(toSourceLoc(op), bop, std::move(copy),
+                                        std::move(one)));
+      base = NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::Assign,
+                                    std::move(base), std::move(rhs)));
     } else {
       break;
     }
@@ -477,17 +628,14 @@ NodePtr Parser::parsePostfix() {
 }
 
 NodePtr Parser::tryParseLaunch(NodePtr &callee) {
-  // CUDA launch uses '<<<' ... '>>>'. We lex '<' '<' '<' as three tokens
-  // since the lexer doesn't have a dedicated launch-open.
-  if (!(curTok.is(TokKind::lt) &&
+  // CUDA launch uses '<<<' ... '>>>'. The lexer tokenizes '<<' as a single
+  // lessless token and the trailing '<' as lt, so '<<<' = lessless + lt.
+  if (!(curTok.is(TokKind::lessless) &&
         lexer.peek().is(TokKind::lt)))
     return nullptr;
-  // Confirm it's actually '<<<' by checking the peek-ahead is '<' followed
-  // by non-'<'. Cheap heuristic sufficient for the demo.
   Token openLt = curTok;
-  advance(); // first <
-  advance(); // second <
-  advance(); // third <
+  advance(); // '<<'
+  advance(); // '<'
   auto grid = parseExpression();
   expect(TokKind::comma, "','");
   auto block = parseExpression();
@@ -518,7 +666,24 @@ NodePtr Parser::parsePrimary() {
   case TokKind::int_literal: {
     advance();
     int64_t v = 0;
-    t.text.getAsInteger(10, v);
+    StringRef txt = t.text;
+    // Hex literal: 0x... -> parse base 16. Strip the 0x prefix and any
+    // trailing integer suffix (u/U/l/L) before converting.
+    if (txt.size() > 2 && txt[0] == '0' && (txt[1] == 'x' || txt[1] == 'X')) {
+      StringRef hex = txt.substr(2);
+      while (!hex.empty() &&
+             (hex.back() == 'u' || hex.back() == 'U' ||
+              hex.back() == 'l' || hex.back() == 'L'))
+        hex = hex.drop_back();
+      hex.getAsInteger(16, v);
+    } else {
+      // Strip trailing integer suffixes before decimal parse.
+      while (!txt.empty() &&
+             (txt.back() == 'u' || txt.back() == 'U' ||
+              txt.back() == 'l' || txt.back() == 'L'))
+        txt = txt.drop_back();
+      txt.getAsInteger(10, v);
+    }
     return NodePtr(new IntegerLiteral(toSourceLoc(t), v));
   }
   case TokKind::float_literal: {
@@ -543,6 +708,14 @@ NodePtr Parser::parsePrimary() {
     expect(TokKind::r_paren, "')'");
     return e;
   }
+  case TokKind::char_literal:
+    advance();
+    error(t, "character literals are not supported in VC kernels");
+    return nullptr;
+  case TokKind::string_literal:
+    advance();
+    error(t, "string literals are not supported in VC kernels");
+    return nullptr;
   default:
     (void)error(t, "expected expression");
     return nullptr;

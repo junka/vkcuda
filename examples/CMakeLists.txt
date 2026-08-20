@@ -21,3 +21,9 @@ add_executable(async_overlap async_overlap.cpp)
 target_include_directories(async_overlap PRIVATE ${VC_INCLUDE_DIR})
 target_compile_features(async_overlap PRIVATE cxx_std_20)
 target_link_libraries(async_overlap PRIVATE VCRuntime)
+
+add_executable(features_demo features_demo.cpp)
+
+target_include_directories(features_demo PRIVATE ${VC_INCLUDE_DIR})
+target_compile_features(features_demo PRIVATE cxx_std_20)
+target_link_libraries(features_demo PRIVATE VCRuntime)

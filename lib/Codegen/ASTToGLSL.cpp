@@ -50,6 +50,7 @@ public:
     emitHeader();
     emitBindings();
     emitSharedDecls();
+    emitDeviceFunctions(tu);
     emitBody();
     return true;
   }
@@ -246,6 +247,63 @@ private:
     }
   }
 
+  // Emit every __device__ function as a GLSL top-level function, before
+  // main(). These are callable helpers (CUDA __device__ functions); the
+  // __global__ kernel becomes main(). Forward references are handled if the
+  // helper is declared before use (CUDA source is typically top-down).
+  void emitDeviceFunctions(const TranslationUnit &tu) {
+    for (auto &d : tu.decls) {
+      if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
+      auto *f = static_cast<const FunctionDecl *>(d.get());
+      if (f->deviceAttr != DeviceAttr::Device) continue;
+      emitFunction(f);
+    }
+  }
+
+  // Emit one function signature + body (used for __device__ helpers).
+  void emitFunction(const FunctionDecl *f) {
+    os << glslType(f->returnType) << " " << f->name << "(";
+    for (unsigned i = 0; i < f->params.size(); ++i) {
+      if (i) os << ", ";
+      os << glslType(f->params[i]->type) << " " << f->params[i]->name;
+    }
+    os << ") {\n";
+    if (f->body &&
+        f->body->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
+      auto *cs = static_cast<const CompoundStmt *>(f->body.get());
+      for (auto &s : cs->statements)
+        emitStmt(s.get(), 1);
+    }
+    os << "}\n\n";
+  }
+
+  // Map a CUDA/math builtin name to its GLSL equivalent. Returns the name
+  // unchanged if no mapping is known (lets user helpers and GLSL builtins
+  // pass through verbatim). CUDA single-precision math intrinsics (__sinf,
+  // __expf, ...) lower to GLSL's float math builtins.
+  StringRef lowerBuiltinCall(StringRef name) {
+    // CUDA __f-prefixed intrinsics -> GLSL float builtin (drop leading __,
+    // trailing f).
+    if (name.starts_with("__") && name.ends_with("f") && name.size() > 3) {
+      // e.g. __sinf -> sin, __expf -> exp, __powf -> pow
+      return name.substr(2, name.size() - 3);
+    }
+    // CUDA f-suffixed intrinsics without __ : sinf -> sin, sqrtf -> sqrt.
+    if (name.ends_with("f") && name.size() > 2) {
+      // Only strip if the result is a plausible GLSL builtin; we don't have a
+      // full table, so only strip the common math set.
+      StringRef base = name.drop_back();
+      if (base == "sin" || base == "cos" || base == "tan" || base == "asin" ||
+          base == "acos" || base == "atan" || base == "exp" || base == "log" ||
+          base == "exp2" || base == "log2" || base == "sqrt" || base == "abs" ||
+          base == "pow" || base == "floor" || base == "ceil" || base == "round" ||
+          base == "trunc" || base == "fract")
+        return base;
+    }
+    // CUDA fabsf/fminf/fmaxf already handled above by f-strip or builtin pass.
+    return name;
+  }
+
   void emitBody() {
     os << "void main() {\n";
     if (kernel->body &&
@@ -344,6 +402,19 @@ private:
       pad(indent); os << "}\n";
       break;
     }
+    case ASTNode::NodeKind::DoStmt: {
+      auto *ds = static_cast<const DoStmt *>(n);
+      pad(indent); os << "do {\n";
+      if (ds->body) emitStmt(ds->body.get(), indent + 1);
+      pad(indent); os << "} while ("; emitExpr(ds->cond.get()); os << ");\n";
+      break;
+    }
+    case ASTNode::NodeKind::BreakStmt:
+      pad(indent); os << "break;\n";
+      break;
+    case ASTNode::NodeKind::ContinueStmt:
+      pad(indent); os << "continue;\n";
+      break;
     default:
       break;
     }
@@ -383,6 +454,17 @@ private:
       emitExpr(u->operand.get());
       break;
     }
+    case ASTNode::NodeKind::ConditionalExpr: {
+      auto *c = static_cast<const ConditionalExpr *>(n);
+      os << "(";
+      emitExpr(c->cond.get());
+      os << " ? ";
+      emitExpr(c->thenExpr.get());
+      os << " : ";
+      emitExpr(c->elseExpr.get());
+      os << ")";
+      break;
+    }
     case ASTNode::NodeKind::IndexExpr: {
       auto *ie = static_cast<const IndexExpr *>(n);
       emitExpr(ie->base.get());
@@ -415,8 +497,17 @@ private:
           c->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
         auto *ref = static_cast<const DeclRefExpr *>(c->callee.get());
         if (ref->name == "__syncthreads") { os << "barrier()"; return; }
-        // TODO: user functions.
+        // User __device__ helper or CUDA/math builtin: lower the name and emit
+        // a normal GLSL call expression.
+        os << lowerBuiltinCall(ref->name) << "(";
+        for (unsigned i = 0; i < c->args.size(); ++i) {
+          if (i) os << ", ";
+          emitExpr(c->args[i].get());
+        }
+        os << ")";
+        return;
       }
+      // Callee is not a simple name reference — emit a placeholder.
       os << "/*call*/";
       break;
     }
@@ -432,6 +523,7 @@ private:
     case BinaryOp::Sub: return "-";
     case BinaryOp::Mul: return "*";
     case BinaryOp::Div: return "/";
+    case BinaryOp::Mod: return "%";
     case BinaryOp::Assign: return "=";
     case BinaryOp::Eq: return "==";
     case BinaryOp::NEq: return "!=";
@@ -439,8 +531,11 @@ private:
     case BinaryOp::Gt: return ">";
     case BinaryOp::Le: return "<=";
     case BinaryOp::Ge: return ">=";
+    case BinaryOp::Shl: return "<<";
+    case BinaryOp::Shr: return ">>";
     case BinaryOp::And: return "&";
     case BinaryOp::Or: return "|";
+    case BinaryOp::Xor: return "^";
     case BinaryOp::LAnd: return "&&";
     case BinaryOp::LOr: return "||";
     default: return "?";

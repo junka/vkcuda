@@ -4,6 +4,7 @@
 add_library(VCFrontend STATIC
   Lexer.cpp
   Parser.cpp
+  ASTHelpers.cpp
   ASTDumper.cpp
   Sema.cpp
   ../Codegen/ASTToGLSL.cpp

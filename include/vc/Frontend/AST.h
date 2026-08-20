@@ -110,9 +110,13 @@ public:
     IfStmt,
     ForStmt,
     WhileStmt,
+    DoStmt,
+    BreakStmt,
+    ContinueStmt,
     // Expressions
     BinaryExpr,
     UnaryExpr,
+    ConditionalExpr, // cond ? then : else
     CallExpr,
     DeclRefExpr,
     IntegerLiteral,
@@ -126,6 +130,13 @@ public:
 };
 
 using NodePtr = std::unique_ptr<ASTNode>;
+
+/// Deep-clone an expression node. Used by the parser to expand compound
+/// assignment (`a += b` -> `a = a + b`) and `++`/`--` into plain AST, so no
+/// new node kinds are needed for those. Covers the expression subset that
+/// can appear as an lvalue/rvalue in such contexts; returns null for
+/// statements/decls. Defined in ASTHelpers.cpp.
+NodePtr cloneExpr(const ASTNode *n);
 
 //===----------------------------------------------------------------------===//
 // Declarations
@@ -251,12 +262,34 @@ public:
   NodeKind getNodeType() const override { return NodeKind::WhileStmt; }
 };
 
+// C: `do body while (cond);`  — body executes at least once, then repeats
+// while cond is true.
+class DoStmt : public ASTNode {
+public:
+  NodePtr body;
+  NodePtr cond;
+  DoStmt(SourceLocation l) : ASTNode(l) {}
+  NodeKind getNodeType() const override { return NodeKind::DoStmt; }
+};
+
+class BreakStmt : public ASTNode {
+public:
+  BreakStmt(SourceLocation l) : ASTNode(l) {}
+  NodeKind getNodeType() const override { return NodeKind::BreakStmt; }
+};
+
+class ContinueStmt : public ASTNode {
+public:
+  ContinueStmt(SourceLocation l) : ASTNode(l) {}
+  NodeKind getNodeType() const override { return NodeKind::ContinueStmt; }
+};
+
 //===----------------------------------------------------------------------===//
 // Expressions
 //===----------------------------------------------------------------------===//
 
-enum class BinaryOp { Add, Sub, Mul, Div, Assign, Eq, NEq, Lt, Gt, Le, Ge,
-                      And, Or, LAnd, LOr };
+enum class BinaryOp { Add, Sub, Mul, Div, Mod, Assign, Eq, NEq, Lt, Gt, Le, Ge,
+                      Shl, Shr, And, Or, Xor, LAnd, LOr };
 
 class BinaryExpr : public ASTNode {
 public:
@@ -276,6 +309,16 @@ public:
   UnaryExpr(SourceLocation l, UnaryOp o, NodePtr e)
       : ASTNode(l), op(o), operand(std::move(e)) {}
   NodeKind getNodeType() const override { return NodeKind::UnaryExpr; }
+};
+
+// C ternary:  cond ? thenExpr : elseExpr   (right-associative)
+class ConditionalExpr : public ASTNode {
+public:
+  NodePtr cond, thenExpr, elseExpr;
+  ConditionalExpr(SourceLocation l, NodePtr c, NodePtr t, NodePtr e)
+      : ASTNode(l), cond(std::move(c)), thenExpr(std::move(t)),
+        elseExpr(std::move(e)) {}
+  NodeKind getNodeType() const override { return NodeKind::ConditionalExpr; }
 };
 
 class CallExpr : public ASTNode {

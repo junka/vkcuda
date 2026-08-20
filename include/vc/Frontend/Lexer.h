@@ -24,9 +24,17 @@ enum class TokKind {
   l_brace, r_brace,
   l_square, r_square,
   comma, semi, colon,
+  question, // ?
   star, plus, minus, slash, percent,
   assign,
+  // compound assignment
+  plus_equal, minus_equal, star_equal, slash_equal, percent_equal,
+  lessless_equal, greatergreater_equal,
+  amp_equal, pipe_equal, caret_equal,
+  // increment / decrement
+  plus_plus, minus_minus,
   eq, ne, lt, gt, le, ge,
+  lessless, greatergreater, // << >>
   amp_amp, pipe_pipe, bang,
   amp, pipe, caret, tilde,
   dot,
@@ -37,10 +45,16 @@ enum class TokKind {
   identifier,
   int_literal,
   float_literal,
+  // Char/string literals are tokenized for friendliness; the parser currently
+  // does not lower them to AST nodes (VC kernels don't use them).
+  char_literal,
+  string_literal,
 
   // Keywords
   kw_void, kw_bool, kw_int, kw_uint, kw_long, kw_ulong, kw_float, kw_double,
-  kw_return, kw_if, kw_else, kw_for, kw_while, kw_const,
+  kw_return, kw_if, kw_else, kw_for, kw_while, kw_do,
+  kw_break, kw_continue,
+  kw_const,
   // CUDA attributes
   kw_global, kw_device, kw_host, kw_shared, kw_restrict,
   // CUDA builtins recognized as keywords
@@ -91,6 +105,8 @@ private:
 
   Token lexIdentifier();
   Token lexNumber();
+  Token lexCharLiteral();
+  Token lexStringLiteral();
   TokKind classifyKeyword(llvm::StringRef ident);
 };
 

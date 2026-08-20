@@ -53,15 +53,21 @@ private:
   NodePtr parseReturnStmt();
   NodePtr parseForStmt();
   NodePtr parseWhileStmt();
+  NodePtr parseDoStmt();
   NodePtr parseDeclOrExprStmt();
 
   // Expressions (precedence climbing)
   NodePtr parseExpression();
   NodePtr parseAssignment();
+  NodePtr parseConditional();
   NodePtr parseLogicalOr();
+  NodePtr parseBitwiseOr();
+  NodePtr parseBitwiseXor();
+  NodePtr parseBitwiseAnd();
   NodePtr parseLogicalAnd();
   NodePtr parseEquality();
   NodePtr parseRelational();
+  NodePtr parseShift();
   NodePtr parseAdditive();
   NodePtr parseMultiplicative();
   NodePtr parseUnary();

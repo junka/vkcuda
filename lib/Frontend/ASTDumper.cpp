@@ -108,6 +108,21 @@ public:
       --indent;
       break;
     }
+    case ASTNode::NodeKind::DoStmt: {
+      const auto *ds = cast<DoStmt>(n);
+      os << "DoWhile\n";
+      ++indent;
+      if (ds->body) dumpNode(ds->body.get());
+      dumpNode(ds->cond.get());
+      --indent;
+      break;
+    }
+    case ASTNode::NodeKind::BreakStmt:
+      os << "Break\n";
+      break;
+    case ASTNode::NodeKind::ContinueStmt:
+      os << "Continue\n";
+      break;
     case ASTNode::NodeKind::BinaryExpr: {
       const auto *b = cast<BinaryExpr>(n);
       const char *op = "?";
@@ -116,6 +131,7 @@ public:
       case BinaryOp::Sub: op = "-"; break;
       case BinaryOp::Mul: op = "*"; break;
       case BinaryOp::Div: op = "/"; break;
+      case BinaryOp::Mod: op = "%"; break;
       case BinaryOp::Assign: op = "="; break;
       case BinaryOp::Lt: op = "<"; break;
       case BinaryOp::Gt: op = ">"; break;
@@ -123,8 +139,11 @@ public:
       case BinaryOp::Ge: op = ">="; break;
       case BinaryOp::Eq: op = "=="; break;
       case BinaryOp::NEq: op = "!="; break;
+      case BinaryOp::Shl: op = "<<"; break;
+      case BinaryOp::Shr: op = ">>"; break;
       case BinaryOp::And: op = "&"; break;
       case BinaryOp::Or: op = "|"; break;
+      case BinaryOp::Xor: op = "^"; break;
       case BinaryOp::LAnd: op = "&&"; break;
       case BinaryOp::LOr: op = "||"; break;
       default: break;
@@ -186,6 +205,16 @@ public:
       const auto *u = cast<UnaryExpr>(n);
       os << "Unary\n";
       ++indent; dumpNode(u->operand.get()); --indent;
+      break;
+    }
+    case ASTNode::NodeKind::ConditionalExpr: {
+      const auto *c = cast<ConditionalExpr>(n);
+      os << "Conditional\n";
+      ++indent;
+      dumpNode(c->cond.get());
+      dumpNode(c->thenExpr.get());
+      dumpNode(c->elseExpr.get());
+      --indent;
       break;
     }
     case ASTNode::NodeKind::ParamDecl:

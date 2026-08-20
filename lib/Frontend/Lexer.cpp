@@ -67,6 +67,9 @@ TokKind Lexer::classifyKeyword(StringRef ident) {
       .Case("else", TokKind::kw_else)
       .Case("for", TokKind::kw_for)
       .Case("while", TokKind::kw_while)
+      .Case("do", TokKind::kw_do)
+      .Case("break", TokKind::kw_break)
+      .Case("continue", TokKind::kw_continue)
       .Case("const", TokKind::kw_const)
       .Case("__global__", TokKind::kw_global)
       .Case("__device__", TokKind::kw_device)
@@ -99,6 +102,24 @@ Token Lexer::lexNumber() {
   unsigned startLine = curLine;
   unsigned start = pos;
   bool isFloat = false;
+
+  // Hexadecimal integer: 0x / 0X followed by hex digits.
+  if (pos + 1 < buffer.size() && buffer[pos] == '0' &&
+      (buffer[pos + 1] == 'x' || buffer[pos + 1] == 'X')) {
+    nextChar(); // '0'
+    nextChar(); // 'x'/'X'
+    while (pos < buffer.size() &&
+           std::isxdigit(static_cast<unsigned char>(buffer[pos])))
+      nextChar();
+    // consume optional integer suffix
+    while (pos < buffer.size() &&
+           (buffer[pos] == 'u' || buffer[pos] == 'U' ||
+            buffer[pos] == 'l' || buffer[pos] == 'L'))
+      nextChar();
+    StringRef text = buffer.substr(start, pos - start);
+    return makeToken(TokKind::int_literal, text, startLine, startCol);
+  }
+
   while (pos < buffer.size()) {
     char c = buffer[pos];
     if (std::isdigit(static_cast<unsigned char>(c))) {
@@ -106,6 +127,28 @@ Token Lexer::lexNumber() {
     } else if (c == '.' && !isFloat) {
       isFloat = true;
       nextChar();
+    } else if (c == 'e' || c == 'E') {
+      // Floating-point exponent: e/E, optional +/-, then digits. Allowed
+      // both after a fractional part (2.5e2) and as a pure-int exponent
+      // (1e-3); in the latter case this turns the token into a float.
+      unsigned savePos = pos;
+      unsigned saveLine = curLine, saveCol = curCol;
+      nextChar(); // 'e'
+      if (pos < buffer.size() &&
+          (buffer[pos] == '+' || buffer[pos] == '-'))
+        nextChar();
+      if (pos < buffer.size() &&
+          std::isdigit(static_cast<unsigned char>(buffer[pos]))) {
+        isFloat = true;
+        while (pos < buffer.size() &&
+               std::isdigit(static_cast<unsigned char>(buffer[pos])))
+          nextChar();
+      } else {
+        // Not actually an exponent (e.g. "1e" with no digits) — roll back and
+        // stop here so the number ends before the 'e'.
+        pos = savePos; curLine = saveLine; curCol = saveCol;
+        break;
+      }
     } else if (c == 'f' || c == 'F') {
       isFloat = true;
       nextChar();
@@ -146,8 +189,13 @@ Token Lexer::lex() {
     return lexIdentifier();
   if (std::isdigit(static_cast<unsigned char>(c)))
     return lexNumber();
+  if (c == '\'')
+    return lexCharLiteral();
+  if (c == '"')
+    return lexStringLiteral();
 
   TokKind kind = TokKind::unknown;
+  unsigned start = pos;
   switch (c) {
   case '(': kind = TokKind::l_paren; break;
   case ')': kind = TokKind::r_paren; break;
@@ -158,58 +206,118 @@ Token Lexer::lex() {
   case ',': kind = TokKind::comma; break;
   case ';': kind = TokKind::semi; break;
   case ':': kind = TokKind::colon; break;
-  case '+': kind = TokKind::plus; break;
-  case '-': kind = TokKind::minus; break;
-  case '*': kind = TokKind::star; break;
-  case '/': kind = TokKind::slash; break;
-  case '%': kind = TokKind::percent; break;
-  case '.': kind = TokKind::dot; break;
+  case '?': kind = TokKind::question; break;
   case '~': kind = TokKind::tilde; break;
-  case '^': kind = TokKind::caret; break;
+  case '.':
+    if (pos + 1 < buffer.size() && std::isdigit(static_cast<unsigned char>(buffer[pos + 1]))) {
+      // ".5" style float literal: lexer hit '.' but the next char is a digit.
+      // Back up and lex as a number so the fractional float parses.
+      return lexNumber();
+    }
+    kind = TokKind::dot;
+    break;
+  case '+':
+    if (pos + 1 < buffer.size() && buffer[pos + 1] == '+') {
+      nextChar(); kind = TokKind::plus_plus;
+    } else if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+      nextChar(); kind = TokKind::plus_equal;
+    } else {
+      kind = TokKind::plus;
+    }
+    break;
+  case '-':
+    if (pos + 1 < buffer.size() && buffer[pos + 1] == '-') {
+      nextChar(); kind = TokKind::minus_minus;
+    } else if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+      nextChar(); kind = TokKind::minus_equal;
+    } else {
+      kind = TokKind::minus;
+    }
+    break;
+  case '*':
+    if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+      nextChar(); kind = TokKind::star_equal;
+    } else {
+      kind = TokKind::star;
+    }
+    break;
+  case '/':
+    if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+      nextChar(); kind = TokKind::slash_equal;
+    } else {
+      kind = TokKind::slash;
+    }
+    break;
+  case '%':
+    if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+      nextChar(); kind = TokKind::percent_equal;
+    } else {
+      kind = TokKind::percent;
+    }
+    break;
+  case '^':
+    if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+      nextChar(); kind = TokKind::caret_equal;
+    } else {
+      kind = TokKind::caret;
+    }
+    break;
   case '!':
     if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
-      nextChar();
-      kind = TokKind::ne;
+      nextChar(); kind = TokKind::ne;
     } else {
       kind = TokKind::bang;
     }
     break;
   case '=':
     if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
-      nextChar();
-      kind = TokKind::eq;
+      nextChar(); kind = TokKind::eq;
     } else {
       kind = TokKind::assign;
     }
     break;
   case '<':
-    if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+    if (pos + 1 < buffer.size() && buffer[pos + 1] == '<') {
       nextChar();
-      kind = TokKind::le;
+      if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+        nextChar(); kind = TokKind::lessless_equal;
+      } else {
+        kind = TokKind::lessless;
+      }
+    } else if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+      nextChar(); kind = TokKind::le;
     } else {
       kind = TokKind::lt;
     }
     break;
   case '>':
-    if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+    if (pos + 1 < buffer.size() && buffer[pos + 1] == '>') {
       nextChar();
-      kind = TokKind::ge;
+      if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+        nextChar(); kind = TokKind::greatergreater_equal;
+      } else {
+        kind = TokKind::greatergreater;
+      }
+    } else if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+      nextChar(); kind = TokKind::ge;
     } else {
       kind = TokKind::gt;
     }
     break;
   case '&':
     if (pos + 1 < buffer.size() && buffer[pos + 1] == '&') {
-      nextChar();
-      kind = TokKind::amp_amp;
+      nextChar(); kind = TokKind::amp_amp;
+    } else if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+      nextChar(); kind = TokKind::amp_equal;
     } else {
       kind = TokKind::amp;
     }
     break;
   case '|':
     if (pos + 1 < buffer.size() && buffer[pos + 1] == '|') {
-      nextChar();
-      kind = TokKind::pipe_pipe;
+      nextChar(); kind = TokKind::pipe_pipe;
+    } else if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
+      nextChar(); kind = TokKind::pipe_equal;
     } else {
       kind = TokKind::pipe;
     }
@@ -219,9 +327,51 @@ Token Lexer::lex() {
     break;
   }
 
-  StringRef text = buffer.substr(pos, 1);
+  // Consume the first char of the operator (the switch above only advanced
+  // past the extra chars of multi-char operators).
   nextChar();
+  StringRef text = buffer.substr(start, pos - start);
   return makeToken(kind, text, startLine, startCol);
+}
+
+Token Lexer::lexCharLiteral() {
+  unsigned startLine = curLine;
+  unsigned startCol = curCol;
+  unsigned start = pos;
+  nextChar(); // opening '
+  while (pos < buffer.size()) {
+    char c = buffer[pos];
+    if (c == '\\') { // escape: skip next char
+      nextChar();
+      if (pos < buffer.size()) nextChar();
+      continue;
+    }
+    if (c == '\'') { nextChar(); break; }
+    if (c == '\n') break; // unterminated
+    nextChar();
+  }
+  StringRef text = buffer.substr(start, pos - start);
+  return makeToken(TokKind::char_literal, text, startLine, startCol);
+}
+
+Token Lexer::lexStringLiteral() {
+  unsigned startLine = curLine;
+  unsigned startCol = curCol;
+  unsigned start = pos;
+  nextChar(); // opening "
+  while (pos < buffer.size()) {
+    char c = buffer[pos];
+    if (c == '\\') { // escape: skip next char
+      nextChar();
+      if (pos < buffer.size()) nextChar();
+      continue;
+    }
+    if (c == '"') { nextChar(); break; }
+    if (c == '\n') break; // unterminated
+    nextChar();
+  }
+  StringRef text = buffer.substr(start, pos - start);
+  return makeToken(TokKind::string_literal, text, startLine, startCol);
 }
 
 Token Lexer::peek() {
