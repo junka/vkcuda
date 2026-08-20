@@ -3,6 +3,7 @@
 #include "vc/Runtime/VCRuntime.h"
 #include "RuntimeInternal.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -26,10 +27,6 @@ const char *vcErrorString(VCError err) {
   }
 }
 
-static VCError vkErr(VkResult r) {
-  return r == VK_SUCCESS ? VCError::Success : VCError::Unknown;
-}
-
 //----------------------------------------------------------------------------
 // Runtime singleton
 //----------------------------------------------------------------------------
@@ -43,7 +40,6 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL
 debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
               VkDebugUtilsMessageTypeFlagsEXT,
               const VkDebugUtilsMessengerCallbackDataEXT *data, void *) {
-  //fprintf(stderr, "[vc-vk] %s\n", data->pMessage);
   (void)data;
   return VK_FALSE;
 }
@@ -74,8 +70,8 @@ VCError Runtime::init() {
 
   if (!pickPhysicalDevice()) return VCError::InvalidDevice;
   if (!createLogicalDevice()) return VCError::InitializationError;
-  if (!createCommandPool()) return VCError::InitializationError;
-  if (!createDescriptorPool()) return VCError::InitializationError;
+  if (!createDefaultStream()) return VCError::InitializationError;
+  if (!createPipelineCache()) return VCError::InitializationError;
 
   init_ = true;
   return VCError::Success;
@@ -97,6 +93,7 @@ bool Runtime::pickPhysicalDevice() {
       if (props[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
         device_->physical = d;
         device_->computeQueueFamily = i;
+        vkGetPhysicalDeviceMemoryProperties(d, &device_->memProps);
         return true;
       }
     }
@@ -127,37 +124,93 @@ bool Runtime::createLogicalDevice() {
   return true;
 }
 
-bool Runtime::createCommandPool() {
-  VkCommandPoolCreateInfo ci{};
-  ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-  ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-  ci.queueFamilyIndex = device_->computeQueueFamily;
-  return vkCreateCommandPool(device_->device, &ci, nullptr,
-                             &device_->commandPool) == VK_SUCCESS;
+// Build a stream over the compute queue with a FRAME_RING-sized frame ring.
+// Each frame has its own command buffer, fence, and descriptor pool so it can
+// be reset independently when recycled.
+static bool initStream(VulkanDevice &dev, VCStream &s,
+                       size_t frameRing = 2) {
+  s.queue = dev.computeQueue;
+  s.queueFamily = dev.computeQueueFamily;
+  s.frames.resize(frameRing);
+  s.frameIdx = 0;
+
+  VkCommandPoolCreateInfo pci{};
+  pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  // Reset command buffer bit so frames can be vkResetCommandBuffer'd.
+  pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  pci.queueFamilyIndex = s.queueFamily;
+  if (vkCreateCommandPool(dev.device, &pci, nullptr, &s.commandPool) !=
+      VK_SUCCESS)
+    return false;
+
+  VkCommandBufferAllocateInfo ai{};
+  ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  ai.commandPool = s.commandPool;
+  ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  ai.commandBufferCount = 1;
+
+  VkFenceCreateInfo fci{};
+  fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+  fci.flags = VK_FENCE_CREATE_SIGNALED_BIT; // start signaled so first beginFrame doesn't wait
+
+  VkDescriptorPoolSize ps{};
+  ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  ps.descriptorCount = 64;
+  VkDescriptorPoolCreateInfo dpci{};
+  dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  dpci.maxSets = 32;
+  dpci.poolSizeCount = 1;
+  dpci.pPoolSizes = &ps;
+
+  for (auto &f : s.frames) {
+    if (vkAllocateCommandBuffers(dev.device, &ai, &f.cb) != VK_SUCCESS)
+      return false;
+    if (vkCreateFence(dev.device, &fci, nullptr, &f.fence) != VK_SUCCESS)
+      return false;
+    if (vkCreateDescriptorPool(dev.device, &dpci, nullptr,
+                               &f.descriptorPool) != VK_SUCCESS)
+      return false;
+  }
+  return true;
 }
 
-bool Runtime::createDescriptorPool() {
-  VkDescriptorPoolSize poolSize{};
-  poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSize.descriptorCount = 256;
+static void teardownStream(VulkanDevice &dev, VCStream &s) {
+  // Collect live command-buffer handles into a contiguous array before
+  // freeing: StreamFrame.cb fields are not contiguous in memory (other
+  // members sit between them), so &frames[0].cb is not a valid handle array.
+  std::vector<VkCommandBuffer> cbs;
+  for (auto &f : s.frames) {
+    if (f.descriptorPool)
+      vkDestroyDescriptorPool(dev.device, f.descriptorPool, nullptr);
+    if (f.fence) vkDestroyFence(dev.device, f.fence, nullptr);
+    if (f.cb) cbs.push_back(f.cb);
+  }
+  if (!cbs.empty() && s.commandPool)
+    vkFreeCommandBuffers(dev.device, s.commandPool,
+                         static_cast<uint32_t>(cbs.size()), cbs.data());
+  if (s.commandPool) vkDestroyCommandPool(dev.device, s.commandPool, nullptr);
+}
 
-  VkDescriptorPoolCreateInfo ci{};
-  ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  // Allow individual sets to be freed back to the pool so repeated launches
-  // do not exhaust the 64-set cap.
-  ci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-  ci.maxSets = 64;
-  ci.poolSizeCount = 1;
-  ci.pPoolSizes = &poolSize;
-  return vkCreateDescriptorPool(device_->device, &ci, nullptr,
-                                &device_->descriptorPool) == VK_SUCCESS;
+bool Runtime::createDefaultStream() {
+  defaultStream_ = std::make_unique<VCStream>();
+  return initStream(*device_, *defaultStream_);
+}
+
+bool Runtime::createPipelineCache() {
+  VkPipelineCacheCreateInfo ci{};
+  ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  return vkCreatePipelineCache(device_->device, &ci, nullptr,
+                               &device_->pipelineCache) == VK_SUCCESS;
 }
 
 VCError Runtime::shutdown() {
   if (!init_) return VCError::Success;
   vkDeviceWaitIdle(device_->device);
-  vkDestroyDescriptorPool(device_->device, device_->descriptorPool, nullptr);
-  vkDestroyCommandPool(device_->device, device_->commandPool, nullptr);
+  for (auto &s : streams_) if (s) teardownStream(*device_, *s);
+  streams_.clear();
+  if (defaultStream_) { teardownStream(*device_, *defaultStream_); defaultStream_.reset(); }
+  if (device_->pipelineCache)
+    vkDestroyPipelineCache(device_->device, device_->pipelineCache, nullptr);
   vkDestroyDevice(device_->device, nullptr);
   vkDestroyInstance(device_->instance, nullptr);
   device_.reset();
@@ -166,13 +219,100 @@ VCError Runtime::shutdown() {
 }
 
 //----------------------------------------------------------------------------
-// Buffers
+// Streams
 //----------------------------------------------------------------------------
 
-VCError Runtime::mallocBuffer(size_t bytes, VCBuffer &out) {
-  if (!init_) return VCError::InitializationError;
-  out.size = bytes;
+VCStream &Runtime::resolveStream(VCStreamHandle h) {
+  return h ? *reinterpret_cast<VCStream *>(h) : *defaultStream_;
+}
 
+VCError Runtime::createStream(VCStreamHandle *out) {
+  if (!init_ || !out) return VCError::InitializationError;
+  auto s = std::make_unique<VCStream>();
+  if (!initStream(*device_, *s)) return VCError::InitializationError;
+  *out = reinterpret_cast<VCStreamHandle>(s.get());
+  streams_.push_back(std::move(s));
+  return VCError::Success;
+}
+
+VCError Runtime::destroyStream(VCStreamHandle stream) {
+  if (!init_ || !stream) return VCError::Success;
+  auto *s = reinterpret_cast<VCStream *>(stream);
+  vkQueueWaitIdle(s->queue);
+  teardownStream(*device_, *s);
+  // Remove from ownership vector.
+  for (auto it = streams_.begin(); it != streams_.end(); ++it) {
+    if (it->get() == s) { streams_.erase(it); break; }
+  }
+  return VCError::Success;
+}
+
+VCError Runtime::streamSynchronize(VCStream &s) {
+  // Wait on the in-flight frame's fence (the one most recently submitted).
+  if (!s.frames.empty()) {
+    auto &f = s.frames[(s.frameIdx + s.frames.size() - 1) % s.frames.size()];
+    if (vkWaitForFences(device_->device, 1, &f.fence, VK_TRUE,
+                        UINT64_MAX) != VK_SUCCESS)
+      return VCError::Unknown;
+  }
+  return VCError::Success;
+}
+
+// Wait for the frame we're about to reuse, reset it, begin recording.
+VkCommandBuffer Runtime::beginFrame(VCStream &s) {
+  StreamFrame &f = s.frames[s.frameIdx];
+  // Wait for the GPU to finish with this frame's previous submission.
+  vkWaitForFences(device_->device, 1, &f.fence, VK_TRUE, UINT64_MAX);
+  vkResetFences(device_->device, 1, &f.fence);
+  vkResetCommandBuffer(f.cb, 0);
+  vkResetDescriptorPool(device_->device, f.descriptorPool, 0);
+
+  VkCommandBufferBeginInfo bi{};
+  bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(f.cb, &bi);
+  return f.cb;
+}
+
+void Runtime::endFrame(VCStream &s) {
+  StreamFrame &f = s.frames[s.frameIdx];
+  vkEndCommandBuffer(f.cb);
+  VkSubmitInfo si{};
+  si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &f.cb;
+  vkQueueSubmit(s.queue, 1, &si, f.fence);
+  s.frameIdx = (s.frameIdx + 1) % s.frames.size();
+}
+
+VkDescriptorSet Runtime::allocFrameDescriptorSet(VCStream &s,
+                                                 VkDescriptorSetLayout layout) {
+  StreamFrame &f = s.frames[s.frameIdx];
+  VkDescriptorSetAllocateInfo ai{};
+  ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  ai.descriptorPool = f.descriptorPool;
+  ai.descriptorSetCount = 1;
+  ai.pSetLayouts = &layout;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  vkAllocateDescriptorSets(device_->device, &ai, &set);
+  return set;
+}
+
+//----------------------------------------------------------------------------
+// Memory
+//----------------------------------------------------------------------------
+
+uint32_t Runtime::findMemoryType(uint32_t reqBits,
+                                 VkMemoryPropertyFlags flags) const {
+  for (uint32_t i = 0; i < device_->memProps.memoryTypeCount; ++i) {
+    if ((reqBits & (1u << i)) &&
+        (device_->memProps.memoryTypes[i].propertyFlags & flags) == flags)
+      return i;
+  }
+  return UINT32_MAX;
+}
+
+static VkBuffer createBuffer(VkDevice dev, size_t bytes) {
   VkBufferCreateInfo bci{};
   bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
   bci.size = bytes;
@@ -180,29 +320,33 @@ VCError Runtime::mallocBuffer(size_t bytes, VCBuffer &out) {
               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
               VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VkBuffer buf = VK_NULL_HANDLE;
+  vkCreateBuffer(dev, &bci, nullptr, &buf);
+  return buf;
+}
 
-  if (vkCreateBuffer(device_->device, &bci, nullptr, &out.buffer) != VK_SUCCESS)
-    return VCError::OutOfMemory;
+// device-local: not mapped. Falls back to host-visible if no device-local
+// type satisfies the buffer (e.g. on integrated GPUs device-local == host).
+VCError Runtime::mallocBuffer(size_t bytes, VCBuffer &out) {
+  if (!init_) return VCError::InitializationError;
+  out.size = bytes;
+  out.buffer = createBuffer(device_->device, bytes);
+  if (!out.buffer) return VCError::OutOfMemory;
 
   VkMemoryRequirements reqs;
   vkGetBufferMemoryRequirements(device_->device, out.buffer, &reqs);
-
-  // Find host-visible memory type.
-  VkPhysicalDeviceMemoryProperties memProps;
-  vkGetPhysicalDeviceMemoryProperties(device_->physical, &memProps);
-  uint32_t typeIdx = UINT32_MAX;
-  VkMemoryPropertyFlags wanted =
-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-  for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-    if ((reqs.memoryTypeBits & (1u << i)) &&
-        (memProps.memoryTypes[i].propertyFlags & wanted) == wanted) {
-      typeIdx = i;
-      break;
-    }
-  }
+  uint32_t typeIdx = findMemoryType(
+      reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  bool hostFallback = false;
   if (typeIdx == UINT32_MAX) {
-    vkDestroyBuffer(device_->device, out.buffer, nullptr);
-    return VCError::OutOfMemory;
+    typeIdx = findMemoryType(
+        reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    hostFallback = true;
+    if (typeIdx == UINT32_MAX) {
+      vkDestroyBuffer(device_->device, out.buffer, nullptr);
+      return VCError::OutOfMemory;
+    }
   }
 
   VkMemoryAllocateInfo mai{};
@@ -215,9 +359,40 @@ VCError Runtime::mallocBuffer(size_t bytes, VCBuffer &out) {
     return VCError::OutOfMemory;
   }
   vkBindBufferMemory(device_->device, out.buffer, out.memory, 0);
+  out.hostVisible = hostFallback;
+  if (hostFallback)
+    vkMapMemory(device_->device, out.memory, 0, bytes, 0, &out.mapped);
+  return VCError::Success;
+}
 
-  // Persistently map for simple host access (staging in place).
+// host-visible + coherent, persistently mapped (pinned staging).
+VCError Runtime::mallocHostBuffer(size_t bytes, VCBuffer &out) {
+  if (!init_) return VCError::InitializationError;
+  out.size = bytes;
+  out.buffer = createBuffer(device_->device, bytes);
+  if (!out.buffer) return VCError::OutOfMemory;
+
+  VkMemoryRequirements reqs;
+  vkGetBufferMemoryRequirements(device_->device, out.buffer, &reqs);
+  uint32_t typeIdx = findMemoryType(
+      reqs.memoryTypeBits,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (typeIdx == UINT32_MAX) {
+    vkDestroyBuffer(device_->device, out.buffer, nullptr);
+    return VCError::OutOfMemory;
+  }
+  VkMemoryAllocateInfo mai{};
+  mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  mai.allocationSize = reqs.size;
+  mai.memoryTypeIndex = typeIdx;
+  if (vkAllocateMemory(device_->device, &mai, nullptr, &out.memory) !=
+      VK_SUCCESS) {
+    vkDestroyBuffer(device_->device, out.buffer, nullptr);
+    return VCError::OutOfMemory;
+  }
+  vkBindBufferMemory(device_->device, out.buffer, out.memory, 0);
   vkMapMemory(device_->device, out.memory, 0, bytes, 0, &out.mapped);
+  out.hostVisible = true;
   return VCError::Success;
 }
 
@@ -233,31 +408,58 @@ VCError Runtime::freeBuffer(VCBuffer &buf) {
   return VCError::Success;
 }
 
-VCError Runtime::copy(void *dst, const void *src, size_t bytes,
-                      VCMemcpyKind kind) {
+// Primitive: record vkCmdCopyBuffer(src.buf -> dst.buf) on stream s.
+VCError Runtime::copyDeviceToDevice(VCBuffer &dst, const VCBuffer &src,
+                                    size_t bytes, VCStream &s) {
+  VkCommandBuffer cb = beginFrame(s);
+  VkBufferCopy region{0, 0, bytes};
+  vkCmdCopyBuffer(cb, src.buffer, dst.buffer, 1, &region);
+  endFrame(s);
+  return VCError::Success;
+}
+
+// H2D: copy `bytes` from a host pointer into device buffer `dst` on stream s.
+// Stages through a transient host-visible scratch buffer.
+VCError Runtime::copyHostToDevice(VCBuffer &dst, const void *hostSrc,
+                                  size_t bytes, VCStream &s) {
+  VCBuffer scratch{};
+  if (mallocHostBuffer(bytes, scratch) != VCError::Success)
+    return VCError::OutOfMemory;
+  std::memcpy(scratch.mapped, hostSrc, bytes);
+  VkCommandBuffer cb = beginFrame(s);
+  VkBufferCopy region{0, 0, bytes};
+  vkCmdCopyBuffer(cb, scratch.buffer, dst.buffer, 1, &region);
+  endFrame(s);
+  streamSynchronize(s); // scratch must survive until the copy executes
+  freeBuffer(scratch);
+  return VCError::Success;
+}
+
+// D2H: copy `bytes` from device buffer `src` into a host pointer. Syncs so
+// the caller can read the result immediately.
+VCError Runtime::copyDeviceToHost(void *hostDst, const VCBuffer &src,
+                                  size_t bytes, VCStream &s) {
+  VCBuffer scratch{};
+  if (mallocHostBuffer(bytes, scratch) != VCError::Success)
+    return VCError::OutOfMemory;
+  VkCommandBuffer cb = beginFrame(s);
+  VkBufferCopy region{0, 0, bytes};
+  vkCmdCopyBuffer(cb, src.buffer, scratch.buffer, 1, &region);
+  endFrame(s);
+  streamSynchronize(s);
+  std::memcpy(hostDst, scratch.mapped, bytes);
+  freeBuffer(scratch);
+  return VCError::Success;
+}
+
+VCError Runtime::synchronize() {
   if (!init_) return VCError::InitializationError;
-  // Buffers are host-visible/coherent, so a simple memcpy through the
-  // mapped pointer suffices for the scaffold. A real runtime would issue
-  // transfer commands for device-local memory.
-  if (kind == VCMemcpyKind::HostToDevice) {
-    VCBuffer *b = reinterpret_cast<VCBuffer *>(dst);
-    if (!b || !b->mapped) return VCError::InvalidValue;
-    std::memcpy(b->mapped, src, bytes);
-  } else if (kind == VCMemcpyKind::DeviceToHost) {
-    VCBuffer *b = reinterpret_cast<VCBuffer *>(const_cast<void *>(src));
-    if (!b || !b->mapped) return VCError::InvalidValue;
-    std::memcpy(dst, b->mapped, bytes);
-  } else {
-    VCBuffer *db = reinterpret_cast<VCBuffer *>(dst);
-    VCBuffer *sb = reinterpret_cast<VCBuffer *>(const_cast<void *>(src));
-    if (!db || !sb || !db->mapped || !sb->mapped) return VCError::InvalidValue;
-    std::memcpy(db->mapped, sb->mapped, bytes);
-  }
+  vkDeviceWaitIdle(device_->device);
   return VCError::Success;
 }
 
 //----------------------------------------------------------------------------
-// Kernels
+// Kernels / pipelines
 //----------------------------------------------------------------------------
 
 VCError Runtime::loadKernel(const uint32_t *words, size_t wordCount,
@@ -289,32 +491,46 @@ VCError Runtime::loadKernelFromFile(const char *path, const char *entryPoint,
 
 void Runtime::releaseKernel(VCKernel &k) {
   if (!init_) return;
-  if (k.pipeline) vkDestroyPipeline(device_->device, k.pipeline, nullptr);
+  for (auto &kv : k.pipelines)
+    if (kv.second) vkDestroyPipeline(device_->device, kv.second, nullptr);
+  k.pipelines.clear();
   if (k.pipelineLayout)
     vkDestroyPipelineLayout(device_->device, k.pipelineLayout, nullptr);
   if (k.descriptorSetLayout)
     vkDestroyDescriptorSetLayout(device_->device, k.descriptorSetLayout,
                                  nullptr);
-  if (k.shaderModule) vkDestroyShaderModule(device_->device, k.shaderModule, nullptr);
+  if (k.shaderModule)
+    vkDestroyShaderModule(device_->device, k.shaderModule, nullptr);
   k = VCKernel{};
 }
 
-// Build the descriptor-set + pipeline layouts for a kernel given its arg
-// count. These are layout-only and reusable across launches; the actual
-// compute pipeline (which carries the workgroup-size specialization) is
-// built per launch in buildPipelineWithSpec().
-bool Runtime::buildPipelineForKernel(VCKernel &k, int argCount) {
-  // One storage-buffer binding per pointer argument.
-  std::vector<VkDescriptorSetLayoutBinding> bindings(argCount);
+// Build the descriptor-set + pipeline layouts. Pointer args get consecutive
+// SSBO bindings; scalar args are packed into a single push-constant range
+// (so they don't need per-launch staging buffers). `args`/`argCount` define
+// the arrangement; the layout is built once and cached on the kernel.
+bool Runtime::buildLayout(VCKernel &k, const VCKernelArg *args, int argCount) {
+  k.argCount = argCount;
+  // Collect pointer bindings + measure push-constant size for scalars.
+  std::vector<VkDescriptorSetLayoutBinding> bindings;
+  uint32_t pcSize = 0;
   for (int i = 0; i < argCount; ++i) {
-    bindings[i].binding = i;
-    bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[i].descriptorCount = 1;
-    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    if (args[i].kind == VCKernelArg::Pointer) {
+      VkDescriptorSetLayoutBinding b{};
+      b.binding = static_cast<uint32_t>(bindings.size());
+      b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      b.descriptorCount = 1;
+      b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      bindings.push_back(b);
+    } else {
+      // Round scalar size up to 4 bytes for std140-friendly packing.
+      uint32_t sz = static_cast<uint32_t>((args[i].size + 3) & ~size_t(3));
+      pcSize += sz;
+    }
   }
+
   VkDescriptorSetLayoutCreateInfo dci{};
   dci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  dci.bindingCount = argCount;
+  dci.bindingCount = static_cast<uint32_t>(bindings.size());
   dci.pBindings = bindings.data();
   if (vkCreateDescriptorSetLayout(device_->device, &dci, nullptr,
                                   &k.descriptorSetLayout) != VK_SUCCESS)
@@ -324,25 +540,36 @@ bool Runtime::buildPipelineForKernel(VCKernel &k, int argCount) {
   plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   plci.setLayoutCount = 1;
   plci.pSetLayouts = &k.descriptorSetLayout;
+  VkPushConstantRange pcr{};
+  if (pcSize > 0) {
+    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcr.offset = 0;
+    pcr.size = pcSize;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pcr;
+  }
   if (vkCreatePipelineLayout(device_->device, &plci, nullptr,
                              &k.pipelineLayout) != VK_SUCCESS)
     return false;
-  k.argCount = argCount;
+  k.pcSize = pcSize;
+  k.layoutBuilt = true;
   return true;
 }
 
-// Build a compute pipeline specializing the workgroup size to the given
-// block dimensions. Specialization constant IDs match what the GLSL
-// backend emits: 0 -> local_size_x, 1 -> local_size_y, 2 -> local_size_z.
-bool Runtime::buildPipelineWithSpec(VCKernel &k, unsigned blockX,
-                                    unsigned blockY, unsigned blockZ) {
-  if (k.pipeline) {
-    vkDestroyPipeline(device_->device, k.pipeline, nullptr);
-    k.pipeline = VK_NULL_HANDLE;
-  }
+// Fetch or create a pipeline specialized to the block size. Layout must be
+// built first (via buildLayout) — done in dispatch on first use.
+VkPipeline Runtime::getPipeline(VCKernel &k, unsigned blockX,
+                                unsigned blockY, unsigned blockZ,
+                                const VCKernelArg *args, int argCount) {
+  if (!k.layoutBuilt && !buildLayout(k, args, argCount))
+    return VK_NULL_HANDLE;
 
-  // Always provide all three; the shader only reads the IDs it declared,
-  // and extra map entries for undeclared IDs are ignored by the driver.
+  // Key: pack block dims into 64 bits (16 bits each + reserved).
+  uint64_t key = (uint64_t(blockX) << 32) | (uint64_t(blockY) << 16) | blockZ;
+  auto it = k.pipelines.find(key);
+  if (it != k.pipelines.end()) return it->second;
+
+  // Specialization constants: 0->x, 1->y, 2->z (matches GLSL backend).
   VkSpecializationMapEntry entries[3];
   unsigned data[3] = {blockX ? blockX : 1, blockY ? blockY : 1,
                       blockZ ? blockZ : 1};
@@ -365,144 +592,91 @@ bool Runtime::buildPipelineWithSpec(VCKernel &k, unsigned blockX,
   pci.stage.pName = k.entryPoint.c_str();
   pci.stage.pSpecializationInfo = &spec;
   pci.layout = k.pipelineLayout;
-  return vkCreateComputePipelines(device_->device, VK_NULL_HANDLE, 1, &pci,
-                                  nullptr, &k.pipeline) == VK_SUCCESS;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  if (vkCreateComputePipelines(device_->device, device_->pipelineCache, 1,
+                               &pci, nullptr, &pipeline) != VK_SUCCESS)
+    return VK_NULL_HANDLE;
+  k.pipelines[key] = pipeline;
+  return pipeline;
 }
 
-VkCommandBuffer Runtime::beginOneTime() const {
-  VkCommandBufferAllocateInfo ai{};
-  ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-  ai.commandPool = device_->commandPool;
-  ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  ai.commandBufferCount = 1;
-  VkCommandBuffer cb;
-  vkAllocateCommandBuffers(device_->device, &ai, &cb);
-  VkCommandBufferBeginInfo bi{};
-  bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  vkBeginCommandBuffer(cb, &bi);
-  return cb;
-}
+//----------------------------------------------------------------------------
+// Launch
+//----------------------------------------------------------------------------
 
-void Runtime::endOneTime(VkCommandBuffer cb) const {
-  vkEndCommandBuffer(cb);
-  VkSubmitInfo si{};
-  si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  si.commandBufferCount = 1;
-  si.pCommandBuffers = &cb;
-  vkQueueSubmit(device_->computeQueue, 1, &si, VK_NULL_HANDLE);
-  vkQueueWaitIdle(device_->computeQueue);
-  vkFreeCommandBuffers(device_->device, device_->commandPool, 1, &cb);
-}
-
-VCError Runtime::launch(VCKernel &k, unsigned gridDim, unsigned blockDim,
-                        const VCKernelArg *args, int argCount) {
-  if (!init_) return VCError::InitializationError;
+VCError Runtime::dispatch(VCKernel &k, unsigned wgX, unsigned wgY,
+                          unsigned wgZ, unsigned blockX, unsigned blockY,
+                          unsigned blockZ, const VCKernelArg *args,
+                          int argCount, VCStream &s) {
   if (!k.shaderModule) return VCError::InvalidKernel;
-  if (!k.pipelineLayout && !buildPipelineForKernel(k, argCount))
-    return VCError::InvalidKernel;
+  VkPipeline pipeline = getPipeline(k, blockX, blockY, blockZ, args, argCount);
+  if (!pipeline) return VCError::InvalidKernel;
 
-  unsigned workgroups = (gridDim + blockDim - 1) / blockDim;
-  if (!buildPipelineWithSpec(k, blockDim, 1, 1))
-    return VCError::InvalidKernel;
-  return dispatchBound(k, args, argCount, workgroups, 1, 1);
-}
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  // Only allocate a set if there are pointer args (SSBO bindings).
+  bool hasPointer = false;
+  for (int i = 0; i < argCount; ++i)
+    if (args[i].kind == VCKernelArg::Pointer) { hasPointer = true; break; }
+  if (hasPointer)
+    set = allocFrameDescriptorSet(s, k.descriptorSetLayout);
+  if (hasPointer && !set) return VCError::Unknown;
 
-VCError Runtime::launch2D(VCKernel &k, unsigned gridDimX, unsigned gridDimY,
-                          unsigned blockDimX, unsigned blockDimY,
-                          const VCKernelArg *args, int argCount) {
-  if (!init_) return VCError::InitializationError;
-  if (!k.shaderModule) return VCError::InvalidKernel;
-  if (!k.pipelineLayout && !buildPipelineForKernel(k, argCount))
-    return VCError::InvalidKernel;
-
-  unsigned wgX = (gridDimX + blockDimX - 1) / blockDimX;
-  unsigned wgY = (gridDimY + blockDimY - 1) / blockDimY;
-  if (!buildPipelineWithSpec(k, blockDimX, blockDimY, 1))
-    return VCError::InvalidKernel;
-  return dispatchBound(k, args, argCount, wgX, wgY, 1);
-}
-
-VCError Runtime::dispatchBound(VCKernel &k, const VCKernelArg *args,
-                               int argCount, unsigned wgX, unsigned wgY,
-                               unsigned wgZ) {
-  // Allocate + write a descriptor set.
-  VkDescriptorSetAllocateInfo dsai{};
-  dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-  dsai.descriptorPool = device_->descriptorPool;
-  dsai.descriptorSetCount = 1;
-  dsai.pSetLayouts = &k.descriptorSetLayout;
-  VkDescriptorSet set;
-  if (vkAllocateDescriptorSets(device_->device, &dsai, &set) != VK_SUCCESS)
-    return VCError::Unknown;
-
+  // Write descriptor bindings for pointer args (consecutive binding index).
   std::vector<VkDescriptorBufferInfo> bufInfos;
   std::vector<VkWriteDescriptorSet> writes;
-  // Temporary buffers backing scalar-by-value arguments (each is bound as
-  // a storage buffer to match the shader's SSBO binding).
-  std::vector<VCBuffer> scalarBufs;
   bufInfos.reserve(argCount);
   writes.reserve(argCount);
+  uint32_t bindIdx = 0;
   for (int i = 0; i < argCount; ++i) {
+    if (args[i].kind != VCKernelArg::Pointer) continue;
+    auto *b = reinterpret_cast<VCBuffer *>(const_cast<void *>(args[i].data));
     VkDescriptorBufferInfo bi{};
-    if (args[i].kind == VCKernelArg::Pointer) {
-      auto *b = reinterpret_cast<VCBuffer *>(const_cast<void *>(args[i].data));
-      bi.buffer = b ? b->buffer : VK_NULL_HANDLE;
-      bi.offset = 0;
-      bi.range = b ? b->size : 0;
-    } else {
-      // Scalar: stage into a small device buffer.
-      scalarBufs.emplace_back();
-      if (mallocBuffer(std::max<size_t>(args[i].size, 4), scalarBufs.back()) !=
-          VCError::Success) {
-        for (auto &sb : scalarBufs) freeBuffer(sb);
-        return VCError::OutOfMemory;
-      }
-      std::memcpy(scalarBufs.back().mapped, args[i].data, args[i].size);
-      bi.buffer = scalarBufs.back().buffer;
-      bi.offset = 0;
-      bi.range = args[i].size;
-    }
+    bi.buffer = b ? b->buffer : VK_NULL_HANDLE;
+    bi.offset = 0;
+    bi.range = b ? b->size : 0;
     bufInfos.push_back(bi);
     VkWriteDescriptorSet w{};
     w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w.dstSet = set;
-    w.dstBinding = i;
+    w.dstBinding = bindIdx++;
     w.descriptorCount = 1;
     w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     w.pBufferInfo = &bufInfos.back();
     writes.push_back(w);
   }
-  vkUpdateDescriptorSets(device_->device, writes.size(), writes.data(), 0,
-                         nullptr);
+  if (!writes.empty())
+    vkUpdateDescriptorSets(device_->device, writes.size(), writes.data(), 0,
+                           nullptr);
 
-  VkCommandBuffer cb = beginOneTime();
-  vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipeline);
-  vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipelineLayout,
-                          0, 1, &set, 0, nullptr);
+  // Pack scalar args into a push-constant buffer.
+  std::vector<uint8_t> pcData;
+  pcData.reserve(k.pcSize);
+  if (k.pcSize > 0) {
+    for (int i = 0; i < argCount; ++i) {
+      if (args[i].kind != VCKernelArg::Scalar) continue;
+      uint32_t sz = static_cast<uint32_t>((args[i].size + 3) & ~size_t(3));
+      size_t off = pcData.size();
+      pcData.resize(off + sz, 0);
+      std::memcpy(pcData.data() + off, args[i].data, args[i].size);
+    }
+  }
+
+  VkCommandBuffer cb = beginFrame(s);
+  vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+  if (set)
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            k.pipelineLayout, 0, 1, &set, 0, nullptr);
+  if (!pcData.empty())
+    vkCmdPushConstants(cb, k.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       static_cast<uint32_t>(pcData.size()), pcData.data());
   vkCmdDispatch(cb, wgX, wgY, wgZ);
-  endOneTime(cb); // waits for the queue to idle, so scalar buffers are safe
-                 // to release now.
-  for (auto &sb : scalarBufs) freeBuffer(sb);
-  // Return the descriptor set to the pool; the pool was created with
-  // FREE_DESCRIPTOR_SET_BIT so this won't exhaust it across launches.
-  vkFreeDescriptorSets(device_->device, device_->descriptorPool, 1, &set);
+  endFrame(s);
   return VCError::Success;
 }
-
-VCError Runtime::synchronize() {
-  if (!init_) return VCError::InitializationError;
-  vkDeviceWaitIdle(device_->device);
-  return VCError::Success;
-}
-
-} // namespace vc
 
 //----------------------------------------------------------------------------
 // C API wrappers
 //----------------------------------------------------------------------------
-
-namespace vc {
 
 VCError vcInit() { return Runtime::get().init(); }
 VCError vcShutdown() { return Runtime::get().shutdown(); }
@@ -527,6 +701,15 @@ VCError vcMalloc(void **devPtr, size_t bytes) {
   return VCError::Success;
 }
 
+VCError vcMallocHost(void **hostPtr, size_t bytes) {
+  if (!hostPtr) return VCError::InvalidValue;
+  auto *b = new VCBuffer{};
+  VCError e = Runtime::get().mallocHostBuffer(bytes, *b);
+  if (e != VCError::Success) { delete b; return e; }
+  *hostPtr = b;
+  return VCError::Success;
+}
+
 VCError vcFree(void *devPtr) {
   if (!devPtr) return VCError::Success;
   auto *b = reinterpret_cast<VCBuffer *>(devPtr);
@@ -535,11 +718,45 @@ VCError vcFree(void *devPtr) {
   return e;
 }
 
-VCError vcMemcpy(void *dst, const void *src, size_t count, VCMemcpyKind kind) {
-  return Runtime::get().copy(dst, src, count, kind);
+VCError vcMemcpyS(void *dst, const void *src, size_t count,
+                  VCMemcpyKind kind, VCStreamHandle stream) {
+  auto &rt = Runtime::get();
+  auto &s = rt.resolveStream(stream);
+  if (kind == VCMemcpyKind::HostToDevice) {
+    auto *b = reinterpret_cast<VCBuffer *>(dst);
+    if (!b) return VCError::InvalidValue;
+    return rt.copyHostToDevice(*b, src, count, s);
+  } else if (kind == VCMemcpyKind::DeviceToHost) {
+    auto *b = reinterpret_cast<VCBuffer *>(const_cast<void *>(src));
+    if (!b) return VCError::InvalidValue;
+    return rt.copyDeviceToHost(dst, *b, count, s);
+  } else { // DeviceToDevice
+    auto *db = reinterpret_cast<VCBuffer *>(dst);
+    auto *sb = reinterpret_cast<VCBuffer *>(const_cast<void *>(src));
+    if (!db || !sb) return VCError::InvalidValue;
+    return rt.copyDeviceToDevice(*db, *sb, count, s);
+  }
+}
+
+VCError vcMemcpy(void *dst, const void *src, size_t count,
+                 VCMemcpyKind kind) {
+  return vcMemcpyS(dst, src, count, kind, nullptr);
 }
 
 VCError vcDeviceSynchronize() { return Runtime::get().synchronize(); }
+
+VCError vcStreamCreate(VCStreamHandle *out) {
+  return Runtime::get().createStream(out);
+}
+
+VCError vcStreamDestroy(VCStreamHandle stream) {
+  return Runtime::get().destroyStream(stream);
+}
+
+VCError vcStreamSynchronize(VCStreamHandle stream) {
+  auto &rt = Runtime::get();
+  return rt.streamSynchronize(rt.resolveStream(stream));
+}
 
 VCError vcLoadKernel(const uint32_t *spirvWords, size_t wordCount,
                      const char *entryPoint, VCKernelHandle *outKernel) {
@@ -569,22 +786,43 @@ VCError vcReleaseKernel(VCKernelHandle kernel) {
   return VCError::Success;
 }
 
+VCError vcLaunchKernelS(VCKernelHandle kernel, unsigned gridDim,
+                        unsigned blockDim, const VCKernelArg *args,
+                        int argCount, VCStreamHandle stream) {
+  if (!kernel) return VCError::InvalidKernel;
+  auto &rt = Runtime::get();
+  auto *k = reinterpret_cast<VCKernel *>(kernel);
+  unsigned wg = (gridDim + blockDim - 1) / blockDim;
+  return rt.dispatch(*k, wg, 1, 1, blockDim, 1, 1, args, argCount,
+                     rt.resolveStream(stream));
+}
+
+VCError vcLaunchKernel2DS(VCKernelHandle kernel, unsigned gridDimX,
+                          unsigned gridDimY, unsigned blockDimX,
+                          unsigned blockDimY, const VCKernelArg *args,
+                          int argCount, VCStreamHandle stream) {
+  if (!kernel) return VCError::InvalidKernel;
+  auto &rt = Runtime::get();
+  auto *k = reinterpret_cast<VCKernel *>(kernel);
+  unsigned wgX = (gridDimX + blockDimX - 1) / blockDimX;
+  unsigned wgY = (gridDimY + blockDimY - 1) / blockDimY;
+  return rt.dispatch(*k, wgX, wgY, 1, blockDimX, blockDimY, 1, args, argCount,
+                     rt.resolveStream(stream));
+}
+
 VCError vcLaunchKernel(VCKernelHandle kernel, unsigned gridDim,
                        unsigned blockDim, const VCKernelArg *args,
                        int argCount) {
-  if (!kernel) return VCError::InvalidKernel;
-  auto *k = reinterpret_cast<VCKernel *>(kernel);
-  return Runtime::get().launch(*k, gridDim, blockDim, args, argCount);
+  return vcLaunchKernelS(kernel, gridDim, blockDim, args, argCount, nullptr);
 }
 
 VCError vcLaunchKernel2D(VCKernelHandle kernel, unsigned gridDimX,
                          unsigned gridDimY, unsigned blockDimX,
                          unsigned blockDimY, const VCKernelArg *args,
                          int argCount) {
-  if (!kernel) return VCError::InvalidKernel;
-  auto *k = reinterpret_cast<VCKernel *>(kernel);
-  return Runtime::get().launch2D(*k, gridDimX, gridDimY, blockDimX, blockDimY,
-                                 args, argCount);
+  return vcLaunchKernel2DS(kernel, gridDimX, gridDimY, blockDimX, blockDimY,
+                           args, argCount, nullptr);
 }
 
 } // namespace vc
+

@@ -1,9 +1,10 @@
 # VC Examples
 
-Three end-to-end demos that compile a `.vc` kernel to SPIR-V (via the GLSL
+Four end-to-end demos that compile a `.vc` kernel to SPIR-V (via the GLSL
 backend) and run it on Vulkan through the CUDA-style runtime API. Each is a
 self-contained host program: allocate buffers, launch the kernel, copy back,
-print `PASS`/`FAIL`.
+print `PASS`/`FAIL`. The first three are synchronous correctness demos; the
+fourth (`async_overlap`) exercises the async stream API.
 
 ## Prerequisites
 
@@ -123,7 +124,63 @@ dimensions, so the same `.spv` runs at any block shape without recompiling.
 
 ---
 
-## Run all three
+## async_overlap
+
+**Kernel:** [`test/vadd.vc`](../test/vadd.vc) (reused)
+**Host:** [`async_overlap.cpp`](async_overlap.cpp)
+
+Async stream overlap demo. Two independent `vector_add` workloads are
+dispatched back-to-back on **two separate streams** (`vcStreamCreate`), with no
+synchronization between them, then each stream is synchronized and verified
+independently. This exercises the stream API added by the runtime refactor:
+
+- `vcStreamCreate` / `vcStreamDestroy` / `vcStreamSynchronize`
+- `vcLaunchKernelS(..., stream)` — explicit-stream 1D launch (`NULL` = default)
+- `vcMemcpyS(..., stream)` — explicit-stream memcpy
+
+```bash
+./build/tools/vc-glsl/vc-glsl test/vadd.vc -o build/vadd.spv
+./build/examples/async_overlap build/vadd.spv
+# async_overlap: PASS
+```
+
+It proves launches no longer block the host (no per-launch `vkQueueWaitIdle`),
+that per-stream command ordering holds (memcpy-then-launch within a stream is
+correct without cross-stream sync), and that work on different streams stays
+independent.
+
+---
+
+## Stream & memcpy semantics
+
+The runtime mirrors a subset of the CUDA Runtime API semantics:
+
+| API | Memory | mapped? | Async? |
+|-----|--------|---------|--------|
+| `vcMalloc` | device-local | no | — |
+| `vcMallocHost` | host-visible (pinned) | yes | — |
+| `vcMemcpy` H2D | — | — | async on stream |
+| `vcMemcpy` D2D | — | — | async on stream |
+| `vcMemcpy` D2H | — | — | **synchronous** (waits so the host can read) |
+
+- **Streams** are ordered command queues. `NULL` (or omitting the stream arg)
+  is the default stream. Commands issued to the same stream execute in order;
+  different streams may execute concurrently.
+- **`_S` suffix** variants (`vcLaunchKernelS`, `vcLaunchKernel2DS`,
+  `vcMemcpyS`) take a `VCStreamHandle` as their last argument. The unsuffixed
+  `vcLaunchKernel` / `vcLaunchKernel2D` / `vcMemcpy` are wrappers that pass
+  `NULL` (default stream) — so existing programs work unchanged.
+- **D2H memcpy blocks** until the copy completes, matching `cudaMemcpy(D2H)`,
+  so the destination is readable on return. Truly async D2H is a future TODO.
+- **Scalar kernel args** are passed via push constants (`pc.<name>` in the
+  emitted GLSL), not staging buffers; pointer args get consecutive SSBO
+  bindings. This is handled jointly by the GLSL backend and the runtime, and
+  is transparent to `.vc` source and host code.
+
+---
+
+## Run all four
+
 
 ```bash
 for d in vadd:vector_add reduce:block_reduce matmul:matmul; do
@@ -131,6 +188,8 @@ for d in vadd:vector_add reduce:block_reduce matmul:matmul; do
   ./build/tools/vc-glsl/vc-glsl test/$k.vc -o build/$k.spv && \
   ./build/examples/$b build/$k.spv
 done
+# async_overlap reuses the vadd kernel:
+./build/examples/async_overlap build/vadd.spv
 ```
 
 ## Troubleshooting

@@ -30,6 +30,12 @@ using VCBufferHandle = VCBuffer *;
 struct VCKernel;
 using VCKernelHandle = VCKernel *;
 
+/// Opaque handle to an execution stream (an ordered command queue). Commands
+/// issued to the same stream execute in order; different streams may execute
+/// concurrently. NULL is the default stream.
+struct VCStream;
+using VCStreamHandle = VCStream *;
+
 /// Error codes mirroring cudaError_t style.
 enum class VCError {
   Success = 0,
@@ -59,17 +65,37 @@ VCError vcShutdown();
 /// Query the number of available Vulkan devices.
 VCError vcGetDeviceCount(int *count);
 
-/// Allocate `bytes` of device-local, host-visible memory.
+/// Allocate `bytes` of device-local memory. Not host-accessible; use
+/// vcMemcpy to move data in/out.
 VCError vcMalloc(void **devPtr, size_t bytes);
 
-/// Free a device allocation.
+/// Allocate `bytes` of host-visible (pinned) memory, persistently mapped.
+/// Useful for staging buffers the host reads/writes directly.
+VCError vcMallocHost(void **hostPtr, size_t bytes);
+
+/// Free a device or host allocation.
 VCError vcFree(void *devPtr);
 
-/// Copy memory. `count` is bytes.
+/// Copy memory. `count` is bytes. H2D and D2D are asynchronous on the
+/// default stream; D2H blocks until the copy completes so the host can read
+/// the destination immediately.
 VCError vcMemcpy(void *dst, const void *src, size_t count, VCMemcpyKind kind);
+
+/// Like vcMemcpy but on an explicit `stream` (NULL = default stream).
+VCError vcMemcpyS(void *dst, const void *src, size_t count, VCMemcpyKind kind,
+                  VCStreamHandle stream);
 
 /// Block until all queued device work is complete.
 VCError vcDeviceSynchronize();
+
+/// Create an execution stream. Commands on the same stream run in order.
+VCError vcStreamCreate(VCStreamHandle *out);
+
+/// Destroy a stream. Implicitly waits for pending work on it.
+VCError vcStreamDestroy(VCStreamHandle stream);
+
+/// Block until all work queued on `stream` is complete. NULL = default stream.
+VCError vcStreamSynchronize(VCStreamHandle stream);
 
 /// Load a SPIR-V binary (already assembled into a .spv blob) as a kernel.
 /// `entryPoint` names the spir-v entry function (default "main").
@@ -92,7 +118,8 @@ struct VCKernelArg {
 };
 
 /// Launch a kernel with a 1D grid/block. `gridDim`/`blockDim` are element
-/// counts; the workgroup count = ceil(gridDim/blockDim).
+/// counts; the workgroup count = ceil(gridDim/blockDim). Asynchronous on the
+/// default stream.
 VCError vcLaunchKernel(VCKernelHandle kernel, unsigned gridDim,
                        unsigned blockDim, const VCKernelArg *args,
                        int argCount);
@@ -104,6 +131,17 @@ VCError vcLaunchKernel2D(VCKernelHandle kernel, unsigned gridDimX,
                          unsigned gridDimY, unsigned blockDimX,
                          unsigned blockDimY, const VCKernelArg *args,
                          int argCount);
+
+/// Asynchronous 1D launch on an explicit `stream` (NULL = default stream).
+VCError vcLaunchKernelS(VCKernelHandle kernel, unsigned gridDim,
+                        unsigned blockDim, const VCKernelArg *args,
+                        int argCount, VCStreamHandle stream);
+
+/// Asynchronous 2D launch on an explicit `stream` (NULL = default stream).
+VCError vcLaunchKernel2DS(VCKernelHandle kernel, unsigned gridDimX,
+                          unsigned gridDimY, unsigned blockDimX,
+                          unsigned blockDimY, const VCKernelArg *args,
+                          int argCount, VCStreamHandle stream);
 
 /// Human-readable string for an error code.
 const char *vcErrorString(VCError err);

@@ -23,6 +23,9 @@ class GLSLEmitter {
   // by the host via specialization constants.
   bool useY = false;
   bool useZ = false;
+  // Names of scalar parameters, which are accessed as `pc.<name>` since they
+  // live in the push-constant block.
+  SmallVector<StringRef, 8> scalarParams;
 
 public:
   GLSLEmitter(raw_ostream &o) : os(o) {}
@@ -164,22 +167,27 @@ private:
   }
 
   void emitBindings() {
-    // One SSBO binding per parameter, in declaration order. Pointer params
-    // expose a runtime-sized array; scalar params expose a single value.
-    // This mirrors the runtime, which binds every argument as a storage
-    // buffer.
+    // Pointer params get consecutive SSBO bindings (0,1,2,...). Scalar
+    // params are packed into a single push-constant block instead of SSBOs,
+    // so the runtime can pass them via vkCmdPushConstants without staging
+    // buffers. Binding indices skip scalars, matching the runtime's layout.
+    SmallVector<const ParamDecl *, 8> scalars;
+    unsigned bindIdx = 0;
     for (unsigned i = 0; i < params.size(); ++i) {
       const ParamDecl *p = params[i];
-      const char *ty = glslType(p->type);
       bool isPtr = p->type && p->type->getKind() == TypeKind::Pointer;
-      os << "layout(set = 0, binding = " << i << ") buffer B" << i << " {\n";
-      if (isPtr)
-        os << "  " << ty << " " << p->name << "[];\n";
-      else
-        os << "  " << ty << " " << p->name << ";\n";
-      os << "};\n\n";
+      if (!isPtr) { scalars.push_back(p); scalarParams.push_back(p->name); continue; }
+      const char *ty = glslType(p->type);
+      os << "layout(set = 0, binding = " << bindIdx << ") buffer B" << bindIdx
+         << " {\n  " << ty << " " << p->name << "[];\n};\n\n";
+      ++bindIdx;
     }
-    os << "\n";
+    if (!scalars.empty()) {
+      os << "layout(push_constant) uniform PC {\n";
+      for (const ParamDecl *p : scalars)
+        os << "  " << glslType(p->type) << " " << p->name << ";\n";
+      os << "} pc;\n\n";
+    }
   }
 
   void emitSharedDecls() {
@@ -350,9 +358,16 @@ private:
     case ASTNode::NodeKind::FloatLiteral:
       os << static_cast<const FloatLiteral *>(n)->value;
       break;
-    case ASTNode::NodeKind::DeclRefExpr:
-      os << static_cast<const DeclRefExpr *>(n)->name;
+    case ASTNode::NodeKind::DeclRefExpr: {
+      StringRef name = static_cast<const DeclRefExpr *>(n)->name;
+      // Scalar params live in the push-constant block; qualify them.
+      bool isScalar = false;
+      for (StringRef s : scalarParams)
+        if (s == name) { isScalar = true; break; }
+      if (isScalar) os << "pc.";
+      os << name;
       break;
+    }
     case ASTNode::NodeKind::BinaryExpr: {
       auto *b = static_cast<const BinaryExpr *>(n);
       os << "(";
