@@ -1,0 +1,32 @@
+// Block-sum reduction demo.
+// Each workgroup of `blockDim` threads sums its slice of the input and
+// writes one output element: out[blockIdx.x] = sum(in[blockIdx.x*block .. +block-1]).
+// Exercises: for-loop, __shared__ memory, __syncthreads().
+__global__ void blockReduce(float* inBuf, float* outBuf, int N) {
+  int tid = threadIdx.x;
+  int block = blockDim.x;
+  int start = blockIdx.x * block;
+  int i = start + tid;
+  int end = start + block;
+  if (end > N) end = N;
+
+  __shared__ float s[256];
+
+  // Each thread loads one element (0 if out of range).
+  if (i < N)
+    s[tid] = inBuf[i];
+  else
+    s[tid] = 0.0;
+  __syncthreads();
+
+  // Tree reduction within the workgroup.
+  for (int s2 = block / 2; s2 > 0; s2 = s2 / 2) {
+    if (tid < s2) {
+      s[tid] = s[tid] + s[tid + s2];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0)
+    outBuf[blockIdx.x] = s[0];
+}

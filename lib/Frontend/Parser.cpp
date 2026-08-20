@@ -138,6 +138,18 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
     return nullptr;
   // expect() already consumed the identifier.
   auto *v = new VarDecl(toSourceLoc(nameTok), ty, nameTok.text);
+  // Trailing array dimensions: "name[16][8]". Each must be a constant
+  // integer literal for now (no runtime sizing on locals).
+  while (curTok.is(TokKind::l_square)) {
+    advance();
+    NodePtr dim = parseExpression();
+    if (dim && dim->getNodeType() == ASTNode::NodeKind::IntegerLiteral)
+      v->arrayDims.push_back(
+          static_cast<IntegerLiteral *>(dim.get())->value);
+    else
+      v->arrayDims.push_back(0); // unsized / unknown
+    expect(TokKind::r_square, "']'");
+  }
   if (curTok.is(TokKind::assign)) {
     advance();
     v->init = parseExpression();
@@ -178,6 +190,8 @@ NodePtr Parser::parseStatement() {
   switch (curTok.kind) {
   case TokKind::l_brace: return parseCompoundStmt();
   case TokKind::kw_return: return parseReturnStmt();
+  case TokKind::kw_for: return parseForStmt();
+  case TokKind::kw_while: return parseWhileStmt();
   case TokKind::kw_if: {
     Token t = curTok;
     advance();
@@ -229,6 +243,48 @@ NodePtr Parser::parseReturnStmt() {
   return NodePtr(rs);
 }
 
+// for (init; cond; step) body
+// init: a declaration or expression statement (consumes its ';')
+// cond: optional expression
+// step: optional expression
+NodePtr Parser::parseForStmt() {
+  Token f = curTok;
+  advance();
+  auto *fs = new ForStmt(toSourceLoc(f));
+  expect(TokKind::l_paren, "'('");
+
+  // init: empty, a declaration, or an expression.
+  if (!curTok.is(TokKind::semi)) {
+    fs->init = parseDeclOrExprStmt(); // consumes the ';'
+  } else {
+    advance(); // consume ';'
+  }
+
+  // cond: optional expression followed by ';'.
+  if (!curTok.is(TokKind::semi))
+    fs->cond = parseExpression();
+  expect(TokKind::semi, "';'");
+
+  // step: optional expression followed by ')'.
+  if (!curTok.is(TokKind::r_paren))
+    fs->step = parseExpression();
+  expect(TokKind::r_paren, "')'");
+
+  fs->body = parseStatement();
+  return NodePtr(fs);
+}
+
+NodePtr Parser::parseWhileStmt() {
+  Token w = curTok;
+  advance();
+  expect(TokKind::l_paren, "'('");
+  auto *ws = new WhileStmt(toSourceLoc(w));
+  ws->cond = parseExpression();
+  expect(TokKind::r_paren, "')'");
+  ws->body = parseStatement();
+  return NodePtr(ws);
+}
+
 NodePtr Parser::parseDeclOrExprStmt() {
   // If the current token starts a type, parse a declaration.
   Token save = curTok;
@@ -268,7 +324,7 @@ NodePtr Parser::parseDeclOrExprStmt() {
 NodePtr Parser::parseExpression() { return parseAssignment(); }
 
 NodePtr Parser::parseAssignment() {
-  auto lhs = parseEquality();
+  auto lhs = parseLogicalOr();
   if (!lhs) return nullptr;
   if (curTok.is(TokKind::assign)) {
     Token op = curTok;
@@ -276,6 +332,30 @@ NodePtr Parser::parseAssignment() {
     auto rhs = parseAssignment();
     return NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::Assign,
                                   std::move(lhs), std::move(rhs)));
+  }
+  return lhs;
+}
+
+NodePtr Parser::parseLogicalOr() {
+  auto lhs = parseLogicalAnd();
+  while (curTok.is(TokKind::pipe_pipe)) {
+    Token op = curTok;
+    advance();
+    auto rhs = parseLogicalAnd();
+    lhs = NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::LOr,
+                                 std::move(lhs), std::move(rhs)));
+  }
+  return lhs;
+}
+
+NodePtr Parser::parseLogicalAnd() {
+  auto lhs = parseEquality();
+  while (curTok.is(TokKind::amp_amp)) {
+    Token op = curTok;
+    advance();
+    auto rhs = parseEquality();
+    lhs = NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::LAnd,
+                                 std::move(lhs), std::move(rhs)));
   }
   return lhs;
 }

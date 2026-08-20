@@ -68,7 +68,18 @@ public:
 
   VCError launch(VCKernel &k, unsigned gridDim, unsigned blockDim,
                  const VCKernelArg *args, int argCount);
+  // 2D launch: grid/block given as element counts per axis; dispatches
+  // ceil(grid/block) workgroups in x and y.
+  VCError launch2D(VCKernel &k, unsigned gridDimX, unsigned gridDimY,
+                   unsigned blockDimX, unsigned blockDimY,
+                   const VCKernelArg *args, int argCount);
   VCError synchronize();
+
+  // Shared core of launch/launch2D: builds+binds the descriptor set for the
+  // args and dispatches `wgX x wgY x wgZ` workgroups. Both scalar-staging
+  // buffers and the descriptor set are reclaimed after the queue goes idle.
+  VCError dispatchBound(VCKernel &k, const VCKernelArg *args, int argCount,
+                        unsigned wgX, unsigned wgY, unsigned wgZ);
 
 private:
   std::unique_ptr<VulkanDevice> device_;
@@ -79,6 +90,10 @@ private:
   bool createCommandPool();
   bool createDescriptorPool();
   bool buildPipelineForKernel(VCKernel &k, int argCount);
+  // Build a compute pipeline specialized to the given workgroup size. Called
+  // per launch because the block dimensions may vary between launches.
+  bool buildPipelineWithSpec(VCKernel &k, unsigned blockX, unsigned blockY,
+                             unsigned blockZ);
   VkCommandBuffer beginOneTime() const;
   void endOneTime(VkCommandBuffer cb) const;
 };

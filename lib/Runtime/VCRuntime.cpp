@@ -143,6 +143,9 @@ bool Runtime::createDescriptorPool() {
 
   VkDescriptorPoolCreateInfo ci{};
   ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  // Allow individual sets to be freed back to the pool so repeated launches
+  // do not exhaust the 64-set cap.
+  ci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
   ci.maxSets = 64;
   ci.poolSizeCount = 1;
   ci.pPoolSizes = &poolSize;
@@ -296,6 +299,10 @@ void Runtime::releaseKernel(VCKernel &k) {
   k = VCKernel{};
 }
 
+// Build the descriptor-set + pipeline layouts for a kernel given its arg
+// count. These are layout-only and reusable across launches; the actual
+// compute pipeline (which carries the workgroup-size specialization) is
+// built per launch in buildPipelineWithSpec().
 bool Runtime::buildPipelineForKernel(VCKernel &k, int argCount) {
   // One storage-buffer binding per pointer argument.
   std::vector<VkDescriptorSetLayoutBinding> bindings(argCount);
@@ -320,6 +327,35 @@ bool Runtime::buildPipelineForKernel(VCKernel &k, int argCount) {
   if (vkCreatePipelineLayout(device_->device, &plci, nullptr,
                              &k.pipelineLayout) != VK_SUCCESS)
     return false;
+  k.argCount = argCount;
+  return true;
+}
+
+// Build a compute pipeline specializing the workgroup size to the given
+// block dimensions. Specialization constant IDs match what the GLSL
+// backend emits: 0 -> local_size_x, 1 -> local_size_y, 2 -> local_size_z.
+bool Runtime::buildPipelineWithSpec(VCKernel &k, unsigned blockX,
+                                    unsigned blockY, unsigned blockZ) {
+  if (k.pipeline) {
+    vkDestroyPipeline(device_->device, k.pipeline, nullptr);
+    k.pipeline = VK_NULL_HANDLE;
+  }
+
+  // Always provide all three; the shader only reads the IDs it declared,
+  // and extra map entries for undeclared IDs are ignored by the driver.
+  VkSpecializationMapEntry entries[3];
+  unsigned data[3] = {blockX ? blockX : 1, blockY ? blockY : 1,
+                      blockZ ? blockZ : 1};
+  for (int i = 0; i < 3; ++i) {
+    entries[i].constantID = i;
+    entries[i].offset = i * sizeof(unsigned);
+    entries[i].size = sizeof(unsigned);
+  }
+  VkSpecializationInfo spec{};
+  spec.mapEntryCount = 3;
+  spec.pMapEntries = entries;
+  spec.dataSize = sizeof(data);
+  spec.pData = data;
 
   VkComputePipelineCreateInfo pci{};
   pci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -327,12 +363,10 @@ bool Runtime::buildPipelineForKernel(VCKernel &k, int argCount) {
   pci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
   pci.stage.module = k.shaderModule;
   pci.stage.pName = k.entryPoint.c_str();
+  pci.stage.pSpecializationInfo = &spec;
   pci.layout = k.pipelineLayout;
-  if (vkCreateComputePipelines(device_->device, VK_NULL_HANDLE, 1, &pci,
-                               nullptr, &k.pipeline) != VK_SUCCESS)
-    return false;
-  k.argCount = argCount;
-  return true;
+  return vkCreateComputePipelines(device_->device, VK_NULL_HANDLE, 1, &pci,
+                                  nullptr, &k.pipeline) == VK_SUCCESS;
 }
 
 VkCommandBuffer Runtime::beginOneTime() const {
@@ -365,9 +399,33 @@ VCError Runtime::launch(VCKernel &k, unsigned gridDim, unsigned blockDim,
                         const VCKernelArg *args, int argCount) {
   if (!init_) return VCError::InitializationError;
   if (!k.shaderModule) return VCError::InvalidKernel;
-  if (!k.pipeline && !buildPipelineForKernel(k, argCount))
+  if (!k.pipelineLayout && !buildPipelineForKernel(k, argCount))
     return VCError::InvalidKernel;
 
+  unsigned workgroups = (gridDim + blockDim - 1) / blockDim;
+  if (!buildPipelineWithSpec(k, blockDim, 1, 1))
+    return VCError::InvalidKernel;
+  return dispatchBound(k, args, argCount, workgroups, 1, 1);
+}
+
+VCError Runtime::launch2D(VCKernel &k, unsigned gridDimX, unsigned gridDimY,
+                          unsigned blockDimX, unsigned blockDimY,
+                          const VCKernelArg *args, int argCount) {
+  if (!init_) return VCError::InitializationError;
+  if (!k.shaderModule) return VCError::InvalidKernel;
+  if (!k.pipelineLayout && !buildPipelineForKernel(k, argCount))
+    return VCError::InvalidKernel;
+
+  unsigned wgX = (gridDimX + blockDimX - 1) / blockDimX;
+  unsigned wgY = (gridDimY + blockDimY - 1) / blockDimY;
+  if (!buildPipelineWithSpec(k, blockDimX, blockDimY, 1))
+    return VCError::InvalidKernel;
+  return dispatchBound(k, args, argCount, wgX, wgY, 1);
+}
+
+VCError Runtime::dispatchBound(VCKernel &k, const VCKernelArg *args,
+                               int argCount, unsigned wgX, unsigned wgY,
+                               unsigned wgZ) {
   // Allocate + write a descriptor set.
   VkDescriptorSetAllocateInfo dsai{};
   dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -418,15 +476,17 @@ VCError Runtime::launch(VCKernel &k, unsigned gridDim, unsigned blockDim,
   vkUpdateDescriptorSets(device_->device, writes.size(), writes.data(), 0,
                          nullptr);
 
-  unsigned workgroups = (gridDim + blockDim - 1) / blockDim;
   VkCommandBuffer cb = beginOneTime();
   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipeline);
   vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipelineLayout,
                           0, 1, &set, 0, nullptr);
-  vkCmdDispatch(cb, workgroups, 1, 1);
+  vkCmdDispatch(cb, wgX, wgY, wgZ);
   endOneTime(cb); // waits for the queue to idle, so scalar buffers are safe
                  // to release now.
   for (auto &sb : scalarBufs) freeBuffer(sb);
+  // Return the descriptor set to the pool; the pool was created with
+  // FREE_DESCRIPTOR_SET_BIT so this won't exhaust it across launches.
+  vkFreeDescriptorSets(device_->device, device_->descriptorPool, 1, &set);
   return VCError::Success;
 }
 
@@ -515,6 +575,16 @@ VCError vcLaunchKernel(VCKernelHandle kernel, unsigned gridDim,
   if (!kernel) return VCError::InvalidKernel;
   auto *k = reinterpret_cast<VCKernel *>(kernel);
   return Runtime::get().launch(*k, gridDim, blockDim, args, argCount);
+}
+
+VCError vcLaunchKernel2D(VCKernelHandle kernel, unsigned gridDimX,
+                         unsigned gridDimY, unsigned blockDimX,
+                         unsigned blockDimY, const VCKernelArg *args,
+                         int argCount) {
+  if (!kernel) return VCError::InvalidKernel;
+  auto *k = reinterpret_cast<VCKernel *>(kernel);
+  return Runtime::get().launch2D(*k, gridDimX, gridDimY, blockDimX, blockDimY,
+                                 args, argCount);
 }
 
 } // namespace vc

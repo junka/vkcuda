@@ -97,6 +97,14 @@ VCError vcLaunchKernel(VCKernelHandle kernel, unsigned gridDim,
                        unsigned blockDim, const VCKernelArg *args,
                        int argCount);
 
+/// Launch a kernel with a 2D grid/block. `gridDimX/Y` and `blockDimX/Y` are
+/// element counts; workgroup counts are ceil(grid/block) per axis. Use this
+/// for kernels that read threadIdx.y / blockIdx.y.
+VCError vcLaunchKernel2D(VCKernelHandle kernel, unsigned gridDimX,
+                         unsigned gridDimY, unsigned blockDimX,
+                         unsigned blockDimY, const VCKernelArg *args,
+                         int argCount);
+
 /// Human-readable string for an error code.
 const char *vcErrorString(VCError err);
 

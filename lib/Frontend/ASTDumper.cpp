@@ -88,6 +88,26 @@ public:
       --indent;
       break;
     }
+    case ASTNode::NodeKind::ForStmt: {
+      const auto *fs = cast<ForStmt>(n);
+      os << "For\n";
+      ++indent;
+      if (fs->init) dumpNode(fs->init.get());
+      if (fs->cond) dumpNode(fs->cond.get());
+      if (fs->step) dumpNode(fs->step.get());
+      if (fs->body) dumpNode(fs->body.get());
+      --indent;
+      break;
+    }
+    case ASTNode::NodeKind::WhileStmt: {
+      const auto *ws = cast<WhileStmt>(n);
+      os << "While\n";
+      ++indent;
+      dumpNode(ws->cond.get());
+      if (ws->body) dumpNode(ws->body.get());
+      --indent;
+      break;
+    }
     case ASTNode::NodeKind::BinaryExpr: {
       const auto *b = cast<BinaryExpr>(n);
       const char *op = "?";
@@ -103,6 +123,10 @@ public:
       case BinaryOp::Ge: op = ">="; break;
       case BinaryOp::Eq: op = "=="; break;
       case BinaryOp::NEq: op = "!="; break;
+      case BinaryOp::And: op = "&"; break;
+      case BinaryOp::Or: op = "|"; break;
+      case BinaryOp::LAnd: op = "&&"; break;
+      case BinaryOp::LOr: op = "||"; break;
       default: break;
       }
       os << "BinOp " << op << "\n";

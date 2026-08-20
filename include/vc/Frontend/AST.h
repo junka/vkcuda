@@ -108,6 +108,8 @@ public:
     DeclStmt,
     ExprStmt,
     IfStmt,
+    ForStmt,
+    WhileStmt,
     // Expressions
     BinaryExpr,
     UnaryExpr,
@@ -180,6 +182,9 @@ public:
   StringRef name;
   NodePtr init; // optional initializer expr
   bool isShared = false; // CUDA __shared__
+  // Trailing array dimensions, e.g. "float a[16][8]" -> {16,8}. Empty for
+  // a scalar. A runtime-sized pointer param leaves this empty.
+  std::vector<int64_t> arrayDims;
 
   VarDecl(SourceLocation l, Type *t, StringRef n)
       : ASTNode(l), type(t), name(n) {}
@@ -225,6 +230,25 @@ public:
   NodePtr elseStmt; // optional
   IfStmt(SourceLocation l) : ASTNode(l) {}
   NodeKind getNodeType() const override { return NodeKind::IfStmt; }
+};
+
+// C-style for(init; cond; step) body.  init/step may be null.
+class ForStmt : public ASTNode {
+public:
+  NodePtr init; // DeclStmt or ExprStmt, optional
+  NodePtr cond; // ExprStmt's expr, optional
+  NodePtr step; // Expr, optional
+  NodePtr body; // CompoundStmt or single stmt
+  ForStmt(SourceLocation l) : ASTNode(l) {}
+  NodeKind getNodeType() const override { return NodeKind::ForStmt; }
+};
+
+class WhileStmt : public ASTNode {
+public:
+  NodePtr cond;
+  NodePtr body; // CompoundStmt or single stmt
+  WhileStmt(SourceLocation l) : ASTNode(l) {}
+  NodeKind getNodeType() const override { return NodeKind::WhileStmt; }
 };
 
 //===----------------------------------------------------------------------===//

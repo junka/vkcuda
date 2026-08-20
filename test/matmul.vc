@@ -1,0 +1,38 @@
+// Tiled matrix multiply kernel (N x N, row-major).
+//   C[i][j] = sum_k A[i][k] * B[k][j]
+// Tile size TS=16, one workgroup computes a TS x TS output tile.
+__global__ void matmul(float* A, float* B, float* C, int N) {
+  int TS = 16;
+  int row = blockIdx.y * TS + threadIdx.y;
+  int col = blockIdx.x * TS + threadIdx.x;
+
+  __shared__ float As[16][16];
+  __shared__ float Bs[16][16];
+
+  float acc = 0.0;
+  int numTiles = (N + TS - 1) / TS;
+
+  for (int t = 0; t < numTiles; t = t + 1) {
+    // Load one tile of A and B into shared memory.
+    int aCol = t * TS + threadIdx.x;
+    int bRow = t * TS + threadIdx.y;
+    if (row < N && aCol < N)
+      As[threadIdx.y][threadIdx.x] = A[row * N + aCol];
+    else
+      As[threadIdx.y][threadIdx.x] = 0.0;
+    if (bRow < N && col < N)
+      Bs[threadIdx.y][threadIdx.x] = B[bRow * N + col];
+    else
+      Bs[threadIdx.y][threadIdx.x] = 0.0;
+    __syncthreads();
+
+    // Accumulate the partial product for this tile.
+    for (int k = 0; k < TS; k = k + 1) {
+      acc = acc + As[threadIdx.y][k] * Bs[k][threadIdx.x];
+    }
+    __syncthreads();
+  }
+
+  if (row < N && col < N)
+    C[row * N + col] = acc;
+}
