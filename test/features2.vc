@@ -1,0 +1,67 @@
+// test/features2.vc — comprehensive kernel exercising the second enrichment
+// pass: vector types + swizzle, C-style & functional casts, init lists,
+// switch/case, struct + typedef, char literals, and real pre/post ++ -- value
+// semantics. One __global__ kernel does it all so a single host demo can
+// verify every feature end-to-end.
+//
+// Build & run:
+//   ./build/tools/vc-glsl/vc-glsl test/features2.vc -o build/features2.spv
+//   ./build/examples/features2_demo build/features2.spv
+
+// --- struct + typedef (Step 5) ---
+struct Vec4 {
+  float c[4];
+};
+typedef float scalar_t;
+
+// --- __device__ helper taking a typedef'd type (Step 5) ---
+__device__ scalar_t sumcomp(Vec4 v) {
+  return v.c[0] + v.c[1] + v.c[2] + v.c[3];
+}
+
+__global__ void features2(float *result) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // --- init list into a struct + array field (Steps 3, 5) ---
+  Vec4 v;
+  v.c[0] = 1.0;
+  v.c[1] = 2.0;
+  v.c[2] = 3.0;
+  v.c[3] = 4.0;
+
+  // --- vector type + swizzle (Step 1) ---
+  float4 q = float4(10.0, 20.0, 30.0, 40.0);
+  float sw = q.x + q.y + q.z + q.w;   // 100
+  float swz = q.xz.x + q.xz.y;        // q.x=10 + q.z=30 = 40 (swizzle .xz then .x/.y)
+
+  // --- C-style cast & functional cast (Step 2) ---
+  float cf = (float)i + float(i);     // 2*i
+
+  // --- char literal (Step 7) ---
+  int ch = 'A';                       // 65
+
+  // --- pre/post ++ -- value semantics (Step 8) ---
+  int a = 0;
+  int j = a++;                        // j=0 (old), a=1
+  int k = ++a;                        // k=2 (new), a=2
+
+  // --- switch / case / default (Step 4) ---
+  int s = 0;
+  int mode = i % 3;
+  switch (mode) {
+  case 0:
+    s = 100;
+    break;
+  case 1:
+    s = 200;
+    break;
+  default:
+    s = 300;
+    break;
+  }
+
+  // Compose everything into one deterministic scalar per thread.
+  scalar_t total = sumcomp(v) + sw + swz + cf + (float)ch + (float)j +
+                   (float)k + (float)s;
+  result[i] = total;
+}

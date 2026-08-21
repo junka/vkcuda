@@ -70,6 +70,9 @@ TokKind Lexer::classifyKeyword(StringRef ident) {
       .Case("do", TokKind::kw_do)
       .Case("break", TokKind::kw_break)
       .Case("continue", TokKind::kw_continue)
+      .Case("switch", TokKind::kw_switch)
+      .Case("case", TokKind::kw_case)
+      .Case("default", TokKind::kw_default)
       .Case("const", TokKind::kw_const)
       .Case("__global__", TokKind::kw_global)
       .Case("__device__", TokKind::kw_device)
@@ -79,6 +82,8 @@ TokKind Lexer::classifyKeyword(StringRef ident) {
       .Case("__syncthreads", TokKind::kw_syncthreads)
       .Case("dim3", TokKind::kw_dim3)
       .Case("wmma", TokKind::kw_wmma)
+      .Case("struct", TokKind::kw_struct)
+      .Case("typedef", TokKind::kw_typedef)
       .Default(TokKind::identifier);
 }
 

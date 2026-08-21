@@ -11,6 +11,7 @@
 #include "vc/Frontend/AST.h"
 #include "vc/Frontend/Lexer.h"
 
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/SourceMgr.h"
 
 namespace vc {
@@ -20,6 +21,10 @@ class Parser {
   llvm::SourceMgr &srcMgr;
   Token curTok;
   TranslationUnit &tu;
+  // User-named types (struct/typedef names) seen so far at top level, so
+  // parseType() can recognize them as types in declarations. Populated as
+  // struct/typedef decls are parsed. Sema does the full validation later.
+  llvm::StringMap<Type *> typeNames;
 
 public:
   Parser(Lexer &lex, llvm::SourceMgr &sm, TranslationUnit &unit)
@@ -40,9 +45,18 @@ private:
   // Top level
   bool parseTopLevelDecl();
   bool parseFunctionOrKernel();
+  bool parseStructDecl();
+  bool parseTypedefDecl();
 
   // Types / decls
   Type *parseType();
+  /// Does the current token start a type? (builtin keyword, a vector name
+  /// like float4, or a known struct/typedef name.) Used to disambiguate
+  /// declaration vs expression statements.
+  bool startsType(const Token &t);
+  /// If `name` is a CUDA-style vector name (float4, int3, ...), build a
+  /// VectorType; otherwise return null.
+  static Type *makeVectorType(llvm::StringRef name);
   bool parseDeviceAttrs(DeviceAttr &out);
   ParamDecl *parseParam();
   VarDecl *parseVarDecl(Type *ty);
@@ -54,6 +68,7 @@ private:
   NodePtr parseForStmt();
   NodePtr parseWhileStmt();
   NodePtr parseDoStmt();
+  NodePtr parseSwitchStmt();
   NodePtr parseDeclOrExprStmt();
 
   // Expressions (precedence climbing)

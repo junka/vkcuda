@@ -54,6 +54,7 @@ enum class TokKind {
   kw_void, kw_bool, kw_int, kw_uint, kw_long, kw_ulong, kw_float, kw_double,
   kw_return, kw_if, kw_else, kw_for, kw_while, kw_do,
   kw_break, kw_continue,
+  kw_switch, kw_case, kw_default,
   kw_const,
   // CUDA attributes
   kw_global, kw_device, kw_host, kw_shared, kw_restrict,
@@ -61,6 +62,8 @@ enum class TokKind {
   kw_syncthreads,
   kw_dim3,
   kw_wmma, // namespace marker: wmma::fragment ... (loosely)
+  // Type-definition keywords
+  kw_struct, kw_typedef,
 };
 
 struct Token {
@@ -92,6 +95,16 @@ public:
   Token lex();
   /// Peek without consuming.
   Token peek();
+
+  /// Opaque save/restore of the lexer position, for speculative parsing
+  /// (e.g. distinguishing a C-style cast `(T)x` from a grouping `(x)`).
+  struct Pos {
+    unsigned pos = 0;
+    unsigned line = 1;
+    unsigned col = 1;
+  };
+  Pos savePos() const { return {pos, curLine, curCol}; }
+  void restorePos(const Pos &p) { pos = p.pos; curLine = p.line; curCol = p.col; }
 
 private:
   char curChar() const { return pos < buffer.size() ? buffer[pos] : '\0'; }

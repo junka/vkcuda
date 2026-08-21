@@ -1,0 +1,21 @@
+// struct + typedef exercising: struct def, typedef alias, struct field access,
+// struct passed as a kernel pointer param (SSBO of structs), and an array field.
+struct Point {
+  float x;
+  float y;
+  float v[2];
+};
+
+typedef float weight_t;
+
+__device__ float scale(weight_t wgt, float v) {
+  return wgt * v;
+}
+
+__global__ void kern(Point *pts, float *result, float w) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  float sx = scale(w, pts[i].x);
+  float sy = scale(w, pts[i].y);
+  float vv = pts[i].v[0] + pts[i].v[1];
+  result[i] = sx + sy + vv;
+}

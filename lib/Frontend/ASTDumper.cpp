@@ -47,6 +47,23 @@ public:
       os << "Kernel -> " << (k->func ? k->func->name : "?") << "\n";
       break;
     }
+    case ASTNode::NodeKind::StructDecl: {
+      const auto *s = cast<StructDecl>(n);
+      os << "Struct " << s->name << "\n";
+      ++indent;
+      for (const auto *f : s->fields) {
+        pad(); os << "Field " << f->name << "\n";
+      }
+      --indent;
+      break;
+    }
+    case ASTNode::NodeKind::FieldDecl:
+      break; // handled inline by StructDecl
+    case ASTNode::NodeKind::TypedefDecl: {
+      const auto *t = cast<TypedefDecl>(n);
+      os << "Typedef " << t->name << "\n";
+      break;
+    }
     case ASTNode::NodeKind::CompoundStmt: {
       os << "{\n";
       ++indent;
@@ -123,6 +140,24 @@ public:
     case ASTNode::NodeKind::ContinueStmt:
       os << "Continue\n";
       break;
+    case ASTNode::NodeKind::SwitchStmt: {
+      const auto *sw = cast<SwitchStmt>(n);
+      os << "Switch\n";
+      ++indent;
+      if (sw->cond) dumpNode(sw->cond.get());
+      if (sw->body) dumpNode(sw->body.get());
+      --indent;
+      break;
+    }
+    case ASTNode::NodeKind::CaseStmt: {
+      const auto *cs = cast<CaseStmt>(n);
+      os << (cs->value ? "Case\n" : "Default\n");
+      ++indent;
+      if (cs->value) dumpNode(cs->value.get());
+      if (cs->sub) dumpNode(cs->sub.get());
+      --indent;
+      break;
+    }
     case ASTNode::NodeKind::BinaryExpr: {
       const auto *b = cast<BinaryExpr>(n);
       const char *op = "?";
@@ -201,9 +236,31 @@ public:
     case ASTNode::NodeKind::FloatLiteral:
       os << "Float " << cast<FloatLiteral>(n)->value << "\n";
       break;
+    case ASTNode::NodeKind::CharLiteral:
+      os << "Char " << cast<CharLiteral>(n)->value << "\n";
+      break;
+    case ASTNode::NodeKind::StringLiteral: {
+      // Note: `StringLiteral` is ambiguous here (llvm::StringLiteral vs
+      // vc::StringLiteral due to `using namespace llvm`), so qualify it.
+      const auto *sl = static_cast<const vc::StringLiteral *>(n);
+      os << "String \"" << sl->value << "\"\n";
+      break;
+    }
     case ASTNode::NodeKind::UnaryExpr: {
       const auto *u = cast<UnaryExpr>(n);
-      os << "Unary\n";
+      const char *opn = "?";
+      switch (u->op) {
+      case UnaryOp::Neg: opn = "-"; break;
+      case UnaryOp::Not: opn = "~"; break;
+      case UnaryOp::LNot: opn = "!"; break;
+      case UnaryOp::Deref: opn = "*"; break;
+      case UnaryOp::AddrOf: opn = "&"; break;
+      case UnaryOp::PreInc: opn = "++(pre)"; break;
+      case UnaryOp::PostInc: opn = "++(post)"; break;
+      case UnaryOp::PreDec: opn = "--(pre)"; break;
+      case UnaryOp::PostDec: opn = "--(post)"; break;
+      }
+      os << "Unary " << opn << "\n";
       ++indent; dumpNode(u->operand.get()); --indent;
       break;
     }
@@ -214,6 +271,22 @@ public:
       dumpNode(c->cond.get());
       dumpNode(c->thenExpr.get());
       dumpNode(c->elseExpr.get());
+      --indent;
+      break;
+    }
+    case ASTNode::NodeKind::CStyleCastExpr: {
+      const auto *c = cast<CStyleCastExpr>(n);
+      os << "Cast\n";
+      ++indent;
+      dumpNode(c->sub.get());
+      --indent;
+      break;
+    }
+    case ASTNode::NodeKind::InitListExpr: {
+      const auto *il = cast<InitListExpr>(n);
+      os << "InitList\n";
+      ++indent;
+      for (auto &e : il->elements) dumpNode(e.get());
       --indent;
       break;
     }

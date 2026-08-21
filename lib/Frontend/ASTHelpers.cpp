@@ -20,6 +20,10 @@ NodePtr vc::cloneExpr(const ASTNode *n) {
     return NodePtr(new IntegerLiteral(L, static_cast<const IntegerLiteral *>(n)->value));
   case NK::FloatLiteral:
     return NodePtr(new FloatLiteral(L, static_cast<const FloatLiteral *>(n)->value));
+  case NK::CharLiteral:
+    return NodePtr(new CharLiteral(L, static_cast<const CharLiteral *>(n)->value));
+  case NK::StringLiteral:
+    return NodePtr(new StringLiteral(L, static_cast<const StringLiteral *>(n)->value));
   case NK::DeclRefExpr:
     return NodePtr(new DeclRefExpr(L, static_cast<const DeclRefExpr *>(n)->name));
   case NK::BinaryExpr: {
@@ -36,6 +40,16 @@ NodePtr vc::cloneExpr(const ASTNode *n) {
     return NodePtr(new ConditionalExpr(L, cloneExpr(c->cond.get()),
                                        cloneExpr(c->thenExpr.get()),
                                        cloneExpr(c->elseExpr.get())));
+  }
+  case NK::CStyleCastExpr: {
+    auto *c = static_cast<const CStyleCastExpr *>(n);
+    return NodePtr(new CStyleCastExpr(L, c->target, cloneExpr(c->sub.get())));
+  }
+  case NK::InitListExpr: {
+    auto *il = static_cast<const InitListExpr *>(n);
+    auto *out = new InitListExpr(L);
+    for (auto &e : il->elements) out->elements.push_back(cloneExpr(e.get()));
+    return NodePtr(out);
   }
   case NK::IndexExpr: {
     auto *i = static_cast<const IndexExpr *>(n);

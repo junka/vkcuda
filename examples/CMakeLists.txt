@@ -27,3 +27,15 @@ add_executable(features_demo features_demo.cpp)
 target_include_directories(features_demo PRIVATE ${VC_INCLUDE_DIR})
 target_compile_features(features_demo PRIVATE cxx_std_20)
 target_link_libraries(features_demo PRIVATE VCRuntime)
+
+add_executable(struct_demo struct_demo.cpp)
+
+target_include_directories(struct_demo PRIVATE ${VC_INCLUDE_DIR})
+target_compile_features(struct_demo PRIVATE cxx_std_20)
+target_link_libraries(struct_demo PRIVATE VCRuntime)
+
+add_executable(features2_demo features2_demo.cpp)
+
+target_include_directories(features2_demo PRIVATE ${VC_INCLUDE_DIR})
+target_compile_features(features2_demo PRIVATE cxx_std_20)
+target_link_libraries(features2_demo PRIVATE VCRuntime)

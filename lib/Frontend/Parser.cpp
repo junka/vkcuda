@@ -7,6 +7,34 @@
 using namespace vc;
 using namespace llvm;
 
+namespace {
+// Decode a single escape sequence starting at the front of `s` (the character
+// after the backslash). Returns the decoded code point. Used for both char and
+// string literals.
+int64_t decodeChar(StringRef s) {
+  if (s.empty()) return 0;
+  char c = s.front();
+  switch (c) {
+  case 'n': return '\n';
+  case 't': return '\t';
+  case 'r': return '\r';
+  case '0': return '\0';
+  case '\\': return '\\';
+  case '\'': return '\'';
+  case '"': return '"';
+  case 'a': return '\a';
+  case 'b': return '\b';
+  case 'f': return '\f';
+  case 'v': return '\v';
+  default: return (unsigned char)c; // unknown escape -> literal char
+  }
+}
+
+// Number of source characters consumed by the escape whose first post-backslash
+// char is at the front of `s` (always 1 for the simple escapes we support).
+unsigned escapeLen(StringRef s) { return 1; }
+} // namespace
+
 bool Parser::parseTranslationUnit() {
   while (!curTok.is(TokKind::eof)) {
     if (!parseTopLevelDecl())
@@ -44,6 +72,10 @@ Diagnostic Parser::error(const Token &at, std::string msg) {
 //===----------------------------------------------------------------------===//
 
 bool Parser::parseTopLevelDecl() {
+  if (curTok.is(TokKind::kw_struct))
+    return parseStructDecl();
+  if (curTok.is(TokKind::kw_typedef))
+    return parseTypedefDecl();
   return parseFunctionOrKernel();
 }
 
@@ -118,6 +150,93 @@ bool Parser::parseFunctionOrKernel() {
   return true;
 }
 
+// struct Name { Type field; Type field[N]; ... };
+// The StructDecl and its RecordType are registered in `typeNames` so later
+// declarations can use `Name` as a type. The StructDecl is added to tu.decls
+// (it owns its FieldDecls).
+bool Parser::parseStructDecl() {
+  Token structTok = curTok;
+  advance(); // 'struct'
+  if (!curTok.is(TokKind::identifier)) {
+    error(curTok, "expected struct name");
+    return false;
+  }
+  Token nameTok = curTok;
+  advance();
+
+  auto *sd = new StructDecl(toSourceLoc(structTok), nameTok.text);
+  auto *recTy = new RecordType(sd);
+  // Register before parsing the body so self-/mutually-referential typedefs
+  // and pointer fields can name the struct.
+  typeNames[nameTok.text] = recTy;
+
+  if (!expect(TokKind::l_brace, "'{'"))
+    return false;
+  while (!curTok.is(TokKind::r_brace) && !curTok.is(TokKind::eof)) {
+    Type *fty = parseType();
+    if (!fty) {
+      error(curTok, "expected field type");
+      return false;
+    }
+    if (!curTok.is(TokKind::identifier)) {
+      error(curTok, "expected field name");
+      return false;
+    }
+    Token fieldTok = curTok;
+    advance();
+    auto *fd = new FieldDecl(toSourceLoc(fieldTok), fty, fieldTok.text);
+    // optional trailing array dims: field[N][M]
+    while (consume(TokKind::l_square)) {
+      if (!curTok.is(TokKind::int_literal)) {
+        error(curTok, "expected array size");
+        return false;
+      }
+      int64_t dim = 0;
+      curTok.text.getAsInteger(10, dim);
+      fd->arrayDims.push_back(dim);
+      advance();
+      if (!expect(TokKind::r_square, "']'"))
+        return false;
+    }
+    if (!expect(TokKind::semi, "';' after field"))
+      return false;
+    sd->fields.push_back(fd);
+  }
+  if (!expect(TokKind::r_brace, "'}'"))
+    return false;
+  if (!expect(TokKind::semi, "';' after struct definition"))
+    return false;
+
+  tu.decls.emplace_back(sd);
+  return true;
+}
+
+// typedef <underlying> <name>;
+// Registers a TypedefType(name -> underlying) in `typeNames`.
+bool Parser::parseTypedefDecl() {
+  Token typedefTok = curTok;
+  advance(); // 'typedef'
+  Type *underlying = parseType();
+  if (!underlying) {
+    error(curTok, "expected type after 'typedef'");
+    return false;
+  }
+  if (!curTok.is(TokKind::identifier)) {
+    error(curTok, "expected typedef name");
+    return false;
+  }
+  Token nameTok = curTok;
+  advance();
+
+  auto *td = new TypedefDecl(toSourceLoc(typedefTok), nameTok.text, underlying);
+  typeNames[nameTok.text] = new TypedefType(td);
+
+  if (!expect(TokKind::semi, "';' after typedef"))
+    return false;
+  tu.decls.emplace_back(td);
+  return true;
+}
+
 ParamDecl *Parser::parseParam() {
   // optional __restrict__
   consume(TokKind::kw_restrict);
@@ -152,7 +271,45 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
   }
   if (curTok.is(TokKind::assign)) {
     advance();
-    v->init = parseExpression();
+    // Brace-enclosed initializer list: { a, b, c }.
+    if (curTok.is(TokKind::l_brace)) {
+      Token lb = curTok;
+      advance();
+      auto *il = new InitListExpr(toSourceLoc(lb));
+      if (!curTok.is(TokKind::r_brace)) {
+        while (true) {
+          // Elements may themselves be init lists (nested) or expressions.
+          if (curTok.is(TokKind::l_brace)) {
+            // Recurse by parsing an expression whose primary handles {...}?
+            // Simpler: parse nested via a temporary by re-entering parseExpr
+            // won't see '{'. Parse nested init list inline.
+            // (Kept minimal: one level of nesting for vec-of-vec / array.)
+            Token lb2 = curTok;
+            advance();
+            auto *il2 = new InitListExpr(toSourceLoc(lb2));
+            if (!curTok.is(TokKind::r_brace)) {
+              while (true) {
+                auto e = parseExpression();
+                if (e) il2->elements.push_back(std::move(e));
+                if (consume(TokKind::comma)) continue;
+                break;
+              }
+            }
+            expect(TokKind::r_brace, "'}'");
+            il->elements.push_back(NodePtr(il2));
+          } else {
+            auto e = parseExpression();
+            if (e) il->elements.push_back(std::move(e));
+          }
+          if (consume(TokKind::comma)) continue;
+          break;
+        }
+      }
+      expect(TokKind::r_brace, "'}'");
+      v->init = NodePtr(il);
+    } else {
+      v->init = parseExpression();
+    }
   }
   return v;
 }
@@ -161,25 +318,78 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
 // Types
 //===----------------------------------------------------------------------===//
 
+Type *Parser::makeVectorType(StringRef name) {
+  // CUDA/HLSL-style vector names: <base><count>, count in 2..4.
+  // Recognized bases: float, int, uint, double, bool.
+  struct Base { const char *prefix; BuiltinTypeKind kind; };
+  static constexpr Base bases[] = {
+      {"float", BuiltinTypeKind::Float32},
+      {"int", BuiltinTypeKind::Int32},
+      {"uint", BuiltinTypeKind::UInt32},
+      {"double", BuiltinTypeKind::Float64},
+      {"bool", BuiltinTypeKind::Bool},
+  };
+  for (const Base &b : bases) {
+    StringRef p = b.prefix;
+    if (name.size() == p.size() + 1 && name.starts_with(p)) {
+      char d = name.back();
+      if (d >= '2' && d <= '4') {
+        unsigned count = d - '0';
+        return new VectorType(new BuiltinType(b.kind), count);
+      }
+    }
+  }
+  return nullptr;
+}
+
 Type *Parser::parseType() {
-  BuiltinTypeKind bk;
+  Type *base = nullptr;
   switch (curTok.kind) {
-  case TokKind::kw_void: bk = BuiltinTypeKind::Void; break;
-  case TokKind::kw_bool: bk = BuiltinTypeKind::Bool; break;
-  case TokKind::kw_int: bk = BuiltinTypeKind::Int32; break;
-  case TokKind::kw_uint: bk = BuiltinTypeKind::UInt32; break;
-  case TokKind::kw_long: bk = BuiltinTypeKind::Int64; break;
-  case TokKind::kw_float: bk = BuiltinTypeKind::Float32; break;
-  case TokKind::kw_double: bk = BuiltinTypeKind::Float64; break;
+  case TokKind::kw_void: base = new BuiltinType(BuiltinTypeKind::Void); break;
+  case TokKind::kw_bool: base = new BuiltinType(BuiltinTypeKind::Bool); break;
+  case TokKind::kw_int: base = new BuiltinType(BuiltinTypeKind::Int32); break;
+  case TokKind::kw_uint: base = new BuiltinType(BuiltinTypeKind::UInt32); break;
+  case TokKind::kw_long: base = new BuiltinType(BuiltinTypeKind::Int64); break;
+  case TokKind::kw_float: base = new BuiltinType(BuiltinTypeKind::Float32); break;
+  case TokKind::kw_double: base = new BuiltinType(BuiltinTypeKind::Float64); break;
+  case TokKind::identifier:
+    // A user-named type (struct/typedef) or a vector name like float4.
+    if (auto *vec = makeVectorType(curTok.text))
+      base = vec;
+    else {
+      auto it = typeNames.find(curTok.text);
+      if (it != typeNames.end())
+        base = it->second;
+    }
+    if (!base) return nullptr;
+    break;
   default: return nullptr;
   }
   advance();
-  auto *base = new BuiltinType(bk);
   // pointer levels: '*' '*'
   Type *ty = base;
   while (consume(TokKind::star))
     ty = new PointerType(ty);
   return ty;
+}
+
+bool Parser::startsType(const Token &t) {
+  switch (t.kind) {
+  case TokKind::kw_void:
+  case TokKind::kw_bool:
+  case TokKind::kw_int:
+  case TokKind::kw_uint:
+  case TokKind::kw_long:
+  case TokKind::kw_float:
+  case TokKind::kw_double:
+    return true;
+  case TokKind::identifier:
+    // Vector names (float4, ...) and known struct/typedef names start types.
+    if (makeVectorType(t.text)) return true;
+    return typeNames.count(t.text) > 0;
+  default:
+    return false;
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -193,6 +403,7 @@ NodePtr Parser::parseStatement() {
   case TokKind::kw_for: return parseForStmt();
   case TokKind::kw_while: return parseWhileStmt();
   case TokKind::kw_do: return parseDoStmt();
+  case TokKind::kw_switch: return parseSwitchStmt();
   case TokKind::kw_break: {
     Token t = curTok;
     advance();
@@ -313,36 +524,59 @@ NodePtr Parser::parseDoStmt() {
   return NodePtr(ds);
 }
 
+NodePtr Parser::parseSwitchStmt() {
+  Token s = curTok;
+  advance(); // 'switch'
+  expect(TokKind::l_paren, "'('");
+  auto *sw = new SwitchStmt(toSourceLoc(s));
+  sw->cond = parseExpression();
+  expect(TokKind::r_paren, "')'");
+  expect(TokKind::l_brace, "'{'");
+  auto *body = new CompoundStmt(toSourceLoc(s));
+  while (!curTok.is(TokKind::r_brace) && !curTok.is(TokKind::eof)) {
+    if (curTok.is(TokKind::kw_case) || curTok.is(TokKind::kw_default)) {
+      Token c = curTok;
+      advance();
+      auto *cs = new CaseStmt(toSourceLoc(c));
+      if (c.kind == TokKind::kw_case) {
+        cs->value = parseExpression();
+        expect(TokKind::colon, "':'");
+      } else {
+        expect(TokKind::colon, "':'");
+      }
+      cs->sub = parseStatement();
+      body->statements.push_back(NodePtr(cs));
+    } else {
+      // A statement not under an explicit case label (rare in C, allowed).
+      auto st = parseStatement();
+      if (st) body->statements.push_back(std::move(st));
+    }
+  }
+  expect(TokKind::r_brace, "'}'");
+  sw->body = NodePtr(body);
+  return NodePtr(sw);
+}
+
 NodePtr Parser::parseDeclOrExprStmt() {
   // If the current token starts a type, parse a declaration.
   Token save = curTok;
-  switch (curTok.kind) {
-  case TokKind::kw_void:
-  case TokKind::kw_bool:
-  case TokKind::kw_int:
-  case TokKind::kw_uint:
-  case TokKind::kw_long:
-  case TokKind::kw_float:
-  case TokKind::kw_double: {
+  if (startsType(curTok)) {
     Type *ty = parseType();
     // Could be "T name = ..." or a cast-like expr; here we assume decl.
     VarDecl *v = parseVarDecl(ty);
     expect(TokKind::semi, "';'");
     return NodePtr(new DeclStmt(v ? v->getLoc() : toSourceLoc(save), v));
   }
-  default: {
-    auto *es = new ExprStmt(toSourceLoc(save));
-    es->expr = parseExpression();
-    // Error recovery: if we made no progress, skip a token to avoid an
-    // infinite loop on an unrecognized statement.
-    if (!es->expr && curTok.kind == save.kind) {
-      error(curTok, "unexpected token in statement");
-      if (!curTok.is(TokKind::eof)) advance();
-    }
-    expect(TokKind::semi, "';'");
-    return NodePtr(es);
+  auto *es = new ExprStmt(toSourceLoc(save));
+  es->expr = parseExpression();
+  // Error recovery: if we made no progress, skip a token to avoid an
+  // infinite loop on an unrecognized statement.
+  if (!es->expr && curTok.kind == save.kind) {
+    error(curTok, "unexpected token in statement");
+    if (!curTok.is(TokKind::eof)) advance();
   }
-  }
+  expect(TokKind::semi, "';'");
+  return NodePtr(es);
 }
 
 //===----------------------------------------------------------------------===//
@@ -543,18 +777,43 @@ NodePtr Parser::parseMultiplicative() {
 }
 
 NodePtr Parser::parseUnary() {
-  // Prefix ++ / -- : `++a` -> `a = a + 1`, `--a` -> `a = a - 1`.
+  // C-style cast: ( type ) expr. Disambiguate from a parenthesized expression
+  // by speculatively parsing a type between '(' and ')'; if the token after
+  // ')' starts an expression, it's a cast, otherwise roll back and treat the
+  // '(' as grouping (handled by parsePostfix -> parsePrimary).
+  if (curTok.is(TokKind::l_paren) && startsType(lexer.peek())) {
+    Token lp = curTok;
+    Token savedTok = curTok;
+    Lexer::Pos savedPos = lexer.savePos(); // pos is just past curTok '('
+    advance(); // '('
+    Type *ty = parseType();
+    if (ty && curTok.is(TokKind::r_paren)) {
+      // Look one past ')' to confirm it starts an expression (cast operand).
+      Token after = lexer.peek();
+      if (after.isOneOf(TokKind::identifier, TokKind::int_literal,
+                        TokKind::float_literal, TokKind::l_paren,
+                        TokKind::minus, TokKind::bang, TokKind::tilde,
+                        TokKind::star, TokKind::amp, TokKind::plus_plus,
+                        TokKind::minus_minus, TokKind::char_literal)) {
+        advance(); // ')'
+        NodePtr sub = parseUnary();
+        return NodePtr(new CStyleCastExpr(toSourceLoc(lp), ty, std::move(sub)));
+      }
+    }
+    // Not a cast: roll back both curTok and the lexer position so the '(' is
+    // reprocessed as grouping by parsePostfix -> parsePrimary.
+    curTok = savedTok;
+    lexer.restorePos(savedPos);
+  }
+  // Prefix ++ / -- : model as a real unary node. GLSL natively implements
+  // `++a` (yields the new value), so pass it through instead of rewriting to
+  // `a = a + 1` (which also modeled the value correctly but loses the form).
   if (curTok.isOneOf(TokKind::plus_plus, TokKind::minus_minus)) {
     Token op = curTok;
-    BinaryOp base = op.is(TokKind::plus_plus) ? BinaryOp::Add : BinaryOp::Sub;
+    UnaryOp uop = op.is(TokKind::plus_plus) ? UnaryOp::PreInc : UnaryOp::PreDec;
     advance();
     auto operand = parseUnary();
-    auto one = NodePtr(new IntegerLiteral(toSourceLoc(op), 1));
-    auto copy = cloneExpr(operand.get());
-    auto rhs = NodePtr(new BinaryExpr(toSourceLoc(op), base, std::move(copy),
-                                      std::move(one)));
-    return NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::Assign,
-                                  std::move(operand), std::move(rhs)));
+    return NodePtr(new UnaryExpr(toSourceLoc(op), uop, std::move(operand)));
   }
   if (curTok.isOneOf(TokKind::minus, TokKind::bang, TokKind::amp,
                      TokKind::star, TokKind::tilde)) {
@@ -608,18 +867,14 @@ NodePtr Parser::parsePostfix() {
       expect(TokKind::r_paren, "')'");
       base = NodePtr(call);
     } else if (curTok.isOneOf(TokKind::plus_plus, TokKind::minus_minus)) {
-      // Postfix ++ / -- : `a++` -> `a = a + 1`. (Value-as-old is not modeled;
-      // the expression yields the new value. Sufficient for `for(...; i++)`
-      // and standalone statement use. See plan TODO.)
+      // Postfix ++ / -- : model as a real unary node. GLSL natively yields the
+      // OLD value for `a++` (the value before increment), which the previous
+      // parser-rewrite to `a = a + 1` got wrong as a sub-expression. Passing
+      // the node through lets GLSL implement the correct value semantics.
       Token op = curTok;
-      BinaryOp bop = op.is(TokKind::plus_plus) ? BinaryOp::Add : BinaryOp::Sub;
+      UnaryOp uop = op.is(TokKind::plus_plus) ? UnaryOp::PostInc : UnaryOp::PostDec;
       advance();
-      auto one = NodePtr(new IntegerLiteral(toSourceLoc(op), 1));
-      auto copy = cloneExpr(base.get());
-      auto rhs = NodePtr(new BinaryExpr(toSourceLoc(op), bop, std::move(copy),
-                                        std::move(one)));
-      base = NodePtr(new BinaryExpr(toSourceLoc(op), BinaryOp::Assign,
-                                    std::move(base), std::move(rhs)));
+      base = NodePtr(new UnaryExpr(toSourceLoc(op), uop, std::move(base)));
     } else {
       break;
     }
@@ -708,15 +963,52 @@ NodePtr Parser::parsePrimary() {
     expect(TokKind::r_paren, "')'");
     return e;
   }
-  case TokKind::char_literal:
+  case TokKind::char_literal: {
     advance();
-    error(t, "character literals are not supported in VC kernels");
-    return nullptr;
-  case TokKind::string_literal:
+    // t.text includes the surrounding quotes; decode the body into an int.
+    int64_t v = 0;
+    StringRef body = t.text;
+    if (!body.empty() && body.front() == '\'') body = body.drop_front();
+    if (!body.empty() && body.back() == '\'') body = body.drop_back();
+    if (!body.empty()) {
+      if (body.front() == '\\' && body.size() >= 2)
+        v = decodeChar(body.substr(1)); // escape: char after backslash
+      else
+        v = (unsigned char)body.front();
+    }
+    return NodePtr(new CharLiteral(toSourceLoc(t), v));
+  }
+  case TokKind::string_literal: {
     advance();
-    error(t, "string literals are not supported in VC kernels");
-    return nullptr;
+    StringRef body = t.text;
+    if (!body.empty() && body.front() == '"') body = body.drop_front();
+    if (!body.empty() && body.back() == '"') body = body.drop_back();
+    std::string decoded;
+    for (size_t i = 0; i < body.size(); ++i) {
+      if (body[i] == '\\' && i + 1 < body.size()) {
+        // Reuse decodeChar on the escape (it handles \n, \t, \\, \", ...).
+        StringRef esc = body.substr(i + 1);
+        decoded.push_back((char)decodeChar(esc));
+        // Skip the escape character plus however many decodeChar consumed.
+        i += escapeLen(esc);
+      } else {
+        decoded.push_back(body[i]);
+      }
+    }
+    return NodePtr(new StringLiteral(toSourceLoc(t), std::move(decoded)));
+  }
   default:
+    // Functional cast: `int(x)`, `float(x)`, `vec4(x)` written with a type
+    // keyword. (Vector names like float4 already route through `identifier`
+    // above as a CallExpr.) A scalar type keyword followed by '(' is a cast.
+    if (startsType(curTok) && lexer.peek().is(TokKind::l_paren)) {
+      Token tt = curTok;
+      Type *ty = parseType();
+      expect(TokKind::l_paren, "'('");
+      NodePtr sub = parseExpression();
+      expect(TokKind::r_paren, "')'");
+      return NodePtr(new CStyleCastExpr(toSourceLoc(tt), ty, std::move(sub)));
+    }
     (void)error(t, "expected expression");
     return nullptr;
   }

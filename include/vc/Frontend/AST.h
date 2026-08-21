@@ -55,7 +55,12 @@ enum class BuiltinTypeKind {
   Float64,
 };
 
-enum class TypeKind { Builtin, Pointer };
+enum class TypeKind { Builtin, Pointer, Vector, Record, Typedef };
+
+// Forward declarations: RecordType/TypedefType point at these decls, which are
+// defined as ASTNodes further down. A pointer is all that's needed here.
+class StructDecl;
+class TypedefDecl;
 
 class Type {
   TypeKind kind;
@@ -83,6 +88,40 @@ public:
   static bool classof(const Type *t) { return t->getKind() == TypeKind::Pointer; }
 };
 
+// A vector of `count` elements of type `elem` (e.g. float4 -> elem=Float32,
+// count=4). CUDA/GPUSims names like `float4`/`int3` lower to this. GLSL has
+// native vec3/ivec4/etc. support and native swizzles (`.xyz`).
+class VectorType : public Type {
+public:
+  Type *elem;
+  unsigned count;
+
+  VectorType(Type *e, unsigned c) : Type(TypeKind::Vector), elem(e), count(c) {}
+  static bool classof(const Type *t) { return t->getKind() == TypeKind::Vector; }
+};
+
+// A user-defined struct type. Refers to its StructDecl by pointer so the type
+// can name the struct before/while it's being defined. GLSL emits the struct
+// definition as `struct Name { fields };` before main().
+class RecordType : public Type {
+public:
+  StructDecl *decl;
+
+  RecordType(StructDecl *d) : Type(TypeKind::Record), decl(d) {}
+  static bool classof(const Type *t) { return t->getKind() == TypeKind::Record; }
+};
+
+// A typedef alias. `typedef <underlying> <name>;` — usages of `name` produce a
+// TypedefType that lowers to its underlying type's GLSL spelling. GLSL has no
+// typedef, so emit resolves to the underlying type.
+class TypedefType : public Type {
+public:
+  TypedefDecl *decl;
+
+  TypedefType(TypedefDecl *d) : Type(TypeKind::Typedef), decl(d) {}
+  static bool classof(const Type *t) { return t->getKind() == TypeKind::Typedef; }
+};
+
 //===----------------------------------------------------------------------===//
 // AST node base
 //===----------------------------------------------------------------------===//
@@ -102,6 +141,9 @@ public:
     FunctionDecl,
     ParamDecl,
     VarDecl,
+    StructDecl,
+    FieldDecl,
+    TypedefDecl,
     // Statements
     CompoundStmt,
     ReturnStmt,
@@ -113,14 +155,20 @@ public:
     DoStmt,
     BreakStmt,
     ContinueStmt,
+    SwitchStmt,
+    CaseStmt, // value null => default
     // Expressions
     BinaryExpr,
     UnaryExpr,
     ConditionalExpr, // cond ? then : else
+    CStyleCastExpr,  // (T)expr or T(expr) functional cast
+    InitListExpr,    // { a, b, c }
     CallExpr,
     DeclRefExpr,
     IntegerLiteral,
     FloatLiteral,
+    CharLiteral,   // 'A' -> 65, decoded
+    StringLiteral, // "..." decoded
     IndexExpr,        // a[i]
     MemberAccessExpr, // threadIdx.x
     LaunchExpr,       // kernel<<<grid,block>>>(args)
@@ -200,6 +248,46 @@ public:
   VarDecl(SourceLocation l, Type *t, StringRef n)
       : ASTNode(l), type(t), name(n) {}
   NodeKind getNodeType() const override { return NodeKind::VarDecl; }
+};
+
+// A named field within a struct. Owned by its StructDecl (raw pointers; the
+// StructDecl owns and deletes them).
+class FieldDecl : public ASTNode {
+public:
+  Type *type;
+  StringRef name;
+  // Optional trailing array dims for a field, e.g. `float v[4]`.
+  std::vector<int64_t> arrayDims;
+
+  FieldDecl(SourceLocation l, Type *t, StringRef n)
+      : ASTNode(l), type(t), name(n) {}
+  NodeKind getNodeType() const override { return NodeKind::FieldDecl; }
+};
+
+// `struct Name { Type field; ... };` — defines a RecordType. Fields are owned
+// by the decl (deleted in the destructor). GLSL lowers to `struct Name {...}`.
+class StructDecl : public ASTNode {
+public:
+  StringRef name;
+  std::vector<FieldDecl *> fields;
+
+  StructDecl(SourceLocation l, StringRef n) : ASTNode(l), name(n) {}
+  ~StructDecl() override {
+    for (auto *f : fields) delete f;
+  }
+  NodeKind getNodeType() const override { return NodeKind::StructDecl; }
+};
+
+// `typedef <underlying> <name>;` — defines a TypedefType alias. GLSL has no
+// typedef, so emit resolves to the underlying type.
+class TypedefDecl : public ASTNode {
+public:
+  StringRef name;
+  Type *underlying;
+
+  TypedefDecl(SourceLocation l, StringRef n, Type *u)
+      : ASTNode(l), name(n), underlying(u) {}
+  NodeKind getNodeType() const override { return NodeKind::TypedefDecl; }
 };
 
 //===----------------------------------------------------------------------===//
@@ -284,6 +372,25 @@ public:
   NodeKind getNodeType() const override { return NodeKind::ContinueStmt; }
 };
 
+// C: `switch (cond) { case X: ...; default: ...; }`. body is a CompoundStmt
+// whose statements are CaseStmt (and possibly other stmts).
+class SwitchStmt : public ASTNode {
+public:
+  NodePtr cond;
+  NodePtr body;
+  SwitchStmt(SourceLocation l) : ASTNode(l) {}
+  NodeKind getNodeType() const override { return NodeKind::SwitchStmt; }
+};
+
+// One case label: `case <value>: <sub>` or `default: <sub>` (value == null).
+class CaseStmt : public ASTNode {
+public:
+  NodePtr value; // null for default
+  NodePtr sub;   // statement following the label (may be a CompoundStmt)
+  CaseStmt(SourceLocation l) : ASTNode(l) {}
+  NodeKind getNodeType() const override { return NodeKind::CaseStmt; }
+};
+
 //===----------------------------------------------------------------------===//
 // Expressions
 //===----------------------------------------------------------------------===//
@@ -300,7 +407,13 @@ public:
   NodeKind getNodeType() const override { return NodeKind::BinaryExpr; }
 };
 
-enum class UnaryOp { Neg, Not, LNot, Deref, AddrOf };
+enum class UnaryOp {
+  Neg, Not, LNot, Deref, AddrOf,
+  // ++ / -- as real unary nodes (not parser-expanded). GLSL models the
+  // pre/post old-vs-new value semantics natively, so passing these through is
+  // more correct than rewriting to `a = a + 1`.
+  PreInc, PostInc, PreDec, PostDec,
+};
 
 class UnaryExpr : public ASTNode {
 public:
@@ -319,6 +432,26 @@ public:
       : ASTNode(l), cond(std::move(c)), thenExpr(std::move(t)),
         elseExpr(std::move(e)) {}
   NodeKind getNodeType() const override { return NodeKind::ConditionalExpr; }
+};
+
+// C-style cast `(T)expr` or functional cast `T(expr)`. Emits as the GLSL
+// constructor form `T(expr)` (valid for scalars and vectors alike).
+class CStyleCastExpr : public ASTNode {
+public:
+  Type *target;
+  NodePtr sub;
+  CStyleCastExpr(SourceLocation l, Type *t, NodePtr s)
+      : ASTNode(l), target(t), sub(std::move(s)) {}
+  NodeKind getNodeType() const override { return NodeKind::CStyleCastExpr; }
+};
+
+// Brace-enclosed initializer list: { a, b, c }. Appears as a VarDecl
+// initializer. Emits as GLSL `{ a, b, c }` (valid for vector/array init).
+class InitListExpr : public ASTNode {
+public:
+  std::vector<NodePtr> elements;
+  InitListExpr(SourceLocation l) : ASTNode(l) {}
+  NodeKind getNodeType() const override { return NodeKind::InitListExpr; }
 };
 
 class CallExpr : public ASTNode {
@@ -348,6 +481,25 @@ public:
   double value;
   FloatLiteral(SourceLocation l, double v) : ASTNode(l), value(v) {}
   NodeKind getNodeType() const override { return NodeKind::FloatLiteral; }
+};
+
+// A character literal 'A' / '\n', decoded to its integer value. GLSL has no
+// char type; it lowers as an int constant (matching C's promotion).
+class CharLiteral : public ASTNode {
+public:
+  int64_t value;
+  CharLiteral(SourceLocation l, int64_t v) : ASTNode(l), value(v) {}
+  NodeKind getNodeType() const override { return NodeKind::CharLiteral; }
+};
+
+// A string literal "..." with quotes stripped and escapes decoded. VC kernels
+// have no string type, so this is primarily so source carrying strings parses
+// cleanly; the backend emits a placeholder comment.
+class StringLiteral : public ASTNode {
+public:
+  std::string value;
+  StringLiteral(SourceLocation l, std::string v) : ASTNode(l), value(std::move(v)) {}
+  NodeKind getNodeType() const override { return NodeKind::StringLiteral; }
 };
 
 class IndexExpr : public ASTNode {

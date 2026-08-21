@@ -87,7 +87,10 @@ int main(int argc, char **argv) {
     return 1;
   }
   Sema sema(tu);
-  sema.analyze();
+  if (!sema.analyze()) {
+    errs() << "sema: aborting due to errors\n";
+    return 1;
+  }
 
   if (kind == EmitKind::AST) {
     dumpAST(tu, outs());
