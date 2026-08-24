@@ -1,20 +1,26 @@
-// test/features2.vc — comprehensive kernel exercising the second enrichment
-// pass: vector types + swizzle, C-style & functional casts, init lists,
-// switch/case, struct + typedef, char literals, and real pre/post ++ -- value
-// semantics. One __global__ kernel does it all so a single host demo can
-// verify every feature end-to-end.
+// test/features2.vc — single-file second-enrichment feature demo.
 //
-// Build & run:
-//   ./build/tools/vc-glsl/vc-glsl test/features2.vc -o build/features2.spv
-//   ./build/examples/features2_demo build/features2.spv
+// Exercises the second enrichment pass end-to-end in one .vc file:
+//   - vector type float4 + swizzle (.x .y .z .w, .xz.x .xz.y)
+//   - C-style cast (float)i and functional cast float(...)
+//   - struct Vec4 + array field, typedef scalar_t, __device__ helper
+//   - char literal 'A'
+//   - real pre/post ++ -- value semantics (j = a++ yields OLD value)
+//   - switch / case / default
+//
+//   vcc test/features2.vc -o build/features2_sf && ./build/features2_sf
 
-// --- struct + typedef (Step 5) ---
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+// --- struct + typedef ---
 struct Vec4 {
   float c[4];
 };
 typedef float scalar_t;
 
-// --- __device__ helper taking a typedef'd type (Step 5) ---
+// --- __device__ helper taking a typedef'd type ---
 __device__ scalar_t sumcomp(Vec4 v) {
   return v.c[0] + v.c[1] + v.c[2] + v.c[3];
 }
@@ -22,30 +28,30 @@ __device__ scalar_t sumcomp(Vec4 v) {
 __global__ void features2(float *result) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-  // --- init list into a struct + array field (Steps 3, 5) ---
+  // --- init list into a struct + array field ---
   Vec4 v;
   v.c[0] = 1.0;
   v.c[1] = 2.0;
   v.c[2] = 3.0;
   v.c[3] = 4.0;
 
-  // --- vector type + swizzle (Step 1) ---
+  // --- vector type + swizzle ---
   float4 q = float4(10.0, 20.0, 30.0, 40.0);
   float sw = q.x + q.y + q.z + q.w;   // 100
-  float swz = q.xz.x + q.xz.y;        // q.x=10 + q.z=30 = 40 (swizzle .xz then .x/.y)
+  float swz = q.xz.x + q.xz.y;        // q.x=10 + q.z=30 = 40
 
-  // --- C-style cast & functional cast (Step 2) ---
+  // --- C-style cast & functional cast ---
   float cf = (float)i + float(i);     // 2*i
 
-  // --- char literal (Step 7) ---
+  // --- char literal ---
   int ch = 'A';                       // 65
 
-  // --- pre/post ++ -- value semantics (Step 8) ---
+  // --- pre/post ++ -- value semantics ---
   int a = 0;
   int j = a++;                        // j=0 (old), a=1
   int k = ++a;                        // k=2 (new), a=2
 
-  // --- switch / case / default (Step 4) ---
+  // --- switch / case / default ---
   int s = 0;
   int mode = i % 3;
   switch (mode) {
@@ -64,4 +70,51 @@ __global__ void features2(float *result) {
   scalar_t total = sumcomp(v) + sw + swz + cf + (float)ch + (float)j +
                    (float)k + (float)s;
   result[i] = total;
+}
+
+// ---- host reference (mirrors the kernel logic) ----
+// total = 217 + 2*i + s, where s = 100/200/300 for i%3 == 0/1/2.
+float reference(int i) {
+  float sumcomp = 1.0f + 2.0f + 3.0f + 4.0f;        // 10
+  float sw = 10.0f + 20.0f + 30.0f + 40.0f;         // 100
+  float swz = 10.0f + 30.0f;                        // 40 (q.x + q.z)
+  float cf = (float)i + (float)i;                   // 2*i
+  float ch = (float)'A';                            // 65
+  int a = 0;
+  int j = a++;                                       // 0 (old value)
+  int k = ++a;                                       // 2 (new value)
+  int mode = i % 3;
+  int s = (mode == 0) ? 100 : (mode == 1) ? 200 : 300;
+  return sumcomp + sw + swz + cf + ch + (float)j + (float)k + (float)s;
+}
+
+int main() {
+  vcInit();
+
+  const int N = 64;
+  float hOut[64];
+  for (int i = 0; i < N; i++) hOut[i] = 0.0f;
+
+  void *dOut = 0;
+  int bytes = N * 4;
+  vcMalloc(&dOut, bytes);
+
+  // One block of N threads. The kernel has no scalar params (output only).
+  features2<<<N, N>>>(dOut);
+
+  vcDeviceSynchronize();
+  vcMemcpy(hOut, dOut, bytes, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    float expect = reference(i);
+    if (std::fabs(hOut[i] - expect) > 1e-3f) {
+      ok = 0;
+    }
+  }
+  printf("features2: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
 }

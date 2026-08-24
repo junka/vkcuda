@@ -46,6 +46,25 @@ void Lexer::skipWhitespaceAndComments() {
         nextChar();
         nextChar();
       }
+    } else if (c == '#' && curCol == 1) {
+      // Preprocessor directive at line start: capture the whole line (from the
+      // '#') verbatim as a hash_line token. Line continuations and multi-line
+      // directives are not handled; one physical line == one token.
+      unsigned start = pos;
+      unsigned startLine = curLine, startCol = curCol;
+      while (pos < buffer.size() && buffer[pos] != '\n')
+        nextChar();
+      hashLineText = buffer.substr(start, pos - start);
+      hashLineLine = startLine;
+      hashLineCol = startCol;
+      haveHashLine = true;
+      // Consume the trailing newline (if any) so the next token starts clean.
+      if (pos < buffer.size() && buffer[pos] == '\n')
+        nextChar();
+      // Stop here so lex() emits this one hash_line token. Without the break a
+      // run of consecutive `#` lines would overwrite hashLineText and only the
+      // last would survive (dropping e.g. `#include <cstdio>` / `<cmath>`).
+      break;
     } else {
       break;
     }
@@ -80,7 +99,10 @@ TokKind Lexer::classifyKeyword(StringRef ident) {
       .Case("__shared__", TokKind::kw_shared)
       .Case("__restrict__", TokKind::kw_restrict)
       .Case("__syncthreads", TokKind::kw_syncthreads)
-      .Case("dim3", TokKind::kw_dim3)
+      // `dim3` is intentionally NOT a keyword: leaving it as a plain identifier
+      // lets `dim3(N,N)` parse as a CallExpr, which the launch translator then
+      // splits into X/Y components for vcLaunchKernel2D. A `struct dim3` def is
+      // injected in the host preamble so the expression also type-checks.
       .Case("wmma", TokKind::kw_wmma)
       .Case("struct", TokKind::kw_struct)
       .Case("typedef", TokKind::kw_typedef)
@@ -172,6 +194,15 @@ Token Lexer::lexNumber() {
 
 Token Lexer::lex() {
   skipWhitespaceAndComments();
+
+  // If whitespace skipping captured a preprocessor line, emit it before the
+  // next real token. (A '#' line is consumed entirely by the skip loop, so
+  // this always precedes the token that follows it on the next line.)
+  if (haveHashLine) {
+    haveHashLine = false;
+    return makeToken(TokKind::hash_line, hashLineText, hashLineLine,
+                     hashLineCol);
+  }
 
   unsigned startLine = curLine;
   unsigned startCol = curCol;
@@ -384,9 +415,16 @@ Token Lexer::peek() {
   unsigned savedPos = pos;
   unsigned savedLine = curLine;
   unsigned savedCol = curCol;
+  bool savedHaveHash = haveHashLine;
+  llvm::StringRef savedHashText = hashLineText;
+  unsigned savedHashLine = hashLineLine, savedHashCol = hashLineCol;
   Token t = lex();
   pos = savedPos;
   curLine = savedLine;
   curCol = savedCol;
+  haveHashLine = savedHaveHash;
+  hashLineText = savedHashText;
+  hashLineLine = savedHashLine;
+  hashLineCol = savedHashCol;
   return t;
 }

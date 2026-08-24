@@ -72,6 +72,13 @@ Diagnostic Parser::error(const Token &at, std::string msg) {
 //===----------------------------------------------------------------------===//
 
 bool Parser::parseTopLevelDecl() {
+  if (curTok.is(TokKind::hash_line)) {
+    // Preprocessor directive (`#include ...`, `#define ...`): store verbatim
+    // for the host C++ backend to emit at the top of the generated .cpp.
+    tu.hostPpLines.push_back(std::string(curTok.text));
+    advance();
+    return true;
+  }
   if (curTok.is(TokKind::kw_struct))
     return parseStructDecl();
   if (curTok.is(TokKind::kw_typedef))
@@ -251,22 +258,72 @@ ParamDecl *Parser::parseParam() {
   return new ParamDecl(toSourceLoc(nameTok), ty, nameTok.text);
 }
 
+// Best-effort compile-time integer evaluation: folds IntegerLiteral and
+// arithmetic/bitwise expressions over literals. Used for array dimensions
+// (`float a[32 * 32]`) so the host backend emits a concrete size instead of 0.
+bool Parser::evalConstInt(const ASTNode *e, int64_t &out) {
+  if (!e) return false;
+  switch (e->getNodeType()) {
+  case ASTNode::NodeKind::IntegerLiteral:
+    out = static_cast<const IntegerLiteral *>(e)->value;
+    return true;
+  case ASTNode::NodeKind::UnaryExpr: {
+    auto *u = static_cast<const UnaryExpr *>(e);
+    int64_t v;
+    if (!evalConstInt(u->operand.get(), v)) return false;
+    switch (u->op) {
+    case UnaryOp::Neg: out = -v; return true;
+    case UnaryOp::Not: out = ~v; return true;
+    case UnaryOp::LNot: out = !v; return true;
+    default: return false; // Deref/AddrOf/Inc/Dec are not constant.
+    }
+  }
+  case ASTNode::NodeKind::BinaryExpr: {
+    auto *b = static_cast<const BinaryExpr *>(e);
+    int64_t l, r;
+    if (!evalConstInt(b->lhs.get(), l) || !evalConstInt(b->rhs.get(), r))
+      return false;
+    switch (b->op) {
+    case BinaryOp::Add: out = l + r; return true;
+    case BinaryOp::Sub: out = l - r; return true;
+    case BinaryOp::Mul: out = l * r; return true;
+    case BinaryOp::Div: out = l / r; return true;
+    case BinaryOp::Mod: out = l % r; return true;
+    case BinaryOp::Shl: out = l << r; return true;
+    case BinaryOp::Shr: out = l >> r; return true;
+    case BinaryOp::And: out = l & r; return true;
+    case BinaryOp::Or: out = l | r; return true;
+    case BinaryOp::Xor: out = l ^ r; return true;
+    case BinaryOp::LAnd: out = l && r; return true;
+    case BinaryOp::LOr: out = l || r; return true;
+    default: return false; // comparisons/assign not needed for sizes.
+    }
+  }
+  default:
+    return false;
+  }
+}
+
 VarDecl *Parser::parseVarDecl(Type *ty) {
+  // Per-declarator leading pointer stars: in `int *a, *b;` each declarator
+  // may carry its own `*`s applied to the shared base type.
+  Type *declTy = ty;
+  while (consume(TokKind::star))
+    declTy = new PointerType(declTy);
   Token nameTok = curTok;
   if (!expect(TokKind::identifier, "variable name"))
     return nullptr;
   // expect() already consumed the identifier.
-  auto *v = new VarDecl(toSourceLoc(nameTok), ty, nameTok.text);
-  // Trailing array dimensions: "name[16][8]". Each must be a constant
-  // integer literal for now (no runtime sizing on locals).
+  auto *v = new VarDecl(toSourceLoc(nameTok), declTy, nameTok.text);
+  // Trailing array dimensions: "name[16][8]" or "name[32 * 32]". Each is
+  // constant-folded to a concrete size; a non-constant dim falls back to 0.
   while (curTok.is(TokKind::l_square)) {
     advance();
     NodePtr dim = parseExpression();
-    if (dim && dim->getNodeType() == ASTNode::NodeKind::IntegerLiteral)
-      v->arrayDims.push_back(
-          static_cast<IntegerLiteral *>(dim.get())->value);
-    else
-      v->arrayDims.push_back(0); // unsized / unknown
+    int64_t sz = 0;
+    if (!evalConstInt(dim.get(), sz))
+      sz = 0; // unsized / non-constant
+    v->arrayDims.push_back(sz);
     expect(TokKind::r_square, "']'");
   }
   if (curTok.is(TokKind::assign)) {
@@ -342,7 +399,12 @@ Type *Parser::makeVectorType(StringRef name) {
   return nullptr;
 }
 
-Type *Parser::parseType() {
+Type *Parser::parseBaseType() {
+  // Discard leading qualifiers (`const`) — VC's type system doesn't track
+  // cv-qualifiers; the GLSL/host backends don't need them. Multiple `const`
+  // and `__restrict__` tokens are tolerated.
+  while (curTok.is(TokKind::kw_const) || curTok.is(TokKind::kw_restrict))
+    advance();
   Type *base = nullptr;
   switch (curTok.kind) {
   case TokKind::kw_void: base = new BuiltinType(BuiltinTypeKind::Void); break;
@@ -360,21 +422,41 @@ Type *Parser::parseType() {
       auto it = typeNames.find(curTok.text);
       if (it != typeNames.end())
         base = it->second;
+      else {
+        // Unknown named type (e.g. a runtime typedef like VCStreamHandle or
+        // VCKernelHandle from VCRuntime.h, or an opaque host type). Treat it
+        // as a forward-declared record so the host backend emits the name
+        // verbatim; the real definition comes from the #included header.
+        auto *sd = new StructDecl(toSourceLoc(curTok), curTok.text);
+        base = new RecordType(sd);
+        typeNames[curTok.text] = base;
+      }
     }
-    if (!base) return nullptr;
     break;
   default: return nullptr;
   }
   advance();
+  return base;
+}
+
+Type *Parser::parseType() {
+  Type *base = parseBaseType();
+  if (!base) return nullptr;
   // pointer levels: '*' '*'
   Type *ty = base;
   while (consume(TokKind::star))
     ty = new PointerType(ty);
+  // reference levels: '&' (host-only, e.g. `const Point &p` in a helper).
+  while (consume(TokKind::amp))
+    ty = new ReferenceType(ty);
   return ty;
 }
 
 bool Parser::startsType(const Token &t) {
   switch (t.kind) {
+  case TokKind::kw_const:
+    // `const` qualifies a following type; peek through it.
+    return true;
   case TokKind::kw_void:
   case TokKind::kw_bool:
   case TokKind::kw_int:
@@ -386,7 +468,24 @@ bool Parser::startsType(const Token &t) {
   case TokKind::identifier:
     // Vector names (float4, ...) and known struct/typedef names start types.
     if (makeVectorType(t.text)) return true;
-    return typeNames.count(t.text) > 0;
+    if (typeNames.count(t.text) > 0) return true;
+    // An unknown capitalized identifier likely names a runtime/opaque type
+    // (e.g. VCStreamHandle from VCRuntime.h). Treat it as a type only when the
+    // next token looks like a declarator name or `*`, so plain expression
+    // statements like `s = 5;` aren't misread as declarations. We deliberately
+    // do NOT treat a following `&` as a declarator indicator: `name & expr` is
+    // overwhelmingly a bitwise-and expression (e.g. `(k & 1)`), not a reference
+    // declaration. Reference parameters only occur in host helper signatures
+    // like `const Point &p`, where the type name is already known (struct/
+    // typedef) or capitalized — handled by the branches above.
+    {
+      const Token &nx = lexer.peek();
+      if (nx.is(TokKind::identifier) && !makeVectorType(nx.text))
+        return true;
+      if (nx.is(TokKind::star))
+        return true;
+    }
+    return false;
   default:
     return false;
   }
@@ -561,11 +660,20 @@ NodePtr Parser::parseDeclOrExprStmt() {
   // If the current token starts a type, parse a declaration.
   Token save = curTok;
   if (startsType(curTok)) {
-    Type *ty = parseType();
-    // Could be "T name = ..." or a cast-like expr; here we assume decl.
-    VarDecl *v = parseVarDecl(ty);
+    // Parse the base type once; each declarator carries its own pointer `*`s
+    // (so `int *a, b;` gives a=int*, b=int; `void *x, *y;` gives both void*).
+    Type *baseTy = parseBaseType();
+    VarDecl *first = parseVarDecl(baseTy);
+    // A DeclStmt may hold several declarators sharing one base type
+    // (`float a[4], b, c[8];`). They share the enclosing scope (no extra {}),
+    // so build one DeclStmt whose `decls` lists them all.
+    auto *ds = new DeclStmt(toSourceLoc(save), first);
+    while (consume(TokKind::comma)) {
+      if (VarDecl *v = parseVarDecl(baseTy))
+        ds->decls.push_back(v);
+    }
     expect(TokKind::semi, "';'");
-    return NodePtr(new DeclStmt(v ? v->getLoc() : toSourceLoc(save), v));
+    return NodePtr(ds);
   }
   auto *es = new ExprStmt(toSourceLoc(save));
   es->expr = parseExpression();
@@ -785,6 +893,21 @@ NodePtr Parser::parseUnary() {
     Token lp = curTok;
     Token savedTok = curTok;
     Lexer::Pos savedPos = lexer.savePos(); // pos is just past curTok '('
+    // The speculative parseType() below may register an unknown identifier
+    // (e.g. a variable name like `k` in `(k & 1)`) as a synthetic RecordType in
+    // `typeNames`. That registration is NOT rolled back by lexer.restorePos, so
+    // it would leak and make every later occurrence of that name parse as a
+    // type. Snapshot whether the peeked base name is already known so we can
+    // undo any speculative insertion on rollback.
+    std::string specName;
+    bool specWasKnown = false;
+    {
+      const Token &pk = lexer.peek();
+      if (pk.is(TokKind::identifier)) {
+        specName = pk.text.str();
+        specWasKnown = typeNames.count(specName) > 0;
+      }
+    }
     advance(); // '('
     Type *ty = parseType();
     if (ty && curTok.is(TokKind::r_paren)) {
@@ -800,8 +923,10 @@ NodePtr Parser::parseUnary() {
         return NodePtr(new CStyleCastExpr(toSourceLoc(lp), ty, std::move(sub)));
       }
     }
-    // Not a cast: roll back both curTok and the lexer position so the '(' is
-    // reprocessed as grouping by parsePostfix -> parsePrimary.
+    // Not a cast: roll back curTok, the lexer position, AND any speculative
+    // typeNames insertion so the '(' is reprocessed cleanly as grouping.
+    if (!specName.empty() && !specWasKnown)
+      typeNames.erase(specName);
     curTok = savedTok;
     lexer.restorePos(savedPos);
   }
@@ -836,6 +961,13 @@ NodePtr Parser::parseUnary() {
 NodePtr Parser::parsePostfix() {
   auto base = parsePrimary();
   while (base) {
+    // CUDA launch `kernel<<<grid,block>>>(args)` must be detected before any
+    // other postfix handling: the `<<<` opens with a `lessless` token.
+    if (curTok.is(TokKind::lessless) &&
+        lexer.peek().is(TokKind::lt)) {
+      if (auto launch = tryParseLaunch(base))
+        return launch;
+    }
     if (curTok.is(TokKind::l_square)) {
       Token lb = curTok;
       advance();
@@ -849,6 +981,18 @@ NodePtr Parser::parsePostfix() {
         return nullptr;
       // expect() already consumed the member identifier.
       base = NodePtr(new MemberAccessExpr(toSourceLoc(m), std::move(base), m.text));
+    } else if (curTok.is(TokKind::colon) && lexer.peek().is(TokKind::colon)) {
+      // Scope/resolution operator `::` (lexed as two `colon` tokens), as in
+      // `VCMemcpyKind::HostToDevice`. Lowered to a MemberAccessExpr so the
+      // host backend can emit it verbatim; the device backend rarely sees it.
+      advance();
+      advance();
+      Token m = curTok;
+      if (!expect(TokKind::identifier, "scoped name"))
+        return nullptr;
+      auto *ma = new MemberAccessExpr(toSourceLoc(m), std::move(base), m.text);
+      ma->isScope = true; // source used `::`, not `.`
+      base = NodePtr(ma);
     } else if (curTok.is(TokKind::l_paren)) {
       // call: callee ( args )
       if (auto launch = tryParseLaunch(base))
@@ -894,15 +1038,37 @@ NodePtr Parser::tryParseLaunch(NodePtr &callee) {
   auto grid = parseExpression();
   expect(TokKind::comma, "','");
   auto block = parseExpression();
-  // optional shared-mem stream args ignored for now
-  if (!curTok.is(TokKind::launch_close)) {
-    // tolerate extra commas
-    while (consume(TokKind::comma)) parseExpression();
+  // Optional extra launch arguments: <<<g, b, sharedMem, stream>>>. The 3rd
+  // (dynamic shared memory) is unused by the VC runtime and dropped; the 4th
+  // (stream handle) is captured so the host backend can emit vcLaunchKernelS.
+  NodePtr stream;
+  if (consume(TokKind::comma)) {
+    parseExpression(); // shared-mem size — ignored
+    if (consume(TokKind::comma))
+      stream = parseExpression(); // stream handle
   }
   expect(TokKind::launch_close, "'>>>'");
   expect(TokKind::l_paren, "'(' after >>>");
+
+  // Split a `dim3(a, b)` call into its X and Y components so the host backend
+  // can emit vcLaunchKernel2D. A plain scalar grid/block stays 1D (Y = null).
+  auto splitDim3 = [this](NodePtr n) -> std::pair<NodePtr, NodePtr> {
+    if (n && n->getNodeType() == ASTNode::NodeKind::CallExpr) {
+      auto *c = static_cast<CallExpr *>(n.get());
+      if (c->callee &&
+          c->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr &&
+          static_cast<DeclRefExpr *>(c->callee.get())->name == "dim3" &&
+          c->args.size() >= 2)
+        return {std::move(c->args[0]), std::move(c->args[1])};
+    }
+    return {std::move(n), nullptr};
+  };
+  auto [gx, gy] = splitDim3(std::move(grid));
+  auto [bx, by] = splitDim3(std::move(block));
+
   auto *launch = new LaunchExpr(toSourceLoc(openLt), std::move(callee),
-                                std::move(grid), std::move(block));
+                                std::move(gx), std::move(bx),
+                                std::move(gy), std::move(by), std::move(stream));
   if (!curTok.is(TokKind::r_paren)) {
     while (true) {
       auto a = parseExpression();

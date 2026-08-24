@@ -1,8 +1,14 @@
-// Block-sum reduction demo.
-// Each workgroup of `blockDim` threads sums its slice of the input and
-// writes one output element: out[blockIdx.x] = sum(in[blockIdx.x*block .. +block-1]).
-// Exercises: for-loop, __shared__ memory, __syncthreads().
-__global__ void blockReduce(float* inBuf, float* outBuf, int N) {
+// test/reduce.vc — single-file block-reduce demo (kernel + host main + launch).
+//
+// Each workgroup of `blockDim` threads sums its slice of the input and writes
+// one output element. Exercises for-loop, __shared__ memory, __syncthreads().
+//
+//   vcc test/reduce.vc -o build/reduce_sf && ./build/reduce_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void blockReduce(float *inBuf, float *outBuf, int N) {
   int tid = threadIdx.x;
   int block = blockDim.x;
   int start = blockIdx.x * block;
@@ -29,4 +35,48 @@ __global__ void blockReduce(float* inBuf, float* outBuf, int N) {
 
   if (tid == 0)
     outBuf[blockIdx.x] = s[0];
+}
+
+int main() {
+  vcInit();
+
+  const int N = 128;
+  const int block = 32;
+  const int numBlocks = (N + block - 1) / block;
+
+  float hIn[128];
+  for (int i = 0; i < N; i++) hIn[i] = 1.0f * i; // 0,1,2,...,127
+  float hOut[4];
+  for (int b = 0; b < numBlocks; b++) hOut[b] = 0.0f;
+
+  void *dIn = 0, *dOut = 0;
+  vcMalloc(&dIn, N * 4);
+  vcMalloc(&dOut, numBlocks * 4);
+  vcMemcpy(dIn, hIn, N * 4, VCMemcpyKind::HostToDevice);
+
+  // gridDim = N (element count), blockDim = block. The runtime computes
+  // workgroup count = ceil(gridDim/blockDim) = numBlocks.
+  blockReduce<<<N, block>>>(dIn, dOut, N);
+
+  vcDeviceSynchronize();
+  vcMemcpy(hOut, dOut, numBlocks * 4, VCMemcpyKind::DeviceToHost);
+
+  // Expected partial sums: block b covers [b*block, min((b+1)*block, N)).
+  int ok = 1;
+  for (int b = 0; b < numBlocks; b++) {
+    int lo = b * block;
+    int hi = (b + 1) * block;
+    if (hi > N) hi = N;
+    float expect = 0.0f;
+    for (int i = lo; i < hi; i++) expect += hIn[i];
+    if (hOut[b] != expect) {
+      ok = 0;
+    }
+  }
+  printf("block_reduce: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dIn);
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
 }

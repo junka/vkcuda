@@ -19,6 +19,11 @@ enum class TokKind {
   eof,
   unknown,
 
+  // A preprocessor directive line (`#include ...`, `#define ...`) captured
+  // verbatim from line start to end of line. The parser treats it as opaque
+  // text to pass through to the host C++ backend.
+  hash_line,
+
   // Punctuation / operators
   l_paren, r_paren,
   l_brace, r_brace,
@@ -87,6 +92,12 @@ class Lexer {
   unsigned curLine = 1;
   unsigned curCol = 1;
   int bufferID;
+  // A preprocessor line (`#...` at line start) captured during whitespace
+  // skipping. lex() emits it as a hash_line token before the next real token.
+  bool haveHashLine = false;
+  llvm::StringRef hashLineText;
+  unsigned hashLineLine = 0;
+  unsigned hashLineCol = 0;
 
 public:
   Lexer(llvm::SourceMgr &sm, int mainBufferID);

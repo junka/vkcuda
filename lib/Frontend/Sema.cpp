@@ -143,6 +143,14 @@ void Sema::checkFunctions() {
     if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
     auto *f = static_cast<FunctionDecl *>(d.get());
     if (!f->body) continue;
+    // Only check device code (kernels and __device__ helpers). Host functions
+    // (DeviceAttr::Host or None, e.g. `int main()` calling printf/vcMalloc)
+    // are lowered to C++ by the host backend, where printf/vcMalloc/etc. are
+    // real symbols — checking them here would produce false "undeclared
+    // function" warnings. Host-side expression checking is intentionally lax.
+    if (f->deviceAttr != DeviceAttr::Global &&
+        f->deviceAttr != DeviceAttr::Device)
+      continue;
     pushScope();
     for (ParamDecl *p : f->params) declare(p->name, p);
     checkStmt(f->body.get());
@@ -162,11 +170,12 @@ void Sema::checkStmt(const ASTNode *n) {
   }
   case ASTNode::NodeKind::DeclStmt: {
     auto *ds = static_cast<const DeclStmt *>(n);
-    VarDecl *v = ds->decl;
-    if (v) {
+    for (VarDecl *v : ds->decls) {
+      if (!v) continue;
       declare(v->name, v);
       if (v->init) checkExpr(v->init.get());
     }
+    // Back-compat: a DeclStmt built with a single decl also sets `decl`.
     return;
   }
   case ASTNode::NodeKind::ExprStmt:

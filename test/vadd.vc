@@ -1,10 +1,51 @@
-// vadd.vc — minimal VC kernel: elementwise float addition.
+// test/vadd.vc — single-file vadd demo (kernel + host main + launch).
 //
-// This is the device-side source the `vc` compiler turns into SPIR-V.
-// Host-side launch is in examples/vector_add.cpp.
-__global__ void vadd(float* a, float* b, float* c, int n) {
+// Elementwise float addition, the canonical end-to-end VC demo. One .vc file
+// holds the __global__ kernel AND the host int main() that allocates device
+// buffers, launches, copies back, and verifies — compiled by `vcc` like nvcc:
+//
+//   vcc test/vadd.vc -o build/vadd_sf && ./build/vadd_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void vadd(float *a, float *b, float *c, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) {
     c[i] = a[i] + b[i];
   }
+}
+
+int main() {
+  vcInit();
+
+  const int N = 64;
+  float hA[64], hB[64], hC[64];
+  for (int i = 0; i < N; i++) { hA[i] = 1.0f * i; hB[i] = 2.0f; }
+
+  void *dA = 0, *dB = 0, *dC = 0;
+  int bytes = N * 4;
+  vcMalloc(&dA, bytes);
+  vcMalloc(&dB, bytes);
+  vcMalloc(&dC, bytes);
+
+  vcMemcpy(dA, hA, bytes, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dB, hB, bytes, VCMemcpyKind::HostToDevice);
+
+  vadd<<<N, 32>>>(dA, dB, dC, N);
+
+  vcDeviceSynchronize();
+  vcMemcpy(hC, dC, bytes, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    if (hC[i] != hA[i] + hB[i]) { ok = 0; }
+  }
+  printf("vector_add: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dA);
+  vcFree(dB);
+  vcFree(dC);
+  vcShutdown();
+  return ok ? 0 : 1;
 }

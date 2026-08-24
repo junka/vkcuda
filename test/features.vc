@@ -1,6 +1,7 @@
-// features.vc — comprehensive frontend feature exercise.
+// test/features.vc — single-file comprehensive frontend feature demo.
 //
-// Exercises every language feature added in the frontend-enrichment pass:
+// Exercises every language feature added in the frontend-enrichment pass
+// end-to-end in one .vc file (kernel + host reference + launch):
 //   - real modulo (%) and bitwise & | ^ ~
 //   - shifts << >>
 //   - compound assignment += etc.
@@ -12,22 +13,11 @@
 //   - CUDA math builtin lowering (__sinf etc.)
 //   - hex literals (0x..) and float exponents (1e-3)
 //
-// The kernel computes, for each thread i, a value that the host can verify
-// against a reference so the result is end-to-end checked (not just dumped).
-//
-// Per-thread contract (n = blockDim, one block):
-//   out[i] = clampf(sin(i) , ...) mixed with bit-twiddling of i.
-//
-// Reference (host mirrors this exactly):
-//   v  = i
-//   b  = ((i % 4) << 3) | ((i >> 2) & 1)        // % << >> & |
-//   b  = b ^ 1;                                  // ^
-//   b  = b & ~0;                                 // ~ (no-op mask)
-//   s  = clampf(tof(v), 0, 8) + __sinf(tof(i))  // device helper + builtin
-//   t  = (i < 4) ? 1.0 : 2.0                     // ternary
-//   out = b + s + t                              // combined
-// do-while + break/continue just count iterations into a scratch sum that is
-// folded in so the control-flow features are exercised on a real path.
+//   vcc test/features.vc -o build/features_sf && ./build/features_sf
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
 
 __device__ float clampf(float x, float lo, float hi) {
   // ternary + device helper returning float
@@ -84,4 +74,74 @@ __global__ void features(float *result, int n) {
   int oddsum = sumodd(i);
 
   result[i] = b + s + t + cnt + oddsum;
+}
+
+// ---- host reference (must match the kernel byte-for-logic) ----
+
+float ref_clampf(float x, float lo, float hi) {
+  return x < lo ? lo : (x > hi ? hi : x);
+}
+
+// sumodd: mirrors the kernel's do-while (k starts at 0, incremented to 1
+// first, then checked; break at k>=32; skip evens).
+int ref_sumodd(int upTo) {
+  int s = 0;
+  int k = 0;
+  do {
+    k += 1;
+    if (k >= 32) break;
+    if ((k & 1) == 0) continue;
+    s += k;
+  } while (k < upTo);
+  return s;
+}
+
+float reference(int i) {
+  int mask = 0x1F;
+  int v = i & mask;
+  int b = ((i % 4) << 3) | ((i >> 2) & 1);
+  b = b ^ 1;
+  b = b & ~0;
+  float lo = 0.0f;
+  float hi = 8.0f;
+  float s = ref_clampf((float)v, lo, hi) + std::sin((float)i);
+  float t = i < 4 ? 1.0f : 2.0f;
+  int cnt = 0;
+  cnt += b;
+  cnt++;
+  int oddsum = ref_sumodd(i);
+  return (float)b + s + t + (float)cnt + (float)oddsum;
+}
+
+int main() {
+  vcInit();
+
+  // One block of N threads so threadIdx.x == i directly.
+  const int N = 64;
+  float hOut[64];
+  for (int i = 0; i < N; i++) hOut[i] = 0.0f;
+
+  void *dOut = 0;
+  int bytes = N * 4;
+  vcMalloc(&dOut, bytes);
+
+  // Launch one block of N threads: grid=N, block=N -> 1 workgroup.
+  features<<<N, N>>>(dOut, N);
+
+  vcDeviceSynchronize();
+  vcMemcpy(hOut, dOut, bytes, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    float expect = reference(i);
+    // Allow a small epsilon for float sin() differences across drivers.
+    if (std::fabs(hOut[i] - expect) > 1e-3f) {
+      ok = 0;
+    }
+  }
+  printf("features: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
 }

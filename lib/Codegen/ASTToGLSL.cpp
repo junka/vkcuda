@@ -172,6 +172,10 @@ private:
     // pointer-to-T -> T (SSBO element type)
     if (t->getKind() == TypeKind::Pointer)
       return glslType(static_cast<const PointerType *>(t)->pointee);
+    // Reference types are host-only and should never reach the GLSL backend;
+    // resolve to the underlying type defensively if they do.
+    if (t->getKind() == TypeKind::Reference)
+      return glslType(static_cast<const ReferenceType *>(t)->pointee);
     // vector: float4 -> vec4, int3 -> ivec3, uint2 -> uvec2,
     // double2 -> dvec2, bool4 -> bvec4.
     if (t->getKind() == TypeKind::Vector) {
@@ -281,8 +285,9 @@ private:
     if (!n) return;
     switch (n->getNodeType()) {
     case ASTNode::NodeKind::DeclStmt: {
-      auto *d = static_cast<const DeclStmt *>(n)->decl;
-      if (d && d->isShared) out.push_back(d);
+      // All declarators in one statement share isShared; check each.
+      for (VarDecl *d : static_cast<const DeclStmt *>(n)->decls)
+        if (d && d->isShared) out.push_back(d);
       break;
     }
     case ASTNode::NodeKind::CompoundStmt:
@@ -437,10 +442,17 @@ private:
   void emitForInit(const ASTNode *n) {
     if (!n) return;
     if (n->getNodeType() == ASTNode::NodeKind::DeclStmt) {
-      auto *d = static_cast<const DeclStmt *>(n)->decl;
-      if (!d) return;
-      os << glslType(d->type) << " " << d->name;
-      if (d->init) { os << " = "; emitExpr(d->init.get()); }
+      auto *ds = static_cast<const DeclStmt *>(n);
+      bool first = true;
+      for (VarDecl *d : ds->decls) {
+        if (!d) continue;
+        if (!first) os << ", ";
+        first = false;
+        os << glslType(d->type) << " " << d->name;
+        for (int64_t dim : d->arrayDims)
+          os << "[" << dim << "]";
+        if (d->init) { os << " = "; emitExpr(d->init.get()); }
+      }
       return;
     }
     if (n->getNodeType() == ASTNode::NodeKind::ExprStmt) {
@@ -468,6 +480,16 @@ private:
       for (int64_t dim : d->arrayDims)
         os << "[" << dim << "]";
       if (d->init) { os << " = "; emitExpr(d->init.get()); }
+      // Additional declarators sharing this statement's type (`int a, b;`).
+      // GLSL allows comma-separated declarations in the same statement.
+      for (unsigned i = 1; i < static_cast<const DeclStmt *>(n)->decls.size();
+           ++i) {
+        VarDecl *vd = static_cast<const DeclStmt *>(n)->decls[i];
+        os << ", " << glslType(vd->type) << " " << vd->name;
+        for (int64_t dim : vd->arrayDims)
+          os << "[" << dim << "]";
+        if (vd->init) { os << " = "; emitExpr(vd->init.get()); }
+      }
       os << ";\n";
       break;
     }

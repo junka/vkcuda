@@ -8,6 +8,7 @@ add_library(VCFrontend STATIC
   ASTDumper.cpp
   Sema.cpp
   ../Codegen/ASTToGLSL.cpp
+  ../Codegen/ASTToHost.cpp
 )
 
 target_include_directories(VCFrontend PUBLIC

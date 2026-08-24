@@ -80,11 +80,14 @@ public:
       break;
     }
     case ASTNode::NodeKind::DeclStmt: {
-      const auto *v = cast<DeclStmt>(n)->decl;
-      os << "Var " << (v ? v->name : "?")
-         << (v && v->isShared ? " [shared]" : "") << "\n";
+      const auto *ds = cast<DeclStmt>(n);
+      os << "DeclStmt\n";
       ++indent;
-      if (v && v->init) dumpNode(v->init.get());
+      for (const VarDecl *v : ds->decls) {
+        pad(); os << "Var " << (v ? v->name : std::string("?"))
+                  << (v && v->isShared ? " [shared]" : "") << "\n";
+        if (v && v->init) { ++indent; dumpNode(v->init.get()); --indent; }
+      }
       --indent;
       break;
     }
@@ -222,7 +225,10 @@ public:
       ++indent;
       dumpNode(l->callee.get());
       pad(); os << "grid:\n"; ++indent; dumpNode(l->gridDim.get()); --indent;
+      if (l->gridDimY) { pad(); os << "gridY:\n"; ++indent; dumpNode(l->gridDimY.get()); --indent; }
       pad(); os << "block:\n"; ++indent; dumpNode(l->blockDim.get()); --indent;
+      if (l->blockDimY) { pad(); os << "blockY:\n"; ++indent; dumpNode(l->blockDimY.get()); --indent; }
+      if (l->stream) { pad(); os << "stream:\n"; ++indent; dumpNode(l->stream.get()); --indent; }
       for (auto &a : l->args) dumpNode(a.get());
       --indent;
       break;

@@ -1,41 +1,36 @@
-add_executable(vector_add vector_add.cpp)
+# All demos are single-file `.vc` sources (kernel + host main + launch in one
+# file), compiled by the `vcc` driver at build time. There are no hand-written
+# host .cpp files anymore. Each demo lives under test/ (which doubles as the
+# single-file demo directory); vcc lowers the device subset to SPIR-V, the host
+# subset to C++ embedding it, and drives g++ to produce a self-contained exe.
+#
+# `vcc` bakes the include dir / runtime lib / vulkan flags at its own link, so
+# each custom command only needs the input and output path.
 
-target_include_directories(vector_add PRIVATE ${VC_INCLUDE_DIR})
-target_compile_features(vector_add PRIVATE cxx_std_20)
-target_link_libraries(vector_add PRIVATE VCRuntime)
+set(VC_SINGLEFILE_DEMOS vadd reduce matmul struct features features2 async_overlap)
 
-add_executable(block_reduce block_reduce.cpp)
+foreach(demo ${VC_SINGLEFILE_DEMOS})
+  add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/${demo}_sf
+    COMMAND vcc ${CMAKE_SOURCE_DIR}/test/${demo}.vc
+            -o ${CMAKE_BINARY_DIR}/${demo}_sf
+    DEPENDS vcc ${CMAKE_SOURCE_DIR}/test/${demo}.vc
+    COMMENT "vcc compiling test/${demo}.vc (single-file CUDA-style)"
+    VERBATIM)
+  add_custom_target(${demo}_sf ALL
+    SOURCES ${CMAKE_SOURCE_DIR}/test/${demo}.vc
+    DEPENDS ${CMAKE_BINARY_DIR}/${demo}_sf)
+endforeach()
 
-target_include_directories(block_reduce PRIVATE ${VC_INCLUDE_DIR})
-target_compile_features(block_reduce PRIVATE cxx_std_20)
-target_link_libraries(block_reduce PRIVATE VCRuntime)
-
-add_executable(matmul matmul.cpp)
-
-target_include_directories(matmul PRIVATE ${VC_INCLUDE_DIR})
-target_compile_features(matmul PRIVATE cxx_std_20)
-target_link_libraries(matmul PRIVATE VCRuntime)
-
-add_executable(async_overlap async_overlap.cpp)
-
-target_include_directories(async_overlap PRIVATE ${VC_INCLUDE_DIR})
-target_compile_features(async_overlap PRIVATE cxx_std_20)
-target_link_libraries(async_overlap PRIVATE VCRuntime)
-
-add_executable(features_demo features_demo.cpp)
-
-target_include_directories(features_demo PRIVATE ${VC_INCLUDE_DIR})
-target_compile_features(features_demo PRIVATE cxx_std_20)
-target_link_libraries(features_demo PRIVATE VCRuntime)
-
-add_executable(struct_demo struct_demo.cpp)
-
-target_include_directories(struct_demo PRIVATE ${VC_INCLUDE_DIR})
-target_compile_features(struct_demo PRIVATE cxx_std_20)
-target_link_libraries(struct_demo PRIVATE VCRuntime)
-
-add_executable(features2_demo features2_demo.cpp)
-
-target_include_directories(features2_demo PRIVATE ${VC_INCLUDE_DIR})
-target_compile_features(features2_demo PRIVATE cxx_std_20)
-target_link_libraries(features2_demo PRIVATE VCRuntime)
+# The original canonical single-file example (kept as its own target for
+# documentation/reference alongside the test/ demos).
+add_custom_command(
+  OUTPUT ${CMAKE_BINARY_DIR}/singlefile
+  COMMAND vcc ${CMAKE_CURRENT_SOURCE_DIR}/singlefile.vc
+          -o ${CMAKE_BINARY_DIR}/singlefile
+  DEPENDS vcc ${CMAKE_CURRENT_SOURCE_DIR}/singlefile.vc
+  COMMENT "vcc compiling singlefile.vc (single-file CUDA-style)"
+  VERBATIM)
+add_custom_target(singlefile ALL
+  SOURCES singlefile.vc
+  DEPENDS ${CMAKE_BINARY_DIR}/singlefile)

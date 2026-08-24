@@ -1,0 +1,82 @@
+// test/async_overlap.vc — single-file async stream overlap demo.
+//
+// Exercises the stream API via CUDA-style 4-argument launches:
+//   kernel<<<grid, block, shmem, stream>>>(args)
+// which `vcc` lowers to vcLaunchKernelS, plus the host-side stream/memcpy-S
+// calls. Two independent vadd workloads are dispatched on two separate
+// streams back-to-back with NO synchronization between them; each stream
+// writes its own output buffer. We then sync each stream and verify both.
+//
+//   vcc test/async_overlap.vc -o build/async_overlap_sf && ./build/async_overlap_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void vadd(float *a, float *b, float *c, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    c[i] = a[i] + b[i];
+  }
+}
+
+int main() {
+  vcInit();
+
+  // Two independent workloads, each on its own stream.
+  const int N = 64;
+  const int bytes = N * 4;
+  const int block = 32;
+
+  VCStreamHandle streamA = 0, streamB = 0;
+  vcStreamCreate(&streamA);
+  vcStreamCreate(&streamB);
+
+  void *dAa = 0, *dBa = 0, *dCa = 0; // workload A buffers
+  void *dAb = 0, *dBb = 0, *dCb = 0; // workload B buffers
+  vcMalloc(&dAa, bytes); vcMalloc(&dBa, bytes); vcMalloc(&dCa, bytes);
+  vcMalloc(&dAb, bytes); vcMalloc(&dBb, bytes); vcMalloc(&dCb, bytes);
+
+  float hAa[64], hBa[64], hCa[64];
+  float hAb[64], hBb[64], hCb[64];
+  for (int i = 0; i < N; i++) {
+    hAa[i] = 1.0f * i;        hBa[i] = 2.0f;          // A: i + 2
+    hAb[i] = 3.0f * i;        hBb[i] = 4.0f;          // B: 3i + 4
+    hCa[i] = 0.0f;
+    hCb[i] = 0.0f;
+  }
+
+  int nA = N, nB = N;
+
+  // Stream A workload (all async, recorded into streamA). The memcpy-then-
+  // launch ordering is intra-stream, so it is correct without cross-stream sync.
+  vcMemcpyS(dAa, hAa, bytes, VCMemcpyKind::HostToDevice, streamA);
+  vcMemcpyS(dBa, hBa, bytes, VCMemcpyKind::HostToDevice, streamA);
+  vadd<<<N, block, 0, streamA>>>(dAa, dBa, dCa, nA);
+
+  // Stream B workload (all async, recorded into streamB, independent of A).
+  vcMemcpyS(dAb, hAb, bytes, VCMemcpyKind::HostToDevice, streamB);
+  vcMemcpyS(dBb, hBb, bytes, VCMemcpyKind::HostToDevice, streamB);
+  vadd<<<N, block, 0, streamB>>>(dAb, dBb, dCb, nB);
+
+  // Now read results back per stream. D2H memcpy is synchronous on its stream.
+  vcMemcpyS(hCa, dCa, bytes, VCMemcpyKind::DeviceToHost, streamA);
+  vcMemcpyS(hCb, dCb, bytes, VCMemcpyKind::DeviceToHost, streamB);
+
+  // Belt-and-suspenders: also wait for any lingering in-flight frames.
+  vcStreamSynchronize(streamA);
+  vcStreamSynchronize(streamB);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    if (hCa[i] != hAa[i] + hBa[i]) { ok = 0; }
+    if (hCb[i] != hAb[i] + hBb[i]) { ok = 0; }
+  }
+  printf("async_overlap: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dAa); vcFree(dBa); vcFree(dCa);
+  vcFree(dAb); vcFree(dBb); vcFree(dCb);
+  vcStreamDestroy(streamA);
+  vcStreamDestroy(streamB);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

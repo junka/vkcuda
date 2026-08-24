@@ -1,0 +1,40 @@
+// examples/singlefile.vc — single-file CUDA-style source.
+//
+// One .vc file holds both the __global__ kernel AND the host int main()
+// with a kernel<<<grid,block>>>(...) launch site, exactly like nvcc. The
+// `vcc` compiler:
+//   1. lowers the __global__ kernel to SPIR-V (via the GLSL backend),
+//   2. lowers the host code (main + launch) to C++, embedding the SPIR-V,
+//   3. hands the generated .cpp to g++ to produce a self-contained executable.
+//
+// Build & run:
+//   vcc examples/singlefile.vc -o build/sf && ./build/sf
+// Expect: "singlefile vadd: PASS"
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void vadd(float *a, float *b, float *c, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) c[i] = a[i] + b[i];
+}
+
+int main() {
+  vcInit();
+  const int N = 64;
+  float hA[64], hB[64], hC[64];
+  for (int i = 0; i < N; i++) { hA[i] = i; hB[i] = i*2; }
+  void *dA, *dB, *dC;
+  vcMalloc(&dA, N*4); vcMalloc(&dB, N*4); vcMalloc(&dC, N*4);
+  vcMemcpy(dA, hA, N*4, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dB, hB, N*4, VCMemcpyKind::HostToDevice);
+  vadd<<<N, 32>>>(dA, dB, dC, N);
+  vcDeviceSynchronize();
+  vcMemcpy(hC, dC, N*4, VCMemcpyKind::DeviceToHost);
+  int ok = 1;
+  for (int i = 0; i < N; i++) if (hC[i] != hA[i]+hB[i]) ok = 0;
+  printf("singlefile vadd: %s\n", ok ? "PASS" : "FAIL");
+  vcFree(dA); vcFree(dB); vcFree(dC);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

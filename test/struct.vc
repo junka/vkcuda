@@ -1,5 +1,15 @@
-// struct + typedef exercising: struct def, typedef alias, struct field access,
-// struct passed as a kernel pointer param (SSBO of structs), and an array field.
+// test/struct.vc — single-file struct demo (kernel + host main + launch).
+//
+// Exercises struct definition, typedef alias, struct field access, array
+// fields, struct passed as a kernel SSBO, and a __device__ helper taking a
+// typedef'd type. The struct/typedef are shared between device and host.
+//
+//   vcc test/struct.vc -o build/struct_sf && ./build/struct_sf
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
 struct Point {
   float x;
   float y;
@@ -18,4 +28,52 @@ __global__ void kern(Point *pts, float *result, float w) {
   float sy = scale(w, pts[i].y);
   float vv = pts[i].v[0] + pts[i].v[1];
   result[i] = sx + sy + vv;
+}
+
+// Host reference mirroring the kernel: out = w*pts.x + w*pts.y + (v[0]+v[1]).
+float reference(const Point &p, float w) {
+  return w * p.x + w * p.y + (p.v[0] + p.v[1]);
+}
+
+int main() {
+  vcInit();
+
+  const int N = 64;
+  Point hPts[64];
+  float hOut[64];
+  for (int i = 0; i < N; i++) {
+    hPts[i].x = (float)i;
+    hPts[i].y = (float)(i * 2);
+    hPts[i].v[0] = 1.0f;
+    hPts[i].v[1] = 2.0f;
+    hOut[i] = 0.0f;
+  }
+
+  void *dPts = 0, *dOut = 0;
+  int ptsBytes = N * 16;   // sizeof(Point) = 16 under std430 (x,y,v[0],v[1])
+  int outBytes = N * 4;
+  vcMalloc(&dPts, ptsBytes);
+  vcMalloc(&dOut, outBytes);
+  vcMemcpy(dPts, hPts, ptsBytes, VCMemcpyKind::HostToDevice);
+
+  float w = 0.5f;
+  // One block of N threads so threadIdx.x == i directly.
+  kern<<<N, N>>>(dPts, dOut, w);
+
+  vcDeviceSynchronize();
+  vcMemcpy(hOut, dOut, outBytes, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    float expect = reference(hPts[i], w);
+    if (std::fabs(hOut[i] - expect) > 1e-4f) {
+      ok = 0;
+    }
+  }
+  printf("struct: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dPts);
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
 }

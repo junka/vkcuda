@@ -50,6 +50,10 @@ private:
 
   // Types / decls
   Type *parseType();
+  /// Parse only the base type specifier (no trailing pointer `*`s). Used by
+  /// declarations so each declarator can carry its own pointer levels in a
+  /// shared-type comma list (`int *a, *b;`).
+  Type *parseBaseType();
   /// Does the current token start a type? (builtin keyword, a vector name
   /// like float4, or a known struct/typedef name.) Used to disambiguate
   /// declaration vs expression statements.
@@ -60,6 +64,10 @@ private:
   bool parseDeviceAttrs(DeviceAttr &out);
   ParamDecl *parseParam();
   VarDecl *parseVarDecl(Type *ty);
+  /// Best-effort compile-time integer evaluation for array dimensions and
+  /// similar constant contexts. Returns true and sets `out` for a literal or
+  /// a foldable arithmetic/bitwise expression over literals; false otherwise.
+  static bool evalConstInt(const ASTNode *e, int64_t &out);
 
   // Statements
   NodePtr parseStatement();

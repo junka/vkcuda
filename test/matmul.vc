@@ -1,7 +1,15 @@
-// Tiled matrix multiply kernel (N x N, row-major).
-//   C[i][j] = sum_k A[i][k] * B[k][j]
-// Tile size TS=16, one workgroup computes a TS x TS output tile.
-__global__ void matmul(float* A, float* B, float* C, int N) {
+// test/matmul.vc — single-file tiled matrix multiply (kernel + host main + 2D launch).
+//
+// C[i][j] = sum_k A[i][k] * B[k][j] for N x N single-precision matrices,
+// row-major. Tile size TS=16; one workgroup computes a TS x TS output tile.
+// Launched as a 2D grid of TS x TS blocks via dim3.
+//
+//   vcc test/matmul.vc -o build/matmul_sf && ./build/matmul_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void matmul(float *A, float *B, float *C, int N) {
   int TS = 16;
   int row = blockIdx.y * TS + threadIdx.y;
   int col = blockIdx.x * TS + threadIdx.x;
@@ -35,4 +43,52 @@ __global__ void matmul(float* A, float* B, float* C, int N) {
 
   if (row < N && col < N)
     C[row * N + col] = acc;
+}
+
+int main() {
+  vcInit();
+
+  const int N = 32;        // matrix dimension (multiple of the tile)
+  const int TS = 16;       // tile / block size
+
+  float hA[32 * 32];
+  float hB[32 * 32];
+  float hC[32 * 32];
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < N; j++) {
+      hA[i * N + j] = (i == j) ? 1.0f : 0.0f; // identity -> C should equal B
+      hB[i * N + j] = 1.0f * (i + j);
+      hC[i * N + j] = 0.0f;
+    }
+  }
+
+  void *dA = 0, *dB = 0, *dC = 0;
+  int bytes = N * N * 4;
+  vcMalloc(&dA, bytes);
+  vcMalloc(&dB, bytes);
+  vcMalloc(&dC, bytes);
+  vcMemcpy(dA, hA, bytes, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dB, hB, bytes, VCMemcpyKind::HostToDevice);
+
+  // 2D launch: grid (N x N elements) covered by TS x TS blocks. VC's launch
+  // convention treats gridDim as the element count and divides by blockDim to
+  // get the workgroup count, so N/TS = 2 workgroups per axis here.
+  matmul<<<dim3(N, N), dim3(TS, TS)>>>(dA, dB, dC, N);
+
+  vcDeviceSynchronize();
+  vcMemcpy(hC, dC, bytes, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N && ok; i++) {
+    for (int j = 0; j < N; j++) {
+      if (hC[i * N + j] != hB[i * N + j]) { ok = 0; break; }
+    }
+  }
+  printf("matmul: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dA);
+  vcFree(dB);
+  vcFree(dC);
+  vcShutdown();
+  return ok ? 0 : 1;
 }

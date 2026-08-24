@@ -55,7 +55,7 @@ enum class BuiltinTypeKind {
   Float64,
 };
 
-enum class TypeKind { Builtin, Pointer, Vector, Record, Typedef };
+enum class TypeKind { Builtin, Pointer, Reference, Vector, Record, Typedef };
 
 // Forward declarations: RecordType/TypedefType point at these decls, which are
 // defined as ASTNodes further down. A pointer is all that's needed here.
@@ -86,6 +86,17 @@ public:
 
   PointerType(Type *p) : Type(TypeKind::Pointer), pointee(p) {}
   static bool classof(const Type *t) { return t->getKind() == TypeKind::Pointer; }
+};
+
+// A C++ lvalue reference `T&`. Host-only (device kernels don't use references);
+// the host backend emits `T&`, the GLSL backend never sees one. Used for host
+// helper functions like `reference(const Point &p, float w)`.
+class ReferenceType : public Type {
+public:
+  Type *pointee;
+
+  ReferenceType(Type *p) : Type(TypeKind::Reference), pointee(p) {}
+  static bool classof(const Type *t) { return t->getKind() == TypeKind::Reference; }
 };
 
 // A vector of `count` elements of type `elem` (e.g. float4 -> elem=Float32,
@@ -194,6 +205,10 @@ class TranslationUnit : public ASTNode {
 public:
   std::vector<NodePtr> decls;
   std::vector<Diagnostic> diagnostics;
+  // Preprocessor directive lines (`#include ...`, `#define ...`) captured
+  // verbatim from source. The host C++ backend emits these at the top of the
+  // generated .cpp; the device (GLSL) backend ignores them.
+  std::vector<std::string> hostPpLines;
 
   TranslationUnit(SourceLocation l) : ASTNode(l) {}
   NodeKind getNodeType() const override { return NodeKind::TranslationUnit; }
@@ -310,8 +325,15 @@ public:
 
 class DeclStmt : public ASTNode {
 public:
-  VarDecl *decl;
-  DeclStmt(SourceLocation l, VarDecl *d) : ASTNode(l), decl(d) {}
+  // The first (often only) declarator. Kept for single-decl compatibility;
+  // `decls` holds all declarators when a statement declares several names
+  // sharing one type (`int a, b, c;`). VarDecls are heap-allocated and not
+  // owned by the DeclStmt (matching the rest of the AST's VarDecl handling).
+  VarDecl *decl = nullptr;
+  std::vector<VarDecl *> decls;
+  DeclStmt(SourceLocation l, VarDecl *d) : ASTNode(l), decl(d) {
+    if (d) decls.push_back(d);
+  }
   NodeKind getNodeType() const override { return NodeKind::DeclStmt; }
 };
 
@@ -512,25 +534,37 @@ public:
 };
 
 // e.g. threadIdx.x  ->  base="threadIdx", member="x"
+// `isScope` distinguishes C++ scope resolution `::` (e.g. VCMemcpyKind::HostToDevice)
+// from member access `.`. Both parse into this node; the host backend emits `::` when set.
 class MemberAccessExpr : public ASTNode {
 public:
   NodePtr base;
   StringRef member;
+  bool isScope = false; // true if the source used `::` rather than `.`
   MemberAccessExpr(SourceLocation l, NodePtr b, StringRef m)
       : ASTNode(l), base(std::move(b)), member(m) {}
   NodeKind getNodeType() const override { return NodeKind::MemberAccessExpr; }
 };
 
 // kernel<<<grid, block>>>(args...)   — CUDA launch syntax
+// grid/block may be `dim3(a,b)` (parsed as a CallExpr); the parser splits such
+// a call into the X component (gridDim/blockDim) and Y (gridDimY/blockDimY),
+// null Y meaning 1D. `stream` captures the optional 4th launch argument
+// (<<<g,b,shmem,stream>>>); null means the default stream.
 class LaunchExpr : public ASTNode {
 public:
   NodePtr callee;          // DeclRefExpr naming the kernel
-  NodePtr gridDim;         // grid size (int or dim3-like)
-  NodePtr blockDim;        // block size
+  NodePtr gridDim;         // grid size X (int or dim3.x)
+  NodePtr blockDim;        // block size X
+  NodePtr gridDimY;        // grid size Y (null = 1D)
+  NodePtr blockDimY;       // block size Y (null = 1D)
+  NodePtr stream;          // optional stream handle (null = default stream)
   std::vector<NodePtr> args;
-  LaunchExpr(SourceLocation l, NodePtr c, NodePtr g, NodePtr b)
+  LaunchExpr(SourceLocation l, NodePtr c, NodePtr g, NodePtr b,
+             NodePtr gy = nullptr, NodePtr by = nullptr, NodePtr s = nullptr)
       : ASTNode(l), callee(std::move(c)), gridDim(std::move(g)),
-        blockDim(std::move(b)) {}
+        blockDim(std::move(b)), gridDimY(std::move(gy)),
+        blockDimY(std::move(by)), stream(std::move(s)) {}
   NodeKind getNodeType() const override { return NodeKind::LaunchExpr; }
 };
 
