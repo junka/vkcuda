@@ -42,9 +42,36 @@ bool Sema::isMathBuiltin(StringRef name) const {
       "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "expf", "logf",
       "powf", "sqrtf", "fabsf", "fminf", "fmaxf", "floorf", "ceilf", "__sinf",
       "__cosf", "__expf", "__logf", "__powf", "__fabsf",
+      // GLSL vector/geometric builtins.
+      "dot", "cross", "length", "normalize", "reflect", "refract",
+      "distance", "faceforward", "all", "any", "lessThan", "greaterThan",
+      // CUDA atomics (lowered by the GLSL backend to GLSL atomic* functions).
+      "atomicAdd", "atomicSub", "atomicExch", "atomicMin", "atomicMax",
+      "atomicInc", "atomicDec", "atomicCAS", "atomicAnd", "atomicOr",
+      "atomicXor",
   };
   for (const char *m : names)
     if (name == m) return true;
+  // CUDA make_<vec>(...) vector constructors and <base><N> vector constructors
+  // (float4, int3, uint4, long4, ...) pass through as GLSL constructors.
+  if (name.starts_with("make_"))
+    return isVectorCtorName(name.substr(5));
+  return isVectorCtorName(name);
+}
+
+// Recognize CUDA-style vector type names: <base><2..4> where base is one of
+// float/int/uint/double/bool/long/ulong. Mirrors Parser::makeVectorType so the
+// Sema pass doesn't need access to Parser internals.
+bool Sema::isVectorCtorName(StringRef name) const {
+  static const char *bases[] = {"float", "int", "uint", "double",
+                                "bool", "long", "ulong"};
+  for (const char *b : bases) {
+    StringRef p = b;
+    if (name.size() == p.size() + 1 && name.starts_with(p)) {
+      char d = name.back();
+      if (d >= '2' && d <= '4') return true;
+    }
+  }
   return false;
 }
 

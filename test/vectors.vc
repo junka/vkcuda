@@ -1,0 +1,90 @@
+// test/vectors.vc — single-file vector-types demo (kernel + host + launch).
+//
+// Exercises the CUDA vector type family and operations end-to-end, verifying
+// the GLSL backend emits correct vec/ivec/uvec/dvec/i64vec types and that
+// make_<vec> constructors, multi-char swizzles (read + write), componentwise
+// arithmetic, and geometric builtins (dot/cross) all work:
+//   - float4 / int4 / uint4 / double2 / long4 types
+//   - make_float4(...) constructor lowering
+//   - .xy / .xyz / .xz swizzle (read), .xz = swizzle (write)
+//   - componentwise a + b, scalar broadcast
+//   - dot(a, b), cross(a, b)
+//
+//   vcc test/vectors.vc -o build/vectors_sf && ./build/vectors_sf
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+struct Result {
+  float f;
+  int i;
+  int u;
+  double d;
+  long l;
+};
+
+__global__ void vecKernel(Result *result) {
+  // --- float4: constructor, swizzle read/write, arithmetic, dot ---
+  float4 a = make_float4(1.0, 2.0, 3.0, 4.0);
+  float4 b = float4(10.0, 20.0, 30.0, 40.0);
+  float4 sum = a + b;                 // (11, 22, 33, 44)
+  float2 lo = sum.xy;                 // (11, 22)
+  float2 hi = sum.zw;                 // (33, 44)
+  float d = dot(a, b);                // 10+40+90+160 = 300
+
+  float4 sw;
+  sw.xz = float2(lo.x, hi.x);         // sw = (11, 0, 33, 0)
+  float swsum = sw.x + sw.y + sw.z + sw.w;  // 11+0+33+0 = 44
+
+  // --- int4 / uint4 ---
+  int4 iv = int4(1, 2, 3, 4);
+  uint4 uv = uint4(10, 20, 30, 40);
+  int isum = iv.x + iv.y + iv.z + iv.w;        // 10
+  int usum = int(uv.x) + int(uv.y);            // 30
+
+  // --- double2 ---
+  double2 d2 = double2(1.5, 2.5);
+  double dval = d2.x + d2.y;                   // 4.0
+
+  // --- long4 (i64vec4) ---
+  long4 lv = long4(100, 200, 300, 400);
+  long lval = lv.x + lv.y + lv.z + lv.w;       // 1000
+
+  // --- cross product on float3 ---
+  float3 x = float3(1.0, 0.0, 0.0);
+  float3 y = float3(0.0, 1.0, 0.0);
+  float3 z = cross(x, y);                      // (0,0,1)
+  float zlen = z.z;                            // 1
+
+  result[0].f = float(d) + float(swsum) + float(zlen);  // 300 + 44 + 1 = 345
+  result[0].i = isum + usum;                             // 40
+  result[0].u = 0;
+  result[0].d = dval;                                    // 4.0
+  result[0].l = lval;                                    // 1000
+}
+
+int main() {
+  vcInit();
+
+  void *dOut = 0;
+  int bytes = sizeof(Result);
+  vcMalloc(&dOut, bytes);
+
+  vecKernel<<<1, 1>>>(dOut);
+  vcDeviceSynchronize();
+
+  Result h;
+  vcMemcpy(&h, dOut, bytes, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  if (std::fabs(h.f - 345.0) > 1e-3) ok = 0;
+  if (h.i != 40) ok = 0;
+  if (std::fabs(h.d - 4.0) > 1e-3) ok = 0;
+  if (h.l != 1000) ok = 0;
+  printf("vectors: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

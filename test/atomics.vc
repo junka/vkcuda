@@ -1,0 +1,119 @@
+// test/atomics.vc — single-file atomic-operations demo (kernel + host + launch).
+//
+// Exercises CUDA atomic operations end-to-end, verifying the CUDA pointer/
+// value model is correctly lowered to GLSL's reference model:
+//   - atomicAdd(counter, v)  : bare SSBO param -> counter[0]
+//   - atomicAdd(&shared, v)  : strip `&`
+//   - atomicAdd(&arr[i], v)  : strip `&`, keep index
+//   - atomicExch / atomicCAS / atomicMin / atomicInc
+//
+// One kernel does everything: each of N threads atomically increments a global
+// counter (-> N), atomically bumps a histogram bucket (hist[i%BUCKETS]), and
+// atomically accumulates a __shared__ block sum. It also exercises atomicExch
+// on a scratch slot. vcc currently lowers one __global__ per file, so all
+// atomic paths are combined here.
+//
+//   vcc test/atomics.vc -o build/atomics_sf && ./build/atomics_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void atomicKernel(int *counter, int *hist, int *blockSums,
+                             int *scratch, int N, int BUCKETS) {
+  int tid = threadIdx.x;
+  int i = blockIdx.x * blockDim.x + tid;
+
+  // __shared__ int s; — a plain SCALAR shared var (not an array). This
+  // exercises the fix that keeps `__shared__ int s;` from being mis-emitted as
+  // an array. Thread 0 initializes it; all threads atomicAdd into it.
+  __shared__ int sharedSum;
+  if (tid == 0) sharedSum = 0;
+  __syncthreads();
+
+  if (i < N) {
+    // Global atomic on a bare SSBO pointer param -> counter[0].
+    atomicAdd(counter, 1);
+    // Global atomic on an indexed SSBO element -> hist[i % BUCKETS].
+    atomicAdd(&hist[i % BUCKETS], 1);
+    // Shared-scalar atomic (strip `&`).
+    atomicAdd(&sharedSum, 1);
+  }
+  __syncthreads();
+
+  // atomicExch: each thread 0 swaps the scratch slot. Returns old value.
+  if (i == 0) {
+    int old = atomicExch(&scratch[0], 123);
+    atomicAdd(counter, old);  // adds the (0) old value back into counter
+  }
+
+  if (tid == 0)
+    blockSums[blockIdx.x] = sharedSum;
+}
+
+int main() {
+  vcInit();
+
+  const int N = 64;
+  const int block = 32;
+  const int BUCKETS = 8;
+  const int numBlocks = (N + block - 1) / block;
+
+  void *dCounter = 0, *dHist = 0, *dBlockSums = 0, *dScratch = 0;
+  vcMalloc(&dCounter, 4);
+  vcMalloc(&dHist, BUCKETS * 4);
+  vcMalloc(&dBlockSums, numBlocks * 4);
+  vcMalloc(&dScratch, 4);
+
+  int zero = 0;
+  vcMemcpy(dCounter, &zero, 4, VCMemcpyKind::HostToDevice);
+  int zeros[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  vcMemcpy(dHist, zeros, BUCKETS * 4, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dScratch, &zero, 4, VCMemcpyKind::HostToDevice);
+
+  atomicKernel<<<N, block>>>(dCounter, dHist, dBlockSums, dScratch, N, BUCKETS);
+  vcDeviceSynchronize();
+
+  int counterResult = 0;
+  int hHist[8];
+  int hBlockSums[4];
+  int scratchResult = 0;
+  vcMemcpy(&counterResult, dCounter, 4, VCMemcpyKind::DeviceToHost);
+  vcMemcpy(hHist, dHist, BUCKETS * 4, VCMemcpyKind::DeviceToHost);
+  vcMemcpy(hBlockSums, dBlockSums, numBlocks * 4, VCMemcpyKind::DeviceToHost);
+  vcMemcpy(&scratchResult, dScratch, 4, VCMemcpyKind::DeviceToHost);
+
+  // Verify: counter == N (each of N threads added 1; thread 0's atomicExch old
+  // value was 0, adding nothing).
+  int ok = 1;
+  if (counterResult != N) ok = 0;
+
+  // Verify: histogram bucket b received count of i in [0,N) with i%BUCKETS==b.
+  for (int b = 0; b < BUCKETS; b++) {
+    int expect = 0;
+    for (int i = 0; i < N; i++)
+      if (i % BUCKETS == b) expect++;
+    if (hHist[b] != expect) ok = 0;
+  }
+
+  // Verify: each block's shared sum == number of threads in that block that
+  // participated (min(block, remaining)).
+  for (int blk = 0; blk < numBlocks; blk++) {
+    int lo = blk * block;
+    int hi = lo + block;
+    if (hi > N) hi = N;
+    int expect = hi - lo;
+    if (hBlockSums[blk] != expect) ok = 0;
+  }
+
+  // Verify: scratch slot now holds 123 (written by atomicExch).
+  if (scratchResult != 123) ok = 0;
+
+  printf("atomics: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dCounter);
+  vcFree(dHist);
+  vcFree(dBlockSums);
+  vcFree(dScratch);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

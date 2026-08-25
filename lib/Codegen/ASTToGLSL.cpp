@@ -29,6 +29,10 @@ class GLSLEmitter {
   // Names of scalar parameters, which are accessed as `pc.<name>` since they
   // live in the push-constant block.
   SmallVector<StringRef, 8> scalarParams;
+  // Names of pointer (SSBO buffer) parameters. CUDA `atomicAdd(counter, v)`
+  // treats `counter` as a pointer to a single value, but in GLSL it's an SSBO
+  // array — so a bare reference must be lowered to `counter[0]`.
+  SmallVector<StringRef, 8> ssboParams;
 
 public:
   GLSLEmitter(raw_ostream &o) : os(o) {}
@@ -184,9 +188,12 @@ private:
       if (v->elem->getKind() == TypeKind::Builtin) {
         switch (static_cast<const BuiltinType *>(v->elem)->builtin) {
         case BuiltinTypeKind::Float32: p = "vec"; break;
-        case BuiltinTypeKind::Int32: case BuiltinTypeKind::UInt32: p = "ivec"; break;
+        case BuiltinTypeKind::Int32: p = "ivec"; break;
+        case BuiltinTypeKind::UInt32: p = "uvec"; break;
         case BuiltinTypeKind::Float64: p = "dvec"; break;
         case BuiltinTypeKind::Bool: p = "bvec"; break;
+        case BuiltinTypeKind::Int64: p = "i64vec"; break;
+        case BuiltinTypeKind::UInt64: p = "u64vec"; break;
         default: break;
         }
       }
@@ -244,6 +251,7 @@ private:
       const ParamDecl *p = params[i];
       bool isPtr = p->type && p->type->getKind() == TypeKind::Pointer;
       if (!isPtr) { scalars.push_back(p); scalarParams.push_back(p->name); continue; }
+      ssboParams.push_back(p->name);
       const char *ty = glslType(p->type);
       os << "layout(set = 0, binding = " << bindIdx << ") buffer B" << bindIdx
          << " {\n  " << ty << " " << p->name << "[];\n};\n\n";
@@ -266,13 +274,15 @@ private:
     for (const VarDecl *v : sharedVars) {
       const char *ty = glslType(v->type);
       os << "shared " << ty << " " << v->name;
-      // Emit explicit array dimensions if present (e.g. As[16][16]).
+      // Emit explicit array dimensions if present (e.g. As[16][16]). A declared
+      // but unsized dimension (extern __shared__ T s[], parsed as arrayDims={0})
+      // defaults to the workgroup x size. A plain scalar (__shared__ int s;)
+      // has no arrayDims and must NOT get a trailing [].
       if (!v->arrayDims.empty()) {
-        for (int64_t d : v->arrayDims)
-          os << "[" << d << "]";
-      } else if (!v->init) {
-        // No declared size: default to the workgroup x dimension.
-        os << "[gl_WorkGroupSize.x]";
+        for (int64_t d : v->arrayDims) {
+          if (d > 0) os << "[" << d << "]";
+          else os << "[gl_WorkGroupSize.x]"; // extern __shared__ T s[]
+        }
       }
       if (v->init) { os << " = "; emitExpr(v->init.get()); }
       os << ";\n";
@@ -379,6 +389,13 @@ private:
     // (Recognize the CUDA-style vector name and emit the GLSL constructor.)
     if (auto *glslName = glslVectorCtorName(name))
       return glslName;
+    // CUDA make_<vec>(...) constructors -> GLSL vec(...) constructors.
+    // e.g. make_float4 -> vec4, make_int3 -> ivec3, make_uint4 -> uvec4.
+    if (name.starts_with("make_")) {
+      StringRef base = name.substr(5); // drop "make_"
+      if (auto *glslName = glslVectorCtorName(base))
+        return glslName;
+    }
     // CUDA __f-prefixed intrinsics -> GLSL float builtin (drop leading __,
     // trailing f).
     if (name.starts_with("__") && name.ends_with("f") && name.size() > 3) {
@@ -409,6 +426,7 @@ private:
     static constexpr Base bases[] = {
         {"float", "vec"}, {"int", "ivec"}, {"uint", "uvec"},
         {"double", "dvec"}, {"bool", "bvec"},
+        {"long", "i64vec"}, {"ulong", "u64vec"},
     };
     for (const Base &b : bases) {
       StringRef p = b.prefix;
@@ -422,6 +440,80 @@ private:
       }
     }
     return nullptr;
+  }
+
+  // --- CUDA atomic -> GLSL atomic lowering --------------------------------
+  // CUDA atomics take a pointer (`atomicAdd(&ptr, v)` or `atomicAdd(ptr, v)`
+  // where `ptr` is a `T*` kernel param) and return the old value. GLSL atomics
+  // take an lvalue reference to a single scalar and return the old value, so:
+  //   - `atomicX(&e, ...)`  -> `atomicX(e, ...)`
+  //   - `atomicX(ssboArr, ...)` (bare SSBO array param, no index) -> `atomicX(ssboArr[0], ...)`
+  //   - `atomicX(ssboArr[i], ...)` / `atomicX(sharedVar, ...)` -> unchanged
+  // atomicInc/atomicDec (no direct GLSL form) map to atomicAdd/atomicSub by 1.
+  // atomicExch -> atomicExchange, atomicCAS -> atomicCompSwap.
+  static bool isAtomicName(StringRef name) {
+    return name == "atomicAdd" || name == "atomicSub" || name == "atomicExch" ||
+           name == "atomicMin" || name == "atomicMax" || name == "atomicInc" ||
+           name == "atomicDec" || name == "atomicCAS" || name == "atomicAnd" ||
+           name == "atomicOr" || name == "atomicXor";
+  }
+
+  // Map a CUDA atomic name to its GLSL counterpart. atomicInc/atomicDec are
+  // special-cased by the caller (they change arity, not just the name).
+  static StringRef lowerAtomicName(StringRef name) {
+    if (name == "atomicExch") return "atomicExchange";
+    if (name == "atomicCAS") return "atomicCompSwap";
+    return name; // atomicAdd/Sub/Min/Max/And/Or/Xor are identical in GLSL
+  }
+
+  // Is `n` a bare DeclRefExpr naming an SSBO (pointer) kernel parameter with
+  // no indexing applied? CUDA writes `atomicAdd(counter, v)` for a `T* counter`
+  // param; in GLSL that buffer is `counter[]`, so the single value is [0].
+  bool isBareSsboRef(const ASTNode *n) const {
+    if (!n || n->getNodeType() != ASTNode::NodeKind::DeclRefExpr) return false;
+    StringRef name = static_cast<const DeclRefExpr *>(n)->name;
+    for (StringRef s : ssboParams)
+      if (s == name) return true;
+    return false;
+  }
+
+  // Emit the atomic target expression: strip a leading `&` (AddrOf) from a
+  // CUDA `atomicX(&e, ...)`, and index a bare SSBO param to `[0]`.
+  void emitAtomicTarget(const ASTNode *target) {
+    if (target &&
+        target->getNodeType() == ASTNode::NodeKind::UnaryExpr) {
+      auto *u = static_cast<const UnaryExpr *>(target);
+      if (u->op == UnaryOp::AddrOf) {
+        // `&e` -> `e`
+        emitAtomicTarget(u->operand.get());
+        return;
+      }
+    }
+    if (isBareSsboRef(target)) {
+      // bare SSBO array param -> first element
+      emitExpr(target);
+      os << "[0]";
+      return;
+    }
+    emitExpr(target);
+  }
+
+  void emitAtomicCall(StringRef name, const std::vector<NodePtr> &args) {
+    if (args.empty()) { os << lowerAtomicName(name) << "()"; return; }
+    // atomicInc(a) / atomicDec(a) -> atomicAdd(a, 1) / atomicSub(a, 1).
+    if (name == "atomicInc" || name == "atomicDec") {
+      os << (name == "atomicInc" ? "atomicAdd" : "atomicSub") << "(";
+      emitAtomicTarget(args[0].get());
+      os << ", 1)";
+      return;
+    }
+    os << lowerAtomicName(name) << "(";
+    emitAtomicTarget(args[0].get());
+    for (unsigned i = 1; i < args.size(); ++i) {
+      os << ", ";
+      emitExpr(args[i].get());
+    }
+    os << ")";
   }
 
 
@@ -694,6 +786,12 @@ private:
           c->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
         auto *ref = static_cast<const DeclRefExpr *>(c->callee.get());
         if (ref->name == "__syncthreads") { os << "barrier()"; return; }
+        // CUDA atomics: rewrite the CUDA pointer/value model to GLSL's
+        // reference model before falling through to generic call emission.
+        if (isAtomicName(ref->name)) {
+          emitAtomicCall(ref->name, c->args);
+          return;
+        }
         // User __device__ helper or CUDA/math builtin: lower the name and emit
         // a normal GLSL call expression.
         os << lowerBuiltinCall(ref->name) << "(";

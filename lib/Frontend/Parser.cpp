@@ -205,6 +205,17 @@ bool Parser::parseStructDecl() {
       if (!expect(TokKind::r_square, "']'"))
         return false;
     }
+    // VC struct fields are one-per-line. Comma-separated multi-declarator fields
+    // (`float a, b, c;`) are a deliberate non-feature: structs here are POD
+    // layout descriptors for the GLSL backend, not a full C++ record system, and
+    // the one-field-per-declaration model keeps field parsing simple. nvcc
+    // supports the C++ form; VC intentionally does not.
+    if (curTok.is(TokKind::comma)) {
+      error(curTok,
+            "comma-separated struct fields are not supported; declare one "
+            "field per line (e.g. 'float a; float b;')");
+      return false;
+    }
     if (!expect(TokKind::semi, "';' after field"))
       return false;
     sd->fields.push_back(fd);
@@ -377,7 +388,7 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
 
 Type *Parser::makeVectorType(StringRef name) {
   // CUDA/HLSL-style vector names: <base><count>, count in 2..4.
-  // Recognized bases: float, int, uint, double, bool.
+  // Recognized bases: float, int, uint, double, bool, long, ulong.
   struct Base { const char *prefix; BuiltinTypeKind kind; };
   static constexpr Base bases[] = {
       {"float", BuiltinTypeKind::Float32},
@@ -385,6 +396,8 @@ Type *Parser::makeVectorType(StringRef name) {
       {"uint", BuiltinTypeKind::UInt32},
       {"double", BuiltinTypeKind::Float64},
       {"bool", BuiltinTypeKind::Bool},
+      {"long", BuiltinTypeKind::Int64},
+      {"ulong", BuiltinTypeKind::UInt64},
   };
   for (const Base &b : bases) {
     StringRef p = b.prefix;
