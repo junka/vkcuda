@@ -22,7 +22,7 @@ namespace {
 // backend handles the real lowering.
 bool isThreadBuiltinName(llvm::StringRef n) {
   return n == "threadIdx" || n == "blockIdx" || n == "blockDim" ||
-         n == "gridDim";
+         n == "gridDim" || n == "warpSize";
 }
 } // namespace
 
@@ -55,6 +55,10 @@ bool Sema::isMathBuiltin(StringRef name) const {
       // are voting barriers returning a reduced value.
       "__syncthreads", "__threadfence", "__threadfence_block",
       "__syncthreads_count", "__syncthreads_and", "__syncthreads_or",
+      // CUDA warp intrinsics (lowered by the GLSL backend to Vulkan subgroup
+      // ops; the leading mask argument is dropped at codegen time).
+      "__syncwarp", "__ballot_sync", "__anySync", "__allSync", "__activemask",
+      "__shfl_sync", "__shfl_up_sync", "__shfl_down_sync", "__shfl_xor_sync",
   };
   for (const char *m : names)
     if (name == m) return true;
@@ -285,8 +289,11 @@ Type *Sema::checkExpr(const ASTNode *n) {
   case ASTNode::NodeKind::DeclRefExpr: {
     auto *d = static_cast<const DeclRefExpr *>(n);
     if (isThreadBuiltin(d->name)) {
-      // Implicit thread-index identifier; backend lowers it. Type unknown
-      // but legal.
+      // Implicit thread-index identifier; backend lowers it. The index
+      // builtins (threadIdx/blockIdx/...) are struct-like and typed unknown;
+      // warpSize is a scalar int.
+      if (d->name == "warpSize")
+        return builtin(BuiltinTypeKind::Int32);
       return nullptr;
     }
     if (typeNames.count(d->name)) return nullptr; // a type name used as a value?

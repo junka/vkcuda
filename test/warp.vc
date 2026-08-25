@@ -1,0 +1,123 @@
+// test/warp.vc — single-file warp/subgroup primitives demo (kernel + host).
+//
+// Exercises VC's CUDA warp intrinsics, lowered to Vulkan subgroup ops:
+//   - warpSize                -> gl_SubgroupSize   (adaptive, not hardcoded 32)
+//   - __shfl_sync(mask,v,lane)-> subgroupShuffle   (broadcast within subgroup)
+//   - __shfl_down_sync        -> subgroupShuffleDown (subgroup reduction step)
+//   - __ballot_sync           -> subgroupBallot(...).x
+//   - __anySync / __allSync   -> subgroupAny / subgroupAll
+//   - __syncwarp              -> subgroupBarrier
+//
+// The kernel: each thread holds the value 1. A subgroup-wide reduction via
+// shfl_down sums it (lane 0 of each subgroup holds the subgroup size, since
+// every lane contributed 1). A broadcast + vote then demonstrate the
+// collective primitives. The per-subgroup sums are written out; their total
+// equals N because each of N threads contributed exactly 1, and the reduction
+// is lossless for any power-of-two subgroup size.
+//
+//   vcc test/warp.vc -o build/warp_sf && ./build/warp_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void warpKernel(int *result, int N) {
+  int tid = threadIdx.x;
+  int i = blockIdx.x * blockDim.x + tid;
+  // lane id within the subgroup (CUDA: threadIdx.x % warpSize).
+  int lane = tid % warpSize;
+
+  // Each thread contributes 1. The subgroup sum thus equals the number of
+  // lanes in the subgroup (== warpSize when the subgroup is full).
+  int v = 1;
+
+  // Subgroup-wide reduction via shfl_down: after the loop, lane 0 holds the
+  // subgroup sum. Works for any subgroup size that is a power of two.
+  int ws = warpSize;
+  for (int offset = ws / 2; offset > 0; offset >>= 1) {
+    int n = __shfl_down_sync(0xffffffff, v, offset);
+    if (lane < offset) v += n;
+  }
+  // v now holds the subgroup sum in lane 0 (others have partial garbage).
+
+  // Lane 0 of each subgroup writes the sum. (blockDim is a multiple of
+  // warpSize so each subgroup's lane 0 aligns to a multiple of warpSize.)
+  if (lane == 0) {
+    int subgroupIdx = tid / warpSize;
+    result[blockIdx.x * (blockDim.x / warpSize) + subgroupIdx] = v;
+  }
+
+  // Broadcast: lane 0's sum shfl'd to every lane, then a vote checks that
+  // every lane saw a positive contribution (all threads in range).
+  int sum0 = __shfl_sync(0xffffffff, v, 0);
+  bool allPositive = __allSync(0xffffffff, sum0 > 0);
+
+  // Lane 0 records the any/all vote on bit 16 of its slot (already holds sum
+  // in the low bits). For a full subgroup every lane is in range, so the
+  // all-vote is true.
+  if (lane == 0) {
+    int subgroupIdx = tid / warpSize;
+    int slot = blockIdx.x * (blockDim.x / warpSize) + subgroupIdx;
+    result[slot] = result[slot] | (allPositive ? 1 : 0) << 16;
+  }
+
+  // __ballot_sync: collect the active-lane mask. For a full subgroup this is
+  // (1<<warpSize)-1; lane 0 stashes it in a separate diagnostic slot, written
+  // far past the sum slots so it cannot pollute the sum verification.
+  unsigned mask = __ballot_sync(0xffffffff, i < N);
+  if (lane == 0) {
+    int subgroupIdx = tid / warpSize;
+    int diagSlot = 200 + blockIdx.x * (blockDim.x / warpSize) + subgroupIdx;
+    result[diagSlot] = int(mask);
+  }
+
+  __syncwarp();
+}
+
+int main() {
+  vcInit();
+
+  const int N = 256;
+  const int block = 64;   // 2 subgroups per block when warpSize==32
+  const int numBlocks = (N + block - 1) / block;
+  // VC runtime treats gridDim as element count; pass N.
+  // Subgroups per block = block / warpSize (runtime value, but host can't see
+  // it — we size the output buffer generously and only check the first slots).
+  const int maxSubgroupsPerBlock = block; // upper bound (warpSize>=1)
+  const int totalSlots = numBlocks * maxSubgroupsPerBlock;
+
+  void *dResult = 0;
+  vcMalloc(&dResult, totalSlots * 4);
+  int zeros[256];
+  for (int s = 0; s < totalSlots; ++s) zeros[s] = 0;
+  vcMemcpy(dResult, zeros, totalSlots * 4, VCMemcpyKind::HostToDevice);
+
+  warpKernel<<<N, block>>>(dResult, N);
+  vcDeviceSynchronize();
+
+  int hOut[256];  // totalSlots == numBlocks*block == 4*64 == 256
+  vcMemcpy(hOut, dResult, totalSlots * 4, VCMemcpyKind::DeviceToHost);
+
+  // The device's subgroup size isn't known to the host at compile time. The
+  // invariant that holds for any power-of-two subgroup size: the sum of all
+  // per-subgroup sums (low 16 bits) equals N, because every thread
+  // contributed 1 and the reduction is lossless. Only the first
+  // (numBlocks * subgroupsPerBlock) slots hold real sums; the rest stayed 0.
+  // We can't know subgroupsPerBlock at compile time, but totalSlots is an
+  // upper bound and unused slots are 0, so summing all low-16 bits is safe —
+  // EXCEPT the ballot diagnostic slots (200+), which hold the active mask
+  // and must be excluded. Sum only slots [0, 200).
+  int totalSum = 0;
+  for (int s = 0; s < 200; ++s)
+    totalSum += (hOut[s] & 0xffff);
+
+  // Every real subgroup slot should have bit 16 set (allSync was true — every
+  // lane saw sum0 > 0). Verify at least the low-16 sum is exactly N.
+  int ok = (totalSum == N);
+
+  printf("warp: %s (totalSum=%d, expect=%d)\n", ok ? "PASS" : "FAIL",
+         totalSum, N);
+
+  vcFree(dResult);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

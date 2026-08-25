@@ -131,10 +131,14 @@ int main(int argc, char **argv) {
   SmallString<128> spvPath;
   sys::fs::createTemporaryFile("vckernel", "spv", spvPath);
   std::string entryArg = std::string("-fentry-point=") + std::string(entryPoint);
+  // Subgroup ops (CUDA warp intrinsics) require SPIR-V 1.3 = vulkan1.1 target.
+  // The GLSL backend flags this with a "// vc:needs-spv1.3" header marker.
+  bool needsSpv13 = glslSource.find("vc:needs-spv1.3") != std::string::npos;
   auto runGlslc = [&](bool withEntry) -> int {
     SmallVector<StringRef, 8> args;
     args.push_back(glslc);
     args.push_back("-fshader-stage=compute");
+    if (needsSpv13) args.push_back("--target-env=vulkan1.1");
     args.push_back(glslPath);
     args.push_back("-o");
     args.push_back(spvPath);

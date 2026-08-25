@@ -135,10 +135,16 @@ int main(int argc, char **argv) {
                                                         : std::string(outputFilename);
   std::string entryArg = std::string("-fentry-point=") + std::string(entryPoint);
 
+  // The GLSL backend writes a "// vc:needs-spv1.3" marker into the header when
+  // the kernel uses Vulkan subgroup ops (CUDA warp intrinsics), which require
+  // SPIR-V 1.3 (= vulkan1.1 target env). Default is vulkan1.0/spv1.0.
+  bool needsSpv13 = glslSource.find("vc:needs-spv1.3") != std::string::npos;
+
   auto runGlslc = [&](bool withEntry) -> int {
     SmallVector<StringRef, 8> args;
     args.push_back(glslc);
     args.push_back("-fshader-stage=compute");
+    if (needsSpv13) args.push_back("--target-env=vulkan1.1");
     args.push_back(glslPath);
     args.push_back("-o");
     args.push_back(outPath);
