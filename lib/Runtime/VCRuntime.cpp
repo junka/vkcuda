@@ -56,14 +56,20 @@ VCError Runtime::init() {
   VkInstanceCreateInfo ici{};
   ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   ici.pApplicationInfo = &app;
-  const char *exts[] = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
-  ici.enabledExtensionCount = 1;
+  // macOS (MoltenVK) exposes a "portability subset" driver; the loader only
+  // enumerates it when this flag + extension are set. Without them
+  // vkCreateInstance finds no devices and everything silently no-ops.
+  ici.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+  const char *exts[] = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
+                        VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME};
+  ici.enabledExtensionCount = 2;
   ici.ppEnabledExtensionNames = exts;
 
   VkResult r = vkCreateInstance(&ici, nullptr, &device_->instance);
   if (r != VK_SUCCESS) {
-    // Retry without debug utils extension.
-    ici.enabledExtensionCount = 0;
+    // Retry without debug utils extension (portability ext still required).
+    ici.enabledExtensionCount = 1;
+    ici.ppEnabledExtensionNames = &exts[1];
     r = vkCreateInstance(&ici, nullptr, &device_->instance);
     if (r != VK_SUCCESS) return VCError::InitializationError;
   }

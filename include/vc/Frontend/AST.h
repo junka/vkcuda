@@ -38,6 +38,10 @@ struct Diagnostic {
   DiagnosticKind kind = DiagnosticKind::Error;
   SourceLocation where;
   std::string message;
+  // True when this diagnostic was already rendered to the user (currently the
+  // Parser prints errors inline via SourceMgr as it hits them). Sema reports
+  // whatever does not carry this flag, so nothing is printed twice.
+  bool rendered = false;
 };
 
 //===----------------------------------------------------------------------===//

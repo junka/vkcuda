@@ -1,0 +1,31 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck --allow-empty %s
+//
+// A healthy kernel exercising the checked constructs must produce zero
+// diagnostics.
+
+typedef float real;
+struct P { float x; float y; };
+
+__device__ float scale(real v, float k) { return v * k; }
+
+__global__ void kern(int n, float *a, float *b, float *c) {
+  int i = threadIdx.x;
+
+  float4 v = make_float4(1.0f, 2.0f, 3.0f, 4.0f);
+  (void)v;
+
+  if (i < n) {
+    P pt;
+    pt.x = a[i];
+    c[i] = scale(a[i], 2.0f) + pt.x;
+  }
+
+  int acc = 0;
+  for (int j = 0; j < n; j++) { b[j] = j; }
+  while (i > n) { i--; }
+  do { acc += i; i++; } while (i < n);
+  c[0] = acc;
+
+  // CHECK-NOT: error:
+  // CHECK-NOT: warning:
+}

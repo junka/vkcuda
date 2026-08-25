@@ -2,9 +2,9 @@
 //
 // Scoped symbol table + expression type inference (side table) + diagnostics.
 // Conservative by design: only undeclared identifiers, unknown struct fields,
-// malformed swizzles, and unknown-function calls (when not a recognized
-// builtin) are hard errors. Type mismatches are warnings so existing kernels
-// keep compiling.
+// malformed swizzles, redefinitions, and calls to unknown non-builtin functions
+// are hard errors. Type mismatches, unused variables, division by zero, bad
+// subscripts and similar are warnings so existing kernels keep compiling.
 //
 // Thread index builtins (threadIdx, blockIdx, blockDim, gridDim) and math
 // builtins (sinf, __syncthreads, ...) are treated as implicitly declared so
@@ -23,6 +23,26 @@ namespace {
 bool isThreadBuiltinName(llvm::StringRef n) {
   return n == "threadIdx" || n == "blockIdx" || n == "blockDim" ||
          n == "gridDim" || n == "warpSize";
+}
+
+// Fold a constant integer expression to its value: plain literals and
+// unary-minus literals (e.g. -1). Returns false if the node isn't one, so
+// checks that need a statically-known integer can skip dynamic expressions.
+bool constIntValue(const ASTNode *n, int64_t &out) {
+  if (!n) return false;
+  if (n->getNodeType() == ASTNode::NodeKind::IntegerLiteral) {
+    out = static_cast<const IntegerLiteral *>(n)->value;
+    return true;
+  }
+  if (n->getNodeType() == ASTNode::NodeKind::UnaryExpr) {
+    auto *u = static_cast<const UnaryExpr *>(n);
+    if (u->op == UnaryOp::Neg &&
+        u->operand->getNodeType() == ASTNode::NodeKind::IntegerLiteral) {
+      out = -static_cast<const IntegerLiteral *>(u->operand.get())->value;
+      return true;
+    }
+  }
+  return false;
 }
 } // namespace
 
@@ -59,6 +79,9 @@ bool Sema::isMathBuiltin(StringRef name) const {
       // ops; the leading mask argument is dropped at codegen time).
       "__syncwarp", "__ballot_sync", "__anySync", "__allSync", "__activemask",
       "__shfl_sync", "__shfl_up_sync", "__shfl_down_sync", "__shfl_xor_sync",
+      // CUDA launch dimension constructor `dim3(x, y)` — recognized so the
+      // grid/block slots of a kernel<<<...>>> launch don't warn as unknown.
+      "dim3",
   };
   for (const char *m : names)
     if (name == m) return true;
@@ -106,13 +129,162 @@ bool Sema::isValidSwizzle(StringRef s) {
   return true;
 }
 
+const Type *Sema::resolveTypedefs(const Type *t) {
+  while (t && t->getKind() == TypeKind::Typedef) {
+    const TypedefType *td = static_cast<const TypedefType *>(t);
+    t = td->decl ? td->decl->underlying : nullptr;
+  }
+  return t;
+}
+
+bool Sema::isArithmetic(const Type *t) {
+  if (!t || t->getKind() != TypeKind::Builtin) return false;
+  switch (static_cast<const BuiltinType *>(t)->builtin) {
+  case BuiltinTypeKind::Bool:
+  case BuiltinTypeKind::Int32:
+  case BuiltinTypeKind::UInt32:
+  case BuiltinTypeKind::Int64:
+  case BuiltinTypeKind::UInt64:
+  case BuiltinTypeKind::Float32:
+  case BuiltinTypeKind::Float64:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool Sema::isIntegerType(const Type *t) {
+  if (!t || t->getKind() != TypeKind::Builtin) return false;
+  switch (static_cast<const BuiltinType *>(t)->builtin) {
+  case BuiltinTypeKind::Bool:
+  case BuiltinTypeKind::Int32:
+  case BuiltinTypeKind::UInt32:
+  case BuiltinTypeKind::Int64:
+  case BuiltinTypeKind::UInt64:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool Sema::isFloatType(const Type *t) {
+  if (!t || t->getKind() != TypeKind::Builtin) return false;
+  switch (static_cast<const BuiltinType *>(t)->builtin) {
+  case BuiltinTypeKind::Float32:
+  case BuiltinTypeKind::Float64:
+    return true;
+  default:
+    return false;
+  }
+}
+
+std::string Sema::typeName(const Type *t) {
+  if (!t) return "<unknown>";
+  switch (t->getKind()) {
+  case TypeKind::Builtin:
+    switch (static_cast<const BuiltinType *>(t)->builtin) {
+    case BuiltinTypeKind::Void:    return "void";
+    case BuiltinTypeKind::Bool:    return "bool";
+    case BuiltinTypeKind::Int32:   return "int";
+    case BuiltinTypeKind::UInt32:  return "uint";
+    case BuiltinTypeKind::Int64:   return "long";
+    case BuiltinTypeKind::UInt64:  return "ulong";
+    case BuiltinTypeKind::Float32: return "float";
+    case BuiltinTypeKind::Float64: return "double";
+    }
+    return "<builtin>";
+  case TypeKind::Pointer:
+    return typeName(static_cast<const PointerType *>(t)->pointee) + "*";
+  case TypeKind::Reference:
+    return typeName(static_cast<const ReferenceType *>(t)->pointee) + "&";
+  case TypeKind::Vector:
+    return "vector<" +
+           typeName(static_cast<const VectorType *>(t)->elem) + ">";
+  case TypeKind::Record:
+    return static_cast<const RecordType *>(t)->decl->name.str();
+  case TypeKind::Typedef:
+    return static_cast<const TypedefType *>(t)->decl->name.str();
+  }
+  return "<unknown>";
+}
+
+const char *Sema::opName(BinaryOp op) {
+  switch (op) {
+  case BinaryOp::Add:   return "+";
+  case BinaryOp::Sub:   return "-";
+  case BinaryOp::Mul:   return "*";
+  case BinaryOp::Div:   return "/";
+  case BinaryOp::Mod:   return "%";
+  case BinaryOp::Assign: return "=";
+  case BinaryOp::Eq:    return "==";
+  case BinaryOp::NEq:   return "!=";
+  case BinaryOp::Lt:    return "<";
+  case BinaryOp::Gt:    return ">";
+  case BinaryOp::Le:    return "<=";
+  case BinaryOp::Ge:    return ">=";
+  case BinaryOp::Shl:   return "<<";
+  case BinaryOp::Shr:   return ">>";
+  case BinaryOp::And:   return "&";
+  case BinaryOp::Or:    return "|";
+  case BinaryOp::Xor:   return "^";
+  case BinaryOp::LAnd:  return "&&";
+  case BinaryOp::LOr:   return "||";
+  }
+  return "?";
+}
+
+bool Sema::isCompatibleKinds(const Type *a, const Type *b) {
+  if (!a || !b) return true; // unknown side: don't complain
+  return resolveTypedefs(a)->getKind() == resolveTypedefs(b)->getKind();
+}
+
+bool Sema::isCompatibleForAssign(const Type *dst, const Type *src) {
+  if (!dst || !src) return true; // unknown side: don't complain
+  const Type *d = resolveTypedefs(dst);
+  const Type *s = resolveTypedefs(src);
+  if (isArithmetic(d) && isArithmetic(s)) return true; // implicit conversions
+  // Pointer to pointer needs identical pointees: int* vs float* is a mismatch
+  // even though both share the pointer kind. void* accepts any pointee,
+  // mirroring C's void* conversions.
+  if (d->getKind() == TypeKind::Pointer && s->getKind() == TypeKind::Pointer) {
+    const Type *dp =
+        resolveTypedefs(static_cast<const PointerType *>(d)->pointee);
+    const Type *sp =
+        resolveTypedefs(static_cast<const PointerType *>(s)->pointee);
+    if (dp && dp->getKind() == TypeKind::Builtin &&
+        static_cast<const BuiltinType *>(dp)->builtin == BuiltinTypeKind::Void)
+      return true;
+    if (!dp || !sp) return true; // unknown pointee side: don't complain
+    if (dp->getKind() == TypeKind::Builtin && sp->getKind() == TypeKind::Builtin)
+      // Unlike scalar assignment, builtin pointees must match exactly —
+      // float* does not implicitly convert to int*.
+      return static_cast<const BuiltinType *>(dp)->builtin ==
+             static_cast<const BuiltinType *>(sp)->builtin;
+    return dp->getKind() == sp->getKind();
+  }
+  // Same structural kind (vector/vector, record/record, pointer/pointer)
+  // assigns cleanly; differing kinds need an explicit cast.
+  return d->getKind() == s->getKind();
+}
+
 Type *Sema::builtin(BuiltinTypeKind k) const {
   return new BuiltinType(k);
 }
 
 void Sema::declare(StringRef name, ASTNode *node) {
   if (scopes.empty()) pushScope();
-  scopes.back()[name] = node;
+  auto &frame = scopes.back();
+  // Re-declaring the same name in the same scope is an error; shadowing an
+  // outer scope's name is fine (C blocking semantics).
+  if (frame.find(name) != frame.end()) {
+    error(node, "redefinition of '" + std::string(name) + "'");
+    return;
+  }
+  frame[name] = node;
+  // A fresh local starts unused; any DeclRefExpr flips the flag.
+  if (node->getNodeType() == ASTNode::NodeKind::VarDecl ||
+      node->getNodeType() == ASTNode::NodeKind::ParamDecl)
+    used[node] = false;
 }
 
 ASTNode *Sema::lookup(StringRef name) {
@@ -121,6 +293,48 @@ ASTNode *Sema::lookup(StringRef name) {
     if (found != it->end()) return found->second;
   }
   return nullptr;
+}
+
+// A scope is about to pop: any variable/parameter declared in it that was
+// never referenced is almost certainly a bug worth surfacing (e.g. a typo'd
+// name, or a value you meant to use).
+void Sema::checkUnusedInFrame(const llvm::StringMap<ASTNode *> &frame) {
+  for (const auto &entry : frame) {
+    ASTNode *node = entry.second;
+    auto it = used.find(node);
+    if (it != used.end() && !it->second)
+      warn(node,
+           node->getNodeType() == ASTNode::NodeKind::ParamDecl
+               ? "unused parameter '" + std::string(entry.getKey()) + "'"
+               : "unused variable '" + std::string(entry.getKey()) + "'");
+  }
+}
+
+// Match a call's argument types against a callee's parameter types (each
+// argument is type-checked here, so callers must not pre-check them).
+// Structural mismatches (e.g. passing a float* where an int was expected) are
+// warnings; so is an implicit float->int conversion, which is legal C but
+// almost always a silent precision-loss bug in a kernel.
+void Sema::checkCallArgs(const ASTNode *call, StringRef calleeName,
+                         FunctionDecl *f, const std::vector<NodePtr> &args) {
+  if (f->params.size() != args.size()) {
+    error(call, "call to '" + std::string(calleeName) + "' has " +
+                    std::to_string(args.size()) + " args, expected " +
+                    std::to_string(f->params.size()));
+    return;
+  }
+  for (size_t i = 0; i < f->params.size(); ++i) {
+    Type *paramTy = f->params[i]->type;
+    Type *argTy = checkExpr(args[i].get());
+    std::string msg = "argument " + std::to_string(i + 1) + " of '" +
+                      std::string(calleeName) + "' has type " +
+                      typeName(argTy) + ", expected " + typeName(paramTy);
+    if (!isCompatibleForAssign(paramTy, argTy))
+      warn(args[i].get(), msg);
+    else if (isFloatType(resolveTypedefs(argTy)) &&
+             isIntegerType(resolveTypedefs(paramTy)))
+      warn(args[i].get(), msg + " (implicit conversion loses precision)");
+  }
 }
 
 void Sema::error(const ASTNode *at, std::string msg) {
@@ -138,15 +352,34 @@ bool Sema::analyze() {
   collectTopLevel();
   checkFunctions();
 
-  // Report diagnostics. Errors abort the build (driver checks the return).
+  // Render diagnostics through the SourceMgr so they get the same
+  // caret/source-line treatment as parser errors. Parser errors are already
+  // rendered when they occur (their `rendered` flag is set), so reporting
+  // them again here is skipped — this makes each problem print exactly once.
+  // With -Werror, warnings are upgraded to errors for both output and the
+  // exit status.
   bool hadError = false;
   for (const Diagnostic &d : tu.diagnostics) {
-    const char *tag = d.kind == DiagnosticKind::Error   ? "error"
-                      : d.kind == DiagnosticKind::Warning ? "warning"
-                                                          : "note";
-    llvm::errs() << "sema " << tag << " (line " << d.where.line << ":"
-                 << d.where.col << "): " << d.message << "\n";
-    if (d.kind == DiagnosticKind::Error) hadError = true;
+    DiagnosticKind kind = d.kind;
+    if (warningsAsErrors && kind == DiagnosticKind::Warning)
+      kind = DiagnosticKind::Error;
+    if (!d.rendered) {
+      llvm::SourceMgr::DiagKind smKind = kind == DiagnosticKind::Error
+                                       ? llvm::SourceMgr::DK_Error
+                                       : kind == DiagnosticKind::Warning
+                                             ? llvm::SourceMgr::DK_Warning
+                                             : llvm::SourceMgr::DK_Note;
+      if (d.where.loc.getPointer())
+        srcMgr.PrintMessage(d.where.loc, smKind, d.message);
+      else
+        llvm::errs() << (smKind == llvm::SourceMgr::DK_Error
+                             ? "error: "
+                             : smKind == llvm::SourceMgr::DK_Warning
+                                   ? "warning: "
+                                   : "note: ")
+                     << d.message << "\n";
+    }
+    if (kind == DiagnosticKind::Error) hadError = true;
   }
   return !hadError;
 }
@@ -189,8 +422,10 @@ void Sema::checkFunctions() {
         f->deviceAttr != DeviceAttr::Device)
       continue;
     pushScope();
+    currentFunc = f;
     for (ParamDecl *p : f->params) declare(p->name, p);
     checkStmt(f->body.get());
+    currentFunc = nullptr;
     popScope();
   }
 }
@@ -210,7 +445,16 @@ void Sema::checkStmt(const ASTNode *n) {
     for (VarDecl *v : ds->decls) {
       if (!v) continue;
       declare(v->name, v);
-      if (v->init) checkExpr(v->init.get());
+      if (v->init) {
+        Type *initTy = checkExpr(v->init.get());
+        if (initTy && initTy->getKind() == TypeKind::Builtin &&
+            static_cast<BuiltinType *>(initTy)->builtin ==
+                BuiltinTypeKind::Void)
+          warn(v, "initializer has type void");
+        else if (v->type && !isCompatibleForAssign(v->type, initTy))
+          warn(v, "initializer of type " + typeName(initTy) +
+                      " does not match declared type " + typeName(v->type));
+      }
     }
     // Back-compat: a DeclStmt built with a single decl also sets `decl`.
     return;
@@ -218,12 +462,31 @@ void Sema::checkStmt(const ASTNode *n) {
   case ASTNode::NodeKind::ExprStmt:
     checkExpr(static_cast<const ExprStmt *>(n)->expr.get());
     return;
-  case ASTNode::NodeKind::ReturnStmt:
-    checkExpr(static_cast<const ReturnStmt *>(n)->value.get());
+  case ASTNode::NodeKind::ReturnStmt: {
+    auto *r = static_cast<const ReturnStmt *>(n);
+    Type *valTy = checkExpr(r->value.get());
+    if (!currentFunc) return;
+    Type *retTy = currentFunc->returnType;
+    bool isVoid = retTy && retTy->getKind() == TypeKind::Builtin &&
+                  static_cast<BuiltinType *>(retTy)->builtin ==
+                      BuiltinTypeKind::Void;
+    if (isVoid) {
+      if (r->value)
+        error(n, "void function '" + std::string(currentFunc->name) +
+                     "' cannot return a value");
+    } else {
+      if (!r->value)
+        warn(n, "non-void function '" + std::string(currentFunc->name) +
+                    "' returns no value");
+      else if (retTy && !isCompatibleForAssign(retTy, valTy))
+        warn(n, "return type " + typeName(valTy) +
+                    " does not match declared return type " + typeName(retTy));
+    }
     return;
+  }
   case ASTNode::NodeKind::IfStmt: {
     auto *iff = static_cast<const IfStmt *>(n);
-    checkExpr(iff->cond.get());
+    checkCond(iff->cond.get(), "if");
     checkStmt(iff->thenStmt.get());
     checkStmt(iff->elseStmt.get());
     return;
@@ -232,42 +495,87 @@ void Sema::checkStmt(const ASTNode *n) {
     auto *fs = static_cast<const ForStmt *>(n);
     pushScope();
     checkStmt(fs->init.get());
-    checkExpr(fs->cond.get());
+    checkCond(fs->cond.get(), "for");
     checkExpr(fs->step.get());
+    ++loopDepth;
+    ++breakableDepth;
     checkStmt(fs->body.get());
+    --breakableDepth;
+    --loopDepth;
     popScope();
     return;
   }
   case ASTNode::NodeKind::WhileStmt: {
     auto *ws = static_cast<const WhileStmt *>(n);
-    checkExpr(ws->cond.get());
+    checkCond(ws->cond.get(), "while");
+    ++loopDepth;
+    ++breakableDepth;
     checkStmt(ws->body.get());
+    --breakableDepth;
+    --loopDepth;
     return;
   }
   case ASTNode::NodeKind::DoStmt: {
     auto *ds = static_cast<const DoStmt *>(n);
+    ++loopDepth;
+    ++breakableDepth;
     checkStmt(ds->body.get());
-    checkExpr(ds->cond.get());
+    --breakableDepth;
+    --loopDepth;
+    checkCond(ds->cond.get(), "do-while");
     return;
   }
   case ASTNode::NodeKind::SwitchStmt: {
     auto *sw = static_cast<const SwitchStmt *>(n);
-    checkExpr(sw->cond.get());
+    checkCond(sw->cond.get(), "switch");
+    switchStack.push_back({});
+    ++breakableDepth;
     checkStmt(sw->body.get());
+    --breakableDepth;
+    switchStack.pop_back();
     return;
   }
   case ASTNode::NodeKind::CaseStmt: {
     auto *cs = static_cast<const CaseStmt *>(n);
     checkExpr(cs->value.get());
+    // Duplicate-case detection: constant labels only need comparing values.
+    if (!switchStack.empty()) {
+      SwitchCases &ctx = switchStack.back();
+      if (!cs->value) {
+        if (ctx.sawDefault)
+          warn(cs, "multiple default labels in one switch");
+        ctx.sawDefault = true;
+      } else if (cs->value->getNodeType() ==
+                 ASTNode::NodeKind::IntegerLiteral) {
+        int64_t v = static_cast<const IntegerLiteral *>(cs->value.get())->value;
+        if (!ctx.values.insert(v).second)
+          warn(cs, "duplicate case value " + std::to_string(v));
+      }
+    }
     checkStmt(cs->sub.get());
     return;
   }
   case ASTNode::NodeKind::BreakStmt:
+    if (breakableDepth == 0)
+      error(n, "'break' statement not inside a loop or switch");
+    return;
   case ASTNode::NodeKind::ContinueStmt:
+    if (loopDepth == 0)
+      error(n, "'continue' statement not inside a loop");
     return;
   default:
     return;
   }
+}
+
+// Conditions must be usable as a boolean: a scalar builtin. Vectors, pointers
+// and structs in a condition slot are almost certainly a bug.
+void Sema::checkCond(const ASTNode *cond, const char *what) {
+  if (!cond) return;
+  Type *t = checkExpr(cond);
+  if (t && !isArithmetic(t))
+    warn(cond, std::string(what) + " condition must be a scalar (got " +
+                   typeName(t) + ")");
 }
 
 Type *Sema::checkExpr(const ASTNode *n) {
@@ -302,6 +610,10 @@ Type *Sema::checkExpr(const ASTNode *n) {
       error(n, "use of undeclared identifier '" + std::string(d->name) + "'");
       return nullptr;
     }
+    // Any reference counts as a use for the unused-variable check.
+    if (sym->getNodeType() == ASTNode::NodeKind::VarDecl ||
+        sym->getNodeType() == ASTNode::NodeKind::ParamDecl)
+      used[sym] = true;
     if (sym->getNodeType() == ASTNode::NodeKind::VarDecl)
       return static_cast<VarDecl *>(sym)->type;
     if (sym->getNodeType() == ASTNode::NodeKind::ParamDecl)
@@ -312,6 +624,37 @@ Type *Sema::checkExpr(const ASTNode *n) {
     auto *b = static_cast<const BinaryExpr *>(n);
     Type *lt = checkExpr(b->lhs.get());
     Type *rt = checkExpr(b->rhs.get());
+    const Type *rl = resolveTypedefs(lt);
+    const Type *rr = resolveTypedefs(rt);
+    // Dividing or taking modulo by a literal zero is always a bug.
+    if (b->op == BinaryOp::Div || b->op == BinaryOp::Mod) {
+      int64_t zero = 0;
+      if (constIntValue(b->rhs.get(), zero) && zero == 0)
+        warn(b->rhs.get(), "division by zero");
+    }
+    // '%' and the shifts only make sense for integer operands.
+    if (b->op == BinaryOp::Mod) {
+      const Type *bad = nullptr;
+      if (rl && !isIntegerType(rl) && isArithmetic(rl)) bad = rl;
+      else if (rr && !isIntegerType(rr) && isArithmetic(rr)) bad = rr;
+      if (bad)
+        warn(n, "operand of '%' has non-integer type " + typeName(bad));
+    }
+    if (b->op == BinaryOp::Shl || b->op == BinaryOp::Shr) {
+      if (rl && !isIntegerType(rl) && isArithmetic(rl))
+        warn(b->lhs.get(), "left operand of '" +
+                               std::string(opName(b->op)) +
+                               "' must be an integer (got " + typeName(rl) + ")");
+      if (rr && !isIntegerType(rr) && isArithmetic(rr))
+        warn(b->rhs.get(), "right operand of '" +
+                               std::string(opName(b->op)) +
+                               "' must be an integer (got " + typeName(rr) + ")");
+    }
+    // p + q (two pointers) has no meaning; p - q is the only legal pair.
+    if (b->op == BinaryOp::Add && rl && rr &&
+        rl->getKind() == TypeKind::Pointer &&
+        rr->getKind() == TypeKind::Pointer)
+      warn(n, "invalid operands to binary '+' (two pointers)");
     if (b->op == BinaryOp::Assign) {
       // LHS must be an lvalue.
       auto k = b->lhs->getNodeType();
@@ -319,20 +662,74 @@ Type *Sema::checkExpr(const ASTNode *n) {
           k != ASTNode::NodeKind::IndexExpr &&
           k != ASTNode::NodeKind::MemberAccessExpr)
         warn(n, "assignment to non-lvalue");
+      if (lt && rt && !isCompatibleForAssign(lt, rt))
+        warn(n, "assigning " + typeName(rt) + " to variable of type " +
+                    typeName(lt));
+      // Writing to a variable is not "using" it: checkExpr() above flagged the
+      // LHS DeclRefExpr as used, but a store-only variable is still unused
+      // (mirrors GCC's -Wunused-but-set-variable). A read through an index or
+      // member (`a[0] = x`, `s.f = x`) still counts as using the base.
+      if (k == ASTNode::NodeKind::DeclRefExpr) {
+        ASTNode *sym =
+            lookup(static_cast<const DeclRefExpr *>(b->lhs.get())->name);
+        if (sym &&
+            (sym->getNodeType() == ASTNode::NodeKind::VarDecl ||
+             sym->getNodeType() == ASTNode::NodeKind::ParamDecl))
+          used[sym] = false;
+      }
+      return rt ? rt : lt;
     }
+    // Plain operators (incl. comparisons and shifts): operands of different
+    // kinds only combine through an explicit cast, except pointer+index Add/Sub
+    // which is the standard way to step through an array.
+    bool logical = b->op == BinaryOp::LAnd || b->op == BinaryOp::LOr;
+    bool ptrArith = (b->op == BinaryOp::Add || b->op == BinaryOp::Sub) &&
+                    ((lt && lt->getKind() == TypeKind::Pointer &&
+                      rt && rt->getKind() == TypeKind::Builtin) ||
+                     (lt && lt->getKind() == TypeKind::Builtin &&
+                      rt && rt->getKind() == TypeKind::Pointer));
+    if (!logical && !ptrArith && !isCompatibleKinds(lt, rt))
+      warn(n, "operands of '" + std::string(opName(b->op)) +
+                  "' have incompatible types (" + typeName(lt) + " and " +
+                  typeName(rt) + ")");
     return rt ? rt : lt;
   }
-  case ASTNode::NodeKind::UnaryExpr:
-    return checkExpr(static_cast<const UnaryExpr *>(n)->operand.get());
+  case ASTNode::NodeKind::UnaryExpr: {
+    auto *u = static_cast<const UnaryExpr *>(n);
+    Type *t = checkExpr(u->operand.get());
+    switch (u->op) {
+    case UnaryOp::Deref:
+      if (t && t->getKind() != TypeKind::Pointer)
+        warn(n, "indirection requires pointer operand (got " + typeName(t) +
+                    ")");
+      return t && t->getKind() == TypeKind::Pointer
+                 ? static_cast<PointerType *>(t)->pointee
+                 : t;
+    case UnaryOp::Neg:
+      if (t && !isArithmetic(t) && t->getKind() != TypeKind::Vector)
+        warn(n, "unary '-' on non-numeric type " + typeName(t));
+      return t;
+    default:
+      return t;
+    }
+  }
   case ASTNode::NodeKind::ConditionalExpr: {
     auto *c = static_cast<const ConditionalExpr *>(n);
-    checkExpr(c->cond.get());
+    checkCond(c->cond.get(), "ternary");
     Type *tt = checkExpr(c->thenExpr.get());
     Type *et = checkExpr(c->elseExpr.get());
+    if (tt && et && !isCompatibleKinds(tt, et))
+      warn(n, "incompatible operand types (" + typeName(tt) + " and " +
+                  typeName(et) + ") in ternary expression");
     return tt ? tt : et;
   }
-  case ASTNode::NodeKind::CStyleCastExpr:
-    return static_cast<const CStyleCastExpr *>(n)->target;
+  case ASTNode::NodeKind::CStyleCastExpr: {
+    auto *cc = static_cast<const CStyleCastExpr *>(n);
+    // Visit the sub-expression so uses inside a cast count (e.g. `(void)x`)
+    // and its own diagnostics still fire.
+    checkExpr(cc->sub.get());
+    return cc->target;
+  }
   case ASTNode::NodeKind::InitListExpr: {
     auto *il = static_cast<const InitListExpr *>(n);
     Type *first = nullptr;
@@ -352,20 +749,29 @@ Type *Sema::checkExpr(const ASTNode *n) {
 
     // Vector constructors (float4(...)) and math builtins pass through.
     if (!calleeName.empty()) {
-      for (auto &a : c->args) checkExpr(a.get());
-      if (isMathBuiltin(calleeName)) return nullptr;
+      if (isMathBuiltin(calleeName)) {
+        for (auto &a : c->args) checkExpr(a.get());
+        return nullptr;
+      }
       auto it = functions.find(calleeName);
       if (it != functions.end()) {
         FunctionDecl *f = it->second;
-        if (f->params.size() != c->args.size())
-          error(n, "call to '" + std::string(calleeName) +
-                       "' has " + std::to_string(c->args.size()) +
-                       " args, expected " + std::to_string(f->params.size()));
+        // Device code may only call __device__/__global__ functions; a plain
+        // (host) function is not callable from a kernel.
+        if ((f->deviceAttr == DeviceAttr::None ||
+             f->deviceAttr == DeviceAttr::Host) &&
+            currentFunc &&
+            (currentFunc->deviceAttr == DeviceAttr::Global ||
+             currentFunc->deviceAttr == DeviceAttr::Device))
+          warn(n, "call to host function '" + std::string(calleeName) +
+                      "' from device code");
+        checkCallArgs(n, calleeName, f, c->args);
         return f->returnType;
       }
       // Unknown callee: could be a GLSL builtin we didn't list (e.g. a
       // vector constructor). Warn softly rather than hard-error, so we don't
       // break valid kernels using less-common builtins.
+      for (auto &a : c->args) checkExpr(a.get());
       warn(n, "call to undeclared function '" + std::string(calleeName) +
                   "' (assuming builtin)");
       return nullptr;
@@ -377,18 +783,69 @@ Type *Sema::checkExpr(const ASTNode *n) {
   case ASTNode::NodeKind::IndexExpr: {
     auto *ie = static_cast<const IndexExpr *>(n);
     Type *base = checkExpr(ie->base.get());
-    checkExpr(ie->index.get());
-    // Pointer-to-T or array-of-T indexes to T.
-    if (base) {
-      if (base->getKind() == TypeKind::Pointer)
-        return static_cast<PointerType *>(base)->pointee;
+    Type *idx = checkExpr(ie->index.get());
+    const Type *rb = resolveTypedefs(base);
+
+    // An array variable (`float a[16]`) is typed as its element type but
+    // carries trailing array dims — legal to subscript, unlike a plain scalar.
+    VarDecl *arrayVar = nullptr;
+    if (ie->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+      ASTNode *sym =
+          lookup(static_cast<const DeclRefExpr *>(ie->base.get())->name);
+      if (sym && sym->getNodeType() == ASTNode::NodeKind::VarDecl) {
+        auto *vd = static_cast<VarDecl *>(sym);
+        if (!vd->arrayDims.empty()) arrayVar = vd;
+      }
     }
-    return nullptr;
+
+    if (rb && rb->getKind() != TypeKind::Pointer &&
+        rb->getKind() != TypeKind::Vector && !arrayVar)
+      warn(ie->base.get(),
+           "subscripted value is not an array, pointer, or vector");
+    if (idx && !isIntegerType(idx))
+      warn(ie->index.get(),
+           "array index is not an integer (got " + typeName(idx) + ")");
+
+    // Constant index out of bounds: vector element counts and array sizes are
+    // both statically known, so an out-of-range literal is determinable.
+    int64_t iv = 0;
+    if (constIntValue(ie->index.get(), iv)) {
+      if (rb && rb->getKind() == TypeKind::Vector &&
+          (iv < 0 ||
+           (unsigned long long)iv >=
+               static_cast<const VectorType *>(rb)->count))
+        warn(ie->index.get(), "array index " + std::to_string(iv) +
+                                  " out of bounds (vector size " +
+                                  std::to_string(
+                                      static_cast<const VectorType *>(rb)->count) +
+                                  ")");
+      else if (arrayVar && !arrayVar->arrayDims.empty() &&
+               arrayVar->arrayDims.back() > 0 &&
+               (iv < 0 || iv >= arrayVar->arrayDims.back()))
+        warn(ie->index.get(),
+             "array index " + std::to_string(iv) +
+                 " out of bounds (declared size " +
+                 std::to_string(arrayVar->arrayDims.back()) + ")");
+    }
+
+    // Indexing yields the pointee / element type.
+    if (rb) {
+      if (rb->getKind() == TypeKind::Pointer)
+        return static_cast<const PointerType *>(rb)->pointee;
+      if (rb->getKind() == TypeKind::Vector)
+        return static_cast<const VectorType *>(rb)->elem;
+    }
+    return base;
   }
   case ASTNode::NodeKind::MemberAccessExpr: {
     auto *m = static_cast<const MemberAccessExpr *>(n);
     Type *baseTy = checkExpr(m->base.get());
     if (!baseTy) return nullptr;
+    if (baseTy->getKind() == TypeKind::Builtin) {
+      warn(n, "request for member '" + std::string(m->member) +
+                  "' in non-class type " + typeName(baseTy));
+      return nullptr;
+    }
     if (baseTy->getKind() == TypeKind::Vector) {
       if (!isValidSwizzle(m->member))
         error(n, "invalid swizzle '." + std::string(m->member) + "'");
@@ -421,9 +878,29 @@ Type *Sema::checkExpr(const ASTNode *n) {
   }
   case ASTNode::NodeKind::LaunchExpr: {
     auto *l = static_cast<const LaunchExpr *>(n);
+    StringRef name;
+    if (l->callee &&
+        l->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr)
+      name = static_cast<const DeclRefExpr *>(l->callee.get())->name;
+    if (!name.empty()) {
+      auto it = functions.find(name);
+      if (it != functions.end()) {
+        FunctionDecl *f = it->second;
+        if (f->deviceAttr != DeviceAttr::Global)
+          error(n, "launch target '" + std::string(name) +
+                       "' is not a __global__ kernel");
+        else
+          checkCallArgs(n, name, f, l->args);
+      } else {
+        warn(n, "launch of undeclared kernel '" + std::string(name) + "'");
+        for (auto &a : l->args) checkExpr(a.get());
+      }
+    }
     checkExpr(l->gridDim.get());
     checkExpr(l->blockDim.get());
-    for (auto &a : l->args) checkExpr(a.get());
+    checkExpr(l->gridDimY.get());
+    checkExpr(l->blockDimY.get());
+    checkExpr(l->stream.get());
     return nullptr;
   }
   default:

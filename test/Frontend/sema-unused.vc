@@ -1,0 +1,39 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// Unused variables and unused parameters are reported when their scope ends.
+// A variable only ever written (but never read) still counts as unused.
+// Diagnostics are grouped by scope (inner scopes pop first) and not
+// source-ordered, so checks use CHECK-DAG.
+
+__global__ void kern(float *out) {
+  // x is read by the `if` below: never reported.
+  int x = 1;
+  // y is declared and never touched: reported.
+  // CHECK-DAG: warning: unused variable 'y'
+  float y;
+  // z is written then read (z + 1): never reported.
+  int z = 2;
+  z = 3;
+  out[0] = (float)(z + 1);
+
+  // w is written but never read: still reported as unused.
+  // CHECK-DAG: warning: unused variable 'w'
+  int w = 5;
+  w = 6;
+
+  if (x > 0) {
+    // CHECK-DAG: warning: unused variable 'inner'
+    float inner = 1.0f;
+  }
+
+  // Used variables do not warn.
+  int used_v = 42;
+  out[1] = (float)used_v;
+}
+
+__device__ void helper(float helper_param) {
+  // CHECK-DAG: warning: unused parameter 'helper_param'
+  // CHECK-DAG: warning: unused variable 'helper_local'
+  float helper_local = 1.0f;
+  // Neither is used; both reported when helper's scope pops.
+}

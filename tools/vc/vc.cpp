@@ -18,14 +18,20 @@
 #include "vc/Frontend/Parser.h"
 #include "vc/Frontend/Sema.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/IR/MLIRContext.h"
-#include "mlir/InitAllDialects.h"
+#include "mlir/Target/SPIRV/Serialization.h"
 #include "mlir/Target/SPIRV/Target.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
 
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/ToolOutputFile.h"
@@ -61,6 +67,10 @@ int main(int argc, char **argv) {
       llvm::cl::init("mlir"));
   llvm::cl::opt<std::string> outputFilename("o",
       llvm::cl::desc("output filename"), llvm::cl::init("-"));
+  llvm::cl::opt<bool> warningsAsErrors("Werror",
+      llvm::cl::desc("treat warnings as errors"));
+  llvm::cl::opt<bool> syntaxOnly("fsyntax-only",
+      llvm::cl::desc("lex, parse and type-check only; emit no output"));
   llvm::cl::ParseCommandLineOptions(argc, argv, "VC compiler\n");
 
   EmitKind kind = EmitKind::MLIR;
@@ -76,14 +86,21 @@ int main(int argc, char **argv) {
 
   int mainBuf = sm.getMainFileID();
   Lexer lex(sm, mainBuf);
-  TranslationUnit tu(llvm::SMLoc());
+  SourceLocation start;
+  TranslationUnit tu{start};
   Parser parser(lex, sm, tu);
   if (!parser.parseTranslationUnit()) {
     llvm::errs() << "parse failed\n";
     return 1;
   }
-  Sema sema(tu);
-  sema.analyze();
+  Sema sema(tu, sm);
+  sema.setWarningsAsErrors(warningsAsErrors);
+  if (!sema.analyze()) {
+    llvm::errs() << "sema: aborting due to errors\n";
+    return 1;
+  }
+
+  if (syntaxOnly) return 0;
 
   if (kind == EmitKind::AST) {
     dumpAST(tu, llvm::outs());
@@ -93,8 +110,10 @@ int main(int argc, char **argv) {
   // MLIR / SPIRV
   MLIRContext ctx;
   DialectRegistry registry;
-  registerAllDialects(registry);
-  registry.insert<vc::VCDialect, SPIRVDialect>();
+  registry.insert<vc::VCDialect, mlir::spirv::SPIRVDialect,
+                  mlir::func::FuncDialect, mlir::arith::ArithDialect,
+                  mlir::memref::MemRefDialect, mlir::gpu::GPUDialect,
+                  mlir::index::IndexDialect>();
   ctx.appendDialectRegistry(registry);
 
   auto module = codegen::translateASTToMLIR(tu, ctx);
@@ -111,18 +130,21 @@ int main(int argc, char **argv) {
   // SPIRV: run lowering then translate to binary.
   codegen::runLoweringPipeline(*module);
 
-  // Write the spirv.module as assembly text (binary emission to .spv uses
-  // mlir::translateModuleToSPIRVBinary).
+  // Serialize the spirv.module to a SPIR-V binary.
   SmallVector<uint32_t, 0> binary;
-  if (failed(spirv::translateModuleToBinary(
-          *module, binary, /*emitDebugInfo=*/false))) {
+  mlir::spirv::ModuleOp spirvModule;
+  module->walk([&](mlir::spirv::ModuleOp m) {
+    if (!spirvModule)
+      spirvModule = m;
+  });
+  if (!spirvModule || failed(mlir::spirv::serialize(spirvModule, binary))) {
     llvm::errs() << "spirv translation failed\n";
     return 1;
   }
 
   std::error_code ec;
-  auto out = std::make_unique<llvm::ToolOutputFile>(outputFilename, ec,
-                                                    llvm::sys::fs::OF_None);
+  auto out = std::make_unique<llvm::ToolOutputFile>(
+      outputFilename, ec, llvm::sys::fs::OF_None);
   if (ec) {
     llvm::errs() << "cannot open " << outputFilename << ": " << ec.message()
                  << "\n";

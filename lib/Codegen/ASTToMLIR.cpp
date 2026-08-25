@@ -63,11 +63,11 @@ private:
     // vc.kernel wrapper there).
   }
 
-  Type cvtType(const Type *t) {
-    if (!t) return Type();
+  mlir::Type cvtType(const vc::Type *t) {
+    if (!t) return mlir::Type();
     if (isa<BuiltinType>(t)) {
       switch (cast<BuiltinType>(t)->builtin) {
-      case BuiltinTypeKind::Void: return builder.getType<VoidType>();
+      case BuiltinTypeKind::Void: return builder.getNoneType();
       case BuiltinTypeKind::Bool: return builder.getI1Type();
       case BuiltinTypeKind::Int32: case BuiltinTypeKind::UInt32:
         return builder.getI32Type();
@@ -79,19 +79,21 @@ private:
     }
     if (isa<PointerType>(t)) {
       // pointer-to-T  ->  memref<?xT> (device/global address space = 1)
-      Type pointee = cvtType(cast<PointerType>(t)->pointee);
-      return MemRefType::get({ShapedType::kDynamic}, pointee, {}, 1);
+      mlir::Type pointee = cvtType(cast<PointerType>(t)->pointee);
+      return MemRefType::get(ArrayRef<int64_t>{ShapedType::kDynamic}, pointee,
+                             MemRefLayoutAttrInterface(),
+                             builder.getI64IntegerAttr(1));
     }
-    return Type();
+    return mlir::Type();
   }
 
   void buildFunction(const FunctionDecl *fn) {
     if (!fn) return;
     // Function signature
-    SmallVector<Type> argTypes;
+    SmallVector<mlir::Type> argTypes;
     for (auto *p : fn->params)
       argTypes.push_back(cvtType(p->type));
-    Type retTy = cvtType(fn->returnType);
+    mlir::Type retTy = cvtType(fn->returnType);
     FunctionType fty = builder.getFunctionType(argTypes, retTy);
 
     auto f = func::FuncOp::create(loc(fn), fn->name, fty);
@@ -112,9 +114,12 @@ private:
     for (unsigned i = 0; i < fn->params.size(); ++i)
       locals[fn->params[i]->name] = entry->getArgument(i);
 
-    if (auto *cs = dyn_cast<CompoundStmt>(fn->body.get()))
+    if (fn->body &&
+        fn->body->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
+      auto *cs = static_cast<CompoundStmt *>(fn->body.get());
       for (auto &s : cs->statements)
         visitStmt(s.get());
+    }
 
     // Ensure a void return has a terminator.
     if (builder.getBlock()->empty() ||
@@ -124,7 +129,7 @@ private:
     // For kernels, emit a vc.kernel wrapper referencing this function.
     if (fn->deviceAttr == DeviceAttr::Global) {
       builder.setInsertionPointToStart(module.getBody());
-      auto symRef = SymbolRefAttr::get(ctx, fn->name);
+      auto symRef = SymbolRefAttr::get(&ctx, fn->name, {});
       builder.create<vc::KernelOp>(loc(fn), symRef);
     }
   }
@@ -132,7 +137,7 @@ private:
   // name -> Value (block arg / local memref / alloca)
   llvm::StringMap<Value> locals;
 
-  void visitStmt(const ASTNode *n) {
+  void visitStmt(ASTNode *n) {
     if (!n) return;
     switch (n->getNodeType()) {
     case ASTNode::NodeKind::CompoundStmt:
@@ -150,7 +155,7 @@ private:
       if (!d) break;
       // Locals become stack allocations; __shared__ would map to workgroup
       // memory space (TODO: use memref.alloca with memory space 3).
-      Type ty = cvtType(d->type);
+      mlir::Type ty = cvtType(d->type);
       // For a scalar decl we use a 0-d memref as a mutable slot.
       MemRefType slotTy = MemRefType::get({}, ty);
       Value addr = builder.create<memref::AllocaOp>(loc(d), slotTy);
@@ -170,7 +175,7 @@ private:
     }
   }
 
-  Value visitExpr(const ASTNode *n) {
+  Value visitExpr(ASTNode *n) {
     if (!n) return Value();
     switch (n->getNodeType()) {
     case ASTNode::NodeKind::IntegerLiteral:
@@ -238,26 +243,32 @@ private:
     case ASTNode::NodeKind::MemberAccessExpr: {
       // threadIdx.x / blockIdx.x / blockDim.x / gridDim.x
       auto *m = static_cast<MemberAccessExpr *>(n);
-      if (auto *base = dyn_cast<DeclRefExpr>(m->base.get())) {
+      if (m->base &&
+          m->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+        auto *base = static_cast<DeclRefExpr *>(m->base.get());
         vc::Dim dim = vc::Dim::x;
         if (m->member == "y") dim = vc::Dim::y;
         else if (m->member == "z") dim = vc::Dim::z;
         if (base->name == "threadIdx")
-          return builder.create<vc::ThreadIdOp>(loc(n), dim);
+          return builder.create<vc::ThreadIdOp>(loc(n), builder.getIndexType(), dim);
         if (base->name == "blockIdx")
-          return builder.create<vc::BlockIdOp>(loc(n), dim);
+          return builder.create<vc::BlockIdOp>(loc(n), builder.getIndexType(), dim);
         if (base->name == "blockDim")
-          return builder.create<vc::BlockDimOp>(loc(n), dim);
+          return builder.create<vc::BlockDimOp>(loc(n), builder.getIndexType(), dim);
         if (base->name == "gridDim")
-          return builder.create<vc::GridDimOp>(loc(n), dim);
+          return builder.create<vc::GridDimOp>(loc(n), builder.getIndexType(), dim);
       }
       return Value();
     }
     case ASTNode::NodeKind::CallExpr: {
       auto *c = static_cast<CallExpr *>(n);
-      if (auto *ref = dyn_cast<DeclRefExpr>(c->callee.get())) {
-        if (ref->name == "__syncthreads")
-          return builder.create<vc::BarrierOp>(loc(n));
+      if (c->callee &&
+          c->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+        auto *ref = static_cast<DeclRefExpr *>(c->callee.get());
+        if (ref->name == "__syncthreads") {
+          builder.create<vc::BarrierOp>(loc(n));
+          return Value();
+        }
         // TODO: resolve user/device functions.
       }
       return Value();

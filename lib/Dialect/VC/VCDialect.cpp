@@ -15,10 +15,16 @@ using namespace vc;
 //===----------------------------------------------------------------------===//
 
 void VCDialect::initialize() {
-  registerOperations();
-  // Types and attrs would be registered here once added to VC.td.
+  addOperations<
+#define GET_OP_LIST
+#include "VCOps.cpp.inc"
+  >();
 }
 
 // The VCDialect class body (constructor, namespace accessor, registration
 // macros) is supplied by VCDialect.cpp.inc generated from VC.td.
-#include "vc/Dialect/VC/VCDialect.cpp.inc"
+#include "VCDialect.cpp.inc"
+
+// Enum attribute class definitions (vc::DimAttr etc.) generated from VC.td.
+// No guard macro: definitions are included exactly once here.
+#include "VCEnumAttrs.cpp.inc"

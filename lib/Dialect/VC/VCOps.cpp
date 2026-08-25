@@ -13,10 +13,10 @@ using namespace mlir;
 using namespace vc;
 
 #define GET_OP_CLASSES
-#include "vc/Dialect/VC/VCOps.cpp.inc"
+#include "VCOps.cpp.inc"
 
 // Verifiers / interface methods that need hand-written bodies go here.
 // Most ops (including BarrierOp's MemoryEffectsOpInterface) rely on the
 // default behavior generated into VCOps.cpp.inc; extend here as the
 // lowering pipeline is filled in.
-::mlir::LogicalResult BarrierOp::verify() { return ::mlir::success(); }
+// (No custom verifiers yet; all ops use the generated ones.)

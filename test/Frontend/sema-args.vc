@@ -1,0 +1,42 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// Call argument types are matched against parameters. Structural mismatches
+// and implicit float->int precision loss are warnings; a wrong argument count
+// is a hard error. int -> float (widening) is legal and stays quiet.
+
+__device__ int pick(int base) { return base + 1; }
+__device__ float mixf(float a, float b) { return a * b; }
+
+__global__ void kern(float *out) {
+  // int -> float is a legal widening conversion: no warning.
+  float s = mixf(1, 2.0f);
+
+  // CHECK: warning: argument 1 of 'mixf' has type float*, expected float
+  float t = mixf(out, 2.0f);
+
+  // CHECK: warning: argument 1 of 'pick' has type float, expected int (implicit conversion loses precision)
+  int r = pick(1.5f);
+
+  // Exact matches are clean.
+  out[0] = s + t + (float)r;
+  out[1] = mixf(1.0f, 2.0f);
+}
+
+__global__ void take(int n, float *p) {
+  p[0] = (float)n;
+}
+
+__global__ void launch_probe(float *out) {
+  // Kernel launch arguments are checked the same way.
+  // CHECK: warning: argument 1 of 'take' has type float, expected int
+  take<<<1, 1>>>(1.5f, out);
+  // CHECK: warning: argument 2 of 'take' has type int, expected float*
+  take<<<1, 1>>>(1, 42);
+  out[0] = 1.0f;
+}
+
+__global__ void arity_probe(float *out) {
+  // A wrong argument count is a hard error.
+  // CHECK: error: call to 'arity_probe' has 2 args, expected 1
+  arity_probe<<<1, 1>>>(out, 2.0f);
+}

@@ -65,6 +65,10 @@ int main(int argc, char **argv) {
       cl::desc("output filename (executable or .spv)"), cl::init("a.out"));
   cl::opt<std::string> entryPoint("entry",
       cl::desc("SPIR-V entry point name"), cl::init("main"));
+  cl::opt<bool> warningsAsErrors("Werror",
+      cl::desc("treat warnings as errors"));
+  cl::opt<bool> syntaxOnly("fsyntax-only",
+      cl::desc("lex, parse and type-check only; emit no output"));
   cl::ParseCommandLineOptions(argc, argv, "VC single-file compiler\n");
 
   EmitKind kind = EmitKind::Full;
@@ -92,12 +96,14 @@ int main(int argc, char **argv) {
     errs() << "parse failed\n";
     return 1;
   }
-  Sema sema(tu);
+  Sema sema(tu, sm);
+  sema.setWarningsAsErrors(warningsAsErrors);
   if (!sema.analyze()) {
     errs() << "sema: aborting due to errors\n";
     return 1;
   }
 
+  if (syntaxOnly) return 0;
   if (emitOpt == "ast") { dumpAST(tu, outs()); return 0; }
 
   // 2. Device subset -> GLSL

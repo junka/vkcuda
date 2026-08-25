@@ -1,0 +1,27 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// Control flow legality: break/continue outside a loop and returning a value
+// from a void function are errors.
+
+__global__ void kern(int n, float *out) {
+  // CHECK: error: 'break' statement not inside a loop or switch
+  break;
+  // CHECK: error: 'continue' statement not inside a loop
+  continue;
+  // CHECK: error: void function 'kern' cannot return a value
+  return 1;
+}
+
+// break is fine inside a switch (which is why switch increments only
+// breakableDepth, not loopDepth).
+__device__ int classify(float x) {
+  int c = 0;
+  switch (x > 0.0f ? 1 : 0) {
+  case 1:
+    c = 1;
+    break; // legal: inside switch
+  default:
+    break; // legal: inside switch
+  }
+  return c;
+}

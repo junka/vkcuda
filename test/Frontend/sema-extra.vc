@@ -1,0 +1,65 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// Additional checks: division by zero, non-integer shift/modulo operands,
+// out-of-range constant indexes, member access on a scalar, duplicate case
+// labels, void initializers, and calling a host function from device code.
+
+// A plain (host) function; calling it from device code is diagnosed.
+int compute(int v) { return v * 2; }
+
+__global__ void kern(int n, float *out) {
+  // CHECK: warning: division by zero
+  int a = 10 / 0;
+  // CHECK: warning: division by zero
+  int b = 10 % 0;
+
+  // CHECK: warning: right operand of '<<' must be an integer (got float)
+  int c = 1 << 1.5f;
+  // CHECK: warning: operand of '%' has non-integer type float
+  int d = 5 % 1.5f;
+
+  // Out-of-range constant subscripts.
+  float local[8];
+  // CHECK: warning: array index 8 out of bounds (declared size 8)
+  float e = local[8];
+  // CHECK: warning: array index -1 out of bounds (declared size 8)
+  float f = local[-1];
+
+  // CHECK: warning: subscripted value is not an array, pointer, or vector
+  int g = n[0];
+
+  // CHECK: warning: array index is not an integer (got float)
+  float h = local[1.5f];
+
+  // Member access on a scalar.
+  // CHECK: warning: request for member 'x' in non-class type int
+  int m = n.x;
+
+  // CHECK: warning: duplicate case value 1
+  switch (n) {
+  case 1: a = 1; break;
+  case 1: a = 2; break;
+  // CHECK: warning: multiple default labels in one switch
+  default: a = 3; break;
+  default: a = 4; break;
+  }
+
+  // Calling a host (non-device) function from a kernel.
+  // CHECK: warning: call to host function 'compute' from device code
+  int hc = compute(a);
+
+  // CHECK: warning: initializer has type void
+  int vv = helper_void();
+
+  out[0] = (float)(a + b + c + d + e + f + g + h + m + hc + vv);
+}
+
+void helper_void() {}
+
+// A structurally-incompatible call still warns (not errors) so kernels build.
+__device__ int takePtr(int *p) { return *p; }
+__global__ void kern2(int *p, float *out) {
+  // CHECK: warning: argument 1 of 'takePtr' has type float*, expected int*
+  int r = takePtr(out);
+  out[0] = (float)r;
+}

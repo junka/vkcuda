@@ -10,6 +10,8 @@
 #define VC_DIALECT
 
 include "mlir/IR/OpBase.td"
+include "mlir/IR/EnumAttr.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 //===----------------------------------------------------------------------===//
 // Dialect definition
@@ -25,7 +27,6 @@ def VC_Dialect : Dialect {
     Vulkan compute shader.
   }];
   let cppNamespace = "::vc";
-  let useDefaultTypePrinterParser = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -93,7 +94,10 @@ def GridDimOp : VC_Op<"grid_dim"> {
 }
 
 // CUDA __syncthreads()  ->  spirv.ControlBarrier(Workgroup)
-def BarrierOp : VC_Op<"barrier", [MemoryEffectsOpInterface]> {
+// NOTE: no MemoryEffectsOpInterface yet; it requires a getEffects() impl.
+// Add it (and the corresponding SPIR-V lowering) when side-effect analysis
+// is needed.
+def BarrierOp : VC_Op<"barrier"> {
   let summary = "workgroup synchronization barrier (CUDA __syncthreads)";
   let assemblyFormat = "attr-dict";
 }
@@ -111,20 +115,20 @@ def WMMALoadOp : VC_Op<"wmma.load"> {
   }];
   let arguments = (ins AnyMemRef:$memref);
   let results = (outs AnyType:$fragment);
-  let assemblyFormat = "$memref attr-dict type($fragment)";
+  let assemblyFormat = "type($memref) $memref attr-dict type($fragment)";
 }
 
 def WMMAStoreOp : VC_Op<"wmma.store"> {
   let summary = "store a WMMA fragment (placeholder)";
   let arguments = (ins AnyType:$fragment, AnyMemRef:$memref);
-  let assemblyFormat = "$fragment `,` $memref attr-dict";
+  let assemblyFormat = "$fragment `,` $memref attr-dict type($fragment) type($memref)";
 }
 
 def WMMAMmaOp : VC_Op<"wmma.mma"> {
   let summary = "WMMA multiply-accumulate (placeholder)";
   let arguments = (ins AnyType:$a, AnyType:$b, AnyType:$c);
   let results = (outs AnyType:$result);
-  let assemblyFormat = "$a `,` $b `,` $c attr-dict type($result)";
+  let assemblyFormat = "$a `,` $b `,` $c attr-dict type($a) type($b) type($c) type($result)";
 }
 
 #endif // VC_DIALECT

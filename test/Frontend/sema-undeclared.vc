@@ -1,0 +1,25 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// Declaration resolution: undeclared identifiers / unknown functions / bad
+// struct member / illegal swizzle are hard errors.
+
+struct Point { float x; float y; };
+
+__global__ void kern(float *out) {
+  // CHECK: error: use of undeclared identifier 'missing_name'
+  int v = missing_name;
+
+  // CHECK: warning: call to undeclared function 'unknown_call' (assuming builtin)
+  float s = unknown_call(1.0f);
+
+  Point p;
+  // CHECK: error: no member named 'z' in struct 'Point'
+  p.z = 1.0f;
+  out[v + 1] = s;
+}
+
+__global__ void swizzleKern(float4 v, float *out) {
+  // Mixing swizzle sets ('.q' is stpq, '.z' is xyzw) is invalid.
+  // CHECK: error: invalid swizzle '.qz'
+  out[0] = v.qz;
+}

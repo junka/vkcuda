@@ -7,9 +7,11 @@
 //
 // The analysis is deliberately conservative about hard errors: only clearly
 // wrong programs (undeclared identifier, unknown struct field, malformed
-// swizzle, call to unknown non-builtin function with wrong arity) produce
-// errors that fail the build. Type-mismatch is a warning so existing kernels
-// keep compiling while still surfacing issues.
+// swizzle, call to unknown non-builtin function with wrong arity, redefinition)
+// produce errors that fail the build. Everything else — type mismatches,
+// unused variables/parameters, division by zero, bad subscripts, duplicate
+// case labels, calling a host function from device code, etc. — is a warning
+// so existing kernels keep compiling while still surfacing issues.
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,12 +21,17 @@
 #include "vc/Frontend/AST.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/SourceMgr.h"
 
 namespace vc {
 
 class Sema {
   TranslationUnit &tu;
+  llvm::SourceMgr &srcMgr;
+  // -Werror mode: warnings are reported (and count) as errors.
+  bool warningsAsErrors = false;
 
   // Scope stack: innermost last. Each frame maps a name to the ASTNode that
   // declared it (VarDecl* or ParamDecl*). A CompoundStmt/for-init pushes a
@@ -40,8 +47,33 @@ class Sema {
   // Side table of inferred expression types, keyed by AST node identity.
   llvm::DenseMap<const ASTNode *, Type *> exprTypes;
 
+  // Context for the function body currently being checked (drives the
+  // return-type consistency check). Null outside a __global__/__device__ body.
+  FunctionDecl *currentFunc = nullptr;
+
+  // Break/continue legality: break is allowed inside a loop or a switch,
+  // continue only inside a loop. Maintained by checkStmt as it descends.
+  unsigned loopDepth = 0;
+  unsigned breakableDepth = 0;
+
+  // Unused-variable tracking. declare() seeds a VarDecl/ParamDecl as unused;
+  // every DeclRefExpr to it flips the flag. When a scope pops, entries left
+  // unused are reported as warnings.
+  llvm::DenseMap<const ASTNode *, bool> used;
+
+  // Per-switch case constants so `case 3:` twice — and a repeated `default` —
+  // is caught. One entry per active switch, maintained by checkStmt.
+  struct SwitchCases {
+    llvm::DenseSet<int64_t> values;
+    bool sawDefault = false;
+  };
+  std::vector<SwitchCases> switchStack;
+
 public:
-  Sema(TranslationUnit &unit) : tu(unit) {}
+  Sema(TranslationUnit &unit, llvm::SourceMgr &sm) : tu(unit), srcMgr(sm) {}
+
+  /// -Werror: upgrade warnings to errors during reporting.
+  void setWarningsAsErrors(bool on) { warningsAsErrors = on; }
 
   /// Run analysis; returns true if no Error-severity diagnostics were added.
   bool analyze();
@@ -55,9 +87,19 @@ public:
 private:
   // Scope management.
   void pushScope() { scopes.emplace_back(); }
-  void popScope() { scopes.pop_back(); }
+  void popScope() {
+    checkUnusedInFrame(scopes.back());
+    scopes.pop_back();
+  }
   void declare(StringRef name, ASTNode *node);
   ASTNode *lookup(StringRef name);
+  // Warn about VarDecl/ParamDecl declared in `frame` that were never read.
+  void checkUnusedInFrame(const llvm::StringMap<ASTNode *> &frame);
+  // Type-check a call (or kernel launch) against a callee's parameter list.
+  // Checks each argument against its parameter and reports structural
+  // mismatches and lossy float->int conversions as warnings.
+  void checkCallArgs(const ASTNode *call, StringRef calleeName,
+                     FunctionDecl *f, const std::vector<NodePtr> &args);
 
   // Diagnostics.
   void error(const ASTNode *at, std::string msg);
@@ -70,6 +112,7 @@ private:
   // Statement / expression checking.
   void checkStmt(const ASTNode *n);
   Type *checkExpr(const ASTNode *n);
+  void checkCond(const ASTNode *cond, const char *what);
 
   // Helpers.
   bool isThreadBuiltin(StringRef name) const;
@@ -77,6 +120,23 @@ private:
   bool isVectorCtorName(StringRef name) const;
   static bool isValidSwizzle(StringRef s);
   Type *builtin(BuiltinTypeKind k) const;
+
+  // Type taxonomy used by the compatibility checks. Arithmetic covers the
+  // builtin scalars between which C-style implicit conversions are legal;
+  // anything else (pointer/vector/record) does not implicitly convert.
+  static bool isArithmetic(const Type *t);
+  static bool isIntegerType(const Type *t);
+  static bool isFloatType(const Type *t);
+  static std::string typeName(const Type *t);
+  static const char *opName(BinaryOp op);
+  // Strip typedef aliases down to the underlying type for comparison and
+  // arithmetic classification. A TypedefType is never directly comparable.
+  static const Type *resolveTypedefs(const Type *t);
+  // Two operands with the same TypeKind convert implicitly (builtin->builtin,
+  // vector->vector, pointer->pointer); differing kinds only convert via an
+  // explicit cast or for pointer+index Add/Sub.
+  static bool isCompatibleKinds(const Type *a, const Type *b);
+  static bool isCompatibleForAssign(const Type *dst, const Type *src);
 };
 
 } // namespace vc

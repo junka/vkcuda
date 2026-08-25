@@ -1,0 +1,11 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// kernel<<<...>>> may only name a __global__ function.
+
+__device__ float helper(float x) { return x * 2.0f; }
+
+__global__ void kern(float *out) {
+  // CHECK: error: launch target 'helper' is not a __global__ kernel
+  helper<<<1, 1>>>(out);
+  out[0] = 1.0f;
+}

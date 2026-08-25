@@ -1,0 +1,24 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// Type mismatches are warnings (not errors) so working kernels keep building,
+// but structurally incompatible kinds still get flagged: initializer, plain
+// assignment, and non-scalar conditions.
+
+__global__ void kern(int *p, float *out) {
+  // CHECK: warning: initializer of type int* does not match declared type int
+  int i = p;
+
+  // CHECK: warning: assigning float* to variable of type int
+  i = out;
+
+  // Pointer + index is legal pointer arithmetic; must not warn.
+  int *q = p + 1;
+  (void)q;
+
+  // CHECK: warning: if condition must be a scalar (got int*)
+  if (p) { }
+
+  // Same-kind operand mixes are fine: int + float converts implicitly.
+  i = i + 1.5f;
+  out[0] = i;
+}

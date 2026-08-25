@@ -19,8 +19,6 @@ target_link_libraries(vc PRIVATE
   MLIRIR
   MLIRSPIRVTarget
   MLIRTranslateLib
-  MLIRTargetSPIRV
-  MLIRAllDialects
   MLIRSupport
   LLVMSupport
 )

@@ -60,6 +60,7 @@ bool Parser::expect(TokKind k, const char *what) {
 
 Diagnostic Parser::error(const Token &at, std::string msg) {
   Diagnostic d{DiagnosticKind::Error, toSourceLoc(at), std::move(msg)};
+  d.rendered = true; // printed inline below; Sema must not re-report it.
   tu.diagnostics.push_back(d);
   // Associate with the SourceMgr so mlir/LLVM diagnostics can render it.
   srcMgr.PrintMessage(SMLoc::getFromPointer(at.text.data()),
@@ -126,8 +127,10 @@ bool Parser::parseFunctionOrKernel() {
     while (true) {
       if (auto *p = parseParam())
         fn->params.push_back(p);
-      else
+      else {
+        error(curTok, "expected parameter declaration");
         return false;
+      }
       if (consume(TokKind::comma))
         continue;
       break;

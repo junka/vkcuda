@@ -1,0 +1,10 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// Parser errors are reported exactly once (Sema skips already-rendered
+// diagnostics), so 'parse failed' is the only tail.
+
+__global__ void f( {
+  int x;
+}
+// CHECK: error: expected parameter declaration
+// CHECK-NOT: expected parameter declaration

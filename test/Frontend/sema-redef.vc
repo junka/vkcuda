@@ -1,0 +1,16 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// Re-declaring a name in the same scope is an error; shadowing an outer
+// scope is allowed (C blocking semantics).
+
+__global__ void kern(float *out) {
+  int a;
+  // CHECK: error: redefinition of 'a'
+  int a;
+
+  // Shadowing a function parameter is legal.
+  if (out) {
+    float out = 1.0f;
+    a = (int)out;
+  }
+}

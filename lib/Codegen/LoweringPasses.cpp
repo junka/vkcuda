@@ -24,7 +24,7 @@ namespace vc::codegen {
 
 void runLoweringPipeline(ModuleOp module) {
   MLIRContext &ctx = *module.getContext();
-  ctx.getOrLoadDialect<SPIRVDialect>();
+  ctx.getOrLoadDialect<mlir::spirv::SPIRVDialect>();
 
   PassManager pm(&ctx);
 

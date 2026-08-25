@@ -1,0 +1,10 @@
+// RUN: vcc -Werror -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// -Werror upgrades warnings to errors, and the driver aborts compilation.
+
+__global__ void kern(float *out) {
+  // CHECK: error: assignment to non-lvalue
+  1 = out[0];
+  out[0] = 1.0f;
+}
+// CHECK: sema: aborting due to errors
