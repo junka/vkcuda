@@ -1,0 +1,73 @@
+// test/sync.vc — single-file synchronization-primitives demo (kernel + host).
+//
+// Exercises VC's CUDA synchronization primitives end-to-end, verifying the
+// GLSL backend lowers them correctly:
+//   - __syncthreads()        : block execution barrier -> barrier()
+//   - __threadfence_block()  : block-visible memory fence -> groupMemoryBarrier()
+//   - __threadfence()        : device-visible memory fence -> memoryBarrierBuffer()
+//
+// The kernel: each block sums its threads' contributions into a __shared__
+// accumulator using __syncthreads to bracket the reduction, and writes the
+// block sum out. A __threadfence_block between the shared write and the global
+// write ensures the shared value is visible (conservatively correct lowering).
+// Thread 0 of each block then atomicAdds the block sum into a global total
+// under __threadfence so cross-block visibility is ordered.
+//
+//   vcc test/sync.vc -o build/sync_sf && ./build/sync_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void syncKernel(int *total, int N) {
+  int tid = threadIdx.x;
+  int i = blockIdx.x * blockDim.x + tid;
+
+  // Each thread contributes 1 (if in range) to a shared block sum.
+  __shared__ int blockSum;
+  if (tid == 0) blockSum = 0;
+  __syncthreads();
+
+  if (i < N) {
+    // Atomically accumulate into the shared block sum.
+    atomicAdd(&blockSum, 1);
+  }
+  // All threads must finish contributing before thread 0 reads the sum.
+  __syncthreads();
+
+  // Thread 0 publishes the block sum. A block-level memory fence between the
+  // shared write (already barriered above) and the global atomicAdd keeps the
+  // ordering conservative under VC's lowering.
+  if (tid == 0) {
+    __threadfence_block();
+    atomicAdd(total, blockSum);
+    // A device-level fence after the cross-block accumulation.
+    __threadfence();
+  }
+}
+
+int main() {
+  vcInit();
+
+  const int N = 256;
+  const int block = 64;
+  const int numBlocks = (N + block - 1) / block;
+
+  void *dTotal = 0;
+  vcMalloc(&dTotal, 4);
+  int zero = 0;
+  vcMemcpy(dTotal, &zero, 4, VCMemcpyKind::HostToDevice);
+
+  syncKernel<<<N, block>>>(dTotal, N);
+  vcDeviceSynchronize();
+
+  int total = 0;
+  vcMemcpy(&total, dTotal, 4, VCMemcpyKind::DeviceToHost);
+
+  // Each of N threads contributed 1; the total across all blocks must be N.
+  int ok = (total == N);
+  printf("sync: %s (total=%d, expect=%d)\n", ok ? "PASS" : "FAIL", total, N);
+
+  vcFree(dTotal);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

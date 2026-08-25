@@ -786,6 +786,39 @@ private:
           c->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
         auto *ref = static_cast<const DeclRefExpr *>(c->callee.get());
         if (ref->name == "__syncthreads") { os << "barrier()"; return; }
+        // CUDA memory fences. CUDA fences only order memory visibility, not
+        // execution; they are safe inside divergent control flow (e.g. inside
+        // `if (tid == 0)`), which real kernels rely on. GLSL's memoryBarrier*
+        // primitives are the direct counterpart — they order memory without
+        // synchronizing execution. We must NOT pair them with barrier(): a
+        // GLSL barrier() is only legal in uniform control flow, and emitting
+        // one here would push it into the divergent branch that fences are
+        // typically used in, producing undefined behavior. So lower purely to
+        // the matching memory barrier, no execution barrier.
+        //   __threadfence_block : block-visible  -> groupMemoryBarrier
+        //   __threadfence       : device-visible -> memoryBarrierBuffer (SSBO)
+        if (ref->name == "__threadfence_block") {
+          os << "groupMemoryBarrier()";
+          return;
+        }
+        if (ref->name == "__threadfence") {
+          os << "memoryBarrierBuffer()";
+          return;
+        }
+        // __syncthreads_count/and/or are voting barriers: they take a predicate
+        // and return the count / logical-and / logical-or of all threads'
+        // predicates across the block. GLSL's barrier() returns nothing and a
+        // correct lowering needs a shared-array reduction lifted into statement
+        // scope (it cannot be expressed as a single GLSL expression). VC does
+        // not yet implement the statement-lifting pass this requires, so emit a
+        // clear marker rather than silently wrong code.
+        if (ref->name == "__syncthreads_count" ||
+            ref->name == "__syncthreads_and" ||
+            ref->name == "__syncthreads_or") {
+          os << "/*VC_UNSUPPORTED:" << ref->name
+             << " needs block-wide vote reduction*/";
+          return;
+        }
         // CUDA atomics: rewrite the CUDA pointer/value model to GLSL's
         // reference model before falling through to generic call emission.
         if (isAtomicName(ref->name)) {

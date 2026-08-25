@@ -49,6 +49,12 @@ bool Sema::isMathBuiltin(StringRef name) const {
       "atomicAdd", "atomicSub", "atomicExch", "atomicMin", "atomicMax",
       "atomicInc", "atomicDec", "atomicCAS", "atomicAnd", "atomicOr",
       "atomicXor",
+      // CUDA synchronization primitives (lowered to GLSL barriers by the
+      // backend). __syncthreads is the pure execution barrier; the fence
+      // variants are memory-ordering barriers; the _count/_and/_or variants
+      // are voting barriers returning a reduced value.
+      "__syncthreads", "__threadfence", "__threadfence_block",
+      "__syncthreads_count", "__syncthreads_and", "__syncthreads_or",
   };
   for (const char *m : names)
     if (name == m) return true;
