@@ -1,0 +1,89 @@
+// test/vote.vc — single-file block-wide vote demo (kernel + host + launch).
+//
+// Exercises CUDA __syncthreads_count / __syncthreads_and / __syncthreads_or:
+//   - __syncthreads_count(pred): returns the number of threads in the block
+//     whose predicate is nonzero (also acts as a barrier).
+//   - __syncthreads_and(pred):  returns nonzero iff EVERY thread's predicate
+//     is nonzero.
+//   - __syncthreads_or(pred):   returns nonzero iff ANY thread's predicate
+//     is nonzero.
+//
+// These are block-wide reductions, not warp ops, so they lower to a shared-
+// array reduction + two barriers (every thread writes its booleanized
+// predicate, barrier, thread 0 folds, barrier, all read the result). The
+// backend hoists that prologue before the enclosing statement.
+//
+//   vcc test/vote.vc -o build/vote_sf && ./build/vote_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void voteKernel(int *result, int N) {
+  int tid = threadIdx.x;
+
+  // count: threads with tid >= 4. For a block of B threads, that's max(0, B-4).
+  int cnt = __syncthreads_count(tid >= 4);
+
+  // and: are ALL threads' tid < N? (yes, since tid in [0,B) and B <= N here).
+  int allLt = __syncthreads_and(tid < N);
+
+  // and: are all threads' tid even? No (mixed parity) -> 0.
+  int allEven = __syncthreads_and((tid % 2) == 0);
+
+  // or: is any thread's tid == 0? Yes -> 1.
+  int anyZero = __syncthreads_or(tid == 0);
+
+  // or: is any thread's tid == 999? No -> 0.
+  int anyBig = __syncthreads_or(tid == 999);
+
+  // count: threads with tid even -> ceil(B/2).
+  int cntEven = __syncthreads_count((tid % 2) == 0);
+
+  if (tid == 0) {
+    result[0] = cnt;       // expect B - 4
+    result[1] = allLt;     // expect 1
+    result[2] = allEven;   // expect 0
+    result[3] = anyZero;   // expect 1
+    result[4] = anyBig;    // expect 0
+    result[5] = cntEven;   // expect ceil(B/2)
+  }
+}
+
+int main() {
+  vcInit();
+
+  const int B = 32;   // block size
+  const int N = 32;   // element count (>= B so allLt is true)
+
+  void *dR = 0;
+  vcMalloc(&dR, 6 * 4);
+  int zeros[6] = {0, 0, 0, 0, 0, 0};
+  vcMemcpy(dR, zeros, 6 * 4, VCMemcpyKind::HostToDevice);
+
+  voteKernel<<<N, B>>>(dR, N);
+  vcDeviceSynchronize();
+
+  int hr[6];
+  vcMemcpy(hr, dR, 6 * 4, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  // cnt = B - 4 = 28
+  if (hr[0] != B - 4) { printf("  cnt got=%d expect=%d\n", hr[0], B - 4); ok = 0; }
+  // allLt = 1 (all tid < N)
+  if (hr[1] != 1) { printf("  allLt got=%d expect=1\n", hr[1]); ok = 0; }
+  // allEven = 0 (tid 1,3,5... are odd)
+  if (hr[2] != 0) { printf("  allEven got=%d expect=0\n", hr[2]); ok = 0; }
+  // anyZero = 1 (tid 0 exists)
+  if (hr[3] != 1) { printf("  anyZero got=%d expect=1\n", hr[3]); ok = 0; }
+  // anyBig = 0 (no tid == 999)
+  if (hr[4] != 0) { printf("  anyBig got=%d expect=0\n", hr[4]); ok = 0; }
+  // cntEven = ceil(B/2) = 16
+  int expectEven = (B + 1) / 2;
+  if (hr[5] != expectEven) { printf("  cntEven got=%d expect=%d\n", hr[5], expectEven); ok = 0; }
+
+  printf("vote: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dR);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

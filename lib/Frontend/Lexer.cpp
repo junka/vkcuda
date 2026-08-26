@@ -81,6 +81,12 @@ TokKind Lexer::classifyKeyword(StringRef ident) {
       .Case("long", TokKind::kw_long)
       .Case("float", TokKind::kw_float)
       .Case("double", TokKind::kw_double)
+      // CUDA half-precision: both the bare `half` (modern CUDA) and the
+      // double-underscore `__half` (legacy CUDA header type) spell the same
+      // scalar type. `half2`/`half3`/`half4` are NOT keywords — they lex as
+      // identifiers and makeVectorType turns them into f16vecN.
+      .Case("half", TokKind::kw_half)
+      .Case("__half", TokKind::kw_half)
       .Case("return", TokKind::kw_return)
       .Case("if", TokKind::kw_if)
       .Case("else", TokKind::kw_else)
@@ -98,6 +104,11 @@ TokKind Lexer::classifyKeyword(StringRef ident) {
       .Case("__host__", TokKind::kw_host)
       .Case("__shared__", TokKind::kw_shared)
       .Case("__restrict__", TokKind::kw_restrict)
+      // CUDA __constant__ variables: device-resident read-only globals. VC
+      // lowers these to `const` GLSL/C++ globals with compile-time initializers
+      // only (no cudaMemcpyToSymbol runtime path). Useful for lookup tables and
+      // fixed coefficients that live on the device.
+      .Case("__constant__", TokKind::kw_constant)
       .Case("__syncthreads", TokKind::kw_syncthreads)
       // `dim3` is intentionally NOT a keyword: leaving it as a plain identifier
       // lets `dim3(N,N)` parse as a CallExpr, which the launch translator then
@@ -106,6 +117,7 @@ TokKind Lexer::classifyKeyword(StringRef ident) {
       .Case("wmma", TokKind::kw_wmma)
       .Case("struct", TokKind::kw_struct)
       .Case("typedef", TokKind::kw_typedef)
+      .Case("enum", TokKind::kw_enum)
       .Default(TokKind::identifier);
 }
 

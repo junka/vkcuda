@@ -41,8 +41,18 @@ class Sema {
   // Top-level function table: name -> FunctionDecl*.
   llvm::StringMap<FunctionDecl *> functions;
 
+  // Top-level global variables (__constant__ decls): name -> VarDecl*. These
+  // are file-scope, so DeclRefExpr resolves against this map (they aren't in
+  // any lexical scope frame).
+  llvm::StringMap<VarDecl *> globalVars;
+
   // Top-level type names: struct/typedef name -> Type* (RecordType/TypedefType).
   llvm::StringMap<Type *> typeNames;
+
+  // Unscoped enum constants: name -> integer value. Populated from EnumDecls
+  // in collectTopLevel; DeclRefExpr resolves against this so enum names are not
+  // flagged as undeclared.
+  llvm::StringMap<int64_t> enumConstants;
 
   // Side table of inferred expression types, keyed by AST node identity.
   llvm::DenseMap<const ASTNode *, Type *> exprTypes;

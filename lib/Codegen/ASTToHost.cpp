@@ -154,6 +154,24 @@ private:
       } else if (d->getNodeType() == ASTNode::NodeKind::TypedefDecl) {
         auto *td = static_cast<const TypedefDecl *>(d.get());
         os << "typedef " << cppType(td->underlying) << " " << td->name << ";\n";
+      } else if (d->getNodeType() == ASTNode::NodeKind::EnumDecl) {
+        // GLSL has no enum, but C++ does — however emitting the constants as
+        // `const int` keeps the host and device backends identical and avoids
+        // any scoping surprises (VC supports unscoped enums only). Host code
+        // references enum constants by bare name just like device code.
+        auto *ed = static_cast<const EnumDecl *>(d.get());
+        for (auto &c : ed->constants)
+          os << "const int " << c.name << " = " << c.value << ";\n";
+      } else if (d->getNodeType() == ASTNode::NodeKind::VarDecl) {
+        // __constant__ globals: emit as `const` C++ globals so host code can
+        // reference them too. Mirrors the GLSL backend's `const` lowering.
+        auto *v = static_cast<const VarDecl *>(d.get());
+        if (!v->isConstant) continue;
+        os << "const " << cppType(v->type) << " " << v->name;
+        for (int64_t dim : v->arrayDims)
+          os << "[" << dim << "]";
+        if (v->init) { os << " = "; emitHostExpr(v->init.get()); }
+        os << ";\n";
       }
     }
     os << "\n";
@@ -774,6 +792,10 @@ private:
       case BuiltinTypeKind::UInt64: return "unsigned long";
       case BuiltinTypeKind::Float32: return "float";
       case BuiltinTypeKind::Float64: return "double";
+      // The host has no half type; __half declarations on the host (rare — only
+      // if a host var is typed `half`) degrade to float. Device half is lowered
+      // to float16_t by the GLSL backend and never crosses into host code.
+      case BuiltinTypeKind::Float16: return "float";
       }
     }
     if (t->getKind() == TypeKind::Pointer) {

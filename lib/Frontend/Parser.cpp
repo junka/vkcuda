@@ -84,6 +84,10 @@ bool Parser::parseTopLevelDecl() {
     return parseStructDecl();
   if (curTok.is(TokKind::kw_typedef))
     return parseTypedefDecl();
+  if (curTok.is(TokKind::kw_enum))
+    return parseEnumDecl();
+  if (curTok.is(TokKind::kw_constant))
+    return parseConstantDecl();
   return parseFunctionOrKernel();
 }
 
@@ -258,6 +262,92 @@ bool Parser::parseTypedefDecl() {
   return true;
 }
 
+// enum [Name] { A, B = 5, C };
+// Unscoped only. Each constant gets an integer value: the first defaults to 0,
+// each subsequent one to prev+1, unless an explicit `= const-expr` resets it.
+// The GLSL backend emits each constant as `const int NAME = value;`. Sema
+// resolves bare references to enum constants from the EnumDecl in the AST
+// (collectTopLevel populates its enumConstants map), so the parser only needs
+// to build the node correctly — no symbol registration here.
+bool Parser::parseEnumDecl() {
+  Token enumTok = curTok;
+  advance(); // 'enum'
+  // Optional `class`/`struct` (scoped enum) — VC does not support scope access
+  // (`E::A`), so reject with a clear message rather than silently dropping.
+  if (curTok.is(TokKind::identifier) &&
+      (curTok.text == "class" || curTok.text == "struct")) {
+    error(curTok,
+          "scoped enum (enum class) is not supported; use unscoped 'enum' "
+          "(constants referenced by bare name)");
+    return false;
+  }
+  StringRef name;
+  if (curTok.is(TokKind::identifier)) {
+    name = curTok.text;
+    advance();
+  }
+  auto *ed = new EnumDecl(toSourceLoc(enumTok), name);
+  if (!expect(TokKind::l_brace, "'{'"))
+    return false;
+  int64_t nextValue = 0;
+  while (!curTok.is(TokKind::r_brace) && !curTok.is(TokKind::eof)) {
+    if (!curTok.is(TokKind::identifier)) {
+      error(curTok, "expected enumerator name");
+      return false;
+    }
+    Token constTok = curTok;
+    advance();
+    int64_t value = nextValue;
+    if (consume(TokKind::assign)) {
+      NodePtr init = parseExpression();
+      if (!init || !evalConstInt(init.get(), value)) {
+        error(constTok,
+              "enum initializer must be a compile-time integer constant");
+        return false;
+      }
+    }
+    ed->constants.push_back({constTok.text, value});
+    nextValue = value + 1;
+    if (!consume(TokKind::comma))
+      break;
+  }
+  if (!expect(TokKind::r_brace, "'}'"))
+    return false;
+  if (!expect(TokKind::semi, "';' after enum definition"))
+    return false;
+  tu.decls.emplace_back(ed);
+  return true;
+}
+
+// __constant__ <type> name = init;  (also `name[const-N] = {...}`)
+//
+// CUDA __constant__ variables are device-resident read-only globals initialized
+// at compile time (VC does not implement the cudaMemcpyToSymbol runtime path).
+// Parsed as a top-level VarDecl with isConstant=true; the GLSL backend emits it
+// as a `const` global before main(), the host backend as a `const` C++ global.
+// Multiple declarators share one `__constant__` qualifier: `__constant__ int a=1, b=2;`
+bool Parser::parseConstantDecl() {
+  Token constTok = curTok;
+  advance(); // '__constant__'
+  Type *baseTy = parseBaseType();
+  if (!baseTy) {
+    error(curTok, "expected type after '__constant__'");
+    return false;
+  }
+  while (true) {
+    VarDecl *v = parseVarDecl(baseTy);
+    if (!v) return false;
+    v->isConstant = true;
+    tu.decls.emplace_back(v);
+    if (!consume(TokKind::comma)) break;
+  }
+  if (!expect(TokKind::semi, "';' after __constant__ declaration")) {
+    // `expect` already advanced past nothing useful; fall through.
+  }
+  (void)constTok;
+  return true;
+}
+
 ParamDecl *Parser::parseParam() {
   // optional __restrict__
   consume(TokKind::kw_restrict);
@@ -391,7 +481,7 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
 
 Type *Parser::makeVectorType(StringRef name) {
   // CUDA/HLSL-style vector names: <base><count>, count in 2..4.
-  // Recognized bases: float, int, uint, double, bool, long, ulong.
+  // Recognized bases: float, int, uint, double, bool, long, ulong, half.
   struct Base { const char *prefix; BuiltinTypeKind kind; };
   static constexpr Base bases[] = {
       {"float", BuiltinTypeKind::Float32},
@@ -401,6 +491,7 @@ Type *Parser::makeVectorType(StringRef name) {
       {"bool", BuiltinTypeKind::Bool},
       {"long", BuiltinTypeKind::Int64},
       {"ulong", BuiltinTypeKind::UInt64},
+      {"half", BuiltinTypeKind::Float16},
   };
   for (const Base &b : bases) {
     StringRef p = b.prefix;
@@ -430,6 +521,7 @@ Type *Parser::parseBaseType() {
   case TokKind::kw_long: base = new BuiltinType(BuiltinTypeKind::Int64); break;
   case TokKind::kw_float: base = new BuiltinType(BuiltinTypeKind::Float32); break;
   case TokKind::kw_double: base = new BuiltinType(BuiltinTypeKind::Float64); break;
+  case TokKind::kw_half: base = new BuiltinType(BuiltinTypeKind::Float16); break;
   case TokKind::identifier:
     // A user-named type (struct/typedef) or a vector name like float4.
     if (auto *vec = makeVectorType(curTok.text))
@@ -480,6 +572,7 @@ bool Parser::startsType(const Token &t) {
   case TokKind::kw_long:
   case TokKind::kw_float:
   case TokKind::kw_double:
+  case TokKind::kw_half:
     return true;
   case TokKind::identifier:
     // Vector names (float4, ...) and known struct/typedef names start types.

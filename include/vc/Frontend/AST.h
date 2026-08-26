@@ -55,6 +55,7 @@ enum class BuiltinTypeKind {
   UInt32,
   Int64,
   UInt64,
+  Float16,
   Float32,
   Float64,
 };
@@ -159,6 +160,7 @@ public:
     StructDecl,
     FieldDecl,
     TypedefDecl,
+    EnumDecl,
     // Statements
     CompoundStmt,
     ReturnStmt,
@@ -260,6 +262,7 @@ public:
   StringRef name;
   NodePtr init; // optional initializer expr
   bool isShared = false; // CUDA __shared__
+  bool isConstant = false; // CUDA __constant__ (device-resident read-only global)
   // Trailing array dimensions, e.g. "float a[16][8]" -> {16,8}. Empty for
   // a scalar. A runtime-sized pointer param leaves this empty.
   std::vector<int64_t> arrayDims;
@@ -295,6 +298,24 @@ public:
     for (auto *f : fields) delete f;
   }
   NodeKind getNodeType() const override { return NodeKind::StructDecl; }
+};
+
+// `enum [Name] { A, B = 5, C };` — defines integer constants. GLSL has no enum,
+// so the backend emits each constant as `const int NAME = <value>;`. Values are
+// computed at parse time (default 0, auto-increment, explicit `= const-expr`
+// resets). VC supports unscoped enums only (`enum class`'s `E::A` access needs
+// a scope operator, not yet implemented).
+class EnumDecl : public ASTNode {
+public:
+  StringRef name; // may be empty for an anonymous enum
+  struct Constant {
+    StringRef name;
+    int64_t value;
+  };
+  std::vector<Constant> constants;
+
+  EnumDecl(SourceLocation l, StringRef n) : ASTNode(l), name(n) {}
+  NodeKind getNodeType() const override { return NodeKind::EnumDecl; }
 };
 
 // `typedef <underlying> <name>;` — defines a TypedefType alias. GLSL has no

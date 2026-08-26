@@ -57,18 +57,19 @@ enum class TokKind {
 
   // Keywords
   kw_void, kw_bool, kw_int, kw_uint, kw_long, kw_ulong, kw_float, kw_double,
+  kw_half,
   kw_return, kw_if, kw_else, kw_for, kw_while, kw_do,
   kw_break, kw_continue,
   kw_switch, kw_case, kw_default,
   kw_const,
   // CUDA attributes
-  kw_global, kw_device, kw_host, kw_shared, kw_restrict,
+  kw_global, kw_device, kw_host, kw_shared, kw_restrict, kw_constant,
   // CUDA builtins recognized as keywords
   kw_syncthreads,
   kw_dim3,
   kw_wmma, // namespace marker: wmma::fragment ... (loosely)
   // Type-definition keywords
-  kw_struct, kw_typedef,
+  kw_struct, kw_typedef, kw_enum,
 };
 
 struct Token {

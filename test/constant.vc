@@ -1,0 +1,73 @@
+// test/constant.vc — single-file __constant__ demo (kernel + host + launch).
+//
+// Exercises CUDA __constant__ variables end-to-end:
+//   - `__constant__ int LUT[4] = {...}` — a compile-time-initialized lookup
+//     table, lowered to a GLSL `const int LUT[4]` global (device-resident,
+//     read-only). Indexed inside the kernel.
+//   - `__constant__ float SCALE = 0.5f;` — a scalar constant coefficient.
+//   - `__constant__ int BASE = 100;` — a scalar constant used in arithmetic.
+//
+// VC lowers __constant__ to a `const` global with a COMPILE-TIME initializer
+// only. There is no cudaMemcpyToSymbol runtime path (the host cannot mutate
+// these after compile). This covers the common case: fixed coefficients and
+// lookup tables baked into the shader.
+//
+//   vcc test/constant.vc -o build/constant_sf && ./build/constant_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// A small lookup table: powers of 2.
+__constant__ int LUT[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+// Scalar coefficients.
+__constant__ float SCALE = 0.25f;
+__constant__ int BASE = 1000;
+
+__global__ void constantKernel(int *result, int N) {
+  int tid = threadIdx.x;
+  int i = blockIdx.x * blockDim.x + tid;
+  if (i >= N) return;
+
+  // Use the LUT: each thread reads LUT[i % 8] and adds BASE.
+  int v = LUT[i % 8] + BASE;
+  // Use the scalar constant: SCALE * 1000 = 250.
+  int s = int(SCALE * 1000.0f);
+  result[i] = v + s;
+}
+
+int main() {
+  vcInit();
+
+  const int N = 32;
+  const int block = 32;
+
+  void *dR = 0;
+  vcMalloc(&dR, N * 4);
+  int zeros[32] = {0};
+  vcMemcpy(dR, zeros, N * 4, VCMemcpyKind::HostToDevice);
+
+  constantKernel<<<N, block>>>(dR, N);
+  vcDeviceSynchronize();
+
+  int hr[32];
+  vcMemcpy(hr, dR, N * 4, VCMemcpyKind::DeviceToHost);
+
+  // Expected: result[i] = LUT[i%8] + BASE + int(SCALE*1000)
+  //         = LUT[i%8] + 1000 + 250
+  //         = LUT[i%8] + 1250
+  int ok = 1;
+  int expectLUT[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+  for (int i = 0; i < N; i++) {
+    int expect = expectLUT[i % 8] + 1250;
+    if (hr[i] != expect) {
+      printf("  mismatch i=%d got=%d expect=%d\n", i, hr[i], expect);
+      ok = 0;
+    }
+  }
+
+  printf("constant: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dR);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

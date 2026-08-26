@@ -1,0 +1,98 @@
+// test/half.vc — single-file half-precision demo (kernel + host + launch).
+//
+// Exercises CUDA __half / half / halfN end-to-end:
+//   - `__half` and `half` both spell the scalar 16-bit float type, lowered to
+//     GLSL `float16_t` (GL_EXT_shader_explicit_arithmetic_types).
+//   - `half2` / `half3` / `half4` vector types -> GLSL `f16vec2/3/4`.
+//   - `half(x)` functional cast -> `float16_t(x)`.
+//   - `half2(a,b)` / `make_half2(a,b)` constructors -> `f16vec2(a,b)`.
+//   - A __device__ helper operating on half scalars (real device-function
+//     emission + call lowering).
+//
+// To avoid host/device SSBO element-size mismatch (host allocates 4-byte
+// floats; a `float16_t[]` SSBO is 2-byte elements), the kernel reads/writes a
+// `float*` SSBO but does its arithmetic in half precision internally — the
+// realistic mixed-precision pattern (load wide, compute narrow, store wide).
+//
+//   vcc test/half.vc -o build/half_sf && ./build/half_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// A device helper in half precision: fused multiply-add, h(a*b + c).
+__device__ half hfma(half a, half b, half c) {
+  return a * b + c;
+}
+
+__global__ void halfKernel(float *result, float *a, float *b, int N) {
+  int tid = threadIdx.x;
+  int i = blockIdx.x * blockDim.x + tid;
+  if (i >= N) return;
+
+  // Load two floats, convert to half, do half-precision arithmetic, store back
+  // as float. This exercises half(x) casts and half arithmetic.
+  half ha = half(a[i]);
+  half hb = half(b[i]);
+  half hc = half(1.5);
+
+  // half2 vector arithmetic: pack two adjacent lanes, add.
+  half2 va = half2(a[i], b[i]);
+  half2 vb = half2(2.0, 3.0);
+  half2 vs = va + vb;            // f16vec2 add
+  half dot = vs.x + vs.y;        // .x / .y swizzle on f16vec2 -> float16_t
+
+  // Use the device helper.
+  half r = hfma(ha, hb, hc);
+
+  // Store: half result widened back to float for the host-visible buffer.
+  result[i] = float(r) + float(dot);
+}
+
+int main() {
+  vcInit();
+
+  const int N = 32;
+  const int block = 32;
+
+  void *dA = 0, *dB = 0, *dR = 0;
+  vcMalloc(&dA, N * 4);
+  vcMalloc(&dB, N * 4);
+  vcMalloc(&dR, N * 4);
+
+  float ha[32], hb[32];
+  for (int i = 0; i < N; i++) { ha[i] = (float)(i + 1) * 0.5f; hb[i] = (float)(i + 1) * 0.25f; }
+  vcMemcpy(dA, ha, N * 4, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dB, hb, N * 4, VCMemcpyKind::HostToDevice);
+  int zeros[32] = {0};
+  vcMemcpy(dR, zeros, N * 4, VCMemcpyKind::HostToDevice);
+
+  halfKernel<<<N, block>>>(dR, dA, dB, N);
+  vcDeviceSynchronize();
+
+  float hr[32];
+  vcMemcpy(hr, dR, N * 4, VCMemcpyKind::DeviceToHost);
+
+  // Verify against a host recompute of the same half-precision expression.
+  // half is float16 (5-bit exponent, 10-bit mantissa); we approximate by
+  // computing in float and allowing tolerance for fp16 rounding. The point is
+  // the kernel ran and produced sensible values, not bit-exactness.
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    float a = ha[i], b = hb[i];
+    // r = a*b + 1.5 ; dot = (a+2) + (b+3) ; result = r + dot
+    float expect = (a * b + 1.5f) + ((a + 2.0f) + (b + 3.0f));
+    float got = hr[i];
+    if (got < expect - 0.5f || got > expect + 0.5f) {
+      printf("  mismatch i=%d got=%f expect~%f\n", i, got, expect);
+      ok = 0;
+    }
+  }
+
+  printf("half: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dA);
+  vcFree(dB);
+  vcFree(dR);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

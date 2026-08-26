@@ -47,6 +47,8 @@ private:
   bool parseFunctionOrKernel();
   bool parseStructDecl();
   bool parseTypedefDecl();
+  bool parseEnumDecl();
+  bool parseConstantDecl();
 
   // Types / decls
   Type *parseType();

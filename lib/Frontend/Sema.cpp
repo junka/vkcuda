@@ -93,11 +93,11 @@ bool Sema::isMathBuiltin(StringRef name) const {
 }
 
 // Recognize CUDA-style vector type names: <base><2..4> where base is one of
-// float/int/uint/double/bool/long/ulong. Mirrors Parser::makeVectorType so the
-// Sema pass doesn't need access to Parser internals.
+// float/int/uint/double/bool/long/ulong/half. Mirrors Parser::makeVectorType so
+// the Sema pass doesn't need access to Parser internals.
 bool Sema::isVectorCtorName(StringRef name) const {
   static const char *bases[] = {"float", "int", "uint", "double",
-                                "bool", "long", "ulong"};
+                                "bool", "long", "ulong", "half"};
   for (const char *b : bases) {
     StringRef p = b;
     if (name.size() == p.size() + 1 && name.starts_with(p)) {
@@ -402,6 +402,19 @@ void Sema::collectTopLevel() {
       typeNames[t->name] = new TypedefType(t);
       break;
     }
+    case ASTNode::NodeKind::EnumDecl: {
+      auto *e = static_cast<EnumDecl *>(d.get());
+      for (auto &c : e->constants)
+        enumConstants[c.name] = c.value;
+      break;
+    }
+    case ASTNode::NodeKind::VarDecl: {
+      // Top-level globals (__constant__ decls). Registered so DeclRefExpr can
+      // resolve them; they live outside any lexical scope.
+      auto *v = static_cast<VarDecl *>(d.get());
+      globalVars[v->name] = v;
+      break;
+    }
     default:
       break;
     }
@@ -604,6 +617,14 @@ Type *Sema::checkExpr(const ASTNode *n) {
         return builtin(BuiltinTypeKind::Int32);
       return nullptr;
     }
+    // Unscoped enum constant — an integer value.
+    auto it = enumConstants.find(d->name);
+    if (it != enumConstants.end())
+      return builtin(BuiltinTypeKind::Int32);
+    // Top-level __constant__ global.
+    auto gv = globalVars.find(d->name);
+    if (gv != globalVars.end())
+      return gv->second->type;
     if (typeNames.count(d->name)) return nullptr; // a type name used as a value?
     ASTNode *sym = lookup(d->name);
     if (!sym) {

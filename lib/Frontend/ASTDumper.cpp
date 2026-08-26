@@ -64,6 +64,14 @@ public:
       os << "Typedef " << t->name << "\n";
       break;
     }
+    case ASTNode::NodeKind::EnumDecl: {
+      const auto *e = cast<EnumDecl>(n);
+      os << "Enum " << e->name << "\n";
+      ++indent;
+      for (auto &c : e->constants) { pad(); os << c.name << " = " << c.value << "\n"; }
+      --indent;
+      break;
+    }
     case ASTNode::NodeKind::CompoundStmt: {
       os << "{\n";
       ++indent;

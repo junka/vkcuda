@@ -1,0 +1,92 @@
+// test/enum.vc — single-file enum demo (kernel + host + launch).
+//
+// Exercises unscoped enums end-to-end:
+//   - Named enum `enum OpCode { ADD, SUB, MUL, DIV = 10, MOD }` — default 0,
+//     auto-increment, and an explicit `= 10` that resets the sequence.
+//   - Anonymous enum `enum { TILE = 32, BLOCK = 64 }` — constants referenced by
+//     bare name, no type.
+//   - Enum constants used as array indices, switch-case labels, and arithmetic
+//     operands inside a __global__ kernel.
+//
+// GLSL has no enum, so the backend emits each constant as `const int NAME = val;`.
+// Sema resolves bare references to those constants so they aren't flagged as
+// undeclared identifiers.
+//
+//   vcc test/enum.vc -o build/enum_sf && ./build/enum_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+enum OpCode { ADD, SUB, MUL, DIV = 10, MOD };
+enum { TILE = 32, BLOCK = 64 };
+
+// Apply the operation encoded by `op` (an OpCode constant) to a/b.
+__device__ int applyOp(int op, int a, int b) {
+  switch (op) {
+  case ADD: return a + b;
+  case SUB: return a - b;
+  case MUL: return a * b;
+  case DIV: return a / b;
+  case MOD: return a % b;
+  default: return 0;
+  }
+}
+
+__global__ void enumKernel(int *result, int a, int b) {
+  int tid = threadIdx.x;
+  if (tid >= TILE) return;  // enum constant as a bound
+  // Each thread applies a different op, cycling through the enum values.
+  int op = tid % 5;  // 0..4 -> ADD,SUB,MUL,(?),(?) — note DIV=10,MOD=11 are gaps
+  result[tid] = applyOp(op, a, b);
+  // Thread 30+ exercises the explicit-value constants directly.
+  if (tid == 30) result[tid] = applyOp(DIV, a, b);   // a / b
+  if (tid == 31) result[tid] = applyOp(MOD, a, b);   // a % b
+  // BLOCK is an anonymous-enum constant used as an index guard.
+  if (tid == 0) result[TILE] = BLOCK;  // slot 32 = 64
+}
+
+int main() {
+  vcInit();
+
+  const int a = 20, b = 3;
+  const int slots = (TILE + 1);  // 33 slots (0..31 op results + slot 32 = BLOCK)
+
+  void *dOut = 0;
+  vcMalloc(&dOut, slots * 4);
+  int zeros[64];
+  for (int i = 0; i < slots; i++) zeros[i] = 0;
+  vcMemcpy(dOut, zeros, slots * 4, VCMemcpyKind::HostToDevice);
+
+  enumKernel<<<TILE, BLOCK>>>(dOut, a, b);
+  vcDeviceSynchronize();
+
+  int hOut[64];
+  vcMemcpy(hOut, dOut, slots * 4, VCMemcpyKind::DeviceToHost);
+
+  // Expected: tid 0..4 map to op 0..4 = ADD,SUB,MUL,?,? but op 3,4 in the
+  // enum are NOT DIV/MOD (those are 10,11). switch default returns 0 for
+  // op==3 and op==4. So:
+  //   out[0] = ADD: 20+3 = 23
+  //   out[1] = SUB: 20-3 = 17
+  //   out[2] = MUL: 20*3 = 60
+  //   out[3] = default: 0
+  //   out[4] = default: 0
+  //   out[30] = DIV: 20/3 = 6
+  //   out[31] = MOD: 20%3 = 2
+  //   out[32] = BLOCK = 64
+  int ok = 1;
+  if (hOut[0] != 23) ok = 0;
+  if (hOut[1] != 17) ok = 0;
+  if (hOut[2] != 60) ok = 0;
+  if (hOut[3] != 0) ok = 0;
+  if (hOut[4] != 0) ok = 0;
+  if (hOut[30] != 6) ok = 0;
+  if (hOut[31] != 2) ok = 0;
+  if (hOut[32] != 64) ok = 0;
+
+  printf("enum: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
+}
