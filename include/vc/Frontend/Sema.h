@@ -138,6 +138,8 @@ private:
   static bool isIntegerType(const Type *t);
   static bool isFloatType(const Type *t);
   static std::string typeName(const Type *t);
+  // Coarse byte size of a type for `sizeof` folding (no alignment padding).
+  static int64_t sizeOfType(const Type *t);
   static const char *opName(BinaryOp op);
   // Strip typedef aliases down to the underlying type for comparison and
   // arithmetic classification. A TypedefType is never directly comparable.

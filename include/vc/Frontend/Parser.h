@@ -26,6 +26,23 @@ class Parser {
   // struct/typedef decls are parsed. Sema does the full validation later.
   llvm::StringMap<Type *> typeNames;
 
+  // Set by parseBaseType when it consumes a leading `const` qualifier, so the
+  // enclosing declarator (parseVarDecl/parseParam) can record isConst on the
+  // VarDecl/ParamDecl. parseBaseType returns a bare Type* and can't carry the
+  // flag itself. Read-and-clear after building each declarator.
+  bool lastBaseWasConst = false;
+
+  // Likewise for C storage-class specifiers `static`/`extern` consumed as a
+  // leading prefix in parseBaseType. Read-and-clear after building each decl.
+  StorageClass lastBaseStorage = StorageClass::None;
+
+  // Object-like macros from `#define NAME <literal>` (minimal preprocessor).
+  // Only literal replacements (int/float) are supported; the replacement text
+  // is stored verbatim and re-parsed into an IntegerLiteral/FloatLiteral at the
+  // identifier use site in parsePrimary. Identifier-to-identifier macros are
+  // NOT supported (would need multiple passes).
+  llvm::StringMap<std::string> defines;
+
 public:
   Parser(Lexer &lex, llvm::SourceMgr &sm, TranslationUnit &unit)
       : lexer(lex), srcMgr(sm), tu(unit) {
@@ -49,6 +66,15 @@ private:
   bool parseTypedefDecl();
   bool parseEnumDecl();
   bool parseConstantDecl();
+  // File-scope `static`/`extern` variable declaration (no device qualifier).
+  bool parseGlobalVarDecl();
+
+  // Parse a `#define NAME <literal>` directive's text into `defines`.
+  void tryParseDefine(llvm::StringRef line);
+  // Build an IntegerLiteral/FloatLiteral node from a macro replacement text,
+  // or return nullptr if the text isn't a recognized literal (so identifier
+  // macros are left as DeclRefExpr rather than mis-emitted).
+  NodePtr makeLiteralFromText(llvm::StringRef text, SourceLocation loc);
 
   // Types / decls
   Type *parseType();

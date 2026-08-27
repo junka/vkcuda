@@ -1,0 +1,32 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// C storage-class specifiers `static`/`extern` are recognized by the lexer.
+// Function-local `static`/`extern` are legal in host C++ (passed through), but
+// have NO lowering in device GLSL (GLSL has no function-local static storage;
+// `__shared__` is the device persistent-storage mechanism). Sema must reject
+// them inside `__device__`/`__global__` code.
+
+// A `static` local inside a __device__ helper — must error.
+__device__ int bad_static(int n) {
+  // CHECK: error: 'static' local variable is not allowed in device code
+  static int counter = 0;
+  counter += n;
+  return counter;
+}
+
+// An `extern` local inside a __global__ kernel — must error.
+__global__ void bad_extern(int *out) {
+  // CHECK: error: 'extern' local variable is not allowed in device code
+  extern int shared_state;
+  out[0] = shared_state;
+}
+
+// A `static` local in HOST code is fine — Sema does not check host functions
+// for storage-class legality (they lower to C++). No error expected here.
+// CHECK-NOT: error: 'static' local variable
+static int host_counter = 0;
+
+int main() {
+  host_counter += 1;
+  return 0;
+}

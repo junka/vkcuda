@@ -1,0 +1,67 @@
+// test/bool.vc — single-file `true`/`false` literal demo (kernel + host + launch).
+//
+// Exercises CUDA/C boolean literals end-to-end:
+//   - `bool flag = true;` / `bool off = false;` — local bool vars initialized
+//     from the `true`/`false` keywords (lowered to GLSL `true`/`false`).
+//   - `if (cond) ...` where cond is a bool variable.
+//   - bool used as a selection/mask value folded into int arithmetic.
+//
+// Before this feature `true`/`false` lexed as identifiers and Sema flagged
+// them as undeclared. Now they are BoolLiteral nodes.
+//
+//   vcc test/bool.vc -o build/bool_sf && ./build/bool_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void boolKernel(int *result, int N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+
+  bool even = (i % 2 == 0);    // true for even indices
+  bool isOn = true;            // literal true
+  bool skip = false;           // literal false
+
+  if (skip) {
+    result[i] = -1;
+    return;
+  }
+
+  // even && isOn => mask 1; odd => 0. Multiply by 100 to make it visible.
+  int mask = (even && isOn) ? 100 : 0;
+  result[i] = i + mask;
+}
+
+int main() {
+  vcInit();
+
+  const int N = 32;
+  const int block = 32;
+
+  void *dR = 0;
+  vcMalloc(&dR, N * 4);
+  int zeros[32] = {0};
+  vcMemcpy(dR, zeros, N * 4, VCMemcpyKind::HostToDevice);
+
+  boolKernel<<<N, block>>>(dR, N);
+  vcDeviceSynchronize();
+
+  int hr[32];
+  vcMemcpy(hr, dR, N * 4, VCMemcpyKind::DeviceToHost);
+
+  // Expected: even i => i + 100; odd i => i.
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    int expect = (i % 2 == 0) ? i + 100 : i;
+    if (hr[i] != expect) {
+      printf("  mismatch i=%d got=%d expect=%d\n", i, hr[i], expect);
+      ok = 0;
+    }
+  }
+
+  printf("bool: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dR);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

@@ -1,0 +1,63 @@
+// test/define.vc — single-file `#define` constant-macro demo (kernel + host).
+//
+// Exercises the minimal preprocessor: object-like macros `#define NAME <lit>`
+// are substituted at use sites in device code, replaced by their literal value.
+//   - `#define N 16`        — integer macro used as array size + loop bound.
+//   - `#define TILE 4`      — integer macro used in arithmetic.
+//   - `#define SCALE 2.5f`  — float macro used as a coefficient.
+//   - `#define HEX 0x10`    — hex integer macro (== 16).
+//
+// The host C++ backend also sees the `#define` lines (passed through verbatim),
+// so host code can use the same names. Device code gets the literal substitution.
+//
+//   vcc test/define.vc -o build/define_sf && ./build/define_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+#define N 16
+#define TILE 4
+#define SCALE 2.5f
+#define HEX 0x10
+
+__global__ void defineKernel(int *out) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+
+  // TILE * SCALE = 4 * 2.5 = 10 (as int). HEX == 16. So base = 10 + 16 = 26.
+  int base = int(TILE * SCALE) + HEX;
+  out[i] = i + base;  // i + 26
+}
+
+int main() {
+  vcInit();
+
+  const int block = 32;
+
+  void *dOut = 0;
+  vcMalloc(&dOut, N * 4);
+  int zeros[N] = {0};
+  vcMemcpy(dOut, zeros, N * 4, VCMemcpyKind::HostToDevice);
+
+  defineKernel<<<N, block>>>(dOut);
+  vcDeviceSynchronize();
+
+  int hr[N];
+  vcMemcpy(hr, dOut, N * 4, VCMemcpyKind::DeviceToHost);
+
+  // Expected: i + 26 for i in [0, N).
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    int expect = i + 26;
+    if (hr[i] != expect) {
+      printf("  mismatch i=%d got=%d expect=%d\n", i, hr[i], expect);
+      ok = 0;
+    }
+  }
+
+  printf("define: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

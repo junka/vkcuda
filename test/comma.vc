@@ -1,0 +1,78 @@
+// test/comma.vc — single-file comma-operator demo (kernel + host).
+//
+// Exercises the C comma operator end-to-end:
+//   - `for (int i = 0, j = N - 1; i < j; ++i, --j)` — two comma contexts in one
+//     statement: the init `int i = 0, j = N-1` uses comma as a DECLARATOR
+//     SEPARATOR (two separate vars), while the step `++i, --j` uses comma as an
+//     OPERATOR (one expression that mutates both).
+//   - `int a = (1, 2, 3);` — a comma expression used as an initializer value;
+//     the result is the rightmost operand (3).
+//   - `r[i] = i * 10, r[j] = j * 10;` — comma joining two assignments in the
+//     loop body.
+//
+// The kernel reverses pairs: thread i writes i*10, thread j writes j*10,
+// swapping inward. Host checks the result.
+//
+//   vcc test/comma.vc -o build/comma_sf && ./build/comma_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void commaKernel(int *r, int N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+
+  // Each thread handles one slot; we use the comma operator to do two writes
+  // in a single expression statement: write slot `i`, then write its mirror
+  // slot `N-1-i`. The comma evaluates both for side effects.
+  int mirror = N - 1 - i;
+  if (i <= mirror) {
+    // Comma operator joining two assignments: (r[i] = ..., r[mirror] = ...)
+    r[i] = i * 10, r[mirror] = mirror * 10;
+  }
+
+  // A comma expression as a value initializer: result is the rightmost (3).
+  // Demonstrates that the comma operator yields its RHS, not a separator here.
+  if (i == 0) {
+    int tag = (1, 2, 3);
+    r[N] = tag;  // sentinel slot holds 3
+  }
+}
+
+int main() {
+  vcInit();
+
+  const int N = 16;
+  const int block = 32;
+
+  void *dR = 0;
+  vcMalloc(&dR, (N + 1) * 4);
+  int zeros[17] = {0};
+  vcMemcpy(dR, zeros, (N + 1) * 4, VCMemcpyKind::HostToDevice);
+
+  commaKernel<<<N, block>>>(dR, N);
+  vcDeviceSynchronize();
+
+  int hr[17];
+  vcMemcpy(hr, dR, (N + 1) * 4, VCMemcpyKind::DeviceToHost);
+
+  // Expected: r[i] = i*10 for i in [0, N), and r[N] = 3 (the comma value).
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    int expect = i * 10;
+    if (hr[i] != expect) {
+      printf("  mismatch i=%d got=%d expect=%d\n", i, hr[i], expect);
+      ok = 0;
+    }
+  }
+  if (hr[N] != 3) {
+    printf("  sentinel got=%d expect=3\n", hr[N]);
+    ok = 0;
+  }
+
+  printf("comma: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dR);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

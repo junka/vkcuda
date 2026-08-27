@@ -1,0 +1,79 @@
+// test/default_arg.vc — single-file default-argument demo (kernel + host).
+//
+// Exercises C++-style default arguments end-to-end:
+//   - `__device__ int add(int a, int b = 10)` — a device helper whose second
+//     parameter has a default. Calling `add(x)` completes it to `add(x, 10)`;
+//     calling `add(x, y)` passes y explicitly.
+//   - `__device__ int clamplo(int v, int lo = 0, int hi = 100)` — two trailing
+//     defaults; `clamplo(v)` uses both, `clamplo(v, 5)` overrides only `lo`.
+//
+// The call sites are completed by the backends: when a call omits trailing
+// defaulted parameters, the emitted GLSL/C++ appends the default-argument
+// expressions from the callee signature. The function DEFINITION omits the
+// `= val` (defaults belong on declarations, not definitions, in both GLSL and
+// C++).
+//
+//   vcc test/default_arg.vc -o build/default_arg_sf && ./build/default_arg_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// One trailing default.
+__device__ int add(int a, int b = 10) {
+  return a + b;
+}
+
+// Two trailing defaults (right-to-left contiguous, as required).
+__device__ int clamplo(int v, int lo = 0, int hi = 100) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+__global__ void defaultArgKernel(int *out, int N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+
+  int v = i * 50;              // 0, 50, 100, 150, 200, ...
+  // add(v)        -> add(v, 10)  (default b)
+  // clamplo(v)    -> clamplo(v, 0, 100)  (both defaults)
+  // clamplo(v, 5) -> clamplo(v, 5, 100)  (override lo only)
+  out[i] = add(clamplo(v, 5));
+}
+
+int main() {
+  vcInit();
+
+  const int N = 8;
+  const int block = 32;
+
+  void *dOut = 0;
+  vcMalloc(&dOut, N * 4);
+  int zeros[8] = {0};
+  vcMemcpy(dOut, zeros, N * 4, VCMemcpyKind::HostToDevice);
+
+  defaultArgKernel<<<N, block>>>(dOut, N);
+  vcDeviceSynchronize();
+
+  int hr[8];
+  vcMemcpy(hr, dOut, N * 4, VCMemcpyKind::DeviceToHost);
+
+  // v = i*50; clamped to [5, 100]; then +10 (default b).
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    int v = i * 50;
+    if (v < 5) v = 5;
+    if (v > 100) v = 100;
+    int expect = v + 10;
+    if (hr[i] != expect) {
+      printf("  mismatch i=%d got=%d expect=%d\n", i, hr[i], expect);
+      ok = 0;
+    }
+  }
+
+  printf("default_arg: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

@@ -1,0 +1,74 @@
+// test/const_local.vc — single-file `const` qualifier demo (kernel + host).
+//
+// Exercises the C `const` qualifier on locals and parameters end-to-end:
+//   - `const int TILE = 8;` — a compile-time constant local, lowered to GLSL
+//     `const int TILE = 8;` and C++ `const int TILE = 8;`.
+//   - `const float scale = 0.5f;` — a const used in arithmetic.
+//   - `__device__ int clampit(const int v, int lo, int hi)` — a const param
+//     (the helper promises not to mutate `v`).
+//
+// Sema rejects writes to const variables (`TILE = 5;` would error). The demo
+// itself only reads consts.
+//
+//   vcc test/const_local.vc -o build/const_local_sf && ./build/const_local_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// A device helper with a const parameter (promise not to mutate v).
+__device__ int clampit(const int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+__global__ void constKernel(int *result, int N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+
+  const int TILE = 8;          // compile-time constant
+  const float scale = 0.5f;    // const coefficient
+  const int bound = 20;        // clamp upper bound
+
+  // TILE * scale = 4 (as int). Add to thread index.
+  int base = int(TILE * scale);   // 4
+  int val = i + base;
+  // Clamp to [0, bound] via the const-param helper.
+  result[i] = clampit(val, 0, bound);
+}
+
+int main() {
+  vcInit();
+
+  const int N = 32;
+  const int block = 32;
+
+  void *dR = 0;
+  vcMalloc(&dR, N * 4);
+  int zeros[32] = {0};
+  vcMemcpy(dR, zeros, N * 4, VCMemcpyKind::HostToDevice);
+
+  constKernel<<<N, block>>>(dR, N);
+  vcDeviceSynchronize();
+
+  int hr[32];
+  vcMemcpy(hr, dR, N * 4, VCMemcpyKind::DeviceToHost);
+
+  // Expected: clampit(i + 4, 0, 20) => min(max(i+4, 0), 20).
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    int expect = i + 4;
+    if (expect < 0) expect = 0;
+    if (expect > 20) expect = 20;
+    if (hr[i] != expect) {
+      printf("  mismatch i=%d got=%d expect=%d\n", i, hr[i], expect);
+      ok = 0;
+    }
+  }
+
+  printf("const_local: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dR);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

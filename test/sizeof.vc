@@ -1,0 +1,78 @@
+// test/sizeof.vc — single-file `sizeof` demo (kernel + host + launch).
+//
+// Exercises the sizeof operator end-to-end:
+//   - `sizeof(int)` / `sizeof(float)` / `sizeof(double)` / `sizeof(half)` —
+//     type form, folded to byte counts on the device side (GLSL has no sizeof).
+//   - `sizeof(float4)` — vector = elem*count = 16.
+//   - `sizeof(arr)` where arr is `float[8]` — expr form over an array var;
+//     folded to 8*4 = 32.
+//   - On the host side, sizeof is emitted verbatim (C++ computes it).
+//
+//   vcc test/sizeof.vc -o build/sizeof_sf && ./build/sizeof_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+struct Point {
+  float x;
+  float y;
+};
+
+__global__ void sizeofKernel(int *result, int N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+
+  float arr[8];
+  int sz_int = sizeof(int);        // 4
+  int sz_float = sizeof(float);    // 4
+  int sz_double = sizeof(double);  // 8
+  int sz_half = sizeof(half);      // 2
+  int sz_vec = sizeof(float4);     // 16
+  int sz_arr = sizeof(arr);        // 32 (8 * 4)
+  int sz_point = sizeof(Point);    // 8 (4 + 4, no padding in our fold)
+
+  switch (i) {
+  case 0: result[i] = sz_int; break;
+  case 1: result[i] = sz_float; break;
+  case 2: result[i] = sz_double; break;
+  case 3: result[i] = sz_half; break;
+  case 4: result[i] = sz_vec; break;
+  case 5: result[i] = sz_arr; break;
+  case 6: result[i] = sz_point; break;
+  default: result[i] = 0; break;
+  }
+}
+
+int main() {
+  vcInit();
+
+  const int N = 8;
+  const int block = 8;
+
+  void *dR = 0;
+  vcMalloc(&dR, N * 4);
+  int zeros[8] = {0};
+  vcMemcpy(dR, zeros, N * 4, VCMemcpyKind::HostToDevice);
+
+  sizeofKernel<<<N, block>>>(dR, N);
+  vcDeviceSynchronize();
+
+  int hr[8];
+  vcMemcpy(hr, dR, N * 4, VCMemcpyKind::DeviceToHost);
+
+  // Expected byte counts (device-side fold).
+  int expect[8] = {4, 4, 8, 2, 16, 32, 8, 0};
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    if (hr[i] != expect[i]) {
+      printf("  mismatch i=%d got=%d expect=%d\n", i, hr[i], expect[i]);
+      ok = 0;
+    }
+  }
+
+  printf("sizeof: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dR);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

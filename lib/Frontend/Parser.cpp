@@ -77,6 +77,10 @@ bool Parser::parseTopLevelDecl() {
     // Preprocessor directive (`#include ...`, `#define ...`): store verbatim
     // for the host C++ backend to emit at the top of the generated .cpp.
     tu.hostPpLines.push_back(std::string(curTok.text));
+    // Minimal preprocessor: capture object-like macros `#define NAME <literal>`
+    // so device code can use the name as a constant. Only literal replacements
+    // are supported (int/float); function-like macros, #ifdef, #undef are not.
+    tryParseDefine(curTok.text);
     advance();
     return true;
   }
@@ -88,6 +92,13 @@ bool Parser::parseTopLevelDecl() {
     return parseEnumDecl();
   if (curTok.is(TokKind::kw_constant))
     return parseConstantDecl();
+  // File-scope storage-class-qualified variable declarations: `static int x;`
+  // / `extern int g;`. These are not functions (no `(` after the declarator),
+  // and parseFunctionOrKernel would choke on the trailing `=`/`;`. Route them
+  // to a dedicated path. The host backend emits them as C++ globals; the GLSL
+  // backend strips the storage class (no file-scope `static` in device code).
+  if (curTok.is(TokKind::kw_static) || curTok.is(TokKind::kw_extern))
+    return parseGlobalVarDecl();
   return parseFunctionOrKernel();
 }
 
@@ -113,6 +124,13 @@ bool Parser::parseFunctionOrKernel() {
     error(curTok, "expected return type");
     return false;
   }
+  // parseBaseType may have consumed a leading `static`/`extern` before the
+  // return type (e.g. `static int helper()`). Record it on the FunctionDecl so
+  // the host C++ backend can emit it; the GLSL backend strips it. (Note:
+  // `static __device__` requires the storage class AFTER the device attr, which
+  // parseBaseType won't reach — that ordering is intentionally unsupported.)
+  StorageClass fnStorage = lastBaseStorage;
+  lastBaseStorage = StorageClass::None;
   if (!curTok.is(TokKind::identifier)) {
     error(curTok, "expected function name");
     return false;
@@ -124,6 +142,7 @@ bool Parser::parseFunctionOrKernel() {
   fn->returnType = retTy;
   fn->name = nameTok.text;
   fn->deviceAttr = dattr;
+  fn->storageClass = fnStorage;
 
   if (!expect(TokKind::l_paren, "'('"))
     return false;
@@ -299,7 +318,9 @@ bool Parser::parseEnumDecl() {
     advance();
     int64_t value = nextValue;
     if (consume(TokKind::assign)) {
-      NodePtr init = parseExpression();
+      // parseAssignment: a following comma separates enum constants, it is not
+      // the comma operator.
+      NodePtr init = parseAssignment();
       if (!init || !evalConstInt(init.get(), value)) {
         error(constTok,
               "enum initializer must be a compile-time integer constant");
@@ -348,6 +369,123 @@ bool Parser::parseConstantDecl() {
   return true;
 }
 
+// `static int g = 5;` / `extern int g;` at file scope. Parsed as top-level
+// VarDecls carrying storageClass (Static/Extern). Multiple declarators share
+// one storage class: `static int a = 1, b = 2;`. The host backend emits these
+// as C++ globals (verbatim storage class); the GLSL backend ignores file-scope
+// non-__constant__ VarDecls (device code doesn't see host storage classes).
+bool Parser::parseGlobalVarDecl() {
+  // parseBaseType consumes the leading static/extern and sets lastBaseStorage.
+  Type *baseTy = parseBaseType();
+  if (!baseTy) {
+    error(curTok, "expected type after storage-class specifier");
+    return false;
+  }
+  while (true) {
+    VarDecl *v = parseVarDecl(baseTy);
+    if (!v) return false;
+    tu.decls.emplace_back(v);
+    if (!consume(TokKind::comma)) break;
+  }
+  if (!expect(TokKind::semi, "';' after declaration")) {
+    // expect already reported; fall through.
+  }
+  return true;
+}
+
+// Parse `#define NAME <literal>` from a verbatim hash_line text. Only object-like
+// macros with a single literal replacement are captured; anything else (no
+// replacement, multiple tokens, function-like `#define F(x)`, identifier macro)
+// is left for the host C++ backend to handle via hostPpLines (device code won't
+// see the name, matching VC's no-symbol-table behavior for unknown identifiers).
+void Parser::tryParseDefine(StringRef line) {
+  // Strip leading whitespace, then expect `#define`.
+  line = line.ltrim();
+  if (!line.consume_front("#define")) return;
+  line = line.ltrim();
+  // NAME: identifier characters.
+  size_t nameEnd = 0;
+  while (nameEnd < line.size() &&
+         (isalnum((unsigned char)line[nameEnd]) || line[nameEnd] == '_'))
+    ++nameEnd;
+  if (nameEnd == 0) return;
+  StringRef name = line.substr(0, nameEnd);
+  // Function-like macro: `NAME(` — not supported.
+  if (nameEnd < line.size() && line[nameEnd] == '(') return;
+  StringRef rest = line.substr(nameEnd).trim();
+  if (rest.empty()) return;
+  // Single-token replacement only: no embedded whitespace.
+  size_t rEnd = 0;
+  while (rEnd < rest.size() && !isspace((unsigned char)rest[rEnd])) ++rEnd;
+  if (rEnd < rest.size()) return; // more than one token — skip
+  StringRef repl = rest.substr(0, rEnd);
+  // Only store if the replacement parses as a literal; otherwise leave it.
+  if (!makeLiteralFromText(repl, SourceLocation{})) return;
+  defines[name] = std::string(repl);
+}
+
+// Build an IntegerLiteral/FloatLiteral from a macro replacement string, or
+// return nullptr if it isn't a recognized literal form.
+NodePtr Parser::makeLiteralFromText(StringRef text, SourceLocation loc) {
+  if (text.empty()) return nullptr;
+  // Integer? (optional 0x hex, optional u/U/l/L suffix, digits only otherwise)
+  bool looksInt = false;
+  {
+    StringRef t = text;
+    if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) {
+      StringRef hex = t.substr(2);
+      while (!hex.empty() && (hex.back() == 'u' || hex.back() == 'U' ||
+                              hex.back() == 'l' || hex.back() == 'L'))
+        hex = hex.drop_back();
+      if (!hex.empty() &&
+          hex.find_first_not_of("0123456789abcdefABCDEF") == StringRef::npos)
+        looksInt = true;
+    } else {
+      StringRef d = t;
+      while (!d.empty() && (d.back() == 'u' || d.back() == 'U' ||
+                            d.back() == 'l' || d.back() == 'L'))
+        d = d.drop_back();
+      if (!d.empty() && d.find_first_not_of("0123456789") == StringRef::npos)
+        looksInt = true;
+    }
+  }
+  if (looksInt) {
+    int64_t v = 0;
+    StringRef txt = text;
+    if (txt.size() > 2 && txt[0] == '0' && (txt[1] == 'x' || txt[1] == 'X')) {
+      StringRef hex = txt.substr(2);
+      while (!hex.empty() && (hex.back() == 'u' || hex.back() == 'U' ||
+                              hex.back() == 'l' || hex.back() == 'L'))
+        hex = hex.drop_back();
+      hex.getAsInteger(16, v);
+    } else {
+      while (!txt.empty() && (txt.back() == 'u' || txt.back() == 'U' ||
+                              txt.back() == 'l' || txt.back() == 'L'))
+        txt = txt.drop_back();
+      txt.getAsInteger(10, v);
+    }
+    return NodePtr(new IntegerLiteral(loc, v));
+  }
+  // Float? (contains '.' or an exponent, optional f/F suffix)
+  bool looksFloat = false;
+  {
+    StringRef t = text;
+    if (t.ends_with("f") || t.ends_with("F")) t = t.drop_back();
+    if (!t.empty() &&
+        (t.contains('.') || t.contains('e') || t.contains('E')) &&
+        t.find_first_not_of("0123456789.eE+-") == StringRef::npos)
+      looksFloat = true;
+  }
+  if (looksFloat) {
+    double v = 0;
+    StringRef txt = text;
+    if (txt.ends_with("f") || txt.ends_with("F")) txt = txt.drop_back();
+    txt.getAsDouble(v);
+    return NodePtr(new FloatLiteral(loc, v));
+  }
+  return nullptr;
+}
+
 ParamDecl *Parser::parseParam() {
   // optional __restrict__
   consume(TokKind::kw_restrict);
@@ -359,7 +497,16 @@ ParamDecl *Parser::parseParam() {
   if (!expect(TokKind::identifier, "parameter name"))
     return nullptr;
   // expect() already consumed the identifier; do not advance again.
-  return new ParamDecl(toSourceLoc(nameTok), ty, nameTok.text);
+  auto *p = new ParamDecl(toSourceLoc(nameTok), ty, nameTok.text);
+  p->isConst = lastBaseWasConst;
+  lastBaseWasConst = false;
+  lastBaseStorage = StorageClass::None; // params can't carry a storage class
+  // Optional default argument: `int b = 10`. Use parseAssignment (a comma here
+  // would be the param-list separator, not the comma operator).
+  if (consume(TokKind::assign)) {
+    p->defaultVal = parseAssignment();
+  }
+  return p;
 }
 
 // Best-effort compile-time integer evaluation: folds IntegerLiteral and
@@ -419,6 +566,12 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
     return nullptr;
   // expect() already consumed the identifier.
   auto *v = new VarDecl(toSourceLoc(nameTok), declTy, nameTok.text);
+  v->isConst = lastBaseWasConst;
+  v->storageClass = lastBaseStorage;
+  // NOTE: lastBaseWasConst/lastBaseStorage are NOT cleared here — a
+  // multi-declarator statement (`const int a, b;` / `static int a, b;`) shares
+  // one base type, and every declarator should inherit the qualifier.
+  // parseBaseType resets them at the start of the next type.
   // Trailing array dimensions: "name[16][8]" or "name[32 * 32]". Each is
   // constant-folded to a concrete size; a non-constant dim falls back to 0.
   while (curTok.is(TokKind::l_square)) {
@@ -450,7 +603,8 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
             auto *il2 = new InitListExpr(toSourceLoc(lb2));
             if (!curTok.is(TokKind::r_brace)) {
               while (true) {
-                auto e = parseExpression();
+                // parseAssignment, not parseExpression: comma is the separator.
+                auto e = parseAssignment();
                 if (e) il2->elements.push_back(std::move(e));
                 if (consume(TokKind::comma)) continue;
                 break;
@@ -459,7 +613,7 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
             expect(TokKind::r_brace, "'}'");
             il->elements.push_back(NodePtr(il2));
           } else {
-            auto e = parseExpression();
+            auto e = parseAssignment();
             if (e) il->elements.push_back(std::move(e));
           }
           if (consume(TokKind::comma)) continue;
@@ -469,7 +623,9 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
       expect(TokKind::r_brace, "'}'");
       v->init = NodePtr(il);
     } else {
-      v->init = parseExpression();
+      // parseAssignment: a following comma separates declarators (`int a=1, b;`),
+      // it is not the comma operator.
+      v->init = parseAssignment();
     }
   }
   return v;
@@ -507,11 +663,24 @@ Type *Parser::makeVectorType(StringRef name) {
 }
 
 Type *Parser::parseBaseType() {
-  // Discard leading qualifiers (`const`) — VC's type system doesn't track
-  // cv-qualifiers; the GLSL/host backends don't need them. Multiple `const`
-  // and `__restrict__` tokens are tolerated.
-  while (curTok.is(TokKind::kw_const) || curTok.is(TokKind::kw_restrict))
-    advance();
+  // Leading qualifiers (`const`, `__restrict__`, `static`, `extern`). VC's
+  // type system doesn't model cv-qualifiers as part of the Type, but `const`
+  // is recorded via lastBaseWasConst and storage classes via lastBaseStorage so
+  // the declarator can mark VarDecl/ParamDecl (used by Sema to reject unsafe
+  // device-local static, and by the backends to emit/passthrough).
+  lastBaseWasConst = false;
+  lastBaseStorage = StorageClass::None;
+  while (true) {
+    if (curTok.is(TokKind::kw_const)) { lastBaseWasConst = true; advance(); continue; }
+    if (curTok.is(TokKind::kw_restrict)) { advance(); continue; }
+    if (curTok.is(TokKind::kw_static)) {
+      lastBaseStorage = StorageClass::Static; advance(); continue;
+    }
+    if (curTok.is(TokKind::kw_extern)) {
+      lastBaseStorage = StorageClass::Extern; advance(); continue;
+    }
+    break;
+  }
   Type *base = nullptr;
   switch (curTok.kind) {
   case TokKind::kw_void: base = new BuiltinType(BuiltinTypeKind::Void); break;
@@ -564,6 +733,11 @@ bool Parser::startsType(const Token &t) {
   switch (t.kind) {
   case TokKind::kw_const:
     // `const` qualifies a following type; peek through it.
+    return true;
+  case TokKind::kw_static:
+  case TokKind::kw_extern:
+    // Storage-class specifiers prefix a type (`static int x;`, `extern int g;`).
+    // They start a declaration, not an expression.
     return true;
   case TokKind::kw_void:
   case TokKind::kw_bool:
@@ -800,7 +974,24 @@ NodePtr Parser::parseDeclOrExprStmt() {
 // Expressions
 //===----------------------------------------------------------------------===//
 
-NodePtr Parser::parseExpression() { return parseAssignment(); }
+NodePtr Parser::parseExpression() {
+  // Top of the expression grammar: the comma operator. `a, b` evaluates a for
+  // its side effects and yields b. This is LOWER than assignment, so the
+  // operands here are assignment-expressions (right-assoc chains like
+  // `a = b = c` bind tighter than the comma). Element contexts that use comma
+  // as a SEPARATOR (call args, init lists, var-decl lists) call parseAssignment
+  // directly so `f(a, b)` stays two arguments, not one CommaExpr.
+  auto lhs = parseAssignment();
+  if (!lhs) return nullptr;
+  while (curTok.is(TokKind::comma)) {
+    Token op = curTok;
+    advance();
+    auto rhs = parseAssignment();
+    if (!rhs) break;
+    lhs = NodePtr(new CommaExpr(toSourceLoc(op), std::move(lhs), std::move(rhs)));
+  }
+  return lhs;
+}
 
 NodePtr Parser::parseAssignment() {
   auto lhs = parseConditional();
@@ -994,6 +1185,48 @@ NodePtr Parser::parseMultiplicative() {
 }
 
 NodePtr Parser::parseUnary() {
+  // sizeof: `sizeof(T)` (type form) or `sizeof expr` / `sizeof(expr)` (expr
+  // form). The type form is recognized by `(` followed by a type; otherwise the
+  // operand is a unary expression (which itself handles a parenthesized expr).
+  if (curTok.is(TokKind::kw_sizeof)) {
+    Token tok = curTok;
+    advance(); // 'sizeof'
+    // `sizeof ( type )` vs `sizeof ( expr )`. Disambiguate by peeking past '(':
+    // only treat as the type form when the token after '(' is a real type
+    // keyword or a known struct/typedef/vector name — NOT a bare unknown
+    // identifier (which `startsType` would otherwise over-accept, turning
+    // `sizeof(arr)` for a variable `arr` into a bogus type form).
+    if (curTok.is(TokKind::l_paren)) {
+      const Token &inner = lexer.peek();
+      bool isTypeForm = false;
+      switch (inner.kind) {
+      case TokKind::kw_void: case TokKind::kw_bool: case TokKind::kw_int:
+      case TokKind::kw_uint: case TokKind::kw_long: case TokKind::kw_float:
+      case TokKind::kw_double: case TokKind::kw_half:
+        isTypeForm = true;
+        break;
+      case TokKind::identifier:
+        if (makeVectorType(inner.text) || typeNames.count(inner.text) > 0)
+          isTypeForm = true;
+        break;
+      default: break;
+      }
+      if (isTypeForm) {
+        advance(); // '('
+        Type *ty = parseType();
+        expect(TokKind::r_paren, "')' after sizeof type");
+        return NodePtr(new SizeOfExpr(toSourceLoc(tok), ty, nullptr, true));
+      }
+    }
+    // Expr form: `sizeof expr` or `sizeof(expr)`. parseUnary handles a
+    // parenthesized expression via parsePrimary.
+    NodePtr sub = parseUnary();
+    if (!sub) {
+      error(tok, "sizeof requires a type or expression operand");
+      return nullptr;
+    }
+    return NodePtr(new SizeOfExpr(toSourceLoc(tok), nullptr, std::move(sub), false));
+  }
   // C-style cast: ( type ) expr. Disambiguate from a parenthesized expression
   // by speculatively parsing a type between '(' and ')'; if the token after
   // ')' starts an expression, it's a cast, otherwise roll back and treat the
@@ -1111,7 +1344,9 @@ NodePtr Parser::parsePostfix() {
       auto *call = new CallExpr(toSourceLoc(lp), std::move(base));
       if (!curTok.is(TokKind::r_paren)) {
         while (true) {
-          auto a = parseExpression();
+          // Use parseAssignment, NOT parseExpression: a comma here is the arg
+          // separator, not the comma operator (`f(a, b)` = two args).
+          auto a = parseAssignment();
           if (a) call->args.push_back(std::move(a));
           if (consume(TokKind::comma)) continue;
           break;
@@ -1144,17 +1379,19 @@ NodePtr Parser::tryParseLaunch(NodePtr &callee) {
   Token openLt = curTok;
   advance(); // '<<'
   advance(); // '<'
-  auto grid = parseExpression();
+  // parseAssignment: commas here separate the launch config fields (grid, block,
+  // shmem, stream), they are not comma operators.
+  auto grid = parseAssignment();
   expect(TokKind::comma, "','");
-  auto block = parseExpression();
+  auto block = parseAssignment();
   // Optional extra launch arguments: <<<g, b, sharedMem, stream>>>. The 3rd
   // (dynamic shared memory) is unused by the VC runtime and dropped; the 4th
   // (stream handle) is captured so the host backend can emit vcLaunchKernelS.
   NodePtr stream;
   if (consume(TokKind::comma)) {
-    parseExpression(); // shared-mem size — ignored
+    parseAssignment(); // shared-mem size — ignored
     if (consume(TokKind::comma))
-      stream = parseExpression(); // stream handle
+      stream = parseAssignment(); // stream handle
   }
   expect(TokKind::launch_close, "'>>>'");
   expect(TokKind::l_paren, "'(' after >>>");
@@ -1180,7 +1417,8 @@ NodePtr Parser::tryParseLaunch(NodePtr &callee) {
                                 std::move(gy), std::move(by), std::move(stream));
   if (!curTok.is(TokKind::r_paren)) {
     while (true) {
-      auto a = parseExpression();
+      // parseAssignment: comma is the launch-arg separator, not the operator.
+      auto a = parseAssignment();
       if (a) launch->args.push_back(std::move(a));
       if (consume(TokKind::comma)) continue;
       break;
@@ -1227,11 +1465,28 @@ NodePtr Parser::parsePrimary() {
   }
   case TokKind::identifier:
     advance();
+    // Object-like macro substitution: if this identifier is a `#define`d
+    // constant, emit the literal replacement instead of a DeclRefExpr. Only
+    // literal replacements are stored (see tryParseDefine), so this never
+    // produces a DeclRefExpr for a macro name.
+    {
+      auto it = defines.find(t.text);
+      if (it != defines.end()) {
+        NodePtr lit = makeLiteralFromText(it->second, toSourceLoc(t));
+        if (lit) return lit;
+      }
+    }
     return NodePtr(new DeclRefExpr(toSourceLoc(t), t.text));
   case TokKind::kw_syncthreads:
     advance();
     // represent as a call to a builtin named __syncthreads
     return NodePtr(new DeclRefExpr(toSourceLoc(t), "__syncthreads"));
+  case TokKind::kw_true:
+    advance();
+    return NodePtr(new BoolLiteral(toSourceLoc(t), true));
+  case TokKind::kw_false:
+    advance();
+    return NodePtr(new BoolLiteral(toSourceLoc(t), false));
   case TokKind::l_paren: {
     advance();
     auto e = parseExpression();

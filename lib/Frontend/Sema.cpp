@@ -191,6 +191,7 @@ std::string Sema::typeName(const Type *t) {
     case BuiltinTypeKind::UInt64:  return "ulong";
     case BuiltinTypeKind::Float32: return "float";
     case BuiltinTypeKind::Float64: return "double";
+    case BuiltinTypeKind::Float16: return "half";
     }
     return "<builtin>";
   case TypeKind::Pointer:
@@ -206,6 +207,49 @@ std::string Sema::typeName(const Type *t) {
     return static_cast<const TypedefType *>(t)->decl->name.str();
   }
   return "<unknown>";
+}
+
+// Coarse byte-size of a type for `sizeof` folding. Scalars follow the usual
+// widths (half=2, int/float=4, long/double/pointer=8, bool=1). Vectors are
+// elem*count. Records sum field sizes WITHOUT alignment padding (not ABI-exact
+// — sufficient for kernel buffer sizing). Unknown/void => 0.
+int64_t Sema::sizeOfType(const Type *t) {
+  if (!t) return 0;
+  switch (t->getKind()) {
+  case TypeKind::Builtin:
+    switch (static_cast<const BuiltinType *>(t)->builtin) {
+    case BuiltinTypeKind::Void:    return 0;
+    case BuiltinTypeKind::Bool:    return 1;
+    case BuiltinTypeKind::Float16: return 2;
+    case BuiltinTypeKind::Int32:
+    case BuiltinTypeKind::UInt32:
+    case BuiltinTypeKind::Float32: return 4;
+    case BuiltinTypeKind::Int64:
+    case BuiltinTypeKind::UInt64:
+    case BuiltinTypeKind::Float64: return 8;
+    }
+    return 0;
+  case TypeKind::Pointer:
+  case TypeKind::Reference:
+    return 8;
+  case TypeKind::Vector: {
+    const auto *v = static_cast<const VectorType *>(t);
+    return sizeOfType(resolveTypedefs(v->elem)) * v->count;
+  }
+  case TypeKind::Record: {
+    int64_t sz = 0;
+    for (const FieldDecl *f :
+         static_cast<const RecordType *>(t)->decl->fields) {
+      int64_t fsz = sizeOfType(resolveTypedefs(f->type));
+      for (int64_t dim : f->arrayDims) fsz *= dim > 0 ? dim : 1;
+      sz += fsz;
+    }
+    return sz;
+  }
+  case TypeKind::Typedef:
+    return 0; // resolveTypedefs should have stripped this
+  }
+  return 0;
 }
 
 const char *Sema::opName(BinaryOp op) {
@@ -317,13 +361,25 @@ void Sema::checkUnusedInFrame(const llvm::StringMap<ASTNode *> &frame) {
 // almost always a silent precision-loss bug in a kernel.
 void Sema::checkCallArgs(const ASTNode *call, StringRef calleeName,
                          FunctionDecl *f, const std::vector<NodePtr> &args) {
-  if (f->params.size() != args.size()) {
+  // Default arguments: a call may omit trailing parameters that have defaults.
+  // `f(a, b)` for `void f(int a, int b, int c = 10)` is fine — c is defaulted.
+  if (args.size() > f->params.size()) {
     error(call, "call to '" + std::string(calleeName) + "' has " +
                     std::to_string(args.size()) + " args, expected " +
                     std::to_string(f->params.size()));
     return;
   }
-  for (size_t i = 0; i < f->params.size(); ++i) {
+  // Each omitted trailing argument MUST have a default value.
+  for (size_t i = args.size(); i < f->params.size(); ++i) {
+    if (!f->params[i]->defaultVal) {
+      error(call, "call to '" + std::string(calleeName) + "' has " +
+                      std::to_string(args.size()) + " args, expected " +
+                      std::to_string(f->params.size()) + " (parameter '" +
+                      std::string(f->params[i]->name) + "' has no default)");
+      return;
+    }
+  }
+  for (size_t i = 0; i < args.size(); ++i) {
     Type *paramTy = f->params[i]->type;
     Type *argTy = checkExpr(args[i].get());
     std::string msg = "argument " + std::to_string(i + 1) + " of '" +
@@ -390,6 +446,19 @@ void Sema::collectTopLevel() {
     case ASTNode::NodeKind::FunctionDecl: {
       auto *f = static_cast<FunctionDecl *>(d.get());
       functions[f->name] = f;
+      // Default arguments must be right-to-left contiguous: once a parameter
+      // has a default, every parameter after it must also have one. `f(int a,
+      // int b = 1, int c)` is invalid C++ (c has no default but follows one).
+      bool seenDefault = false;
+      for (ParamDecl *p : f->params) {
+        if (p->defaultVal) seenDefault = true;
+        else if (seenDefault) {
+          error(p, "default argument missing for parameter '" +
+                       std::string(p->name) + "' of '" +
+                       std::string(f->name) + "' (parameters with defaults "
+                       "must be right-to-left contiguous)");
+        }
+      }
       break;
     }
     case ASTNode::NodeKind::StructDecl: {
@@ -457,6 +526,20 @@ void Sema::checkStmt(const ASTNode *n) {
     auto *ds = static_cast<const DeclStmt *>(n);
     for (VarDecl *v : ds->decls) {
       if (!v) continue;
+      // Function-local `static`/`extern` in device code has no GLSL lowering:
+      // GLSL has no function-local static storage (a `static` local would need
+      // to persist across invocations, which SPIR-V function storage doesn't),
+      // and `extern` locals have no device analogue. `__shared__` is the device
+      // persistent-storage mechanism, not `static`. Host functions are lowered
+      // to C++ where these are legal, so only reject inside device code.
+      bool inDevice = currentFunc &&
+                      (currentFunc->deviceAttr == DeviceAttr::Global ||
+                       currentFunc->deviceAttr == DeviceAttr::Device);
+      if (inDevice && v->storageClass == StorageClass::Static)
+        error(v, "'static' local variable is not allowed in device code "
+                 "(use __shared__ for block-local persistent storage)");
+      if (inDevice && v->storageClass == StorageClass::Extern)
+        error(v, "'extern' local variable is not allowed in device code");
       declare(v->name, v);
       if (v->init) {
         Type *initTy = checkExpr(v->init.get());
@@ -604,6 +687,40 @@ Type *Sema::checkExpr(const ASTNode *n) {
     // C promotes char to int; treat as Int32.
     exprTypes[n] = builtin(BuiltinTypeKind::Int32);
     return exprTypes[n];
+  case ASTNode::NodeKind::BoolLiteral:
+    exprTypes[n] = builtin(BuiltinTypeKind::Bool);
+    return exprTypes[n];
+  case ASTNode::NodeKind::SizeOfExpr: {
+    auto *s = static_cast<SizeOfExpr *>(const_cast<ASTNode *>(n));
+    // Determine the type whose size we want: the explicit target type, or the
+    // type of the operand expression.
+    Type *ty = nullptr;
+    int64_t arrMul = 1; // for `sizeof(arr)`, multiply elem size by total elems
+    if (s->isType) {
+      ty = s->target;
+    } else {
+      ty = checkExpr(s->sub.get());
+      // If the operand is a bare array variable, checkExpr returns its element
+      // type; fold in the array dimensions so `sizeof(arr)` gives the total
+      // byte count (matching C semantics for stack arrays).
+      if (s->sub &&
+          s->sub->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+        StringRef nm = static_cast<const DeclRefExpr *>(s->sub.get())->name;
+        ASTNode *sym = lookup(nm);
+        if (sym && sym->getNodeType() == ASTNode::NodeKind::VarDecl) {
+          for (int64_t dim :
+               static_cast<VarDecl *>(sym)->arrayDims)
+            arrMul *= dim > 0 ? dim : 1;
+        }
+      }
+    }
+    s->folded = sizeOfType(resolveTypedefs(ty)) * arrMul;
+    if (s->folded == 0)
+      warn(n, "sizeof unable to compute size of type '" +
+                  typeName(ty) + "' (folded to 0)");
+    exprTypes[n] = builtin(BuiltinTypeKind::Int32);
+    return exprTypes[n];
+  }
   case ASTNode::NodeKind::StringLiteral:
     // No string type in kernels; legal but unusable as a value.
     return nullptr;
@@ -697,6 +814,21 @@ Type *Sema::checkExpr(const ASTNode *n) {
             (sym->getNodeType() == ASTNode::NodeKind::VarDecl ||
              sym->getNodeType() == ASTNode::NodeKind::ParamDecl))
           used[sym] = false;
+        // Writing to a `const`-qualified variable is illegal.
+        if (sym) {
+          if (sym->getNodeType() == ASTNode::NodeKind::VarDecl &&
+              static_cast<VarDecl *>(sym)->isConst)
+            error(n, "assignment to const variable '" +
+                         std::string(
+                             static_cast<const DeclRefExpr *>(b->lhs.get())->name) +
+                         "'");
+          else if (sym->getNodeType() == ASTNode::NodeKind::ParamDecl &&
+                   static_cast<ParamDecl *>(sym)->isConst)
+            error(n, "assignment to const parameter '" +
+                         std::string(
+                             static_cast<const DeclRefExpr *>(b->lhs.get())->name) +
+                         "'");
+        }
       }
       return rt ? rt : lt;
     }
@@ -744,6 +876,11 @@ Type *Sema::checkExpr(const ASTNode *n) {
                   typeName(et) + ") in ternary expression");
     return tt ? tt : et;
   }
+  case ASTNode::NodeKind::CommaExpr: {
+    auto *c = static_cast<const CommaExpr *>(n);
+    checkExpr(c->lhs.get());
+    return checkExpr(c->rhs.get());
+  }
   case ASTNode::NodeKind::CStyleCastExpr: {
     auto *cc = static_cast<const CStyleCastExpr *>(n);
     // Visit the sub-expression so uses inside a cast count (e.g. `(void)x`)
@@ -777,6 +914,14 @@ Type *Sema::checkExpr(const ASTNode *n) {
       auto it = functions.find(calleeName);
       if (it != functions.end()) {
         FunctionDecl *f = it->second;
+        // GLSL forbids recursion: a device function calling itself (directly)
+        // would lower to a recursive GLSL function, which is invalid. Reject it
+        // here rather than emit illegal GLSL. Indirect recursion (A->B->A) is
+        // not detected — TODO: needs a call-graph closure.
+        if (currentFunc && f == currentFunc)
+          error(n, "recursive function '" + std::string(calleeName) +
+                       "' is not allowed in GLSL (device functions cannot "
+                       "call themselves)");
         // Device code may only call __device__/__global__ functions; a plain
         // (host) function is not callable from a kernel.
         if ((f->deviceAttr == DeviceAttr::None ||

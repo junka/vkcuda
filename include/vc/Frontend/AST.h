@@ -178,16 +178,19 @@ public:
     BinaryExpr,
     UnaryExpr,
     ConditionalExpr, // cond ? then : else
+    CommaExpr,       // a, b  (evaluates a, result is b)
     CStyleCastExpr,  // (T)expr or T(expr) functional cast
     InitListExpr,    // { a, b, c }
     CallExpr,
     DeclRefExpr,
     IntegerLiteral,
     FloatLiteral,
+    BoolLiteral,   // true/false, lowers to GLSL true/false
     CharLiteral,   // 'A' -> 65, decoded
     StringLiteral, // "..." decoded
     IndexExpr,        // a[i]
     MemberAccessExpr, // threadIdx.x
+    SizeOfExpr,       // sizeof(T) or sizeof expr
     LaunchExpr,       // kernel<<<grid,block>>>(args)
   };
 
@@ -227,10 +230,24 @@ public:
 // CUDA __global__/__device__/__host__ attributes on a function.
 enum class DeviceAttr { None, Global, Device, Host };
 
+// C storage class specifiers. `static`/`extern` are recognized by the lexer and
+// recorded here so the host C++ backend can emit them verbatim. The device GLSL
+// backend strips them (GLSL has no storage-class keywords; its globals are just
+// shader globals). Function-local `static` is rejected by Sema inside device
+// code (GLSL has no function-local static storage — `__shared__` is the device
+// persistent-storage mechanism).
+enum class StorageClass { None, Static, Extern };
+
 class ParamDecl : public ASTNode {
 public:
   Type *type;
   StringRef name;
+  bool isConst = false; // C `const` qualifier on this parameter
+  // Optional default-argument expression (`void f(int a, int b = 10)`). Null
+  // when the parameter has no default. The GLSL/C++ definition omits `= val`
+  // (defaults belong on declarations, and VC's helpers are definitions); call
+  // sites are completed by the backends using these expressions.
+  NodePtr defaultVal;
   ParamDecl(SourceLocation l, Type *t, StringRef n)
       : ASTNode(l), type(t), name(n) {}
   NodeKind getNodeType() const override { return NodeKind::ParamDecl; }
@@ -243,6 +260,7 @@ public:
   std::vector<ParamDecl *> params;
   NodePtr body; // CompoundStmt, may be null
   DeviceAttr deviceAttr = DeviceAttr::None;
+  StorageClass storageClass = StorageClass::None; // C `static`/`extern`
 
   FunctionDecl(SourceLocation l) : ASTNode(l) {}
   NodeKind getNodeType() const override { return NodeKind::FunctionDecl; }
@@ -263,6 +281,8 @@ public:
   NodePtr init; // optional initializer expr
   bool isShared = false; // CUDA __shared__
   bool isConstant = false; // CUDA __constant__ (device-resident read-only global)
+  bool isConst = false; // C `const` qualifier (cv-qualifier on a local/param)
+  StorageClass storageClass = StorageClass::None; // C `static`/`extern`
   // Trailing array dimensions, e.g. "float a[16][8]" -> {16,8}. Empty for
   // a scalar. A runtime-sized pointer param leaves this empty.
   std::vector<int64_t> arrayDims;
@@ -481,6 +501,19 @@ public:
   NodeKind getNodeType() const override { return NodeKind::ConditionalExpr; }
 };
 
+// C comma operator: `a, b` — evaluates a (for its side effects), then b; the
+// result and type are b's. Lower than assignment in precedence, so it appears
+// at statement-init/step and parenthesized contexts, not as a call/init-list
+// element (the parser uses parseAssignment for those to keep `f(a, b)` as two
+// args, not one CommaExpr).
+class CommaExpr : public ASTNode {
+public:
+  NodePtr lhs, rhs;
+  CommaExpr(SourceLocation l, NodePtr a, NodePtr b)
+      : ASTNode(l), lhs(std::move(a)), rhs(std::move(b)) {}
+  NodeKind getNodeType() const override { return NodeKind::CommaExpr; }
+};
+
 // C-style cast `(T)expr` or functional cast `T(expr)`. Emits as the GLSL
 // constructor form `T(expr)` (valid for scalars and vectors alike).
 class CStyleCastExpr : public ASTNode {
@@ -530,6 +563,16 @@ public:
   NodeKind getNodeType() const override { return NodeKind::FloatLiteral; }
 };
 
+// A boolean literal `true`/`false`. GLSL and C++ both spell these `true`/
+// `false`; the node carries the value (1/0) so Sema can type it as Bool and
+// the dumpers can render the source spelling.
+class BoolLiteral : public ASTNode {
+public:
+  bool value;
+  BoolLiteral(SourceLocation l, bool v) : ASTNode(l), value(v) {}
+  NodeKind getNodeType() const override { return NodeKind::BoolLiteral; }
+};
+
 // A character literal 'A' / '\n', decoded to its integer value. GLSL has no
 // char type; it lowers as an int constant (matching C's promotion).
 class CharLiteral : public ASTNode {
@@ -569,6 +612,23 @@ public:
   MemberAccessExpr(SourceLocation l, NodePtr b, StringRef m)
       : ASTNode(l), base(std::move(b)), member(m) {}
   NodeKind getNodeType() const override { return NodeKind::MemberAccessExpr; }
+};
+
+// `sizeof(T)` (isType=true, target set, sub null) or `sizeof expr` /
+// `sizeof(expr)` (isType=false, sub set, target null). GLSL has no sizeof, so
+// the GLSL backend folds it to a byte-count literal (Sema fills `folded` from
+// the type/operand type); the host C++ backend emits `sizeof(...)` verbatim and
+// lets g++ compute it. Byte counts are coarse (struct = sum of fields, no
+// alignment padding) — sufficient for kernel sizing, not ABI-exact.
+class SizeOfExpr : public ASTNode {
+public:
+  Type *target = nullptr;
+  NodePtr sub;
+  bool isType = false;
+  int64_t folded = 0; // filled by Sema; >0 means "already computed"
+  SizeOfExpr(SourceLocation l, Type *t, NodePtr s, bool isTy)
+      : ASTNode(l), target(t), sub(std::move(s)), isType(isTy) {}
+  NodeKind getNodeType() const override { return NodeKind::SizeOfExpr; }
 };
 
 // kernel<<<grid, block>>>(args...)   — CUDA launch syntax

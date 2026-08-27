@@ -42,6 +42,9 @@ class HostEmitter {
   // Kernel names referenced by any LaunchExpr in main(). Drives the
   // handle-declaration + vcLoadKernel prologue emitted at the top of main.
   StringSet<> launchedKernels;
+  // Name -> FunctionDecl for all top-level host functions. Used to complete
+  // call sites that omit trailing defaulted parameters (default arguments).
+  llvm::StringMap<const FunctionDecl *> hostFuncDecls;
 
 public:
   HostEmitter(raw_ostream &o, const uint32_t *w, size_t n)
@@ -57,6 +60,8 @@ public:
       if (f->deviceAttr == DeviceAttr::Global ||
           f->deviceAttr == DeviceAttr::Device)
         continue;
+      // Index host functions for default-argument call-site completion.
+      hostFuncDecls[f->name] = f;
       // Params are host vars too.
       for (ParamDecl *p : f->params)
         if (p->type) hostVarTypes[p->name] = p->type;
@@ -165,9 +170,17 @@ private:
       } else if (d->getNodeType() == ASTNode::NodeKind::VarDecl) {
         // __constant__ globals: emit as `const` C++ globals so host code can
         // reference them too. Mirrors the GLSL backend's `const` lowering.
+        // File-scope `static`/`extern` globals (storageClass) are also emitted
+        // here with the storage class passed through verbatim — these are host
+        // translation-unit globals, legal C++.
         auto *v = static_cast<const VarDecl *>(d.get());
-        if (!v->isConstant) continue;
-        os << "const " << cppType(v->type) << " " << v->name;
+        bool isConstGlobal = v->isConstant;
+        bool hasStorage = v->storageClass != StorageClass::None;
+        if (!isConstGlobal && !hasStorage) continue;
+        if (v->storageClass == StorageClass::Static) os << "static ";
+        else if (v->storageClass == StorageClass::Extern) os << "extern ";
+        if (isConstGlobal) os << "const ";
+        os << cppType(v->type) << " " << v->name;
         for (int64_t dim : v->arrayDims)
           os << "[" << dim << "]";
         if (v->init) { os << " = "; emitHostExpr(v->init.get()); }
@@ -307,6 +320,12 @@ private:
       scanLaunches(c->elseExpr.get());
       return;
     }
+    case ASTNode::NodeKind::CommaExpr: {
+      auto *c = static_cast<const CommaExpr *>(n);
+      scanLaunches(c->lhs.get());
+      scanLaunches(c->rhs.get());
+      return;
+    }
     case ASTNode::NodeKind::CStyleCastExpr:
       scanLaunches(static_cast<const CStyleCastExpr *>(n)->sub.get());
       return;
@@ -339,9 +358,15 @@ private:
   // --------------------------------------------------------------------- //
 
   void emitHostFunction(const FunctionDecl *f, bool isMain) {
+    // C storage class (`static`/`extern`) passes through verbatim to C++.
+    // `static int helper()` is a legal translation-unit-local host function;
+    // `extern` (prototype-only, no body) is also legal C++.
+    if (f->storageClass == StorageClass::Static) os << "static ";
+    else if (f->storageClass == StorageClass::Extern) os << "extern ";
     os << cppType(f->returnType) << " " << f->name << "(";
     for (unsigned i = 0; i < f->params.size(); ++i) {
       if (i) os << ", ";
+      if (f->params[i]->isConst) os << "const ";
       os << cppType(f->params[i]->type) << " " << f->params[i]->name;
     }
     os << ") {\n";
@@ -441,6 +466,9 @@ private:
       for (VarDecl *d : ds->decls) {
         if (!d) continue;
         pad(indent);
+        if (d->storageClass == StorageClass::Static) os << "static ";
+        else if (d->storageClass == StorageClass::Extern) os << "extern ";
+        if (d->isConst) os << "const ";
         os << cppType(d->type) << " " << d->name;
         for (int64_t dim : d->arrayDims)
           os << "[" << dim << "]";
@@ -566,6 +594,22 @@ private:
     case ASTNode::NodeKind::FloatLiteral:
       os << static_cast<const FloatLiteral *>(n)->value;
       return;
+    case ASTNode::NodeKind::BoolLiteral:
+      os << (static_cast<const BoolLiteral *>(n)->value ? "true" : "false");
+      return;
+    case ASTNode::NodeKind::SizeOfExpr: {
+      // C++ has sizeof; emit it verbatim and let g++ compute the size. This is
+      // ABI-exact on the host (unlike the GLSL device-side fold).
+      const auto *s = static_cast<const SizeOfExpr *>(n);
+      os << "sizeof(";
+      if (s->isType) {
+        os << cppType(s->target);
+      } else {
+        emitHostExpr(s->sub.get());
+      }
+      os << ")";
+      return;
+    }
     case ASTNode::NodeKind::CharLiteral:
       os << static_cast<const CharLiteral *>(n)->value;
       return;
@@ -605,6 +649,15 @@ private:
       os << ")";
       return;
     }
+    case ASTNode::NodeKind::CommaExpr: {
+      auto *c = static_cast<const CommaExpr *>(n);
+      os << "(";
+      emitHostExpr(c->lhs.get());
+      os << ", ";
+      emitHostExpr(c->rhs.get());
+      os << ")";
+      return;
+    }
     case ASTNode::NodeKind::CStyleCastExpr: {
       auto *c = static_cast<const CStyleCastExpr *>(n);
       // Emit functional-cast form: T(expr). Valid for scalars and pointers.
@@ -630,6 +683,23 @@ private:
       for (unsigned i = 0; i < c->args.size(); ++i) {
         if (i) os << ", ";
         emitHostExpr(c->args[i].get());
+      }
+      // Complete omitted trailing defaulted parameters from the callee's
+      // signature (default arguments), so `f(a)` resolves `void f(int,int=10)`.
+      if (c->callee &&
+          c->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+        StringRef callee =
+            static_cast<const DeclRefExpr *>(c->callee.get())->name;
+        auto fit = hostFuncDecls.find(callee);
+        if (fit != hostFuncDecls.end()) {
+          const FunctionDecl *calleeFn = fit->second;
+          for (unsigned i = c->args.size(); i < calleeFn->params.size(); ++i) {
+            if (calleeFn->params[i]->defaultVal) {
+              if (i) os << ", ";
+              emitHostExpr(calleeFn->params[i]->defaultVal.get());
+            }
+          }
+        }
       }
       os << ")";
       return;

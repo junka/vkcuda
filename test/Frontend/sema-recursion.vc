@@ -1,0 +1,19 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// GLSL forbids recursion: a __device__/__global__ function that calls itself
+// directly must be rejected (otherwise the backend emits an illegal recursive
+// GLSL function). Indirect recursion is NOT yet detected.
+
+// A self-calling __device__ helper — direct recursion, must error.
+__device__ int fact(int n) {
+  // CHECK: error: recursive function 'fact' is not allowed in GLSL
+  if (n <= 1) return 1;
+  return n * fact(n - 1);
+}
+
+// A __global__ kernel that calls itself via launch syntax is also recursion,
+// but kernel-to-kernel launch isn't a device-side call; only same-function
+// direct calls within device code are caught here.
+__global__ void kern(int *out) {
+  out[0] = fact(3);
+}

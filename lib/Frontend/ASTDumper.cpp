@@ -250,6 +250,17 @@ public:
     case ASTNode::NodeKind::FloatLiteral:
       os << "Float " << cast<FloatLiteral>(n)->value << "\n";
       break;
+    case ASTNode::NodeKind::BoolLiteral:
+      os << "Bool " << (cast<BoolLiteral>(n)->value ? "true" : "false") << "\n";
+      break;
+    case ASTNode::NodeKind::SizeOfExpr: {
+      const auto *s = cast<SizeOfExpr>(n);
+      os << "SizeOf " << (s->isType ? "(type)" : "(expr)") << "\n";
+      ++indent;
+      dumpNode(s->sub.get());
+      --indent;
+      break;
+    }
     case ASTNode::NodeKind::CharLiteral:
       os << "Char " << cast<CharLiteral>(n)->value << "\n";
       break;
@@ -285,6 +296,15 @@ public:
       dumpNode(c->cond.get());
       dumpNode(c->thenExpr.get());
       dumpNode(c->elseExpr.get());
+      --indent;
+      break;
+    }
+    case ASTNode::NodeKind::CommaExpr: {
+      const auto *c = cast<CommaExpr>(n);
+      os << "Comma\n";
+      ++indent;
+      dumpNode(c->lhs.get());
+      dumpNode(c->rhs.get());
       --indent;
       break;
     }

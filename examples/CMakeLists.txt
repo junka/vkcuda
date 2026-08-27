@@ -7,7 +7,7 @@
 # `vcc` bakes the include dir / runtime lib / vulkan flags at its own link, so
 # each custom command only needs the input and output path.
 
-set(VC_SINGLEFILE_DEMOS vadd reduce matmul struct features features2 async_overlap atomics vectors sync warp enum half constant vote)
+set(VC_SINGLEFILE_DEMOS vadd reduce matmul struct features features2 async_overlap atomics vectors sync warp enum half constant vote bool sizeof const_local comma default_arg define)
 
 foreach(demo ${VC_SINGLEFILE_DEMOS})
   add_custom_command(

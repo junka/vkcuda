@@ -4,6 +4,7 @@
 
 #include "vc/Frontend/AST.h"
 
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdio>
@@ -38,6 +39,10 @@ class GLSLEmitter {
   // GL_KHR_shader_subgroup_* extensions; emitHeader drives the extension list
   // and the driver bumps the glslc target to vulkan1.1 when this is set.
   bool usesSubgroup = false;
+  // Name -> FunctionDecl index of all top-level functions (kernels + __device__
+  // helpers). Used to look up default-argument expressions when completing call
+  // sites that omit trailing defaulted parameters.
+  llvm::StringMap<const FunctionDecl *> funcDecls;
   // Whether the kernel uses a block-wide vote intrinsic
   // (__syncthreads_count/and/or). These lower to a shared-array reduction +
   // barriers and need a pre-statement hoisting buffer plus a scratch shared
@@ -71,6 +76,15 @@ public:
     kernel = fn;
     params.assign(fn->params.begin(), fn->params.end());
     if (fn->body) scanDims(fn->body.get());
+
+    // Index all top-level functions so call sites can look up default-argument
+    // expressions to complete calls that omit trailing defaulted parameters.
+    for (auto &d : tu.decls) {
+      if (d->getNodeType() == ASTNode::NodeKind::FunctionDecl) {
+        auto *f = static_cast<const FunctionDecl *>(d.get());
+        funcDecls[f->name] = f;
+      }
+    }
 
     emitHeader();
     emitStructDecls(tu);
@@ -214,7 +228,8 @@ private:
         "out", "in", "uniform", "buffer", "layout", "input", "output",
         "image", "sampler", "patch", "centroid", "flat", "smooth", "noperspective",
         "invariant", "precise", "coherent", "volatile", "restrict", "readonly",
-        "writeonly", "atomic_uint"};
+        "writeonly", "atomic_uint", "active", "filter", "rows", "columns",
+        "sample", "subroutine", "common", "partition", "hit", "hitObject"};
     for (const char *r : reserved)
       if (n == r) return true;
     return false;
@@ -495,6 +510,7 @@ private:
     (*os) << glslType(f->returnType) << " " << f->name << "(";
     for (unsigned i = 0; i < f->params.size(); ++i) {
       if (i) (*os) << ", ";
+      if (f->params[i]->isConst) (*os) << "const ";
       (*os) << glslType(f->params[i]->type) << " " << glslName(f->params[i]->name);
     }
     (*os) << ") {\n";
@@ -904,6 +920,7 @@ private:
       if (!d) break;
       if (d->isShared) break; // hoisted to a `shared` global
       pad(indent);
+      if (d->isConst) (*os) << "const ";
       (*os) << glslType(d->type) << " " << glslName(d->name);
       for (int64_t dim : d->arrayDims)
         (*os) << "[" << dim << "]";
@@ -913,7 +930,9 @@ private:
       for (unsigned i = 1; i < static_cast<const DeclStmt *>(n)->decls.size();
            ++i) {
         VarDecl *vd = static_cast<const DeclStmt *>(n)->decls[i];
-        (*os) << ", " << glslType(vd->type) << " " << glslName(vd->name);
+        (*os) << ", ";
+        if (vd->isConst) (*os) << "const ";
+        (*os) << glslType(vd->type) << " " << glslName(vd->name);
         for (int64_t dim : vd->arrayDims)
           (*os) << "[" << dim << "]";
         if (vd->init) { (*os) << " = "; emitExpr(vd->init.get()); }
@@ -1020,6 +1039,17 @@ private:
     case ASTNode::NodeKind::FloatLiteral:
       (*os) << static_cast<const FloatLiteral *>(n)->value;
       break;
+    case ASTNode::NodeKind::BoolLiteral:
+      (*os) << (static_cast<const BoolLiteral *>(n)->value ? "true" : "false");
+      break;
+    case ASTNode::NodeKind::SizeOfExpr: {
+      // GLSL has no sizeof. Sema folded the byte count into `folded` during
+      // analysis; emit it as a bare integer literal. If folding failed (0),
+      // emit 0 so the expression is still well-formed.
+      const auto *s = static_cast<const SizeOfExpr *>(n);
+      (*os) << s->folded;
+      break;
+    }
     case ASTNode::NodeKind::CharLiteral:
       // GLSL has no char; lower as the int code point (C promotes char to int).
       (*os) << static_cast<const CharLiteral *>(n)->value;
@@ -1072,6 +1102,15 @@ private:
       emitExpr(c->thenExpr.get());
       (*os) << " : ";
       emitExpr(c->elseExpr.get());
+      (*os) << ")";
+      break;
+    }
+    case ASTNode::NodeKind::CommaExpr: {
+      auto *c = static_cast<const CommaExpr *>(n);
+      (*os) << "(";
+      emitExpr(c->lhs.get());
+      (*os) << ", ";
+      emitExpr(c->rhs.get());
       (*os) << ")";
       break;
     }
@@ -1174,11 +1213,23 @@ private:
           return;
         }
         // User __device__ helper or CUDA/math builtin: lower the name and emit
-        // a normal GLSL call expression.
+        // a normal GLSL call expression. Complete omitted trailing defaulted
+        // parameters from the callee's signature (default arguments).
         (*os) << lowerBuiltinCall(ref->name) << "(";
         for (unsigned i = 0; i < c->args.size(); ++i) {
           if (i) (*os) << ", ";
           emitExpr(c->args[i].get());
+        }
+        // Append defaults for any trailing params the call omitted.
+        auto fit = funcDecls.find(ref->name);
+        if (fit != funcDecls.end()) {
+          const FunctionDecl *calleeFn = fit->second;
+          for (unsigned i = c->args.size(); i < calleeFn->params.size(); ++i) {
+            if (calleeFn->params[i]->defaultVal) {
+              if (i) (*os) << ", ";
+              emitExpr(calleeFn->params[i]->defaultVal.get());
+            }
+          }
         }
         (*os) << ")";
         return;

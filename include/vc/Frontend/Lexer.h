@@ -62,6 +62,11 @@ enum class TokKind {
   kw_break, kw_continue,
   kw_switch, kw_case, kw_default,
   kw_const,
+  kw_true, kw_false,
+  kw_sizeof,
+  // C storage classes (recognized so `static`/`extern` don't lex as identifiers
+  // and can be recorded on VarDecl/FunctionDecl for host passthrough).
+  kw_static, kw_extern,
   // CUDA attributes
   kw_global, kw_device, kw_host, kw_shared, kw_restrict, kw_constant,
   // CUDA builtins recognized as keywords
