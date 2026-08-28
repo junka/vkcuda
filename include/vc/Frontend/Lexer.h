@@ -28,7 +28,7 @@ enum class TokKind {
   l_paren, r_paren,
   l_brace, r_brace,
   l_square, r_square,
-  comma, semi, colon,
+  comma, semi, colon, coloncolon, // : ::
   question, // ?
   star, plus, minus, slash, percent,
   assign,
@@ -43,6 +43,7 @@ enum class TokKind {
   amp_amp, pipe_pipe, bang,
   amp, pipe, caret, tilde,
   dot,
+  arrow, // ->
   // CUDA triple-chevron launch:  >>>
   launch_close, // >>>
 
@@ -75,6 +76,12 @@ enum class TokKind {
   kw_wmma, // namespace marker: wmma::fragment ... (loosely)
   // Type-definition keywords
   kw_struct, kw_typedef, kw_enum,
+  // C++ organizational constructs. `namespace`/`class` introduce new decls;
+  // `public`/`private`/`protected` are lexed+parsed but access control is NOT
+  // enforced (GLSL has none; host C++ gets a `public:` segment). `this` is
+  // recognized so member-function bodies lex cleanly (device lowers to a
+  // synthesized first param; host passes through). `using` is lexed only.
+  kw_namespace, kw_class, kw_public, kw_private, kw_protected, kw_this, kw_using,
 };
 
 struct Token {

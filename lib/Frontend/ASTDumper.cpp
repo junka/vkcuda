@@ -32,11 +32,19 @@ public:
     case ASTNode::NodeKind::TranslationUnit: os << "TU\n"; break;
     case ASTNode::NodeKind::FunctionDecl: {
       const auto *f = cast<FunctionDecl>(n);
-      os << "Function " << f->name << " (";
+      os << "Function ";
+      if (f->isMethod && !f->className.empty())
+        os << f->className << "::" << f->name;
+      else
+        os << f->name;
+      os << " (";
       const char *attr = "host";
       if (f->deviceAttr == DeviceAttr::Global) attr = "global";
       else if (f->deviceAttr == DeviceAttr::Device) attr = "device";
-      os << attr << ")\n";
+      os << attr;
+      if (f->isMethod) os << ", method";
+      if (f->hasBody) os << ", defined";
+      os << ")\n";
       ++indent;
       if (f->body) dumpNode(f->body.get());
       --indent;
@@ -49,11 +57,25 @@ public:
     }
     case ASTNode::NodeKind::StructDecl: {
       const auto *s = cast<StructDecl>(n);
-      os << "Struct " << s->name << "\n";
+      os << (s->isClass ? "Class " : "Struct ") << s->name << "\n";
       ++indent;
       for (const auto *f : s->fields) {
         pad(); os << "Field " << f->name << "\n";
       }
+      for (const FunctionDecl *m : s->methods) {
+        pad();
+        os << "Method " << m->name;
+        if (!m->hasBody) os << " (decl only)";
+        os << "\n";
+      }
+      --indent;
+      break;
+    }
+    case ASTNode::NodeKind::NamespaceDecl: {
+      const auto *ns = cast<NamespaceDecl>(n);
+      os << "Namespace " << ns->name << "\n";
+      ++indent;
+      for (auto &d : ns->decls) dumpNode(d.get());
       --indent;
       break;
     }

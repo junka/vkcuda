@@ -1,0 +1,55 @@
+// test/namespace.vc — namespace + :: scope resolution demo.
+//
+// Exercises a `namespace` holding a __device__ helper and a __global__ kernel.
+// The kernel calls the helper as `math::square(x)` (scoped call); host main
+// launches the kernel as `math::fill<<<...>>>(...)`. Both backends must agree:
+//   - device: ns flattened, `math::square` -> `math_square`
+//   - host:   `namespace math { ... }` emitted verbatim, `math::fill` kept as-is
+//
+//   vcc test/namespace.vc -o build/namespace_sf && ./build/namespace_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+namespace math {
+
+__device__ float square(float x) {
+  return x * x;
+}
+
+__global__ void fill(float *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] = math::square((float)(i % 7));
+  }
+}
+
+} // namespace math
+
+int main() {
+  vcInit();
+
+  const int N = 64;
+  float hC[64];
+  for (int i = 0; i < N; i++) hC[i] = 0.0f;
+
+  void *dC = 0;
+  int bytes = N * 4;
+  vcMalloc(&dC, bytes);
+
+  math::fill<<<N, 32>>>(dC, N);
+
+  vcDeviceSynchronize();
+  vcMemcpy(hC, dC, bytes, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    float expect = (float)((i % 7) * (i % 7));
+    if (hC[i] != expect) { ok = 0; }
+  }
+  printf("namespace: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dC);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

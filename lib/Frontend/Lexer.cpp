@@ -123,6 +123,13 @@ TokKind Lexer::classifyKeyword(StringRef ident) {
       .Case("struct", TokKind::kw_struct)
       .Case("typedef", TokKind::kw_typedef)
       .Case("enum", TokKind::kw_enum)
+      .Case("namespace", TokKind::kw_namespace)
+      .Case("class", TokKind::kw_class)
+      .Case("public", TokKind::kw_public)
+      .Case("private", TokKind::kw_private)
+      .Case("protected", TokKind::kw_protected)
+      .Case("this", TokKind::kw_this)
+      .Case("using", TokKind::kw_using)
       .Default(TokKind::identifier);
 }
 
@@ -258,7 +265,15 @@ Token Lexer::lex() {
   case ']': kind = TokKind::r_square; break;
   case ',': kind = TokKind::comma; break;
   case ';': kind = TokKind::semi; break;
-  case ':': kind = TokKind::colon; break;
+  case ':':
+    // Scope resolution `::` vs ternary/label `:`. A second `:` immediately
+    // following makes this a single coloncolon token; otherwise a plain colon.
+    if (pos + 1 < buffer.size() && buffer[pos + 1] == ':') {
+      nextChar(); kind = TokKind::coloncolon;
+    } else {
+      kind = TokKind::colon;
+    }
+    break;
   case '?': kind = TokKind::question; break;
   case '~': kind = TokKind::tilde; break;
   case '.':
@@ -283,6 +298,8 @@ Token Lexer::lex() {
       nextChar(); kind = TokKind::minus_minus;
     } else if (pos + 1 < buffer.size() && buffer[pos + 1] == '=') {
       nextChar(); kind = TokKind::minus_equal;
+    } else if (pos + 1 < buffer.size() && buffer[pos + 1] == '>') {
+      nextChar(); kind = TokKind::arrow;
     } else {
       kind = TokKind::minus;
     }

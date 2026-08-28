@@ -1,0 +1,70 @@
+// test/class.vc — class with methods + :: scope demo.
+//
+// A `class Accumulator` with two int fields and a method `add(int x)` that
+// mutates state via `this->sum`. The __global__ kernel constructs one per
+// thread and uses `acc.add(...)` (object method call), which the device backend
+// lowers to `Accumulator_add(acc, x)` (this as first param); the host backend
+// emits a real C++ class with a real method.
+//
+//   vcc test/class.vc -o build/class_sf && ./build/class_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+class Accumulator {
+ public:
+  int sum;
+  int count;
+
+  __device__ void add(int x) {
+    this->sum = this->sum + x;
+    this->count = this->count + 1;
+  }
+};
+
+__global__ void classify(int *data, int *outSum, int *outCount, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    Accumulator acc;
+    acc.sum = 0;
+    acc.count = 0;
+    acc.add(data[i]);
+    acc.add(data[i]);
+    outSum[i] = acc.sum;
+    outCount[i] = acc.count;
+  }
+}
+
+int main() {
+  vcInit();
+
+  const int N = 64;
+  int hData[64], hSum[64], hCount[64];
+  for (int i = 0; i < N; i++) hData[i] = i;
+
+  void *dData = 0, *dSum = 0, *dCount = 0;
+  int bytes = N * 4;
+  vcMalloc(&dData, bytes);
+  vcMalloc(&dSum, bytes);
+  vcMalloc(&dCount, bytes);
+
+  vcMemcpy(dData, hData, bytes, VCMemcpyKind::HostToDevice);
+
+  classify<<<N, 32>>>(dData, dSum, dCount, N);
+
+  vcDeviceSynchronize();
+  vcMemcpy(hSum, dSum, bytes, VCMemcpyKind::DeviceToHost);
+  vcMemcpy(hCount, dCount, bytes, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    if (hSum[i] != hData[i] * 2 || hCount[i] != 2) { ok = 0; }
+  }
+  printf("class: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dData);
+  vcFree(dSum);
+  vcFree(dCount);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

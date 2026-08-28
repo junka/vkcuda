@@ -117,7 +117,15 @@ private:
 
   // Two passes.
   void collectTopLevel();
+  // Recursive helper: collect decls from a namespace body, prefixing registered
+  // names with `nsPrefix` (e.g. `ns_f` for `ns::f`). An empty prefix means
+  // top-level. The device backend mangles scoped names to underscore-joined
+  // form, so Sema registers them under the same mangled key call sites resolve.
+  void collectDecls(const std::vector<NodePtr> &decls, StringRef nsPrefix);
   void checkFunctions();
+  // Recursive helper: type-check device function bodies, descending into
+  // namespace bodies (mirrors collectDecls' recursion).
+  void checkFunctionsIn(const std::vector<NodePtr> &decls);
 
   // Statement / expression checking.
   void checkStmt(const ASTNode *n);

@@ -52,31 +52,13 @@ public:
 
   bool emit(const TranslationUnit &tu) {
     const FunctionDecl *mainFn = nullptr;
-    // First pass: collect host var types across all host functions so launch
-    // arg classification works even if a var is declared in an outer scope.
-    for (auto &d : tu.decls) {
-      if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
-      auto *f = static_cast<const FunctionDecl *>(d.get());
-      if (f->deviceAttr == DeviceAttr::Global ||
-          f->deviceAttr == DeviceAttr::Device)
-        continue;
-      // Index host functions for default-argument call-site completion.
-      hostFuncDecls[f->name] = f;
-      // Params are host vars too.
-      for (ParamDecl *p : f->params)
-        if (p->type) hostVarTypes[p->name] = p->type;
-      if (f->body) collectHostVars(f->body.get());
-    }
+    // First pass: collect host var types across all host functions (including
+    // those nested in namespaces) so launch arg classification works even if a
+    // var is declared in an outer scope.
+    collectHostFuncInfo(tu.decls);
 
-    // Locate the host main().
-    for (auto &d : tu.decls) {
-      if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
-      auto *f = static_cast<const FunctionDecl *>(d.get());
-      if (f->deviceAttr == DeviceAttr::Global ||
-          f->deviceAttr == DeviceAttr::Device)
-        continue;
-      if (f->name == "main") { mainFn = f; break; }
-    }
+    // Locate the host main() (recursing into namespaces).
+    mainFn = findMain(tu.decls);
     if (!mainFn) return false;
 
     // Find every kernel launched from main so we can preload handles.
@@ -85,22 +67,63 @@ public:
     emitPreamble(tu);
     emitSpirvEmbed();
 
-    // Emit top-level struct/typedef definitions so host code can name those
-    // types (e.g. `Point hPts[64]`). These are shared with the device subset
-    // but the host output needs its own copy visible before main().
-    emitHostTypeDecls(tu);
+    // Emit top-level struct/typedef/class/namespace declarations so host code
+    // can name those types (e.g. `Point hPts[64]`). These are shared with the
+    // device subset but the host output needs its own copy visible before main().
+    emitHostTypeDecls(tu.decls, /*indent=*/0);
 
-    // Emit host functions (Host/None). main is one of them; its body gets the
-    // kernel-handle prologue prepended.
-    for (auto &d : tu.decls) {
+    // Emit host functions (Host/None), preserving namespace blocks. main is one
+    // of them; its body gets the kernel-handle prologue prepended.
+    emitHostFunctions(tu.decls, /*indent=*/0, mainFn);
+    return true;
+  }
+
+  // Recursively collect host function signatures + their local var types, and
+  // index them under the qualified name (`ns::f`, `Class::method`) for
+  // default-argument completion at call sites.
+  void collectHostFuncInfo(const std::vector<NodePtr> &decls) {
+    for (auto &d : decls) {
+      if (d->getNodeType() == ASTNode::NodeKind::NamespaceDecl) {
+        collectHostFuncInfo(static_cast<const NamespaceDecl *>(d.get())->decls);
+        continue;
+      }
       if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
       auto *f = static_cast<const FunctionDecl *>(d.get());
       if (f->deviceAttr == DeviceAttr::Global ||
           f->deviceAttr == DeviceAttr::Device)
         continue;
-      emitHostFunction(f, /*isMain=*/f == mainFn);
+      hostFuncDecls[hostFuncKey(f)] = f;
+      for (ParamDecl *p : f->params)
+        if (p->type) hostVarTypes[p->name] = p->type;
+      if (f->body) collectHostVars(f->body.get());
     }
-    return true;
+  }
+
+  // The host-side spelling of a function name: `ns::f` for a namespace member
+  // (recovered from... actually the FunctionDecl doesn't carry its namespace;
+  // free functions inside a namespace emit as `ns::f` via the namespace block,
+  // so the call site `ns::f(...)` already resolves structurally — we index the
+  // bare name too for default-arg completion). A method is `Class::method`.
+  static std::string hostFuncKey(const FunctionDecl *f) {
+    if (f->isMethod && !f->className.empty())
+      return f->className.str() + "::" + f->name.str();
+    return f->name.str();
+  }
+
+  // Find `int main()` among host functions, recursing into namespaces.
+  const FunctionDecl *findMain(const std::vector<NodePtr> &decls) {
+    for (auto &d : decls) {
+      if (d->getNodeType() == ASTNode::NodeKind::NamespaceDecl)
+        if (auto *m = findMain(static_cast<const NamespaceDecl *>(d.get())->decls))
+          return m;
+      if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
+      auto *f = static_cast<const FunctionDecl *>(d.get());
+      if (f->deviceAttr == DeviceAttr::Global ||
+          f->deviceAttr == DeviceAttr::Device)
+        continue;
+      if (f->name == "main") return f;
+    }
+    return nullptr;
   }
 
 private:
@@ -141,24 +164,47 @@ private:
     os << "static const size_t __vc_spirv_len = " << wordCount << ";\n\n";
   }
 
-  // Emit top-level struct/typedef declarations as plain C++. These mirror the
-  // device-side definitions (the GLSL backend emits its own copy); the host
-  // needs them visible so host code can declare variables of these types.
-  void emitHostTypeDecls(const TranslationUnit &tu) {
-    for (auto &d : tu.decls) {
-      if (d->getNodeType() == ASTNode::NodeKind::StructDecl) {
+  // Emit top-level struct/typedef/enum/constant/class declarations as plain
+  // C++, recursing into namespaces (emitting them verbatim). These mirror the
+  // device-side definitions; the host needs them visible so host code can name
+  // those types (e.g. `Point hPts[64]`).
+  void emitHostTypeDecls(const std::vector<NodePtr> &decls, int indent) {
+    std::string pad(indent * 2, ' ');
+    for (auto &d : decls) {
+      if (d->getNodeType() == ASTNode::NodeKind::NamespaceDecl) {
+        auto *ns = static_cast<const NamespaceDecl *>(d.get());
+        os << pad << "namespace " << ns->name << " {\n";
+        emitHostTypeDecls(ns->decls, indent + 1);
+        os << pad << "} // namespace " << ns->name << "\n";
+      } else if (d->getNodeType() == ASTNode::NodeKind::StructDecl) {
         auto *s = static_cast<const StructDecl *>(d.get());
-        os << "struct " << s->name << " {\n";
+        if (s->isClass) os << pad << "class " << s->name << " {\n public:\n";
+        else os << pad << "struct " << s->name << " {\n";
         for (FieldDecl *f : s->fields) {
-          os << "  " << cppType(f->type) << " " << f->name;
+          os << pad << "  " << cppType(f->type) << " " << f->name;
           for (int64_t dim : f->arrayDims)
             os << "[" << dim << "]";
           os << ";\n";
         }
-        os << "};\n";
+        // Class methods: emit in-class declaration only. The method body is
+        // lowered as a qualified `Class::method(...)` definition by the host
+        // function emit pass (out-of-line). Skip the synthesized `_this` param,
+        // which is real C++ `this`.
+        for (FunctionDecl *m : s->methods) {
+          os << pad << "  " << cppType(m->returnType) << " " << m->name << "(";
+          bool first = true;
+          for (ParamDecl *p : m->params) {
+            if (p->name == "_this") continue;
+            if (!first) os << ", ";
+            first = false;
+            os << cppType(p->type) << " " << p->name;
+          }
+          os << ");\n";
+        }
+        os << pad << "};\n";
       } else if (d->getNodeType() == ASTNode::NodeKind::TypedefDecl) {
         auto *td = static_cast<const TypedefDecl *>(d.get());
-        os << "typedef " << cppType(td->underlying) << " " << td->name << ";\n";
+        os << pad << "typedef " << cppType(td->underlying) << " " << td->name << ";\n";
       } else if (d->getNodeType() == ASTNode::NodeKind::EnumDecl) {
         // GLSL has no enum, but C++ does — however emitting the constants as
         // `const int` keeps the host and device backends identical and avoids
@@ -166,7 +212,7 @@ private:
         // references enum constants by bare name just like device code.
         auto *ed = static_cast<const EnumDecl *>(d.get());
         for (auto &c : ed->constants)
-          os << "const int " << c.name << " = " << c.value << ";\n";
+          os << pad << "const int " << c.name << " = " << c.value << ";\n";
       } else if (d->getNodeType() == ASTNode::NodeKind::VarDecl) {
         // __constant__ globals: emit as `const` C++ globals so host code can
         // reference them too. Mirrors the GLSL backend's `const` lowering.
@@ -177,8 +223,8 @@ private:
         bool isConstGlobal = v->isConstant;
         bool hasStorage = v->storageClass != StorageClass::None;
         if (!isConstGlobal && !hasStorage) continue;
-        if (v->storageClass == StorageClass::Static) os << "static ";
-        else if (v->storageClass == StorageClass::Extern) os << "extern ";
+        if (v->storageClass == StorageClass::Static) os << pad << "static ";
+        else if (v->storageClass == StorageClass::Extern) os << pad << "extern ";
         if (isConstGlobal) os << "const ";
         os << cppType(v->type) << " " << v->name;
         for (int64_t dim : v->arrayDims)
@@ -187,7 +233,30 @@ private:
         os << ";\n";
       }
     }
-    os << "\n";
+    if (indent == 0) os << "\n";
+  }
+
+  // Emit host functions, preserving namespace blocks. `mainFn` (if non-null)
+  // gets the kernel-handle prologue prepended to its body.
+  void emitHostFunctions(const std::vector<NodePtr> &decls, int indent,
+                         const FunctionDecl *mainFn) {
+    std::string pad(indent * 2, ' ');
+    for (auto &d : decls) {
+      if (d->getNodeType() == ASTNode::NodeKind::NamespaceDecl) {
+        auto *ns = static_cast<const NamespaceDecl *>(d.get());
+        os << pad << "namespace " << ns->name << " {\n";
+        emitHostFunctions(ns->decls, indent + 1, mainFn);
+        os << pad << "} // namespace " << ns->name << "\n";
+        continue;
+      }
+      if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
+      auto *f = static_cast<const FunctionDecl *>(d.get());
+      if (f->deviceAttr == DeviceAttr::Global ||
+          f->deviceAttr == DeviceAttr::Device)
+        continue;
+      os << pad;
+      emitHostFunction(f, /*isMain=*/f == mainFn);
+    }
   }
 
   // --------------------------------------------------------------------- //
@@ -237,10 +306,8 @@ private:
     switch (n->getNodeType()) {
     case ASTNode::NodeKind::LaunchExpr: {
       auto *l = static_cast<const LaunchExpr *>(n);
-      if (l->callee &&
-          l->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr)
-        launchedKernels.insert(
-            static_cast<const DeclRefExpr *>(l->callee.get())->name);
+      if (l->callee)
+        launchedKernels.insert(launchHandleName(l->callee.get()));
       scanLaunches(l->gridDim.get());
       scanLaunches(l->blockDim.get());
       scanLaunches(l->gridDimY.get());
@@ -363,9 +430,22 @@ private:
     // `extern` (prototype-only, no body) is also legal C++.
     if (f->storageClass == StorageClass::Static) os << "static ";
     else if (f->storageClass == StorageClass::Extern) os << "extern ";
-    os << cppType(f->returnType) << " " << f->name << "(";
+    os << cppType(f->returnType) << " ";
+    // A class method (out-of-line definition `Class::method`) emits its
+    // qualified name so g++ sees a real C++ member definition. The body uses
+    // `this` natively, which the parser spelled `_this` — rewrite below.
+    if (f->isMethod && !f->className.empty())
+      os << f->className << "::" << f->name;
+    else
+      os << f->name;
+    os << "(";
+    bool first = true;
     for (unsigned i = 0; i < f->params.size(); ++i) {
-      if (i) os << ", ";
+      // The synthesized `_this` param is the device-side encoding of `this`;
+      // a real C++ method has an implicit `this`, so skip it on the host.
+      if (f->isMethod && f->params[i]->name == "_this") continue;
+      if (!first) os << ", ";
+      first = false;
       if (f->params[i]->isConst) os << "const ";
       os << cppType(f->params[i]->type) << " " << f->params[i]->name;
     }
@@ -616,9 +696,15 @@ private:
     case ASTNode::NodeKind::StringLiteral:
       emitCString(static_cast<const vc::StringLiteral *>(n)->value);
       return;
-    case ASTNode::NodeKind::DeclRefExpr:
-      os << static_cast<const DeclRefExpr *>(n)->name;
+    case ASTNode::NodeKind::DeclRefExpr: {
+      StringRef name = static_cast<const DeclRefExpr *>(n)->name;
+      // The parser lowers `this` to a DeclRefExpr named "_this" (the device
+      // backend lowers a method to a free function with a `_this` parameter).
+      // On the host a method is a real C++ member, so emit the native `this`.
+      if (name == "_this") os << "this";
+      else os << name;
       return;
+    }
     case ASTNode::NodeKind::BinaryExpr: {
       auto *b = static_cast<const BinaryExpr *>(n);
       os << "(";
@@ -714,11 +800,18 @@ private:
     }
     case ASTNode::NodeKind::MemberAccessExpr: {
       auto *m = static_cast<const MemberAccessExpr *>(n);
+      // On the host a method's `this` is a real pointer, so `_this.field`
+      // (parser spelling, value-semantics on device) becomes `this->field`.
+      bool baseIsThis =
+          m->base && m->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr &&
+          static_cast<const DeclRefExpr *>(m->base.get())->name == "_this";
       emitHostExpr(m->base.get());
       // The parser lowers both `.` and `::` to MemberAccessExpr; `isScope`
       // records which. A scoped enum/namespace access (VCMemcpyKind::HostToDevice)
       // must emit `::` — `.` is a hard error for those in C++.
-      os << (m->isScope ? "::" : ".") << m->member;
+      if (m->isScope) os << "::" << m->member;
+      else if (baseIsThis) os << "->" << m->member;
+      else os << "." << m->member;
       return;
     }
     default:
@@ -756,15 +849,52 @@ private:
   // Launch translation: kernel<<<grid,block>>>(args)
   // --------------------------------------------------------------------- //
 
+  // Derive the kernel-handle identifier and recorded key for a launch's
+  // callee. A bare `kernel<<<...>>>` uses the kernel name; a scoped
+  // `ns::kernel<<<...>>>` (MemberAccessExpr with isScope) is mangled to
+  // `ns_kernel` (nested `outer::inner::k` -> `outer_inner_k`) so it forms a
+  // valid C++ identifier and matches the key recorded by scanLaunches.
+  std::string launchHandleName(const ASTNode *callee) const {
+    if (callee &&
+        callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr)
+      return static_cast<const DeclRefExpr *>(callee)->name.str();
+    if (callee &&
+        callee->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+      // Reuse the device mangling by walking the scope chain.
+      std::vector<std::string> parts;
+      const MemberAccessExpr *ma =
+          static_cast<const MemberAccessExpr *>(callee);
+      parts.push_back(ma->member.str());
+      const ASTNode *cur = ma->base.get();
+      while (cur) {
+        if (cur->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+          auto *sub = static_cast<const MemberAccessExpr *>(cur);
+          parts.push_back(sub->member.str());
+          cur = sub->base.get();
+        } else if (cur->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+          parts.push_back(static_cast<const DeclRefExpr *>(cur)->name.str());
+          break;
+        } else {
+          break;
+        }
+      }
+      std::reverse(parts.begin(), parts.end());
+      std::string out;
+      for (auto &p : parts) {
+        if (!out.empty()) out += "_";
+        out += p;
+      }
+      return out;
+    }
+    return "main";
+  }
+
   void emitLaunch(const LaunchExpr *l, unsigned indent) {
     pad(indent);
     os << "{\n";
     // Lazy-load the kernel handle on first launch. vcInit() may be called
     // anywhere in the user's main(); this guard runs after it.
-    std::string kname = "main";
-    if (l->callee &&
-        l->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr)
-      kname = static_cast<const DeclRefExpr *>(l->callee.get())->name;
+    std::string kname = launchHandleName(l->callee.get());
     pad(indent + 1);
     os << "if (!__vc_k_" << kname
        << ") vcLoadKernel(__vc_spirv, __vc_spirv_len, \"main\", &__vc_k_"

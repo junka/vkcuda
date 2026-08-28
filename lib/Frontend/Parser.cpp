@@ -86,12 +86,16 @@ bool Parser::parseTopLevelDecl() {
   }
   if (curTok.is(TokKind::kw_struct))
     return parseStructDecl();
+  if (curTok.is(TokKind::kw_class))
+    return parseClassDecl();
   if (curTok.is(TokKind::kw_typedef))
     return parseTypedefDecl();
   if (curTok.is(TokKind::kw_enum))
     return parseEnumDecl();
   if (curTok.is(TokKind::kw_constant))
     return parseConstantDecl();
+  if (curTok.is(TokKind::kw_namespace))
+    return parseNamespaceDecl();
   // File-scope storage-class-qualified variable declarations: `static int x;`
   // / `extern int g;`. These are not functions (no `(` after the declarator),
   // and parseFunctionOrKernel would choke on the trailing `=`/`;`. Route them
@@ -138,11 +142,33 @@ bool Parser::parseFunctionOrKernel() {
   Token nameTok = curTok;
   advance();
 
+  // Out-of-line class method definition: `RetType Class::method(...) { ... }`.
+  // The first identifier is the class name; `::` then the real method name.
+  // Build a FunctionDecl marked isMethod with className set so the device
+  // backend lowers it to `Class_method(...)` and the host backend emits a real
+  // `Class::method` definition.
+  StringRef methodClassName;
+  StringRef methodName = nameTok.text;
+  if (curTok.is(TokKind::coloncolon)) {
+    advance();
+    if (!curTok.is(TokKind::identifier)) {
+      error(curTok, "expected member name after '::'");
+      return false;
+    }
+    methodClassName = nameTok.text;
+    methodName = curTok.text;
+    advance();
+  }
+
   auto *fn = new FunctionDecl(toSourceLoc(nameTok));
   fn->returnType = retTy;
-  fn->name = nameTok.text;
+  fn->name = methodName;
   fn->deviceAttr = dattr;
   fn->storageClass = fnStorage;
+  if (!methodClassName.empty()) {
+    fn->isMethod = true;
+    fn->className = methodClassName;
+  }
 
   if (!expect(TokKind::l_paren, "'('"))
     return false;
@@ -170,6 +196,7 @@ bool Parser::parseFunctionOrKernel() {
 
   if (curTok.is(TokKind::l_brace)) {
     fn->body = parseCompoundStmt();
+    fn->hasBody = true;
   }
 
   tu.decls.emplace_back(fn);
@@ -255,7 +282,237 @@ bool Parser::parseStructDecl() {
   return true;
 }
 
-// typedef <underlying> <name>;
+// class Name { public: fields...; methods...; };
+// Same shape as a struct, but `isClass` is set and access-control labels
+// (`public:`/`private:`/`protected:`) are lexed+ignored (GLSL has no access
+// control; the host backend emits a `public:` segment). Methods declared inside
+// the body are FunctionDecls collected into StructDecl::methods (non-owning —
+// they're also added to tu.decls / the enclosing namespace so the codegen
+// backends see them as top-level functions). Methods may have a body (defined
+// inline) or be declarations only (body defined out-of-line via `Class::m`).
+bool Parser::parseClassDecl() {
+  Token classTok = curTok;
+  advance(); // 'class'
+  if (!curTok.is(TokKind::identifier)) {
+    error(curTok, "expected class name");
+    return false;
+  }
+  Token nameTok = curTok;
+  advance();
+
+  auto *sd = new StructDecl(toSourceLoc(classTok), nameTok.text);
+  sd->isClass = true;
+  auto *recTy = new RecordType(sd);
+  typeNames[nameTok.text] = recTy;
+
+  // Optional base-class list (`class D : public B`) is not supported (no
+  // inheritance in the device lowering). Reject a ':' here explicitly so it
+  // doesn't silently parse as a method body label.
+  if (curTok.is(TokKind::colon) && !lexer.peek().is(TokKind::colon)) {
+    error(curTok, "class inheritance is not supported");
+    return false;
+  }
+
+  if (!expect(TokKind::l_brace, "'{'"))
+    return false;
+
+  while (!curTok.is(TokKind::r_brace) && !curTok.is(TokKind::eof)) {
+    // Access-control labels: consume and ignore (no access semantics).
+    if (curTok.isOneOf(TokKind::kw_public, TokKind::kw_private,
+                       TokKind::kw_protected)) {
+      advance();
+      if (!expect(TokKind::colon, "':' after access label"))
+        return false;
+      continue;
+    }
+    // A member that looks like a function: `<type> name ( params ) { ... }`
+    // or `<type> name ( params );` (declaration only). parseType + identifier
+    // + '(' distinguishes it from a field (`<type> name;` / `<type> name[N];`).
+    // We use a speculative parse: snapshot, parse a type and a name, and check
+    // for '(' to decide method vs field.
+    Token savedTok = curTok;
+    Lexer::Pos savedPos = lexer.savePos();
+    bool specWasConst = lastBaseWasConst;
+    StorageClass specStorage = lastBaseStorage;
+
+    // A method may carry a device/host qualifier (`__device__ void add(...)`),
+    // so consume leading attributes before the type. Storage class (`static`)
+    // is also legal on a method declaration.
+    DeviceAttr mAttr = DeviceAttr::None;
+    parseDeviceAttrs(mAttr);
+    StorageClass mStorage = StorageClass::None;
+    if (curTok.is(TokKind::kw_static)) {
+      mStorage = StorageClass::Static;
+      advance();
+    }
+
+    Type *mty = parseType();
+    if (!mty) {
+      error(curTok, "expected member type in class body");
+      return false;
+    }
+    if (!curTok.is(TokKind::identifier)) {
+      error(curTok, "expected member name in class body");
+      return false;
+    }
+    Token memberTok = curTok;
+    advance();
+    if (curTok.is(TokKind::l_paren)) {
+      // It's a method. Build a FunctionDecl.
+      auto *fn = new FunctionDecl(toSourceLoc(memberTok));
+      fn->returnType = mty;
+      fn->name = memberTok.text;
+      fn->isMethod = true;
+      fn->className = nameTok.text;
+      fn->deviceAttr = mAttr;
+      fn->storageClass = mStorage;
+      // deviceAttr defaults to None (host C++) unless `__device__`/`__global__`
+      // qualified the method. A __device__ method is lowered on the device side
+      // to a free function `Class_method(Class _this, ...)` and on the host side
+      // to a real C++ method (host methods are unchecked and pass through).
+      // Parse parameter list.
+      advance(); // '('
+      if (!curTok.is(TokKind::r_paren)) {
+        while (true) {
+          if (auto *p = parseParam())
+            fn->params.push_back(p);
+          else {
+            error(curTok, "expected parameter declaration");
+            return false;
+          }
+          if (consume(TokKind::comma))
+            continue;
+          break;
+        }
+      }
+      if (!expect(TokKind::r_paren, "')'"))
+        return false;
+      // optional `const` method qualifier (e.g. `float len() const;`) —
+      // lexed+ignored (GLSL/CUDA device side has no const methods).
+      if (curTok.is(TokKind::kw_const)) advance();
+      if (curTok.is(TokKind::l_brace)) {
+        fn->body = parseCompoundStmt();
+        fn->hasBody = true;
+      } else if (curTok.is(TokKind::semi)) {
+        advance(); // declaration only
+      } else {
+        error(curTok, "expected '{' or ';' after method declaration");
+        return false;
+      }
+      sd->methods.push_back(fn);
+      tu.decls.emplace_back(fn);
+    } else {
+      // It's a field. Reuse the field-parsing tail from parseStructDecl.
+      // memberTok is already consumed; build the FieldDecl and parse trailing
+      // array dims.
+      (void)savedTok; (void)savedPos; (void)specWasConst; (void)specStorage;
+      auto *fd = new FieldDecl(toSourceLoc(memberTok), mty, memberTok.text);
+      while (consume(TokKind::l_square)) {
+        if (!curTok.is(TokKind::int_literal)) {
+          error(curTok, "expected array size");
+          return false;
+        }
+        int64_t dim = 0;
+        curTok.text.getAsInteger(10, dim);
+        fd->arrayDims.push_back(dim);
+        advance();
+        if (!expect(TokKind::r_square, "']'"))
+          return false;
+      }
+      if (curTok.is(TokKind::comma)) {
+        error(curTok,
+              "comma-separated class fields are not supported; declare one "
+              "field per line");
+        return false;
+      }
+      if (!expect(TokKind::semi, "';' after field"))
+        return false;
+      sd->fields.push_back(fd);
+    }
+  }
+  if (!expect(TokKind::r_brace, "'}'"))
+    return false;
+  if (!expect(TokKind::semi, "';' after class definition"))
+    return false;
+
+  tu.decls.emplace_back(sd);
+  return true;
+}
+
+// namespace Name { decls... }
+// Body decls are collected into a NamespaceDecl (owned). The decls may be
+// anything parseTopLevelDecl accepts (functions, structs, classes, nested
+// namespaces, globals). Sema recurses into the body to register names with a
+// namespace prefix; the GLSL backend flattens (mangling names), the host
+// backend emits the block verbatim.
+bool Parser::parseNamespaceDecl() {
+  Token nsTok = curTok;
+  advance(); // 'namespace'
+  if (!curTok.is(TokKind::identifier)) {
+    error(curTok, "expected namespace name");
+    return false;
+  }
+  Token nameTok = curTok;
+  advance();
+  auto *ns = new NamespaceDecl(toSourceLoc(nsTok), nameTok.text);
+  if (!expect(TokKind::l_brace, "'{'"))
+    return false;
+  std::vector<NodePtr> body;
+  if (!parseNestedDecls(body))
+    return false;
+  ns->decls = std::move(body);
+  if (!expect(TokKind::r_brace, "'}'"))
+    return false;
+  // Stamp each function in the body with its enclosing namespace scope so the
+  // device backend can mangle `ns::func` -> `ns_func`. Nested namespaces compose
+  // as `outer::inner`. The token text points into the SourceMgr-owned source
+  // buffer, which outlives codegen, so the StringRef is stable.
+  stampNamespace(ns->decls, ns->name);
+  // A namespace has no trailing ';'.
+  tu.decls.emplace_back(ns);
+  return true;
+}
+
+// Recursively set FunctionDecl::nsName on every function in `decls` (including
+// those inside nested namespaces) to `prefix` (or `prefix::nested` for inner
+// namespaces). Methods are skipped — they carry className instead.
+void Parser::stampNamespace(const std::vector<NodePtr> &decls,
+                            StringRef prefix) {
+  for (auto &d : decls) {
+    if (d->getNodeType() == ASTNode::NodeKind::NamespaceDecl) {
+      auto *inner = static_cast<NamespaceDecl *>(d.get());
+      // Compose the nested scope. The composed string must outlive codegen, so
+      // persist it in scopedNameStrs (which owns stable std::strings).
+      std::string composed = prefix.str() + "::" + inner->name.str();
+      scopedNameStrs.push_back(std::make_unique<std::string>(composed));
+      stampNamespace(inner->decls, *scopedNameStrs.back());
+    } else if (d->getNodeType() == ASTNode::NodeKind::FunctionDecl) {
+      auto *f = static_cast<FunctionDecl *>(d.get());
+      if (!f->isMethod) f->nsName = prefix;
+    }
+  }
+}
+
+// Parse zero or more top-level decls into `out` (used for namespace bodies).
+// Stops at '}' (the caller consumes it) or eof.
+bool Parser::parseNestedDecls(std::vector<NodePtr> &out) {
+  // Temporarily redirect tu.decls into `out` by swapping — parseTopLevelDecl
+  // appends to tu.decls, so we make tu.decls refer to a local vector and move
+  // the results back.
+  std::vector<NodePtr> saved;
+  saved.swap(tu.decls);
+  tu.decls = std::vector<NodePtr>{};
+  bool ok = true;
+  while (!curTok.is(TokKind::r_brace) && !curTok.is(TokKind::eof)) {
+    if (!parseTopLevelDecl()) {
+      ok = false;
+      break;
+    }
+  }
+  out = std::move(tu.decls);
+  tu.decls = std::move(saved);
+  return ok;
+}
 // Registers a TypedefType(name -> underlying) in `typeNames`.
 bool Parser::parseTypedefDecl() {
   Token typedefTok = curTok;
@@ -713,6 +970,37 @@ Type *Parser::parseBaseType() {
   default: return nullptr;
   }
   advance();
+  // Scoped type `Name::SubType` (e.g. `ns::Class`, `Outer::Inner`). Only the
+  // identifier base can be followed by `::` (builtins can't). The device
+  // backend mangles scoped names to `Name_SubType` (underscores); the host
+  // backend emits the fully-qualified name verbatim. Model as a RecordType
+  // whose StructDecl carries the mangled name; nested scopes chain.
+  if (base && curTok.is(TokKind::coloncolon) &&
+      base->getKind() == TypeKind::Record) {
+    while (curTok.is(TokKind::coloncolon)) {
+      advance();
+      if (!curTok.is(TokKind::identifier)) {
+        error(curTok, "expected type name after '::'");
+        return nullptr;
+      }
+      auto *rt = static_cast<RecordType *>(base);
+      std::string mangled = rt->decl->name.str() + "_" + curTok.text.str();
+      auto it2 = typeNames.find(mangled);
+      if (it2 != typeNames.end()) {
+        base = it2->second;
+      } else {
+        // Persist the mangled string so the StructDecl::name StringRef is
+        // stable for the rest of the compile.
+        auto stored = std::make_unique<std::string>(std::move(mangled));
+        auto *sd2 = new StructDecl(toSourceLoc(curTok), StringRef());
+        sd2->name = *stored;
+        scopedTypeStrs.push_back(std::move(stored));
+        base = new RecordType(sd2);
+        typeNames[sd2->name] = base;
+      }
+      advance();
+    }
+  }
   return base;
 }
 
@@ -1316,18 +1604,24 @@ NodePtr Parser::parsePostfix() {
       auto idx = parseExpression();
       expect(TokKind::r_square, "']'");
       base = NodePtr(new IndexExpr(toSourceLoc(lb), std::move(base), std::move(idx)));
-    } else if (curTok.is(TokKind::dot)) {
+    } else if (curTok.isOneOf(TokKind::dot, TokKind::arrow)) {
+      // `.` and `->` both lower to MemberAccessExpr. On the device `this` is a
+      // value (`Class _this`), so `.`/`->` both spell as `.`; the host backend
+      // rewrites `_this.field`/`_this->field` to `this->field` (a real C++
+      // pointer). For non-`this` pointer dereference (`p->f`) the device path
+      // is best-effort (GLSL has no pointer member access) but the AST stays
+      // uniform.
       advance();
       Token m = curTok;
       if (!expect(TokKind::identifier, "member name"))
         return nullptr;
       // expect() already consumed the member identifier.
       base = NodePtr(new MemberAccessExpr(toSourceLoc(m), std::move(base), m.text));
-    } else if (curTok.is(TokKind::colon) && lexer.peek().is(TokKind::colon)) {
-      // Scope/resolution operator `::` (lexed as two `colon` tokens), as in
-      // `VCMemcpyKind::HostToDevice`. Lowered to a MemberAccessExpr so the
-      // host backend can emit it verbatim; the device backend rarely sees it.
-      advance();
+    } else if (curTok.is(TokKind::coloncolon)) {
+      // Scope-resolution operator `::` (lexed as a single coloncolon token),
+      // as in `VCMemcpyKind::HostToDevice` or `ns::func`. Lowered to a
+      // MemberAccessExpr with isScope=true so the host backend emits `::` and
+      // the device backend can mangle (`ns_func`).
       advance();
       Token m = curTok;
       if (!expect(TokKind::identifier, "scoped name"))
@@ -1481,6 +1775,14 @@ NodePtr Parser::parsePrimary() {
     advance();
     // represent as a call to a builtin named __syncthreads
     return NodePtr(new DeclRefExpr(toSourceLoc(t), "__syncthreads"));
+  case TokKind::kw_this:
+    // `this` inside a method body. Represented as a DeclRefExpr naming "_this",
+    // which is the synthesized first parameter the device backend injects when
+    // lowering a method to a free function. The host backend emits `this`
+    // verbatim (real C++ method), so it maps DeclRefExpr("_this") -> "this"
+    // only on the device path; on host we emit "this" for the name "_this".
+    advance();
+    return NodePtr(new DeclRefExpr(toSourceLoc(t), "_this"));
   case TokKind::kw_true:
     advance();
     return NodePtr(new BoolLiteral(toSourceLoc(t), true));

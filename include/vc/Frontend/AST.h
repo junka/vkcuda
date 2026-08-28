@@ -161,6 +161,7 @@ public:
     FieldDecl,
     TypedefDecl,
     EnumDecl,
+    NamespaceDecl,
     // Statements
     CompoundStmt,
     ReturnStmt,
@@ -261,6 +262,23 @@ public:
   NodePtr body; // CompoundStmt, may be null
   DeviceAttr deviceAttr = DeviceAttr::None;
   StorageClass storageClass = StorageClass::None; // C `static`/`extern`
+  // C++ class member function. `isMethod` marks this as a method of `className`;
+  // on the device the GLSL backend lowers it to a free function
+  // `Class_method(Class _this, args...)` (this as the first parameter, since
+  // GLSL structs have no member functions). The host backend emits a real C++
+  // method. `className` is empty for free functions.
+  bool isMethod = false;
+  StringRef className;
+  // Enclosing namespace scope, dotted with `::` for nesting (e.g. `outer` or
+  // `outer::inner`). Empty for top-level functions. The device backend mangles
+  // `ns::func` to `ns_func` (and `outer::inner::func` to `outer_inner_func`);
+  // the host backend emits the verbatim `namespace ns { ... }` block and keeps
+  // the qualified spelling at call sites, so this field is device-only.
+  StringRef nsName;
+  // Whether the source defined a body (false => declaration only, e.g. an
+  // out-of-line class method). Methods declared inside a class body may have a
+  // null body; methods defined out-of-line (`void C::f() {...}`) have one.
+  bool hasBody = false;
 
   FunctionDecl(SourceLocation l) : ASTNode(l) {}
   NodeKind getNodeType() const override { return NodeKind::FunctionDecl; }
@@ -308,10 +326,18 @@ public:
 
 // `struct Name { Type field; ... };` — defines a RecordType. Fields are owned
 // by the decl (deleted in the destructor). GLSL lowers to `struct Name {...}`.
+// `isClass` marks a C++ `class` (vs `struct`): only the default access differs,
+// and VC doesn't enforce access control, so the distinction matters only for
+// the host backend (which emits `class Name { public: ... };`). `methods` are
+// member functions declared inside the body; they are NOT owned here (they're
+// owned by the TranslationUnit / NamespaceDecl decl list as FunctionDecls), so
+// the destructor does not delete them. GLSL never emits methods on the struct.
 class StructDecl : public ASTNode {
 public:
   StringRef name;
   std::vector<FieldDecl *> fields;
+  bool isClass = false;
+  std::vector<FunctionDecl *> methods; // non-owning
 
   StructDecl(SourceLocation l, StringRef n) : ASTNode(l), name(n) {}
   ~StructDecl() override {
@@ -348,6 +374,19 @@ public:
   TypedefDecl(SourceLocation l, StringRef n, Type *u)
       : ASTNode(l), name(n), underlying(u) {}
   NodeKind getNodeType() const override { return NodeKind::TypedefDecl; }
+};
+
+// `namespace Name { decls... }` — a named scope. The body decls are owned here
+// (they are moved out of the parser's decl stack). GLSL flattens namespaces:
+// the device backend recurses into the body and emits each decl with a mangled
+// name (`ns::f` -> `ns_f`) rather than emitting a namespace block (GLSL has no
+// namespaces). The host backend emits `namespace Name { ... }` verbatim.
+class NamespaceDecl : public ASTNode {
+public:
+  StringRef name;
+  std::vector<NodePtr> decls;
+  NamespaceDecl(SourceLocation l, StringRef n) : ASTNode(l), name(n) {}
+  NodeKind getNodeType() const override { return NodeKind::NamespaceDecl; }
 };
 
 //===----------------------------------------------------------------------===//

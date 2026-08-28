@@ -25,6 +25,54 @@ bool isThreadBuiltinName(llvm::StringRef n) {
          n == "gridDim" || n == "warpSize";
 }
 
+// Build the source spelling of a `::`-qualified MemberAccessExpr chain as
+// "A::B::C". The chain is left-nested: MemberAccessExpr(base=MemberAccessExpr(
+// base=DeclRefExpr("A"), member="B"), member="C"). Non-scope bases (an object
+// expression, not a name chain) stop the walk — returns empty in that case.
+std::string scopeChainStr(const MemberAccessExpr *ma) {
+  if (!ma) return {};
+  std::vector<std::string> parts;
+  parts.push_back(ma->member.str());
+  const ASTNode *cur = ma->base.get();
+  while (cur) {
+    if (cur->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+      auto *sub = static_cast<const MemberAccessExpr *>(cur);
+      if (!sub->isScope) break; // base is an object expression, not a name
+      parts.push_back(sub->member.str());
+      cur = sub->base.get();
+    } else if (cur->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+      parts.push_back(static_cast<const DeclRefExpr *>(cur)->name.str());
+      break;
+    } else {
+      break;
+    }
+  }
+  std::reverse(parts.begin(), parts.end());
+  std::string out;
+  for (size_t i = 0; i < parts.size(); ++i) {
+    if (i) out += "::";
+    out += parts[i];
+  }
+  return out;
+}
+
+// "A::B::C" -> "A_B_C" (device mangle).
+std::string mangleScopeChain(StringRef chain) {
+  std::string out;
+  StringRef rest = chain;
+  bool first = true;
+  while (!rest.empty()) {
+    size_t pos = rest.find("::");
+    StringRef part = (pos == StringRef::npos) ? rest : rest.substr(0, pos);
+    if (!first) out += "_";
+    out += part.str();
+    first = false;
+    if (pos == StringRef::npos) break;
+    rest = rest.substr(pos + 2);
+  }
+  return out;
+}
+
 // Fold a constant integer expression to its value: plain literals and
 // unary-minus literals (e.g. -1). Returns false if the node isn't one, so
 // checks that need a statically-known integer can skip dynamic expressions.
@@ -446,14 +494,55 @@ bool Sema::analyze() {
 }
 
 void Sema::collectTopLevel() {
-  for (auto &d : tu.decls) {
+  collectDecls(tu.decls, StringRef());
+}
+
+// Compute the device-side mangled symbol name for a function under a namespace
+// prefix. A method becomes `Class_method` (or `ns_Class_method`); a free
+// function becomes `ns_func` (or just `func` at top level). The FunctionDecl's
+// own `name`/`className` fields are left untouched so the HOST backend can emit
+// the original `Class::method` / `ns::func` spelling — only the device symbol
+// table key is mangled.
+static std::string mangledFuncName(const FunctionDecl *f, StringRef nsPrefix) {
+  std::string base;
+  if (f->isMethod && !f->className.empty())
+    base = f->className.str() + "_" + f->name.str();
+  else
+    base = f->name.str();
+  if (nsPrefix.empty()) return base;
+  return nsPrefix.str() + "_" + base;
+}
+
+// Mangle a plain name (struct/typedef/var/enum-const) under a namespace prefix.
+static std::string mangleScoped(StringRef prefix, StringRef name) {
+  if (prefix.empty()) return name.str();
+  return prefix.str() + "_" + name.str();
+}
+
+void Sema::collectDecls(const std::vector<NodePtr> &decls, StringRef nsPrefix) {
+  for (auto &d : decls) {
     switch (d->getNodeType()) {
+    case ASTNode::NodeKind::NamespaceDecl: {
+      // Recurse into the namespace body with an extended prefix. Nested
+      // namespaces chain: `namespace a { namespace b { ... } }` -> `a_b`.
+      auto *ns = static_cast<NamespaceDecl *>(d.get());
+      std::string inner = mangleScoped(nsPrefix, ns->name);
+      // Persist the inner prefix string for the recursive StringRefs.
+      static std::vector<std::unique_ptr<std::string>> pstore;
+      pstore.push_back(std::make_unique<std::string>(std::move(inner)));
+      collectDecls(ns->decls, *pstore.back());
+      break;
+    }
     case ASTNode::NodeKind::FunctionDecl: {
       auto *f = static_cast<FunctionDecl *>(d.get());
-      functions[f->name] = f;
-      // Default arguments must be right-to-left contiguous: once a parameter
-      // has a default, every parameter after it must also have one. `f(int a,
-      // int b = 1, int c)` is invalid C++ (c has no default but follows one).
+      // Register under the mangled device symbol name so scoped call sites
+      // (`ns::f()`, `Class::m()`, `obj.m()`) resolve. The original name is
+      // preserved on the FunctionDecl for host-side emission.
+      std::string key = mangledFuncName(f, nsPrefix);
+      static std::vector<std::unique_ptr<std::string>> fstore;
+      fstore.push_back(std::make_unique<std::string>(std::move(key)));
+      functions[*fstore.back()] = f;
+      // Default-argument contiguity check (same as top-level free functions).
       bool seenDefault = false;
       for (ParamDecl *p : f->params) {
         if (p->defaultVal) seenDefault = true;
@@ -468,25 +557,58 @@ void Sema::collectTopLevel() {
     }
     case ASTNode::NodeKind::StructDecl: {
       auto *s = static_cast<StructDecl *>(d.get());
-      typeNames[s->name] = new RecordType(s);
+      // A struct/class inside a namespace is registered under its mangled name
+      // (`ns_Class`) so scoped type references resolve. The StructDecl's own
+      // `name` is left intact for host emission; only the typeNames key is
+      // mangled (the device backend emits the struct under the mangled name).
+      if (!nsPrefix.empty()) {
+        std::string key = mangleScoped(nsPrefix, s->name);
+        static std::vector<std::unique_ptr<std::string>> tstore;
+        tstore.push_back(std::make_unique<std::string>(std::move(key)));
+        typeNames[*tstore.back()] = new RecordType(s);
+      } else {
+        typeNames[s->name] = new RecordType(s);
+      }
       break;
     }
     case ASTNode::NodeKind::TypedefDecl: {
       auto *t = static_cast<TypedefDecl *>(d.get());
-      typeNames[t->name] = new TypedefType(t);
+      if (!nsPrefix.empty()) {
+        std::string key = mangleScoped(nsPrefix, t->name);
+        static std::vector<std::unique_ptr<std::string>> ttstore;
+        ttstore.push_back(std::make_unique<std::string>(std::move(key)));
+        typeNames[*ttstore.back()] = new TypedefType(t);
+      } else {
+        typeNames[t->name] = new TypedefType(t);
+      }
       break;
     }
     case ASTNode::NodeKind::EnumDecl: {
       auto *e = static_cast<EnumDecl *>(d.get());
-      for (auto &c : e->constants)
-        enumConstants[c.name] = c.value;
+      // Enum constants inside a namespace are registered under a mangled key
+      // (`ns_NAME`) so `ns::CONST` resolves.
+      for (auto &c : e->constants) {
+        if (!nsPrefix.empty()) {
+          std::string key = mangleScoped(nsPrefix, c.name);
+          static std::vector<std::unique_ptr<std::string>> estore;
+          estore.push_back(std::make_unique<std::string>(std::move(key)));
+          enumConstants[*estore.back()] = c.value;
+        } else {
+          enumConstants[c.name] = c.value;
+        }
+      }
       break;
     }
     case ASTNode::NodeKind::VarDecl: {
-      // Top-level globals (__constant__ decls). Registered so DeclRefExpr can
-      // resolve them; they live outside any lexical scope.
       auto *v = static_cast<VarDecl *>(d.get());
-      globalVars[v->name] = v;
+      if (!nsPrefix.empty()) {
+        std::string key = mangleScoped(nsPrefix, v->name);
+        static std::vector<std::unique_ptr<std::string>> vstore;
+        vstore.push_back(std::make_unique<std::string>(std::move(key)));
+        globalVars[*vstore.back()] = v;
+      } else {
+        globalVars[v->name] = v;
+      }
       break;
     }
     default:
@@ -496,7 +618,18 @@ void Sema::collectTopLevel() {
 }
 
 void Sema::checkFunctions() {
-  for (auto &d : tu.decls) {
+  checkFunctionsIn(tu.decls);
+}
+
+// Recursively walk top-level decls (and namespace bodies) and type-check every
+// device function body. Mirrors collectDecls' recursion so methods/helpers
+// declared inside a namespace are still checked.
+void Sema::checkFunctionsIn(const std::vector<NodePtr> &decls) {
+  for (auto &d : decls) {
+    if (d->getNodeType() == ASTNode::NodeKind::NamespaceDecl) {
+      checkFunctionsIn(static_cast<NamespaceDecl *>(d.get())->decls);
+      continue;
+    }
     if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
     auto *f = static_cast<FunctionDecl *>(d.get());
     if (!f->body) continue;
@@ -511,6 +644,18 @@ void Sema::checkFunctions() {
     pushScope();
     currentFunc = f;
     for (ParamDecl *p : f->params) declare(p->name, p);
+    // A device method references `this` (spelled "_this" by the parser). The
+    // device backend lowers the method to `Class_method(Class _this, ...)`,
+    // so synthesize a `_this` parameter typed as the class record so the body
+    // type-checks. Host methods are not checked here (host path is lax), so
+    // this only applies to __device__/__global__ methods.
+    if (f->isMethod && !f->className.empty()) {
+      auto it = typeNames.find(f->className);
+      if (it != typeNames.end()) {
+        auto *thisParam = new ParamDecl(f->getLoc(), it->second, "_this");
+        declare("_this", thisParam);
+      }
+    }
     checkStmt(f->body.get());
     currentFunc = nullptr;
     popScope();
@@ -906,9 +1051,25 @@ Type *Sema::checkExpr(const ASTNode *n) {
     auto *c = static_cast<const CallExpr *>(n);
     // Resolve callee name if it's a plain DeclRefExpr.
     StringRef calleeName;
+    bool calleeIsScoped = false;
     if (c->callee &&
         c->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr)
       calleeName = static_cast<const DeclRefExpr *>(c->callee.get())->name;
+    else if (c->callee && c->callee->getNodeType() ==
+                               ASTNode::NodeKind::MemberAccessExpr) {
+      // Scoped call `ns::func(...)` or member call `obj.method(...)`. For a
+      // scope (`::`) the callee spelling is mangled to `ns_func` so it resolves
+      // against the device symbol table.
+      auto *ma = static_cast<const MemberAccessExpr *>(c->callee.get());
+      if (ma->isScope) {
+        calleeIsScoped = true;
+        std::string chain = scopeChainStr(ma);       // "A::B::func"
+        std::string mangled = mangleScopeChain(chain); // "A_B_func"
+        static std::vector<std::unique_ptr<std::string>> cstore;
+        cstore.push_back(std::make_unique<std::string>(std::move(mangled)));
+        calleeName = *cstore.back();
+      }
+    }
 
     // Vector constructors (float4(...)) and math builtins pass through.
     if (!calleeName.empty()) {
@@ -1027,6 +1188,11 @@ Type *Sema::checkExpr(const ASTNode *n) {
       auto *sd = static_cast<RecordType *>(baseTy)->decl;
       for (FieldDecl *fd : sd->fields)
         if (fd->name == m->member) return fd->type;
+      // A class method accessed as `obj.method` (typically a call target). We
+      // don't model a method type; just accept the member so the device backend
+      // can lower the call to `Class_method(obj, ...)`.
+      for (FunctionDecl *meth : sd->methods)
+        if (meth->name == m->member) return nullptr;
       error(n, "no member named '" + std::string(m->member) + "' in struct '" +
                    std::string(sd->name) + "'");
     }
@@ -1040,6 +1206,8 @@ Type *Sema::checkExpr(const ASTNode *n) {
           auto *sd = static_cast<RecordType *>(under)->decl;
           for (FieldDecl *fd : sd->fields)
             if (fd->name == m->member) return fd->type;
+          for (FunctionDecl *meth : sd->methods)
+            if (meth->name == m->member) return nullptr;
           error(n, "no member named '" + std::string(m->member) +
                        "' in struct '" + std::string(sd->name) + "'");
         }

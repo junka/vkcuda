@@ -61,11 +61,19 @@ public:
   GLSLEmitter(raw_ostream &o) : os(&o) {}
 
   bool emit(const TranslationUnit &tu) {
+    // Flatten the translation unit: namespaces are transparent on the device
+    // side (GLSL has none), so their body decls are spliced into the top-level
+    // list. Structs/functions inside a namespace are emitted with mangled names
+    // (the Sema pass already registered them under those keys; here we just
+    // walk the flattened list).
+    std::vector<const ASTNode *> flat;
+    flattenDecls(tu.decls, flat);
+
     // Find the first __global__ function.
     const FunctionDecl *fn = nullptr;
-    for (auto &d : tu.decls) {
+    for (auto *d : flat) {
       if (d->getNodeType() == ASTNode::NodeKind::FunctionDecl) {
-        auto *f = static_cast<const FunctionDecl *>(d.get());
+        auto *f = static_cast<const FunctionDecl *>(d);
         if (f->deviceAttr == DeviceAttr::Global) { fn = f; break; }
       }
     }
@@ -77,25 +85,63 @@ public:
     params.assign(fn->params.begin(), fn->params.end());
     if (fn->body) scanDims(fn->body.get());
 
-    // Index all top-level functions so call sites can look up default-argument
-    // expressions to complete calls that omit trailing defaulted parameters.
-    for (auto &d : tu.decls) {
+    // Index all functions (kernels + __device__ helpers, including those inside
+    // namespaces) under their mangled device name so call sites resolve. The
+    // Sema pass rewrote scoped call sites to the mangled name already.
+    for (auto *d : flat) {
       if (d->getNodeType() == ASTNode::NodeKind::FunctionDecl) {
-        auto *f = static_cast<const FunctionDecl *>(d.get());
-        funcDecls[f->name] = f;
+        auto *f = static_cast<const FunctionDecl *>(d);
+        funcDecls[deviceFuncName(f)] = f;
       }
     }
 
     emitHeader();
-    emitStructDecls(tu);
-    emitEnumDecls(tu);
-    emitConstantDecls(tu);
+    emitStructDecls(flat);
+    emitEnumDecls(flat);
+    emitConstantDecls(flat);
     emitBindings();
     emitSharedDecls();
     emitVoteDecls();
-    emitDeviceFunctions(tu);
+    emitDeviceFunctions(flat);
     emitBody();
     return true;
+  }
+
+  // Recursively splice NamespaceDecl bodies into `out` (namespaces are
+  // transparent on the device side). Nested namespaces recurse.
+  static void flattenDecls(const std::vector<NodePtr> &decls,
+                           std::vector<const ASTNode *> &out) {
+    for (auto &d : decls) {
+      if (d->getNodeType() == ASTNode::NodeKind::NamespaceDecl) {
+        flattenDecls(static_cast<const NamespaceDecl *>(d.get())->decls, out);
+        continue;
+      }
+      out.push_back(d.get());
+    }
+  }
+
+  // The device-side symbol name for a function: a method becomes
+  // `Class_method` (this is the free-function lowering GLSL needs, since GLSL
+  // structs have no member functions); a namespace member `ns::func` becomes
+  // `ns_func` (nested `outer::inner::func` -> `outer_inner_func`). Top-level
+  // free functions keep their name. This mirrors Sema's mangledFuncName.
+  static std::string deviceFuncName(const FunctionDecl *f) {
+    if (f->isMethod && !f->className.empty())
+      return f->className.str() + "_" + f->name.str();
+    if (!f->nsName.empty()) {
+      // Compose "outer::inner::func" -> "outer_inner_func": split on "::",
+      // join with single underscores.
+      std::string out;
+      llvm::StringRef rest = f->nsName;
+      while (!rest.empty()) {
+        auto pair = rest.split("::");
+        if (!out.empty()) out += '_';
+        out += pair.first.str();
+        rest = pair.second;
+      }
+      return out + "_" + f->name.str();
+    }
+    return f->name.str();
   }
 
 private:
@@ -441,11 +487,14 @@ private:
   // Emit every __device__ function as a GLSL top-level function, before
   // main(). These are callable helpers (CUDA __device__ functions); the
   // __global__ kernel becomes main(). Forward references are handled if the
-  // helper is declared before use (CUDA source is typically top-down).
-  void emitDeviceFunctions(const TranslationUnit &tu) {
-    for (auto &d : tu.decls) {
+  // helper is declared before use (CUDA source is typically top-down). A
+  // __device__ class method is lowered to a free function `Class_method`
+  // with the synthesized `this` (spelled `_this` in the body) as the first
+  // parameter, since GLSL structs have no member functions.
+  void emitDeviceFunctions(const std::vector<const ASTNode *> &flat) {
+    for (auto *d : flat) {
       if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
-      auto *f = static_cast<const FunctionDecl *>(d.get());
+      auto *f = static_cast<const FunctionDecl *>(d);
       if (f->deviceAttr != DeviceAttr::Device) continue;
       emitFunction(f);
     }
@@ -455,10 +504,12 @@ private:
   // before any function body that uses the type. GLSL requires types be
   // declared before use, so all structs are emitted up front regardless of
   // source order (mutual references via pointers are uncommon in kernels).
-  void emitStructDecls(const TranslationUnit &tu) {
-    for (auto &d : tu.decls) {
+  // A `class` is emitted the same way (fields only — GLSL structs have no
+  // methods or access control; methods are lowered to free functions).
+  void emitStructDecls(const std::vector<const ASTNode *> &flat) {
+    for (auto *d : flat) {
       if (d->getNodeType() != ASTNode::NodeKind::StructDecl) continue;
-      auto *sd = static_cast<const StructDecl *>(d.get());
+      auto *sd = static_cast<const StructDecl *>(d);
       (*os) << "struct " << sd->name << " {\n";
       for (const FieldDecl *fd : sd->fields) {
         (*os) << "  " << glslType(fd->type) << " " << glslName(fd->name);
@@ -473,10 +524,10 @@ private:
   // Emit unscoped enum constants as `const int NAME = <value>;`. GLSL has no
   // enum type, so each constant becomes a compile-time int. Anonymous enums
   // (no name) are flattened the same way — their constants are still named.
-  void emitEnumDecls(const TranslationUnit &tu) {
-    for (auto &d : tu.decls) {
+  void emitEnumDecls(const std::vector<const ASTNode *> &flat) {
+    for (auto *d : flat) {
       if (d->getNodeType() != ASTNode::NodeKind::EnumDecl) continue;
-      auto *ed = static_cast<const EnumDecl *>(d.get());
+      auto *ed = static_cast<const EnumDecl *>(d);
       for (auto &c : ed->constants)
         (*os) << "const int " << glslName(c.name) << " = " << c.value << ";\n";
       if (!ed->constants.empty()) (*os) << "\n";
@@ -488,10 +539,10 @@ private:
   // separate constant address space, so a plain `const` global is the correct
   // lowering (it lives in the shader's constant data and is read-only). VC
   // supports compile-time initializers only — no runtime symbol copy.
-  void emitConstantDecls(const TranslationUnit &tu) {
-    for (auto &d : tu.decls) {
+  void emitConstantDecls(const std::vector<const ASTNode *> &flat) {
+    for (auto *d : flat) {
       if (d->getNodeType() != ASTNode::NodeKind::VarDecl) continue;
-      auto *v = static_cast<const VarDecl *>(d.get());
+      auto *v = static_cast<const VarDecl *>(d);
       if (!v->isConstant) continue;
       (*os) << "const " << glslType(v->type) << " " << glslName(v->name);
       for (int64_t dim : v->arrayDims)
@@ -505,11 +556,26 @@ private:
     (*os) << "\n";
   }
 
-  // Emit one function signature + body (used for __device__ helpers).
+  // Emit one function signature + body. A method (isMethod) is lowered to a
+  // free function `Class_method` with a synthesized leading `Class _this`
+  // parameter — the body already references `_this` (the parser mapped `this`
+  // to that name), so no body rewrite is needed. Free functions emit as-is.
   void emitFunction(const FunctionDecl *f) {
-    (*os) << glslType(f->returnType) << " " << f->name << "(";
+    (*os) << glslType(f->returnType) << " " << deviceFuncName(f) << "(";
+    bool emittedParam = false;
+    if (f->isMethod && !f->className.empty()) {
+      // `this` as the first parameter, typed as the class record. Build a
+      // RecordType whose decl carries the class name so glslType spells it.
+      // It is `inout`: a method mutating `this->field` (e.g. `this->sum += x`)
+      // must propagate back to the caller's object, mirroring C++ reference
+      // semantics. GLSL `inout` is the exact counterpart (passed by reference).
+      auto *sd = new StructDecl(f->getLoc(), f->className);
+      (*os) << "inout " << glslType(new RecordType(sd)) << " _this";
+      emittedParam = true;
+    }
     for (unsigned i = 0; i < f->params.size(); ++i) {
-      if (i) (*os) << ", ";
+      if (emittedParam) (*os) << ", ";
+      emittedParam = true;
       if (f->params[i]->isConst) (*os) << "const ";
       (*os) << glslType(f->params[i]->type) << " " << glslName(f->params[i]->name);
     }
@@ -1112,6 +1178,83 @@ private:
     }
   }
 
+  // Build the device mangled name for a `::`-scoped MemberAccessExpr chain:
+  // `ns::func` -> "ns_func", `A::B::C` -> "A_B_C". Mirrors Sema's mangle.
+  static std::string mangleScopeChainGLSL(const MemberAccessExpr *ma) {
+    if (!ma) return {};
+    std::vector<std::string> parts;
+    parts.push_back(ma->member.str());
+    const ASTNode *cur = ma->base.get();
+    while (cur) {
+      if (cur->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+        auto *sub = static_cast<const MemberAccessExpr *>(cur);
+        if (!sub->isScope) break;
+        parts.push_back(sub->member.str());
+        cur = sub->base.get();
+      } else if (cur->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+        parts.push_back(static_cast<const DeclRefExpr *>(cur)->name.str());
+        break;
+      } else {
+        break;
+      }
+    }
+    std::reverse(parts.begin(), parts.end());
+    std::string out;
+    for (size_t i = 0; i < parts.size(); ++i) {
+      if (i) out += "_";
+      out += parts[i];
+    }
+    return out;
+  }
+
+  // For `obj.method(...)`, recover the mangled free-function name
+  // `Class_method`. The Class name comes from the object's record type when the
+  // base is a simple DeclRefExpr to a typed variable; otherwise we can't
+  // recover it and emit a best-effort `method` (which won't resolve, but keeps
+  // emission well-formed).
+  std::string memberCallMethodName(const MemberAccessExpr *ma) const {
+    StringRef method = ma->member;
+    if (ma->base &&
+        ma->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+      StringRef baseName = static_cast<const DeclRefExpr *>(ma->base.get())->name;
+      // Look up the base variable's type through the symbol context. The GLSL
+      // emitter doesn't carry a type table, so recover the class name by
+      // scanning funcDecls for a key of the form "<Class>_<method>" — if exactly
+      // one such method exists, that's the callee.
+      std::string suffix = "_" + method.str();
+      std::string match;
+      for (auto &kv : funcDecls) {
+        if (kv.getKey().ends_with(suffix) && kv.getValue()->isMethod) {
+          if (!match.empty()) { match.clear(); break; } // ambiguous
+          match = kv.getKey().str();
+        }
+      }
+      if (!match.empty()) return match;
+      (void)baseName;
+    }
+    return method.str();
+  }
+
+  // Emit call arguments followed by default-argument completions, looked up by
+  // the callee's mangled device name.
+  void emitCallArgsWithDefaults(StringRef mangledName,
+                                const std::vector<NodePtr> &args) {
+    for (unsigned i = 0; i < args.size(); ++i) {
+      if (i) (*os) << ", ";
+      emitExpr(args[i].get());
+    }
+    auto fit = funcDecls.find(mangledName);
+    if (fit != funcDecls.end()) {
+      const FunctionDecl *calleeFn = fit->second;
+      for (unsigned i = args.size(); i < calleeFn->params.size(); ++i) {
+        if (calleeFn->params[i]->defaultVal) {
+          if (i) (*os) << ", ";
+          emitExpr(calleeFn->params[i]->defaultVal.get());
+        }
+      }
+    }
+  }
+
   void emitExpr(const ASTNode *n) {
     if (!n) { (*os) << "/*null*/"; return; }
     switch (n->getNodeType()) {
@@ -1237,6 +1380,13 @@ private:
         if (b == "blockDim")  { (*os) << "int(gl_WorkGroupSize."   << m->member << ")"; return; }
         if (b == "gridDim")   { (*os) << "int(gl_NumWorkGroups."   << m->member << ")"; return; }
       }
+      // Scope-resolution member access that is NOT a call: `Kind::A`,
+      // `ns::CONST`, `Outer::Inner` (type). Lower to the mangled device name
+      // (`Kind_A`, `ns_CONST`). A chain like `A::B::C` becomes `A_B_C`.
+      if (m->isScope) {
+        (*os) << glslName(mangleScopeChainGLSL(m));
+        return;
+      }
       emitExpr(m->base.get());
       (*os) << "." << glslName(m->member);
       break;
@@ -1319,6 +1469,35 @@ private:
               emitExpr(calleeFn->params[i]->defaultVal.get());
             }
           }
+        }
+        (*os) << ")";
+        return;
+      }
+      // Callee is a scoped or member-access expression: ns::func(), Class::m(),
+      // or obj.method(). Lower to the mangled free-function form.
+      if (c->callee && c->callee->getNodeType() ==
+                            ASTNode::NodeKind::MemberAccessExpr) {
+        auto *ma = static_cast<const MemberAccessExpr *>(c->callee.get());
+        if (ma->isScope) {
+          // ns::func(args) -> ns_func(args). Class::method(args) -> Class_method(args)
+          // (no implicit `this` for scope calls — the caller names the method
+          // directly, e.g. a static-like call).
+          std::string mangled = mangleScopeChainGLSL(ma);
+          (*os) << mangled << "(";
+          emitCallArgsWithDefaults(mangled, c->args);
+          (*os) << ")";
+          return;
+        }
+        // obj.method(args) -> Class_method(obj, args). The object expression
+        // becomes the first argument (`this`). The Class name is recovered from
+        // the object's type when possible; otherwise we look for a method
+        // registered under "<base>_<member>".
+        std::string methodName = memberCallMethodName(ma);
+        (*os) << methodName << "(";
+        emitExpr(ma->base.get());
+        for (auto &a : c->args) {
+          (*os) << ", ";
+          emitExpr(a.get());
         }
         (*os) << ")";
         return;

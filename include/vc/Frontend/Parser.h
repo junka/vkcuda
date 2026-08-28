@@ -12,7 +12,10 @@
 #include "vc/Frontend/Lexer.h"
 
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/SourceMgr.h"
+
+#include <memory>
 
 namespace vc {
 
@@ -43,6 +46,16 @@ class Parser {
   // NOT supported (would need multiple passes).
   llvm::StringMap<std::string> defines;
 
+  // Stable storage for the mangled name strings synthesized for scoped types
+  // (`ns::Class` -> "ns_Class"). The StructDecl::name StringRef of a scoped
+  // RecordType points into these strings, so they must outlive the parse.
+  std::vector<std::unique_ptr<std::string>> scopedTypeStrs;
+
+  // Stable storage for composed nested-namespace scope strings (e.g.
+  // "outer::inner") built by stampNamespace. FunctionDecl::nsName StringRefs
+  // point into these, so they must outlive the parse.
+  std::vector<std::unique_ptr<std::string>> scopedNameStrs;
+
 public:
   Parser(Lexer &lex, llvm::SourceMgr &sm, TranslationUnit &unit)
       : lexer(lex), srcMgr(sm), tu(unit) {
@@ -63,9 +76,18 @@ private:
   bool parseTopLevelDecl();
   bool parseFunctionOrKernel();
   bool parseStructDecl();
+  bool parseClassDecl();
   bool parseTypedefDecl();
   bool parseEnumDecl();
   bool parseConstantDecl();
+  bool parseNamespaceDecl();
+  // Set FunctionDecl::nsName on free functions in a namespace body (recursing
+  // into nested namespaces, composing the scope as "outer::inner").
+  void stampNamespace(const std::vector<NodePtr> &decls, llvm::StringRef prefix);
+  // Parse decls that may appear nested inside a namespace/class body; collects
+  // them into `out` (a namespace's owned decls). Returns false on unrecoverable
+  // error.
+  bool parseNestedDecls(std::vector<NodePtr> &out);
   // File-scope `static`/`extern` variable declaration (no device qualifier).
   bool parseGlobalVarDecl();
 
