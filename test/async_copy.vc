@@ -1,0 +1,110 @@
+// test/async_copy.vc — single-file async-copy approximation demo (kernel + host).
+//
+// Exercises the VC async-copy approximation: vcMemcpyAsync + vcPipeline*.
+// Vulkan/SPIR-V has no TMA hardware (no cp.async.bulk, no mbarrier, no
+// TensorMap), so vcMemcpyAsync is lowered to a SOFTWARE cooperative copy
+// (every workgroup thread copies a contiguous segment) + barrier(). This is
+// synchronous — there is no real DMA overlap — but the API shape mirrors
+// CUDA's __pipeline_memcpy_async so tiled double-buffered kernels can be
+// written correctly today.
+//
+//   vcMemcpyAsync(dst, src, nElems, pipe)
+//     - dst:    __shared__ T[] slot (e.g. buf[0])
+//     - src:    device pointer / SSBO index expr (e.g. in + offset)
+//     - nElems: number of ELEMENTS to copy (not bytes)
+//     - pipe:   VcPipeline& sync token (ignored in the software lowering)
+//   vcPipelineProducerCommit(pipe) / ConsumerWait(pipe) / ConsumerCommit(pipe)
+//     - barrier() wrappers; must sit in uniform control flow.
+//
+// This demo tiles an elementwise scale over two shared-buffer slots in a
+// double-buffered loop. Each tile is copied into one slot while the previous
+// tile is consumed from the other.
+//
+//   vcc test/async_copy.vc -o build/async_copy_sf && ./build/async_copy_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// Pipeline sync token. In the software lowering this carries no real state —
+// vcPipeline* are plain barrier() wrappers. The struct exists so the API
+// reads like CUDA's pipeline model and can be re-lowered to a hardware path
+// if Vulkan gains one. The `phase` field is unused by the backend (the user
+// selects the slot explicitly with t%2), but kept for future use.
+struct VcPipeline {
+  int phase;
+};
+
+#define TILE 64
+#define NTILES 8
+
+__global__ void asyncCopyKernel(float *out, float *in, int n) {
+  // Double-buffered shared memory: two slots of TILE elements each.
+  __shared__ float buf[2][TILE];
+  VcPipeline pipe;
+  pipe.phase = 0;
+
+  // Prefetch tile 0 into slot 0.
+  vcMemcpyAsync(buf[0], in + 0 * TILE, TILE, pipe);
+  vcPipelineProducerCommit(pipe);
+
+  for (int t = 0; t < NTILES; ++t) {
+    int curSlot = t % 2;
+    int nextSlot = (t + 1) % 2;
+    int nextTile = t + 1;
+
+    // Fetch the next tile into the OTHER slot (overlaps conceptually with
+    // consuming the current slot; in software both are synchronous).
+    if (nextTile < NTILES) {
+      vcMemcpyAsync(buf[nextSlot], in + nextTile * TILE, TILE, pipe);
+      vcPipelineProducerCommit(pipe);
+    }
+
+    // Wait for the current tile to be ready, then consume it.
+    vcPipelineConsumerWait(pipe);
+
+    int i = threadIdx.x;
+    if (i < TILE) {
+      int base = t * TILE + i;
+      if (base < n)
+        out[base] = buf[curSlot][i] * 2.0f;
+    }
+
+    vcPipelineConsumerCommit(pipe);
+  }
+}
+
+int main() {
+  vcInit();
+
+  const int n = TILE * NTILES;
+  void *dIn = 0, *dOut = 0;
+  vcMalloc(&dIn, n * 4);
+  vcMalloc(&dOut, n * 4);
+
+  float hin[512] = {0};
+  for (int i = 0; i < n; i++) hin[i] = (float)i;
+  vcMemcpy(dIn, hin, n * 4, VCMemcpyKind::HostToDevice);
+
+  asyncCopyKernel<<<n, TILE>>>(dOut, dIn, n);
+  vcDeviceSynchronize();
+
+  float hout[512] = {0};
+  vcMemcpy(hout, dOut, n * 4, VCMemcpyKind::DeviceToHost);
+
+  // Expected: out[i] == in[i] * 2.
+  int ok = 1;
+  for (int i = 0; i < n; i++) {
+    float expect = hin[i] * 2.0f;
+    if (hout[i] != expect) {
+      printf("  mismatch i=%d got=%.1f expect=%.1f\n", i, hout[i], expect);
+      ok = 0;
+    }
+  }
+
+  printf("async_copy: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dIn);
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

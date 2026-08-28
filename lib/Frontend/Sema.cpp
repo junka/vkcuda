@@ -79,6 +79,11 @@ bool Sema::isMathBuiltin(StringRef name) const {
       // ops; the leading mask argument is dropped at codegen time).
       "__syncwarp", "__ballot_sync", "__anySync", "__allSync", "__activemask",
       "__shfl_sync", "__shfl_up_sync", "__shfl_down_sync", "__shfl_xor_sync",
+      // VC async-copy approximation builtins (lowered by the GLSL backend to a
+      // software cooperative copy + barrier). vcMemcpyAsync(dst, src, nElems,
+      // pipe); vcPipeline* are barrier() wrappers. No hardware DMA in Vulkan.
+      "vcMemcpyAsync", "vcPipelineProducerCommit", "vcPipelineConsumerWait",
+      "vcPipelineConsumerCommit",
       // CUDA launch dimension constructor `dim3(x, y)` — recognized so the
       // grid/block slots of a kernel<<<...>>> launch don't warn as unknown.
       "dim3",

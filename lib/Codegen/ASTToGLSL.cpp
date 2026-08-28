@@ -785,6 +785,88 @@ private:
     (*os) << "_vc_vote_result";
   }
 
+  // --- VC async-copy approximation (software cooperative copy) ---------------
+  // Vulkan/SPIR-V has no TMA hardware (no cp.async.bulk, no mbarrier, no
+  // TensorMap descriptor), so vcMemcpyAsync is lowered to a software
+  // cooperative copy: every workgroup thread copies a contiguous segment of
+  // the source into the shared destination, followed by a barrier(). This is
+  // synchronous (there is no real DMA), but the API shape mirrors CUDA's
+  // __pipeline_memcpy_async so tiled double-buffered kernels can be written
+  // correctly today and re-lowered to a hardware path if one appears.
+  //
+  // vcPipeline* are pure barrier() wrappers (no mbarrier / transactional
+  // barrier exists in Vulkan). They must sit in uniform control flow because
+  // GLSL barrier() is only legal when all invocations reach it.
+  static bool isAsyncCopyBuiltin(StringRef name) {
+    return name == "vcMemcpyAsync" || name == "vcPipelineProducerCommit" ||
+           name == "vcPipelineConsumerWait" || name == "vcPipelineConsumerCommit";
+  }
+
+  // vcMemcpyAsync(dst, src, nElems, pipe)
+  //   dst    : __shared__ T[] slot to write (e.g. buf[0])
+  //   src    : device pointer / SSBO index expression (e.g. in + offset)
+  //   nElems : number of elements to copy (NOT bytes — element-level copy)
+  //   pipe   : VcPipeline& sync token (ignored in the software lowering)
+  // Lowers to a per-thread segment copy + barrier(), written directly to the
+  // output stream at the call site (the prologue IS the statement — there is
+  // no inline value). nElems must be divisible by the workgroup x size; a
+  // remainder needs a tail handler the caller adds explicitly.
+  void emitAsyncCopyCall(StringRef name, const std::vector<NodePtr> &args) {
+    // vcPipeline* -> barrier() only, inline at the call site.
+    if (name != "vcMemcpyAsync") {
+      (*os) << "barrier() /*" << name.str() << "*/";
+      return;
+    }
+    // vcMemcpyAsync: cooperative copy block written inline.
+    if (args.size() < 3) { (*os) << "/*vcMemcpyAsync: missing args*/"; return; }
+    // Capture dst / nElems as text (vote-style raw_string_ostream redirect).
+    std::string dstStr, nStr;
+    auto capture = [&](const ASTNode *n, std::string &out) {
+      raw_string_ostream o(out);
+      raw_ostream *saved = os;
+      os = &o;
+      emitExpr(n);
+      os = saved;
+    };
+    capture(args[0].get(), dstStr);
+    capture(args[2].get(), nStr);
+    // The source is typically CUDA pointer arithmetic `in + offset`, which is
+    // illegal as a GLSL SSBO array expression (`in_ + off`). Detect an Add
+    // node and split it into base + offset so we can emit `base[off + i]`.
+    // A bare indexable source (e.g. another shared array) is emitted as-is.
+    std::string srcBaseStr, srcOffsetStr;
+    bool srcIsAdd = false;
+    const ASTNode *srcArg = args[1].get();
+    if (srcArg && srcArg->getNodeType() == ASTNode::NodeKind::BinaryExpr) {
+      auto *b = static_cast<const BinaryExpr *>(srcArg);
+      if (b->op == BinaryOp::Add) {
+        srcIsAdd = true;
+        capture(b->lhs.get(), srcBaseStr);
+        capture(b->rhs.get(), srcOffsetStr);
+      }
+    }
+    if (!srcIsAdd) capture(srcArg, srcBaseStr);
+    // Emit a block whose first line continues the current line (after the
+    // statement's leading pad), so it sits correctly inside the enclosing
+    // ExprStmt. Each thread copies a contiguous segment of length
+    // nElems/blockDim.x.
+    (*os) << "{ // vcMemcpyAsync cooperative copy\n";
+    (*os) << "    int _vc_n = (" << nStr << ") / int(gl_WorkGroupSize.x);\n";
+    (*os) << "    int _vc_base = int(gl_LocalInvocationIndex) * _vc_n;\n";
+    (*os) << "    for (int _vc_i = 0; _vc_i < _vc_n; ++_vc_i) {\n";
+    (*os) << "      " << dstStr << "[_vc_base + _vc_i] = " << srcBaseStr;
+    if (srcIsAdd)
+      (*os) << "[" << srcOffsetStr << " + _vc_base + _vc_i]";
+    else
+      (*os) << "[_vc_base + _vc_i]";
+    (*os) << ";\n";
+    (*os) << "    }\n";
+    (*os) << "    barrier();\n";
+    (*os) << "  }";
+    // The enclosing ExprStmt appends `;` after this block, yielding `... }`
+    // followed by an empty statement — harmless in GLSL.
+  }
+
   // Pre-pass walker: visit a statement's expressions (with output discarded)
   // so vote calls push their reduction prologues into `preStmts`. Recurses
   // through nested statements so a vote buried in an `if` body is hoisted
@@ -1210,6 +1292,13 @@ private:
         // reference model before falling through to generic call emission.
         if (isAtomicName(ref->name)) {
           emitAtomicCall(ref->name, c->args);
+          return;
+        }
+        // VC async-copy approximation: vcMemcpyAsync lowers to a software
+        // cooperative copy + barrier (hoisted into preStmts); vcPipeline* are
+        // barrier() wrappers. No hardware DMA exists in Vulkan.
+        if (isAsyncCopyBuiltin(ref->name)) {
+          emitAsyncCopyCall(ref->name, c->args);
           return;
         }
         // User __device__ helper or CUDA/math builtin: lower the name and emit
