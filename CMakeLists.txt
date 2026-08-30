@@ -131,3 +131,26 @@ if(Python3_Interpreter_FOUND AND VC_FILECHECK AND TARGET vcc)
 else()
   message(STATUS "vc-check disabled (FileCheck or python3 not found)")
 endif()
+
+# ---------------------------------------------------------------------------
+# MLIR backend regression tests
+#
+# `cmake --build build --target mlir-check` runs every test/MLIR/*.vc through
+# the `vc` tool (-emit=mlir / -emit=spirv) and validates the emitted IR /
+# binaries with FileCheck. Only built with the MLIR backend enabled.
+# ---------------------------------------------------------------------------
+if(VC_ENABLE_MLIR AND Python3_Interpreter_FOUND AND VC_FILECHECK
+   AND TARGET vc AND TARGET vcc)
+  add_custom_target(mlir-check
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_tests.py
+            --vcc $<TARGET_FILE:vcc>
+            --mlirc $<TARGET_FILE:vc>
+            --filecheck ${VC_FILECHECK}
+            ${CMAKE_SOURCE_DIR}/test/MLIR
+    DEPENDS vc
+    COMMENT "Running MLIR backend regression tests (test/MLIR)"
+    USES_TERMINAL)
+else()
+  message(STATUS "mlir-check disabled (needs VC_ENABLE_MLIR, vc, "
+                 "vc-check deps)")
+endif()

@@ -2,6 +2,7 @@
 add_library(VCCodegen STATIC
   ASTToMLIR.cpp
   LoweringPasses.cpp
+  VCToGPU.cpp
 )
 
 target_include_directories(VCCodegen PUBLIC
@@ -22,11 +23,18 @@ target_link_libraries(VCCodegen PUBLIC
   MLIRFuncDialect
   MLIRArithDialect
   MLIRMemRefDialect
+  MLIRSCFDialect
+  MLIRControlFlowDialect
   MLIRGPUDialect
   MLIRSPIRVDialect
   MLIRSPIRVConversion
+  MLIRSPIRVTransforms
   MLIRGPUToSPIRV
   MLIRFuncToSPIRV
+  MLIRSCFToControlFlow
+  MLIRArithToSPIRV
+  MLIRMemRefToSPIRV
+  MLIRControlFlowToSPIRV
   MLIRPass
   MLIRTransforms
 )

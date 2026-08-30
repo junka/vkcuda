@@ -1,0 +1,23 @@
+// test/MLIR/const_globals.vc — __constant__ globals (array + scalars).
+//
+// A file-scope `__constant__` array (LUT) and scalars (SCALE, BASE) are not
+// function locals: the emitter materializes each lazily as a Function-storage
+// memref slot at the top of the kernel and initializes it from the
+// compile-time initializer. This test pins the crash-fix for
+// `LUT[i % 8]` (the array must be recognized and loadable).
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+//
+// CHECK: vc.kernel
+// CHECK: memref<8xi32, #spirv.storage_class<Function>>
+// CHECK: arith.remsi
+// CHECK: memref.load
+// CHECK: arith.fptosi
+
+__constant__ int LUT[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+__constant__ float SCALE = 0.25f;
+__constant__ int BASE = 1000;
+
+__global__ void k(int *out, int i) {
+  out[i] = LUT[i % 8] + BASE + int(SCALE * 1000.0f);
+}

@@ -2,8 +2,19 @@
 //
 // Walks the AST and emits MLIR. Device (__global__) functions become
 // `func.func` entries wrapped by `vc.kernel`; thread/block indexing and
-// barriers map to vc.* ops. This scaffold covers the vector-add subset
-// and is the place to extend as the language grows.
+// barriers map to vc.* ops. Statements/expressions lower to the scf/arith/
+// memref dialect "core" the VC dialect sits on top of:
+//
+//   if/else/conditional  -> scf.if / arith.select
+//   for / while          -> scf.for / scf.while
+//   arithmetic           -> arith.addi/... (+f for floats)
+//   comparison           -> arith.cmpi / arith.cmpf
+//   && ||                -> arith.andi / arith.ori (on i1)
+//   casts                -> arith.sitofp / fptosi / ... / index_cast
+//
+// Integer literals and thread/block indices keep a language-level "int" form;
+// index type appears only where MLIR structurally requires it (memref
+// indexing, scf.for trip counts, block args), bridged with arith.index_cast.
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,6 +26,9 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -31,6 +45,14 @@ class ASTToMLIRImpl {
   ModuleOp module;
   // name -> func::FuncOp
   llvm::DenseMap<llvm::StringRef, func::FuncOp> funcTable;
+  // name -> Value (block arg / local memref / alloca)
+  llvm::StringMap<Value> locals;
+  // name -> __constant__ global VarDecl, materialized lazily per kernel.
+  llvm::StringMap<const VarDecl *> constGlobals;
+  // Entry block of the function being emitted (for hoisting const slots).
+  Block *entryBlock = nullptr;
+  // Return type of the function currently being emitted (None for void).
+  mlir::Type currentRetTy;
 
 public:
   ASTToMLIRImpl(MLIRContext &c)
@@ -39,13 +61,21 @@ public:
     ctx.getOrLoadDialect<func::FuncDialect>();
     ctx.getOrLoadDialect<arith::ArithDialect>();
     ctx.getOrLoadDialect<memref::MemRefDialect>();
+    ctx.getOrLoadDialect<scf::SCFDialect>();
+    ctx.getOrLoadDialect<spirv::SPIRVDialect>();
   }
 
   ModuleOp translate(const TranslationUnit &tu) {
     module = ModuleOp::create(UnknownLoc::get(&ctx));
     builder.setInsertionPointToStart(module.getBody());
-    for (auto &d : tu.decls)
+    for (auto &d : tu.decls) {
+      // Pre-register __constant__ globals so device code can read them.
+      if (d->getNodeType() == ASTNode::NodeKind::VarDecl) {
+        auto *v = static_cast<const VarDecl *>(d.get());
+        if (v->isConstant) constGlobals[v->name] = v;
+      }
       visitTopLevel(d.get());
+    }
     return module;
   }
 
@@ -57,8 +87,14 @@ private:
 
   void visitTopLevel(const ASTNode *n) {
     if (!n) return;
-    if (n->getNodeType() == ASTNode::NodeKind::FunctionDecl)
-      buildFunction(static_cast<const FunctionDecl *>(n));
+    if (n->getNodeType() == ASTNode::NodeKind::FunctionDecl) {
+      auto *fn = static_cast<const FunctionDecl *>(n);
+      // Only device code reaches the shader. Host functions (main, helpers)
+      // are emitted by the ASTToHost backend for the host binary instead.
+      if (fn->deviceAttr == DeviceAttr::Global ||
+          fn->deviceAttr == DeviceAttr::Device)
+        buildFunction(fn);
+    }
     // KernelDecl is handled when its FunctionDecl is built (we emit a
     // vc.kernel wrapper there).
   }
@@ -73,16 +109,24 @@ private:
         return builder.getI32Type();
       case BuiltinTypeKind::Int64: case BuiltinTypeKind::UInt64:
         return builder.getI64Type();
+      case BuiltinTypeKind::Float16: return builder.getF16Type();
       case BuiltinTypeKind::Float32: return builder.getF32Type();
       case BuiltinTypeKind::Float64: return builder.getF64Type();
       }
     }
     if (isa<PointerType>(t)) {
-      // pointer-to-T  ->  memref<?xT> (device/global address space = 1)
+      // pointer-to-T  ->  memref<?xT> in the StorageBuffer (global device
+      // memory) storage class; MemRefToSPIRV requires a SPIR-V storage class
+      // attribute (not a numeric memory space) on every memref it lowers.
+      // The 1-D dynamic memref gets a static strided<[1], offset: 0> layout,
+      // which getVulkanElementPtr needs to emit an element pointer (it refuses
+      // dynamic strides/offsets).
       mlir::Type pointee = cvtType(cast<PointerType>(t)->pointee);
-      return MemRefType::get(ArrayRef<int64_t>{ShapedType::kDynamic}, pointee,
-                             MemRefLayoutAttrInterface(),
-                             builder.getI64IntegerAttr(1));
+      auto layout = mlir::StridedLayoutAttr::get(
+          &ctx, /*offset=*/0, ArrayRef<int64_t>{/*stride=*/1});
+      return MemRefType::get(
+          ArrayRef<int64_t>{ShapedType::kDynamic}, pointee, layout,
+          spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::StorageBuffer));
     }
     return mlir::Type();
   }
@@ -94,7 +138,13 @@ private:
     for (auto *p : fn->params)
       argTypes.push_back(cvtType(p->type));
     mlir::Type retTy = cvtType(fn->returnType);
-    FunctionType fty = builder.getFunctionType(argTypes, retTy);
+    // A void function has an empty result list (SPIR-V entry points must not
+    // declare a `none` result); the LLVM-style none type is an interior
+    // convenience only.
+    TypeRange results = retTy;
+    if (retTy && retTy.isa<NoneType>())
+      results = TypeRange{};
+    FunctionType fty = builder.getFunctionType(argTypes, results);
 
     auto f = func::FuncOp::create(loc(fn), fn->name, fty);
     if (fn->deviceAttr == DeviceAttr::Global) {
@@ -103,23 +153,25 @@ private:
     }
     module.push_back(f);
     funcTable[fn->name] = f;
+    currentRetTy = retTy;
 
     if (!fn->body) return;
 
     // Function body
     Block *entry = f.addEntryBlock();
     builder.setInsertionPointToStart(entry);
+    // locals/entryBlock are per-function state (binding args below).
+    entryBlock = entry;
+    locals.clear();
 
     // Bind parameters to block args.
     for (unsigned i = 0; i < fn->params.size(); ++i)
       locals[fn->params[i]->name] = entry->getArgument(i);
 
-    if (fn->body &&
-        fn->body->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
-      auto *cs = static_cast<CompoundStmt *>(fn->body.get());
-      for (auto &s : cs->statements)
-        visitStmt(s.get());
-    }
+    // Route the body through emitStatements so trailing bare-return guards
+    // (`if (c) return;`) are wrapped in inverted scf.if instead of emitting
+    // func.return inside a structured region (invalid for SPIR-V).
+    if (fn->body) visitStmt(fn->body.get());
 
     // Ensure a void return has a terminator.
     if (builder.getBlock()->empty() ||
@@ -134,35 +186,298 @@ private:
     }
   }
 
-  // name -> Value (block arg / local memref / alloca)
-  llvm::StringMap<Value> locals;
+  //===--------------------------------------------------------------------//
+  // Value plumbing helpers
+  //===--------------------------------------------------------------------//
+
+  // A slot (local var) yields its memref address; load it when a scalar is
+  // wanted. Index expressions are cast to index for memref indexing.
+  Value loadValue(Value v, Location l) {
+    if (!v) return v;
+    if (auto mr = v.getType().dyn_cast<MemRefType>())
+      return builder.create<memref::LoadOp>(l, v, ValueRange{});
+    return v;
+  }
+
+  // Cast an arbitrary scalar to i1 ("truthiness"): compare != 0.
+  Value toI1(Value v, Location l) {
+    v = loadValue(v, l);
+    if (!v) return v;
+    mlir::Type ty = v.getType();
+    if (ty.isInteger(1)) return v;
+    Value zero = builder.create<arith::ConstantOp>(l, ty,
+                                                   builder.getZeroAttr(ty));
+    if (ty.isIntOrIndex())
+      return builder.create<arith::CmpIOp>(l, arith::CmpIPredicate::ne, v, zero);
+    return builder.create<arith::CmpFOp>(l, arith::CmpFPredicate::UNE, v, zero);
+  }
+
+  // Resolve an lvalue (a local-var slot or an array element) to a memref plus
+  // its index list for load/store. Function params (block args) are scalars
+  // and are not writable slots, so they fail here.
+  bool lvalueAddress(ASTNode *n, Value &mem, SmallVectorImpl<Value> &indices) {
+    if (!n) return false;
+    if (n->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+      auto *ref = static_cast<DeclRefExpr *>(n);
+      auto it = locals.find(ref->name);
+      if (it == locals.end() || !it->second.getType().isa<MemRefType>())
+        return false;
+      mem = it->second; // a 0-d memref slot
+      return true;
+    }
+    if (n->getNodeType() == ASTNode::NodeKind::IndexExpr) {
+      auto *ie = static_cast<IndexExpr *>(n);
+      mem = visitExpr(ie->base.get());
+      if (!mem || !mem.getType().isa<MemRefType>()) return false;
+      Value idx = loadValue(visitExpr(ie->index.get()), loc(ie->index.get()));
+      if (!idx) return false;
+      if (!idx.getType().isIndex())
+        idx = builder.create<arith::IndexCastOp>(loc(ie->index.get()),
+                                                 builder.getIndexType(), idx);
+      indices.push_back(idx);
+      return true;
+    }
+    return false;
+  }
+
+  // Read the current value of an lvalue node (slot or array element).
+  Value loadLValue(ASTNode *n, Location l) {
+    Value mem;
+    SmallVector<Value> indices;
+    if (!lvalueAddress(n, mem, indices)) return Value();
+    return builder.create<memref::LoadOp>(l, mem, indices);
+  }
+
+  // Store into a memref slot, bridging index<->int / widening ints.
+  void storeTo(Value mem, ArrayRef<Value> indices, Value v, Location l) {
+    if (!v) return;
+    v = loadValue(v, l);
+    mlir::Type elem = mem.getType().cast<MemRefType>().getElementType();
+    if (v.getType() != elem) {
+      if (v.getType().isIndex() && elem.isSignlessInteger())
+        v = builder.create<arith::IndexCastOp>(l, elem, v);
+      else if (elem.isIndex() && v.getType().isSignlessInteger())
+        v = builder.create<arith::IndexCastOp>(l, elem, v);
+      else if (v.getType().isSignlessInteger() && elem.isSignlessInteger() &&
+               v.getType().getIntOrFloatBitWidth() <
+                   elem.getIntOrFloatBitWidth())
+        v = builder.create<arith::ExtSIOp>(l, elem, v);
+    }
+    if (indices.empty())
+      builder.create<memref::StoreOp>(l, v, mem);
+    else
+      builder.create<memref::StoreOp>(l, v, mem, indices);
+  }
+
+  // Store into a local-var slot (0-d memref), bridging index <-> int if needed.
+  void storeValue(Value addr, Value v, Location l) {
+    storeTo(addr, {}, v, l);
+  }
+
+  // Materialize a __constant__ global (scalar or array) as a slot at the
+  // start of the current function's entry block, initialized from the
+  // compile-time initializer. This is a functional (not physical) mapping:
+  // per-kernel Function-storage stack storage instead of a shared shader
+  // global. Implemented lazily on first reference; each kernel gets its own
+  // slot, and locals[] memoizes it per function.
+  Value materializeConstGlobal(const VarDecl *v, const ASTNode *useSite) {
+    auto hit = locals.find(v->name);
+    if (hit != locals.end()) return hit->second;
+    Location l = loc(useSite);
+    mlir::Type elem = cvtType(v->type);
+    int64_t sz = (!v->arrayDims.empty() && v->arrayDims[0] > 0)
+                     ? v->arrayDims[0]
+                     : 0;
+    MemRefType ty;
+    if (sz > 0)
+      ty = MemRefType::get(
+          ArrayRef<int64_t>{sz}, elem, MemRefLayoutAttrInterface(),
+          spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
+    else
+      ty = MemRefType::get(
+          ArrayRef<int64_t>{}, elem, MemRefLayoutAttrInterface(),
+          spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
+
+    // Hoist alloc + init into the entry block so the slot dominates every use.
+    auto saved = builder.saveInsertionPoint();
+    builder.setInsertionPointToStart(entryBlock);
+    Value addr = builder.create<memref::AllocaOp>(l, ty);
+    if (v->init) {
+      if (v->init->getNodeType() == ASTNode::NodeKind::InitListExpr) {
+        auto *il = static_cast<InitListExpr *>(v->init.get());
+        for (size_t i = 0; i < il->elements.size() && sz > 0; ++i) {
+          SmallVector<Value, 1> idx;
+          idx.push_back(builder.create<arith::ConstantOp>(
+              l, builder.getIndexType(), builder.getIndexAttr(i)));
+          storeTo(addr, idx, visitExpr(il->elements[i].get()), l);
+        }
+      } else {
+        storeTo(addr, {}, visitExpr(v->init.get()), l);
+      }
+    }
+    builder.restoreInsertionPoint(saved);
+    locals[v->name] = addr;
+    return addr;
+  }
+
+  // Put two operands on a common type for a binop: float stays float, and if
+  // one side is index the other is promoted to index (indexing arithmetic).
+  std::pair<Value, Value> commonize(Value l, Value r, Location lc) {
+    l = loadValue(l, lc);
+    r = loadValue(r, lc);
+    if (l.getType() == r.getType()) return {l, r};
+    if (l.getType().isF32() || r.getType().isF32()) return {l, r};
+    if (l.getType().isIndex() && r.getType().isIntOrIndex()) {
+      if (!r.getType().isIndex())
+        r = builder.create<arith::IndexCastOp>(lc, builder.getIndexType(), r);
+    } else if (r.getType().isIndex() && l.getType().isIntOrIndex()) {
+      if (!l.getType().isIndex())
+        l = builder.create<arith::IndexCastOp>(lc, builder.getIndexType(), l);
+    } else if (l.getType().isSignlessInteger() &&
+               r.getType().isSignlessInteger()) {
+      unsigned lw = l.getType().getIntOrFloatBitWidth();
+      unsigned rw = r.getType().getIntOrFloatBitWidth();
+      if (lw != rw) {
+        unsigned w = std::max(lw, rw);
+        auto t = builder.getIntegerType(w);
+        if (lw < w) l = builder.create<arith::ExtSIOp>(lc, t, l);
+        if (rw < w) r = builder.create<arith::ExtSIOp>(lc, t, r);
+      }
+    }
+    return {l, r};
+  }
+
+  Value castValue(Value v, mlir::Type to, Location lc) {
+    v = loadValue(v, lc);
+    mlir::Type from = v.getType();
+    if (from == to) return v;
+    if (from.isIndex() && to.isSignlessInteger())
+      return builder.create<arith::IndexCastOp>(lc, to, v);
+    if (from.isSignlessInteger() && to.isIndex())
+      return builder.create<arith::IndexCastOp>(lc, to, v);
+    if (from.isSignlessInteger() && to.isSignlessInteger()) {
+      if (from.getIntOrFloatBitWidth() == to.getIntOrFloatBitWidth())
+        return builder.create<arith::BitcastOp>(lc, to, v);
+      if (from.getIntOrFloatBitWidth() < to.getIntOrFloatBitWidth())
+        return builder.create<arith::ExtSIOp>(lc, to, v);
+      return builder.create<arith::TruncIOp>(lc, to, v);
+    }
+    if (from.isIntOrIndex() && to.isF32())
+      return builder.create<arith::SIToFPOp>(lc, to, v);
+    if (from.isIntOrIndex() && to.isF64())
+      return builder.create<arith::SIToFPOp>(lc, to, v);
+    if (from.isF32() && to.isSignlessInteger())
+      return builder.create<arith::FPToSIOp>(lc, to, v);
+    if (from.isF64() && to.isSignlessInteger())
+      return builder.create<arith::FPToSIOp>(lc, to, v);
+    if (from.isF32() && to.isF64())
+      return builder.create<arith::ExtFOp>(lc, to, v);
+    if (from.isF64() && to.isF32())
+      return builder.create<arith::TruncFOp>(lc, to, v);
+    return v;
+  }
+
+  //===--------------------------------------------------------------------//
+  // Statements
+  //===--------------------------------------------------------------------//
+
+  // A bare `if (c) return;` (no else, no value). Lowered by wrap-around
+  // (see emitStatements): structured CFG regions cannot contain a return.
+  static bool isBareReturnIf(const ASTNode *n) {
+    if (!n || n->getNodeType() != ASTNode::NodeKind::IfStmt) return false;
+    auto *iff = static_cast<const IfStmt *>(n);
+    if (iff->elseStmt) return false;
+    const ASTNode *t = iff->thenStmt.get();
+    return t && t->getNodeType() == ASTNode::NodeKind::ReturnStmt &&
+           static_cast<const ReturnStmt *>(t)->value == nullptr;
+  }
+
+  // Emit stmts[from..end). Structured CFG ops (scf.if) have no goto, so an
+  // early `return` cannot live inside a region. A bare
+  // `if (c) return;` guard instead inverts the condition and wraps the
+  // REMAINING statements in `scf.if(!c) { ... }`; the function's tail return
+  // covers the fall-through path. A trailing guard (last statement) is
+  // dropped — both its paths end at the tail return anyway.
+  void emitStatements(const std::vector<NodePtr> &stmts, size_t from) {
+    while (from < stmts.size()) {
+      ASTNode *s = stmts[from].get();
+      if (isBareReturnIf(s)) {
+        if (from + 1 >= stmts.size()) break; // trailing guard: tail return
+        auto *iff = static_cast<const IfStmt *>(s);
+        Location l = loc(iff);
+        Value cond = toI1(visitExpr(iff->cond.get()), l);
+        if (!cond) return;
+        auto saved = builder.saveInsertionPoint();
+        Value notCond = builder.create<arith::XOrIOp>(
+            l, cond,
+            builder.create<arith::ConstantOp>(l, builder.getBoolAttr(true)));
+        auto ifOp =
+            builder.create<scf::IfOp>(l, TypeRange{}, notCond, false);
+        builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+        emitStatements(stmts, from + 1);
+        builder.restoreInsertionPoint(saved);
+        return; // remainder was emitted inside the guard
+      }
+      visitStmt(s);
+      ++from;
+    }
+  }
 
   void visitStmt(ASTNode *n) {
     if (!n) return;
+    Location l = loc(n);
     switch (n->getNodeType()) {
     case ASTNode::NodeKind::CompoundStmt:
-      for (auto &s : static_cast<CompoundStmt *>(n)->statements)
-        visitStmt(s.get());
+      emitStatements(static_cast<CompoundStmt *>(n)->statements, 0);
       break;
     case ASTNode::NodeKind::ReturnStmt: {
       auto *r = static_cast<ReturnStmt *>(n);
       Value v = r->value ? visitExpr(r->value.get()) : Value();
-      builder.create<func::ReturnOp>(loc(n), v ? ValueRange(v) : ValueRange());
+      if (v) {
+        v = loadValue(v, loc(r->value.get()));
+        // Bridge index-typed expressions to the function's result type.
+        if (currentRetTy && !currentRetTy.isa<NoneType>())
+          v = castValue(v, currentRetTy, l);
+      }
+      builder.create<func::ReturnOp>(l, v ? ValueRange(v) : ValueRange());
       break;
     }
     case ASTNode::NodeKind::DeclStmt: {
       auto *d = static_cast<DeclStmt *>(n)->decl;
       if (!d) break;
-      // Locals become stack allocations; __shared__ would map to workgroup
-      // memory space (TODO: use memref.alloca with memory space 3).
+      // Locals become stack allocations tagged with the SPIR-V Function
+      // storage class; MemRefToSPIRV refuses to lower allocas whose memory
+      // space is not exactly #spirv.storage_class<Function>. __shared__ would
+      // map to the Workgroup storage class (TODO).
       mlir::Type ty = cvtType(d->type);
-      // For a scalar decl we use a 0-d memref as a mutable slot.
-      MemRefType slotTy = MemRefType::get({}, ty);
-      Value addr = builder.create<memref::AllocaOp>(loc(d), slotTy);
+      // An array declarator (`float a[16]`) gets an N-element slot; a scalar
+      // decl uses a 0-d memref as a mutable slot.
+      int64_t sz = (!d->arrayDims.empty() && d->arrayDims[0] > 0)
+                       ? d->arrayDims[0]
+                       : 0;
+      MemRefType slotTy;
+      if (sz > 0)
+        slotTy = MemRefType::get(
+            ArrayRef<int64_t>{sz}, ty, MemRefLayoutAttrInterface(),
+            spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
+      else
+        slotTy = MemRefType::get(
+            ArrayRef<int64_t>{}, ty, MemRefLayoutAttrInterface(),
+            spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
+      Value addr = builder.create<memref::AllocaOp>(l, slotTy);
       locals[d->name] = addr;
       if (d->init) {
-        Value v = visitExpr(d->init.get());
-        builder.create<memref::StoreOp>(loc(d), v, addr);
+        if (d->init->getNodeType() == ASTNode::NodeKind::InitListExpr) {
+          auto *il = static_cast<InitListExpr *>(d->init.get());
+          for (size_t i = 0; i < il->elements.size() && sz > 0; ++i) {
+            SmallVector<Value, 1> idx;
+            idx.push_back(builder.create<arith::ConstantOp>(
+                l, builder.getIndexType(), builder.getIndexAttr(i)));
+            storeTo(addr, idx, visitExpr(il->elements[i].get()), l);
+          }
+        } else {
+          storeValue(addr, visitExpr(d->init.get()), loc(d));
+        }
       }
       break;
     }
@@ -170,75 +485,172 @@ private:
       if (auto *e = static_cast<ExprStmt *>(n)->expr.get())
         (void)visitExpr(e);
       break;
+    case ASTNode::NodeKind::IfStmt:
+      emitIf(static_cast<IfStmt *>(n));
+      break;
+    case ASTNode::NodeKind::ForStmt:
+      emitFor(static_cast<ForStmt *>(n));
+      break;
+    case ASTNode::NodeKind::WhileStmt:
+      emitWhile(static_cast<WhileStmt *>(n));
+      break;
+    case ASTNode::NodeKind::DoStmt:
+      emitDo(static_cast<DoStmt *>(n));
+      break;
+    case ASTNode::NodeKind::BreakStmt:
+    case ASTNode::NodeKind::ContinueStmt:
+    case ASTNode::NodeKind::SwitchStmt:
+    case ASTNode::NodeKind::CaseStmt:
+      // TODO: break/continue/switch need loop-structure tracking (scf has no
+      // goto; switch lowers to a chain of scf.if once needed).
+      break;
     default:
       break;
     }
   }
 
+  void emitIf(const IfStmt *s) {
+    Location l = loc(s);
+    Value cond = toI1(visitExpr(s->cond.get()), l);
+    if (!cond) return;
+    bool hasElse = bool(s->elseStmt);
+    auto ifOp = builder.create<scf::IfOp>(l, TypeRange{}, cond, hasElse);
+
+    auto saved = builder.saveInsertionPoint();
+    builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+    if (s->thenStmt) visitStmt(s->thenStmt.get());
+    builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+    if (hasElse) visitStmt(s->elseStmt.get());
+    builder.restoreInsertionPoint(saved);
+  }
+
+  void emitFor(const ForStmt *s) {
+    // for (init; cond; step) lowers to
+    //   init;
+    //   scf.while { cond } do { body; step }
+    // which preserves C evaluation semantics exactly (cond/step may depend on
+    // locals through memref slots). A tighter scf.for lowering could be
+    // added later once cond is a canonical `i < bound` form.
+    //
+    // NOTE: unlike scf.if, scf.while's default builder only adds empty
+    // regions -- we must create the entry block ourselves via createBlock
+    // (each call also makes that block the insertion point).
+    Location l = loc(s);
+    if (s->init) visitStmt(s->init.get());
+    auto whileOp = builder.create<scf::WhileOp>(l, TypeRange{}, ValueRange{});
+
+    auto saved = builder.saveInsertionPoint();
+    builder.createBlock(&whileOp.getBefore());
+    Value cond = s->cond ? toI1(visitExpr(s->cond.get()), l)
+                         : builder.create<arith::ConstantOp>(
+                               l, builder.getBoolAttr(true));
+    if (!cond) return;
+    builder.create<scf::ConditionOp>(l, cond, ValueRange{});
+    builder.createBlock(&whileOp.getAfter());
+    if (s->body) visitStmt(s->body.get());
+    if (s->step) (void)visitExpr(s->step.get());
+    builder.create<scf::YieldOp>(l);
+    builder.restoreInsertionPoint(saved);
+  }
+
+  void emitWhile(const WhileStmt *s) {
+    Location l = loc(s);
+    auto whileOp = builder.create<scf::WhileOp>(l, TypeRange{}, ValueRange{});
+
+    auto saved = builder.saveInsertionPoint();
+    builder.createBlock(&whileOp.getBefore());
+    Value cond = toI1(visitExpr(s->cond.get()), l);
+    if (!cond) return;
+    builder.create<scf::ConditionOp>(l, cond, ValueRange{});
+    builder.createBlock(&whileOp.getAfter());
+    if (s->body) visitStmt(s->body.get());
+    builder.create<scf::YieldOp>(l);
+    builder.restoreInsertionPoint(saved);
+  }
+
+  void emitDo(const DoStmt *s) {
+    // do { body } while (cond) runs the body once, then repeats while cond.
+    // A first-iteration flag makes the scf.while condition region start true.
+    Location l = loc(s);
+    auto flagTy =
+        MemRefType::get(ArrayRef<int64_t>{}, builder.getI1Type(),
+                        MemRefLayoutAttrInterface(),
+                        spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
+    Value flag = builder.create<memref::AllocaOp>(l, flagTy);
+    builder.create<memref::StoreOp>(
+        l, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(true)),
+        flag);
+    auto whileOp = builder.create<scf::WhileOp>(l, TypeRange{}, ValueRange{});
+
+    auto saved = builder.saveInsertionPoint();
+    builder.createBlock(&whileOp.getBefore());
+    Value first = builder.create<memref::LoadOp>(l, flag, ValueRange{});
+    builder.create<memref::StoreOp>(
+        l, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(false)),
+        flag);
+    Value cond = s->cond ? toI1(visitExpr(s->cond.get()), l) : Value();
+    if (!cond) return;
+    Value pass = builder.create<arith::OrIOp>(l, first, cond);
+    builder.create<scf::ConditionOp>(l, pass, ValueRange{});
+    builder.createBlock(&whileOp.getAfter());
+    if (s->body) visitStmt(s->body.get());
+    builder.create<scf::YieldOp>(l);
+    builder.restoreInsertionPoint(saved);
+  }
+
+  //===--------------------------------------------------------------------//
+  // Expressions
+  //===--------------------------------------------------------------------//
+
   Value visitExpr(ASTNode *n) {
     if (!n) return Value();
+    Location l = loc(n);
     switch (n->getNodeType()) {
     case ASTNode::NodeKind::IntegerLiteral:
-      return builder.create<arith::ConstantIndexOp>(
-          loc(n), static_cast<IntegerLiteral *>(n)->value);
+      return builder.create<arith::ConstantOp>(
+          l, builder.getI32IntegerAttr(
+                 static_cast<IntegerLiteral *>(n)->value));
     case ASTNode::NodeKind::FloatLiteral: {
       double v = static_cast<FloatLiteral *>(n)->value;
       return builder.create<arith::ConstantOp>(
-          loc(n), builder.getF32Type(),
-          builder.getFloatAttr(builder.getF32Type(), v));
+          l, builder.getF32Type(), builder.getFloatAttr(builder.getF32Type(), v));
     }
+    case ASTNode::NodeKind::CharLiteral:
+      return builder.create<arith::ConstantOp>(
+          l, builder.getI32IntegerAttr(static_cast<CharLiteral *>(n)->value));
     case ASTNode::NodeKind::DeclRefExpr: {
       auto name = static_cast<DeclRefExpr *>(n)->name;
       auto it = locals.find(name);
       if (it != locals.end())
         return it->second; // a memref slot or block arg
+      // A __constant__ global (scalar or array) referenced from device code.
+      auto cg = constGlobals.find(name);
+      if (cg != constGlobals.end())
+        return materializeConstGlobal(cg->second, n);
       return Value();
     }
-    case ASTNode::NodeKind::BinaryExpr: {
-      auto *b = static_cast<BinaryExpr *>(n);
-      if (b->op == BinaryOp::Assign) {
-        // Store rhs into lhs address (lhs must be a memref slot / indexable).
-        Value lhsAddr = visitExpr(b->lhs.get());
-        Value rhs = visitExpr(b->rhs.get());
-        builder.create<memref::StoreOp>(loc(n), rhs, lhsAddr);
-        return rhs;
-      }
-      Value l = visitExpr(b->lhs.get());
-      Value r = visitExpr(b->rhs.get());
-      // If operands are memref slots, load them first.
-      if (auto mr = l.getType().dyn_cast<MemRefType>())
-        l = builder.create<memref::LoadOp>(loc(n), l, ValueRange{});
-      if (auto mr = r.getType().dyn_cast<MemRefType>())
-        r = builder.create<memref::LoadOp>(loc(n), r, ValueRange{});
-      switch (b->op) {
-      case BinaryOp::Add:
-        if (l.getType().isF32())
-          return builder.create<arith::AddFOp>(loc(n), l, r);
-        return builder.create<arith::AddIOp>(loc(n), l, r);
-      case BinaryOp::Sub:
-        if (l.getType().isF32())
-          return builder.create<arith::SubFOp>(loc(n), l, r);
-        return builder.create<arith::SubIOp>(loc(n), l, r);
-      case BinaryOp::Mul:
-        if (l.getType().isF32())
-          return builder.create<arith::MulFOp>(loc(n), l, r);
-        return builder.create<arith::MulIOp>(loc(n), l, r);
-      case BinaryOp::Div:
-        if (l.getType().isF32())
-          return builder.create<arith::DivFOp>(loc(n), l, r);
-        return builder.create<arith::DivSIOp>(loc(n), l, r);
-      default:
-        return Value();
-      }
+    case ASTNode::NodeKind::UnaryExpr:
+      return emitUnary(static_cast<UnaryExpr *>(n));
+    case ASTNode::NodeKind::BinaryExpr:
+      return emitBinary(static_cast<BinaryExpr *>(n));
+    case ASTNode::NodeKind::ConditionalExpr:
+      return emitConditional(static_cast<ConditionalExpr *>(n));
+    case ASTNode::NodeKind::CStyleCastExpr: {
+      auto *c = static_cast<CStyleCastExpr *>(n);
+      mlir::Type to = cvtType(c->target);
+      if (!to) return Value();
+      return castValue(visitExpr(c->sub.get()), to, l);
     }
     case ASTNode::NodeKind::IndexExpr: {
-      // base[idx] where base is a memref arg.
+      // base[idx] where base is a memref arg / slot.
       auto *ie = static_cast<IndexExpr *>(n);
       Value base = visitExpr(ie->base.get());
-      Value idx = visitExpr(ie->index.get());
-      if (base.getType().isa<MemRefType>())
-        return builder.create<memref::LoadOp>(loc(n), base, ValueRange{idx});
-      return Value();
+      if (!base || !base.getType().isa<MemRefType>()) return Value();
+      Value idx = loadValue(visitExpr(ie->index.get()), loc(ie->index.get()));
+      if (!idx.getType().isIndex())
+        idx = builder.create<arith::IndexCastOp>(loc(ie->index.get()),
+                                                 builder.getIndexType(), idx);
+      return builder.create<memref::LoadOp>(l, base, ValueRange{idx});
     }
     case ASTNode::NodeKind::MemberAccessExpr: {
       // threadIdx.x / blockIdx.x / blockDim.x / gridDim.x
@@ -249,14 +661,19 @@ private:
         vc::Dim dim = vc::Dim::x;
         if (m->member == "y") dim = vc::Dim::y;
         else if (m->member == "z") dim = vc::Dim::z;
+        Value idxV;
         if (base->name == "threadIdx")
-          return builder.create<vc::ThreadIdOp>(loc(n), builder.getIndexType(), dim);
-        if (base->name == "blockIdx")
-          return builder.create<vc::BlockIdOp>(loc(n), builder.getIndexType(), dim);
-        if (base->name == "blockDim")
-          return builder.create<vc::BlockDimOp>(loc(n), builder.getIndexType(), dim);
-        if (base->name == "gridDim")
-          return builder.create<vc::GridDimOp>(loc(n), builder.getIndexType(), dim);
+          idxV = builder.create<vc::ThreadIdOp>(l, builder.getIndexType(), dim);
+        else if (base->name == "blockIdx")
+          idxV = builder.create<vc::BlockIdOp>(l, builder.getIndexType(), dim);
+        else if (base->name == "blockDim")
+          idxV = builder.create<vc::BlockDimOp>(l, builder.getIndexType(), dim);
+        else if (base->name == "gridDim")
+          idxV = builder.create<vc::GridDimOp>(l, builder.getIndexType(), dim);
+        if (idxV)
+          // Language-level ints are 32-bit; keep index only where needed.
+          return builder.create<arith::IndexCastOp>(
+              l, builder.getI32Type(), idxV);
       }
       return Value();
     }
@@ -266,16 +683,194 @@ private:
           c->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
         auto *ref = static_cast<DeclRefExpr *>(c->callee.get());
         if (ref->name == "__syncthreads") {
-          builder.create<vc::BarrierOp>(loc(n));
+          builder.create<vc::BarrierOp>(l);
           return Value();
         }
-        // TODO: resolve user/device functions.
+        auto fit = funcTable.find(ref->name);
+        if (fit != funcTable.end()) {
+          SmallVector<Value> args;
+          for (auto &a : c->args) {
+            Value av = visitExpr(a.get());
+            if (!av) return Value();
+            args.push_back(loadValue(av, loc(a.get())));
+          }
+          auto call = builder.create<func::CallOp>(l, fit->second, args);
+          FunctionType fty = fit->second.getFunctionType();
+          if (fty.getNumResults() == 0) return Value();
+          return call.getResult(0);
+        }
       }
       return Value();
     }
     default:
       return Value();
     }
+  }
+
+  Value emitUnary(const UnaryExpr *u) {
+    Location l = loc(u);
+    Value v = visitExpr(u->operand.get());
+    switch (u->op) {
+    case UnaryOp::Neg: {
+      // -x : 0 - x
+      Value loaded = loadValue(v, l);
+      mlir::Type ty = loaded.getType();
+      if (ty.isF32())
+        return builder.create<arith::NegFOp>(l, loaded);
+      Value zero = builder.create<arith::ConstantOp>(l, ty,
+                                                     builder.getZeroAttr(ty));
+      return builder.create<arith::SubIOp>(l, zero, loaded);
+    }
+    case UnaryOp::LNot:
+      return builder.create<arith::XOrIOp>(
+          l, toI1(v, l), builder.create<arith::ConstantOp>(
+                             l, builder.getBoolAttr(true)));
+    case UnaryOp::Not: {
+      Value loaded = loadValue(v, l);
+      mlir::Type ty = loaded.getType();
+      auto minusOne = builder.create<arith::ConstantOp>(
+          l, ty, builder.getIntegerAttr(ty, -1));
+      return builder.create<arith::XOrIOp>(l, loaded, minusOne);
+    }
+    case UnaryOp::PreInc:
+    case UnaryOp::PreDec:
+    case UnaryOp::PostInc:
+    case UnaryOp::PostDec: {
+      // Operand must be a slot (assignment-like side effect).
+      Value addr = v;
+      if (!addr || !addr.getType().isa<MemRefType>()) return Value();
+      mlir::Type elem = addr.getType().cast<MemRefType>().getElementType();
+      Value cur = builder.create<memref::LoadOp>(l, addr, ValueRange{});
+      if (!elem.isIntOrIndex()) return Value();
+      Value one = elem.isF32()
+                      ? builder.create<arith::ConstantOp>(
+                            l, builder.getFloatAttr(elem, 1.0))
+                      : builder.create<arith::ConstantOp>(
+                            l, builder.getIntegerAttr(elem, 1));
+      bool isInc = u->op == UnaryOp::PreInc || u->op == UnaryOp::PostInc;
+      Value nxt = elem.isF32()
+                      ? (Value)builder.create<arith::AddFOp>(l, cur, one)
+                      : (Value)builder.create<arith::AddIOp>(l, cur, one);
+      if (!isInc)
+        nxt = elem.isF32() ? (Value)builder.create<arith::SubFOp>(l, cur, one)
+                           : (Value)builder.create<arith::SubIOp>(l, cur, one);
+      builder.create<memref::StoreOp>(l, nxt, addr);
+      bool isPost = u->op == UnaryOp::PostInc || u->op == UnaryOp::PostDec;
+      return isPost ? cur : nxt;
+    }
+    default:
+      // Deref / AddrOf: degenerate to the operand value (TODO: real lvalue
+      // semantics when struct/array members need them).
+      return v;
+    }
+  }
+
+  Value emitBinary(const BinaryExpr *b) {
+    Location l = loc(b);
+    if (b->op == BinaryOp::Assign) {
+      Value rhs = visitExpr(b->rhs.get());
+      if (!rhs) return Value();
+      Value mem;
+      SmallVector<Value> indices;
+      if (lvalueAddress(b->lhs.get(), mem, indices))
+        storeTo(mem, indices, rhs, l);
+      return rhs;
+    }
+    Value lhs = visitExpr(b->lhs.get());
+    Value rhs = visitExpr(b->rhs.get());
+    if (!lhs || !rhs) return Value();
+
+    switch (b->op) {
+    case BinaryOp::LAnd:
+      return builder.create<arith::AndIOp>(l, toI1(lhs, loc(b->lhs.get())),
+                                           toI1(rhs, loc(b->rhs.get())));
+    case BinaryOp::LOr:
+      return builder.create<arith::OrIOp>(l, toI1(lhs, loc(b->lhs.get())),
+                                          toI1(rhs, loc(b->rhs.get())));
+    default:
+      break;
+    }
+
+    std::tie(lhs, rhs) = commonize(lhs, rhs, l);
+    bool isFloat = lhs.getType().isF32();
+    switch (b->op) {
+    case BinaryOp::Add:
+      return isFloat ? (Value)builder.create<arith::AddFOp>(l, lhs, rhs)
+                     : (Value)builder.create<arith::AddIOp>(l, lhs, rhs);
+    case BinaryOp::Sub:
+      return isFloat ? (Value)builder.create<arith::SubFOp>(l, lhs, rhs)
+                     : (Value)builder.create<arith::SubIOp>(l, lhs, rhs);
+    case BinaryOp::Mul:
+      return isFloat ? (Value)builder.create<arith::MulFOp>(l, lhs, rhs)
+                     : (Value)builder.create<arith::MulIOp>(l, lhs, rhs);
+    case BinaryOp::Div:
+      return isFloat ? (Value)builder.create<arith::DivFOp>(l, lhs, rhs)
+                     : (Value)builder.create<arith::DivSIOp>(l, lhs, rhs);
+    case BinaryOp::Mod:
+      return isFloat ? (Value)builder.create<arith::RemFOp>(l, lhs, rhs)
+                     : (Value)builder.create<arith::RemSIOp>(l, lhs, rhs);
+    case BinaryOp::Shl:
+      return builder.create<arith::ShLIOp>(l, lhs, rhs);
+    case BinaryOp::Shr:
+      return builder.create<arith::ShRSIOp>(l, lhs, rhs);
+    case BinaryOp::And:
+      return builder.create<arith::AndIOp>(l, lhs, rhs);
+    case BinaryOp::Or:
+      return builder.create<arith::OrIOp>(l, lhs, rhs);
+    case BinaryOp::Xor:
+      return builder.create<arith::XOrIOp>(l, lhs, rhs);
+    case BinaryOp::Eq: case BinaryOp::NEq: case BinaryOp::Lt:
+    case BinaryOp::Gt: case BinaryOp::Le: case BinaryOp::Ge: {
+      if (isFloat) {
+        arith::CmpFPredicate p = arith::CmpFPredicate::OEQ;
+        switch (b->op) {
+        case BinaryOp::Eq: p = arith::CmpFPredicate::OEQ; break;
+        case BinaryOp::NEq: p = arith::CmpFPredicate::ONE; break;
+        case BinaryOp::Lt: p = arith::CmpFPredicate::OLT; break;
+        case BinaryOp::Gt: p = arith::CmpFPredicate::OGT; break;
+        case BinaryOp::Le: p = arith::CmpFPredicate::OLE; break;
+        case BinaryOp::Ge: p = arith::CmpFPredicate::OGE; break;
+        default: break;
+        }
+        return builder.create<arith::CmpFOp>(l, p, lhs, rhs);
+      }
+      arith::CmpIPredicate p = arith::CmpIPredicate::eq;
+      switch (b->op) {
+      case BinaryOp::Eq: p = arith::CmpIPredicate::eq; break;
+      case BinaryOp::NEq: p = arith::CmpIPredicate::ne; break;
+      case BinaryOp::Lt: p = arith::CmpIPredicate::slt; break;
+      case BinaryOp::Gt: p = arith::CmpIPredicate::sgt; break;
+      case BinaryOp::Le: p = arith::CmpIPredicate::sle; break;
+      case BinaryOp::Ge: p = arith::CmpIPredicate::sge; break;
+      default: break;
+      }
+      return builder.create<arith::CmpIOp>(l, p, lhs, rhs);
+    }
+    default:
+      return Value();
+    }
+  }
+
+  Value emitConditional(const ConditionalExpr *c) {
+    Location l = loc(c);
+    Value cond = toI1(visitExpr(c->cond.get()), loc(c->cond.get()));
+    Value tv = loadValue(visitExpr(c->thenExpr.get()), loc(c->thenExpr.get()));
+    Value fv = loadValue(visitExpr(c->elseExpr.get()), loc(c->elseExpr.get()));
+    if (!tv || !fv) return Value();
+    if (tv.getType() != fv.getType()) {
+      // Fold to the wider integer type when they differ.
+      mlir::Type tt = tv.getType(), ft = fv.getType();
+      if (tt.isSignlessInteger() && ft.isSignlessInteger()) {
+        unsigned w = std::max(tt.getIntOrFloatBitWidth(),
+                              ft.getIntOrFloatBitWidth());
+        auto t = builder.getIntegerType(w);
+        if (tv.getType().getIntOrFloatBitWidth() < w)
+          tv = builder.create<arith::ExtSIOp>(l, t, tv);
+        if (fv.getType().getIntOrFloatBitWidth() < w)
+          fv = builder.create<arith::ExtSIOp>(l, t, fv);
+      }
+    }
+    return builder.create<arith::SelectOp>(l, tv.getType(), cond, tv, fv);
   }
 };
 

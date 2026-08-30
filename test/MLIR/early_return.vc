@@ -1,0 +1,22 @@
+// test/MLIR/early_return.vc — bare `if (cond) return;` guard lowering.
+//
+// Structured CFG regions (scf.if) cannot contain a return, so the trailing
+// guard is inverted (scf.if over the REMAINING statements) and the function
+// tails out to a single return. There must never be a func.return between the
+// scf.if and the final return (this was the constant.vc SPIR-V crash).
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+//
+// CHECK: vc.kernel
+// CHECK: vc.thread_id
+// CHECK: scf.if
+// CHECK: arith.muli
+// CHECK: memref.store
+// CHECK-NOT: func.return
+// CHECK: return
+
+__global__ void k(int *out, int n) {
+  int i = threadIdx.x;
+  if (i >= n) return;
+  out[i] = i * 2;
+}

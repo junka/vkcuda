@@ -1122,8 +1122,14 @@ Type *Sema::checkExpr(const ASTNode *n) {
     // carries trailing array dims — legal to subscript, unlike a plain scalar.
     VarDecl *arrayVar = nullptr;
     if (ie->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
-      ASTNode *sym =
-          lookup(static_cast<const DeclRefExpr *>(ie->base.get())->name);
+      auto *bref = static_cast<const DeclRefExpr *>(ie->base.get());
+      ASTNode *sym = lookup(bref->name);
+      // Global (__constant__ / file-scope) arrays aren't in the local scope;
+      // fall back to the translation-unit symbol table.
+      if (!sym) {
+        auto gv = globalVars.find(bref->name);
+        if (gv != globalVars.end()) sym = gv->second;
+      }
       if (sym && sym->getNodeType() == ASTNode::NodeKind::VarDecl) {
         auto *vd = static_cast<VarDecl *>(sym);
         if (!vd->arrayDims.empty()) arrayVar = vd;

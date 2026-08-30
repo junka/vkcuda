@@ -5,6 +5,7 @@ Each test file may carry one or more `// RUN:` comment lines; the command
 there is executed with:
 
   * `vcc`      replaced by the path given with --vcc
+  * `mlirc`    replaced by the path given with --mlirc (MLIR backend tests)
   * `FileCheck` replaced by the path given with --filecheck
   * `%s`       replaced by the test file path
   * `%t`       replaced by a fresh temp file name
@@ -48,6 +49,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("tests", nargs="+", help=".vc test files or directories")
     ap.add_argument("--vcc", required=True, help="path to the vcc driver")
+    ap.add_argument("--mlirc",
+                    help="path to the vc (MLIR backend) tool, enables `mlirc` "
+                         "in RUN lines")
     ap.add_argument("--filecheck", required=True,
                     help="path to the FileCheck binary")
     ap.add_argument("--verbose", action="store_true")
@@ -56,7 +60,10 @@ def main():
     args = ap.parse_args()
 
     env = dict(os.environ)
-    env["PATH"] = (os.path.dirname(args.filecheck) + os.pathsep +
+    tool_dirs = [os.path.dirname(args.filecheck)]
+    if args.mlirc:
+        tool_dirs.append(os.path.dirname(args.mlirc))
+    env["PATH"] = (os.pathsep.join(d for d in tool_dirs if d) + os.pathsep +
                    env.get("PATH", ""))
 
     failed = []
@@ -66,6 +73,8 @@ def main():
             n_commands += 1
             cmd = run
             cmd = re.sub(r"\bvcc\b", args.vcc, cmd)
+            if args.mlirc:
+                cmd = re.sub(r"\bmlirc\b", args.mlirc, cmd)
             cmd = re.sub(r"\bFileCheck\b", args.filecheck, cmd)
             fd, tmp = tempfile.mkstemp(suffix=".vc")
             os.close(fd)

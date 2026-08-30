@@ -23,6 +23,7 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -112,8 +113,8 @@ int main(int argc, char **argv) {
   DialectRegistry registry;
   registry.insert<vc::VCDialect, mlir::spirv::SPIRVDialect,
                   mlir::func::FuncDialect, mlir::arith::ArithDialect,
-                  mlir::memref::MemRefDialect, mlir::gpu::GPUDialect,
-                  mlir::index::IndexDialect>();
+                  mlir::memref::MemRefDialect, mlir::scf::SCFDialect,
+                  mlir::gpu::GPUDialect, mlir::index::IndexDialect>();
   ctx.appendDialectRegistry(registry);
 
   auto module = codegen::translateASTToMLIR(tu, ctx);

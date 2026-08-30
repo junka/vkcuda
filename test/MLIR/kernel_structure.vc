@@ -1,0 +1,27 @@
+// test/MLIR/kernel_structure.vc — MLIR lowering of a minimal __global__ kernel.
+//
+// Verifies the shape of the emitted module:
+//   - the kernel function is wrapped by a `vc.kernel` entry marker
+//   - thread/block index built-ins lower to vc.thread_id / vc.block_id /
+//     vc.block_dim (bridged to 32-bit ints)
+//   - pointer parameters become dynamic memrefs tagged with the SPIR-V
+//     StorageBuffer storage class (required by MemRefToSPIRV)
+//   - streaming arithmetic is emitted as arith ops
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+//
+// CHECK: vc.kernel
+// CHECK: func.func @scale
+// CHECK: memref<?xf32, strided<[1]>, #spirv.storage_class<StorageBuffer>>
+// CHECK: vc.block_id
+// CHECK: vc.block_dim
+// CHECK: arith.muli
+// CHECK: vc.thread_id
+// CHECK: arith.addi
+// CHECK: arith.mulf
+
+__global__ void scale(float *out, float *in, float s, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out[i] = in[i] * s;
+}

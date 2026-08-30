@@ -1,0 +1,24 @@
+// test/MLIR/control_flow.vc — structured control-flow lowering.
+//
+// for-loops lower to scf.while (preserving C evaluation order), if/else to
+// scf.if with both regions, and arithmetic to arith ops.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+//
+// CHECK: vc.kernel
+// CHECK: scf.while
+// CHECK: arith.mulf
+// CHECK: arith.addf
+// CHECK: scf.if
+// CHECK: memref.store
+
+__global__ void k(float *out, int n) {
+  float acc = 0.0f;
+  for (int j = 0; j < n; j++)
+    acc += out[j] * 2.0f;
+  int tid = threadIdx.x;
+  if (tid < n)
+    out[tid] = acc;
+  else
+    out[tid] = 0.0f;
+}

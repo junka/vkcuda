@@ -1,0 +1,16 @@
+// test/MLIR/lowers_to_spirv.vc — end-to-end SPIR-V emission smoke test.
+//
+// The MLIR module produced by the AST translator must survive the full
+// lowering pipeline (lowerVCToGPU -> convert-gpu-to-spirv -> lower ABI attrs
+// -> update VCE) and serialize into a non-empty SPIR-V binary. Regression
+// guard for the SPIR-V converter crashing on early returns / missing VCE.
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && test -s %t.spv
+
+__constant__ float K = 2.0f;
+
+__global__ void k(float *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  out[i] = K * 2.0f;
+}

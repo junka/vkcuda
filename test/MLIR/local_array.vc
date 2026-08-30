@@ -1,0 +1,19 @@
+// test/MLIR/local_array.vc — local array declarations.
+//
+// `int arr[4] = {0, 1, 2, 3}` must lower to a 4-element Function-storage
+// memref slot populated element-by-element from the initializer list, then
+// read back through memref.load with a computed (index_cast'ed) subscript.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+//
+// CHECK: vc.kernel
+// CHECK: memref<4xi32, #spirv.storage_class<Function>>
+// CHECK: arith.remsi
+// CHECK: arith.index_cast
+// CHECK: memref.load
+// CHECK: memref.store
+
+__global__ void k(int *out, int i) {
+  int arr[4] = {0, 1, 2, 3};
+  out[i] = arr[i % 4];
+}

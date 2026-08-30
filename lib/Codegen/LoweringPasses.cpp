@@ -1,20 +1,26 @@
 //===- LoweringPasses.cpp - VC -> standard/gpu -> SPIR-V pipeline ---------===//
 //
-// Wires up the lowering pipeline. The first stage (VC -> standard/gpu) is a
-// scaffold with a TODO. The second stage reuses MLIR's built-in SPIR-V
-// conversions.
+// Wires up the lowering pipeline:
+//   Stage 1: VC -> GPU dialect   (lib/Codegen/VCToGPU.cpp)
+//   Stage 2: GPU/standard -> SPIR-V (MLIR's built-in conversion passes)
 //
-// NOTE: the exact pass factory names below must be verified against the
-// installed MLIR 18 headers once libmlir-18-dev is available. They are
-// written to the documented upstream names but have not been compiled yet.
+// Stage 2 is intentionally one pass: the GPU-to-SPIR-V conversion itself
+// clones each gpu.module and fully converts the clone down to spirv.module
+// with the SCF/arith/memref/func patterns already baked in. It leaves the
+// original gpu.module in place (it only exists for live gpu.launch_func
+// hosts, of which a .spv output has none), so we drop it afterwards together
+// with any residual host code and keep just the spirv.module.
 //
 //===----------------------------------------------------------------------===//
 
 #include "vc/Codegen/Passes.h"
 
-#include "mlir/Conversion/FuncToSPIRV/FuncToSPIRVPass.h"
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include <cstdlib>
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
+#include "mlir/Dialect/SPIRV/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 
@@ -28,26 +34,57 @@ void runLoweringPipeline(ModuleOp module) {
 
   PassManager pm(&ctx);
 
-  // ---- Stage 1: VC -> standard/gpu  (TODO scaffold) -------------------
-  // A dedicated conversion pass will be added here to lower:
-  //   vc.thread_id   -> gpu.thread_id
-  //   vc.block_id    -> gpu.block_id
-  //   vc.block_dim   -> gpu.block_dim
-  //   vc.grid_dim    -> gpu.grid_dim
-  //   vc.barrier     -> gpu.barrier
-  //   vc.kernel      -> gpu.module + gpu.func (with kernel attr)
-  // Until that pass exists the pipeline cannot fully lower real kernels;
-  // SPIR-V emission is therefore best-effort for the demo.
+  // ---- Stage 1: VC -> gpu -------------------------------------------------
+  lowerVCToGPU(module);
 
-  // ---- Stage 2: standard/gpu -> SPIR-V --------------------------------
-  // Reuse MLIR's built-in conversions. Pass factory names track upstream
-  // MLIR 18; adjust to the installed headers if they differ.
+  // SPIR-V modules carry device code only. Drop everything at module scope
+  // that is not the gpu.module (host main, runtime API stubs, ...); the
+  // gpu.module holding the kernels is the unit of translation.
+  SmallVector<Operation *> nonDevice;
+  module.walk([&](Operation *op) {
+    if (op->getParentOp() == module.getOperation() &&
+        !isa<gpu::GPUModuleOp>(op))
+      nonDevice.push_back(op);
+  });
+  for (Operation *op : nonDevice)
+    op->erase();
+
+  if (std::getenv("VC_SPIRV_DEBUG")) {
+    llvm::errs() << "=== after lowerVCToGPU ===\n";
+    module->print(llvm::errs(), OpPrintingFlags().assumeVerified());
+    llvm::errs() << "\n";
+  }
+
+  // ---- Stage 2: gpu/standard -> SPIR-V -----------------------------------
+  // ConvertGPUToSPIRV clones every gpu.module and fully legalizes the clone
+  // to a spirv.module (builtin-variable loads for thread/block ids, control
+  // barrier, and the whole arith/scf/memref body via its bundled patterns).
+  // spirv-lower-abi-attrs then materializes the spirv.entry_point_abi /
+  // spirv.interface_var_abi attributes into SPIR-V globals and the entry
+  // point operation.
   pm.addPass(createConvertGPUToSPIRVPass());
-  pm.addPass(createConvertFuncToSPIRVPass());
+  // spirv-lower-abi-attrs runs on spirv.module (the op produced by the pass
+  // above), not on the top-level module.
+  pm.addNestedPass<spirv::ModuleOp>(spirv::createSPIRVLowerABIAttributesPass());
+  // The serializer requires spirv.module to carry a concrete vce_triple;
+  // deduce it from the ops actually present in the module.
+  pm.addNestedPass<spirv::ModuleOp>(
+      spirv::createSPIRVUpdateVCEPass());
 
   if (failed(pm.run(module))) {
     module.emitError("lowering pipeline failed");
   }
+
+  // Keep only the spirv.module: erase the original gpu.module (clone source)
+  // and anything else left at module scope.
+  SmallVector<Operation *> nonSpirv;
+  module.walk([&](Operation *op) {
+    if (op->getParentOp() == module.getOperation() &&
+        !isa<spirv::ModuleOp>(op))
+      nonSpirv.push_back(op);
+  });
+  for (Operation *op : nonSpirv)
+    op->erase();
 }
 
 } // namespace vc::codegen

@@ -23,9 +23,13 @@ namespace codegen {
 ::mlir::OwningOpRef<::mlir::ModuleOp>
 translateASTToMLIR(const TranslationUnit &tu, ::mlir::MLIRContext &ctx);
 
+/// Stage 1 of the lowering pipeline: lower the VC dialect to the GPU dialect
+/// (vc.kernel -> gpu.module/gpu.func; thread/block/barrier ops -> gpu.*).
+void lowerVCToGPU(::mlir::ModuleOp module);
+
 /// Run the full lowering pipeline: VC -> (standard/gpu) -> SPIR-V.
-/// The VC->standard step is a TODO scaffold; gpu->spirv reuses MLIR's
-/// built-in conversion passes.
+/// Stage 1 is `lowerVCToGPU`; the gpu->spirv stage reuses MLIR's built-in
+/// conversion passes.
 void runLoweringPipeline(::mlir::ModuleOp module);
 
 } // namespace codegen
