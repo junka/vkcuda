@@ -104,75 +104,82 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  // 2. AST -> GLSL
-  std::string glslSource;
-  raw_string_ostream glslOS(glslSource);
-  if (!glsl::translateASTToGLSL(tu, glslOS)) {
+  // 2. AST -> one GLSL compute unit per __global__ kernel.
+  auto glslModules = glsl::translateASTToGLSLSources(tu);
+  if (glslModules.empty()) {
     errs() << "no kernel to emit\n";
     return 1;
   }
-  glslOS.flush();
 
   if (kind == EmitKind::GLSL) {
-    outs() << glslSource;
+    for (size_t i = 0; i < glslModules.size(); ++i) {
+      outs() << "// === kernel " << glslModules[i].entryName << " ===\n";
+      outs() << glslModules[i].source;
+      if (i + 1 < glslModules.size()) outs() << "\n";
+    }
     return 0;
   }
 
-  // 3. GLSL -> SPIR-V via glslc
+  // 3. GLSL -> SPIR-V via glslc, one module per kernel.
   std::string glslc = findGlslc();
   if (glslc.empty()) {
     errs() << "error: glslc not found (install glslc / shaderc)\n";
     return 1;
   }
 
-  // Write GLSL to a temp file.
-  SmallString<128> glslPath;
-  sys::fs::createTemporaryFile("vckernel", "comp", glslPath);
-  {
-    std::error_code ec;
-    raw_fd_ostream glslFile(glslPath, ec);
-    if (ec) { errs() << "cannot write temp: " << ec.message() << "\n"; return 1; }
-    glslFile << glslSource;
+  std::string outPath = std::string(outputFilename) == "-"
+                            ? "vadd.spv"
+                            : std::string(outputFilename);
+
+  // -o writes the first kernel's SPIR-V (SPIR-V can't merge multiple entries).
+  for (size_t mi = 0; mi < glslModules.size(); ++mi) {
+    const auto &mod = glslModules[mi];
+    SmallString<128> glslPath;
+    sys::fs::createTemporaryFile("vckernel", "comp", glslPath);
+    {
+      std::error_code ec;
+      raw_fd_ostream glslFile(glslPath, ec);
+      if (ec) { errs() << "cannot write temp: " << ec.message() << "\n"; return 1; }
+      glslFile << mod.source;
+    }
+
+    // glslc -fshader-stage=compute <glsl> -o <out.spv>. Each kernel's .comp
+    // uses `void main()` as its entry (see ASTToGLSL emitBody), so glslc's
+    // default entry point applies — no -fentry-point (shaderc's flag is broken
+    // on common distro builds). Subgroup ops require SPIR-V 1.3 = vulkan1.1.
+    bool needsSpv13 = mod.source.find("vc:needs-spv1.3") != std::string::npos;
+
+    auto runGlslc = [&]() -> int {
+      SmallVector<StringRef, 8> args;
+      args.push_back(glslc);
+      args.push_back("-fshader-stage=compute");
+      if (needsSpv13) args.push_back("--target-env=vulkan1.1");
+      args.push_back(glslPath);
+      // Only the first kernel writes to the user's -o path; others go to a
+      // temp (vc-glsl is a debug driver — multi-kernel users use -emit=glsl).
+      std::string target = outPath;
+      SmallString<128> tmpOut;
+      if (mi > 0) {
+        sys::fs::createTemporaryFile("vckernel", "spv", tmpOut);
+        target = std::string(tmpOut.str());
+      }
+      args.push_back("-o");
+      args.push_back(target);
+      return sys::ExecuteAndWait(glslc, args, std::nullopt, std::nullopt);
+    };
+
+    int rc = runGlslc();
+
+    sys::fs::remove(glslPath);
+    if (rc != 0) {
+      errs() << "glslc failed for kernel '" << mod.entryName
+             << "' (rc=" << rc << ")\n--- GLSL source ---\n" << mod.source;
+      return 1;
+    }
   }
 
-  // glslc -fshader-stage=compute <glsl> -o <out.spv> -fentry-point=<name>
-  // -fentry-point requires a recent shaderc; if unsupported it errors and
-  // we fall back by retrying without it below.
-  std::string outPath = std::string(outputFilename) == "-" ? "vadd.spv"
-                                                        : std::string(outputFilename);
-  std::string entryArg = std::string("-fentry-point=") + std::string(entryPoint);
-
-  // The GLSL backend writes a "// vc:needs-spv1.3" marker into the header when
-  // the kernel uses Vulkan subgroup ops (CUDA warp intrinsics), which require
-  // SPIR-V 1.3 (= vulkan1.1 target env). Default is vulkan1.0/spv1.0.
-  bool needsSpv13 = glslSource.find("vc:needs-spv1.3") != std::string::npos;
-
-  auto runGlslc = [&](bool withEntry) -> int {
-    SmallVector<StringRef, 8> args;
-    args.push_back(glslc);
-    args.push_back("-fshader-stage=compute");
-    if (needsSpv13) args.push_back("--target-env=vulkan1.1");
-    args.push_back(glslPath);
-    args.push_back("-o");
-    args.push_back(outPath);
-    if (withEntry) args.push_back(entryArg);
-
-    std::string errMsg;
-    return sys::ExecuteAndWait(glslc, args, std::nullopt, std::nullopt);
-  };
-
-  int rc = runGlslc(/*withEntry=*/true);
-  if (rc != 0)
-    rc = runGlslc(/*withEntry=*/false); // retry without -fentry-point
-
-  sys::fs::remove(glslPath);
-  if (rc != 0) {
-    errs() << "glslc failed (rc=" << rc << ")\n--- GLSL source ---\n"
-           << glslSource;
-    return 1;
-  }
-
-  outs() << "wrote " << outPath << " (" << glslSource.size()
-         << " bytes GLSL)\n";
+  outs() << "wrote " << outPath << " (" << glslModules.front().source.size()
+         << " bytes GLSL, " << glslModules.size() << " kernel"
+         << (glslModules.size() == 1 ? "" : "s") << ")\n";
   return 0;
 }

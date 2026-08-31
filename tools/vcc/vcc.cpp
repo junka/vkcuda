@@ -106,95 +106,108 @@ int main(int argc, char **argv) {
   if (syntaxOnly) return 0;
   if (emitOpt == "ast") { dumpAST(tu, outs()); return 0; }
 
-  // 2. Device subset -> GLSL
-  std::string glslSource;
-  raw_string_ostream glslOS(glslSource);
-  if (!glsl::translateASTToGLSL(tu, glslOS)) {
+  // 2. Device subset -> one GLSL compute unit per __global__ kernel.
+  auto glslModules = glsl::translateASTToGLSLSources(tu);
+  if (glslModules.empty()) {
     errs() << "no __global__ kernel found in " << inputFilename << "\n";
     return 1;
   }
-  glslOS.flush();
 
   if (kind == EmitKind::GLSL) {
-    outs() << glslSource;
+    // Print every kernel's GLSL, separated by a marker comment.
+    for (size_t i = 0; i < glslModules.size(); ++i) {
+      outs() << "// === kernel " << glslModules[i].entryName << " ===\n";
+      outs() << glslModules[i].source;
+      if (i + 1 < glslModules.size()) outs() << "\n";
+    }
     return 0;
   }
 
-  // 3. GLSL -> SPIR-V via glslc
+  // 3. GLSL -> SPIR-V via glslc, one module per kernel.
   std::string glslc = findTool("glslc");
   if (glslc.empty()) {
     errs() << "error: glslc not found (install shaderc)\n";
     return 1;
   }
-  SmallString<128> glslPath;
-  sys::fs::createTemporaryFile("vckernel", "comp", glslPath);
-  {
-    std::error_code ec;
-    raw_fd_ostream glslFile(glslPath, ec);
-    if (ec) { errs() << "cannot write temp: " << ec.message() << "\n"; return 1; }
-    glslFile << glslSource;
-  }
-  SmallString<128> spvPath;
-  sys::fs::createTemporaryFile("vckernel", "spv", spvPath);
-  std::string entryArg = std::string("-fentry-point=") + std::string(entryPoint);
-  // Subgroup ops (CUDA warp intrinsics) require SPIR-V 1.3 = vulkan1.1 target.
-  // The GLSL backend flags this with a "// vc:needs-spv1.3" header marker.
-  bool needsSpv13 = glslSource.find("vc:needs-spv1.3") != std::string::npos;
-  auto runGlslc = [&](bool withEntry) -> int {
-    SmallVector<StringRef, 8> args;
-    args.push_back(glslc);
-    args.push_back("-fshader-stage=compute");
-    if (needsSpv13) args.push_back("--target-env=vulkan1.1");
-    args.push_back(glslPath);
-    args.push_back("-o");
-    args.push_back(spvPath);
-    if (withEntry) args.push_back(entryArg);
-    return sys::ExecuteAndWait(glslc, args, std::nullopt, std::nullopt);
-  };
-  int rc = runGlslc(/*withEntry=*/true);
-  if (rc != 0) rc = runGlslc(/*withEntry=*/false);
-  sys::fs::remove(glslPath);
-  if (rc != 0) {
-    errs() << "glslc failed (rc=" << rc << ")\n--- GLSL source ---\n"
-           << glslSource;
+
+  // Hold the SPIR-V buffers alive: HostSpirvModule.words points into these.
+  std::vector<std::unique_ptr<MemoryBuffer>> spvBuffers;
+  std::vector<host::HostSpirvModule> hostModules;
+
+  for (const auto &mod : glslModules) {
+    SmallString<128> glslPath;
+    sys::fs::createTemporaryFile("vckernel", "comp", glslPath);
+    {
+      std::error_code ec;
+      raw_fd_ostream glslFile(glslPath, ec);
+      if (ec) { errs() << "cannot write temp: " << ec.message() << "\n"; return 1; }
+      glslFile << mod.source;
+    }
+    SmallString<128> spvPath;
+    sys::fs::createTemporaryFile("vckernel", "spv", spvPath);
+    // Each kernel's .comp uses `void main()` as its entry (see ASTToGLSL
+    // emitBody), so glslc's default entry point applies — no -fentry-point.
+    // (shaderc's -fentry-point is broken on common distro builds.) Subgroup
+    // ops (CUDA warp intrinsics) require SPIR-V 1.3 = vulkan1.1 target; the
+    // GLSL backend flags this with a "// vc:needs-spv1.3" header marker.
+    bool needsSpv13 = mod.source.find("vc:needs-spv1.3") != std::string::npos;
+    auto runGlslc = [&]() -> int {
+      SmallVector<StringRef, 8> args;
+      args.push_back(glslc);
+      args.push_back("-fshader-stage=compute");
+      if (needsSpv13) args.push_back("--target-env=vulkan1.1");
+      args.push_back(glslPath);
+      args.push_back("-o");
+      args.push_back(spvPath);
+      return sys::ExecuteAndWait(glslc, args, std::nullopt, std::nullopt);
+    };
+    int rc = runGlslc();
+    sys::fs::remove(glslPath);
+    if (rc != 0) {
+      errs() << "glslc failed for kernel '" << mod.entryName
+             << "' (rc=" << rc << ")\n--- GLSL source ---\n" << mod.source;
+      sys::fs::remove(spvPath);
+      return 1;
+    }
+
+    auto spvBuf = MemoryBuffer::getFile(spvPath);
+    if (auto ec = spvBuf.getError()) {
+      errs() << "cannot read spirv: " << ec.message() << "\n";
+      sys::fs::remove(spvPath);
+      return 1;
+    }
+    size_t spvBytes = (*spvBuf)->getBufferSize();
+    const uint32_t *words =
+        reinterpret_cast<const uint32_t *>((*spvBuf)->getBufferStart());
+    hostModules.push_back({mod.entryName, words, spvBytes / sizeof(uint32_t)});
+    spvBuffers.push_back(std::move(*spvBuf));
     sys::fs::remove(spvPath);
-    return 1;
+
+    if (kind == EmitKind::SPIRV) {
+      // -emit=spirv writes the first kernel's SPIR-V (SPIR-V can't concatenate
+      // multiple entry points into one file).
+      std::error_code ec;
+      raw_fd_ostream out(outputFilename, ec);
+      if (ec) { errs() << "cannot write " << outputFilename << ": "
+                       << ec.message() << "\n"; return 1; }
+      out.write(reinterpret_cast<const char *>(
+                    hostModules.front().words),
+                hostModules.front().wordCount * sizeof(uint32_t));
+      outs() << "wrote " << outputFilename << " (" << spvBytes
+             << " bytes, kernel " << hostModules.front().kernelName << ")\n";
+      return 0;
+    }
   }
 
-  // Read the SPIR-V bytes.
-  auto spvBuf = MemoryBuffer::getFile(spvPath);
-  if (auto ec = spvBuf.getError()) {
-    errs() << "cannot read spirv: " << ec.message() << "\n";
-    sys::fs::remove(spvPath);
-    return 1;
-  }
-  size_t spvBytes = (*spvBuf)->getBufferSize();
-  size_t wordCount = spvBytes / sizeof(uint32_t);
-  const uint32_t *words =
-      reinterpret_cast<const uint32_t *>((*spvBuf)->getBufferStart());
-
-  if (kind == EmitKind::SPIRV) {
-    std::error_code ec;
-    raw_fd_ostream out(outputFilename, ec);
-    if (ec) { errs() << "cannot write " << outputFilename << ": "
-                     << ec.message() << "\n"; return 1; }
-    out.write((*spvBuf)->getBufferStart(), spvBytes);
-    sys::fs::remove(spvPath);
-    outs() << "wrote " << outputFilename << " (" << spvBytes << " bytes)\n";
-    return 0;
-  }
-
-  // 4. Host subset -> C++ (embedding SPIR-V)
+  // 4. Host subset -> C++ (embedding one SPIR-V module per kernel)
   std::string cppSource;
   raw_string_ostream cppOS(cppSource);
-  if (!host::translateASTToHost(tu, words, wordCount, cppOS)) {
+  if (!host::translateASTToHost(tu, hostModules, cppOS)) {
     errs() << "no host main() found in " << inputFilename
            << " (single-file mode needs an int main())\n";
-    sys::fs::remove(spvPath);
     return 1;
   }
   cppOS.flush();
-  sys::fs::remove(spvPath);
 
   if (kind == EmitKind::Host) {
     outs() << cppSource;
@@ -233,15 +246,19 @@ int main(int argc, char **argv) {
   args.push_back("-o");
   args.push_back(outputFilename);
 
-  rc = sys::ExecuteAndWait(gpp, args, std::nullopt, std::nullopt);
-  if (rc != 0) {
-    errs() << "g++ failed (rc=" << rc << ")\n--- generated host C++ ---\n"
+  int grc = sys::ExecuteAndWait(gpp, args, std::nullopt, std::nullopt);
+  if (grc != 0) {
+    errs() << "g++ failed (rc=" << grc << ")\n--- generated host C++ ---\n"
            << cppSource;
     sys::fs::remove(cppPath);
     return 1;
   }
   sys::fs::remove(cppPath);
+  size_t totalSpv = 0;
+  for (const auto &m : hostModules) totalSpv += m.wordCount * sizeof(uint32_t);
   outs() << "built " << outputFilename << " (" << cppSource.size()
-         << " bytes host C++, " << spvBytes << " bytes SPIR-V)\n";
+         << " bytes host C++, " << totalSpv << " bytes SPIR-V across "
+         << hostModules.size() << " kernel"
+         << (hostModules.size() == 1 ? "" : "s") << ")\n";
   return 0;
 }

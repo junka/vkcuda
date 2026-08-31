@@ -31,8 +31,13 @@ namespace {
 
 class HostEmitter {
   raw_ostream &os;
-  const uint32_t *spirvWords = nullptr;
-  size_t wordCount = 0;
+  // Per-kernel SPIR-V modules keyed by device symbol name (the GLSL entry
+  // name, e.g. `vadd` or `ns_kernel`). Each is embedded as its own
+  // `static const uint32_t __vc_spirv_<name>[]`.
+  const std::vector<host::HostSpirvModule> *modules = nullptr;
+  // kernelName -> embed variable name (`__vc_spirv_<name>`), built once from
+  // `modules` so emitLaunch can pick the right byte array for each launch.
+  llvm::StringMap<std::string> spirvVarForKernel;
   // Name -> Type* for every variable declared in the host functions being
   // emitted. Used to classify launch args as Pointer vs Scalar: a DeclRefExpr
   // arg whose declaration has a PointerType is a device pointer (vcMalloc
@@ -47,8 +52,19 @@ class HostEmitter {
   llvm::StringMap<const FunctionDecl *> hostFuncDecls;
 
 public:
-  HostEmitter(raw_ostream &o, const uint32_t *w, size_t n)
-      : os(o), spirvWords(w), wordCount(n) {}
+  HostEmitter(raw_ostream &o, const std::vector<host::HostSpirvModule> *mods)
+      : os(o), modules(mods) {
+    if (modules) {
+      for (const auto &m : *modules) {
+        // Empty kernel name = legacy single-module path: embed as the generic
+        // `__vc_spirv` (no suffix) and register it as the fallback so any
+        // launch whose kernel has no dedicated module resolves to it.
+        spirvVarForKernel[m.kernelName] =
+            m.kernelName.empty() ? "__vc_spirv"
+                                 : "__vc_spirv_" + m.kernelName;
+      }
+    }
+  }
 
   bool emit(const TranslationUnit &tu) {
     const FunctionDecl *mainFn = nullptr;
@@ -149,19 +165,30 @@ private:
   }
 
   void emitSpirvEmbed() {
-    os << "// Embedded device SPIR-V (kernel subset), little-endian words.\n";
-    os << "static const uint32_t __vc_spirv[] = {";
-    for (size_t i = 0; i < wordCount; ++i) {
-      if ((i % 8) == 0) os << "\n  ";
-      else os << " ";
-      char buf[16];
-      std::snprintf(buf, sizeof(buf), "0x%08x", spirvWords[i]);
-      os << buf;
-      if (i + 1 < wordCount) os << ",";
+    if (!modules || modules->empty()) {
+      os << "// no device SPIR-V (no __global__ kernels)\n\n";
+      return;
     }
-    if (wordCount) os << "\n";
-    os << "};\n";
-    os << "static const size_t __vc_spirv_len = " << wordCount << ";\n\n";
+    os << "// Embedded device SPIR-V (one module per __global__ kernel), "
+          "little-endian words.\n";
+    for (const auto &m : *modules) {
+      const std::string var =
+          m.kernelName.empty() ? "__vc_spirv"
+                               : "__vc_spirv_" + m.kernelName;
+      os << "static const uint32_t " << var << "[] = {";
+      for (size_t i = 0; i < m.wordCount; ++i) {
+        if ((i % 8) == 0) os << "\n  ";
+        else os << " ";
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "0x%08x", m.words[i]);
+        os << buf;
+        if (i + 1 < m.wordCount) os << ",";
+      }
+      if (m.wordCount) os << "\n";
+      os << "};\n";
+      os << "static const size_t " << var << "_len = " << m.wordCount << ";\n";
+    }
+    os << "\n";
   }
 
   // Emit top-level struct/typedef/enum/constant/class declarations as plain
@@ -893,12 +920,24 @@ private:
     pad(indent);
     os << "{\n";
     // Lazy-load the kernel handle on first launch. vcInit() may be called
-    // anywhere in the user's main(); this guard runs after it.
+    // anywhere in the user's main(); this guard runs after it. The SPIR-V
+    // module and entry name are keyed by the kernel's device symbol name
+    // (kname), which keys both the embedded `__vc_spirv_<kname>` array and the
+    // host-side load handle. The SPIR-V entry point itself is always "main"
+    // (each kernel is its own .comp module; see ASTToGLSL emitBody), so the
+    // entryPoint argument to vcLoadKernel is the literal "main".
     std::string kname = launchHandleName(l->callee.get());
+    std::string spirvVar;
+    if (spirvVarForKernel.count(kname))
+      spirvVar = spirvVarForKernel[kname];
+    else if (spirvVarForKernel.count("")) // legacy single-module fallback
+      spirvVar = spirvVarForKernel[""];
+    else
+      spirvVar = "__vc_spirv";
     pad(indent + 1);
     os << "if (!__vc_k_" << kname
-       << ") vcLoadKernel(__vc_spirv, __vc_spirv_len, \"main\", &__vc_k_"
-       << kname << ");\n";
+       << ") vcLoadKernel(" << spirvVar << ", " << spirvVar
+       << "_len, \"main\", &__vc_k_" << kname << ");\n";
     pad(indent + 1);
     os << "VCKernelArg __args[" << l->args.size() << "] = {";
     for (unsigned i = 0; i < l->args.size(); ++i) {
@@ -1073,9 +1112,23 @@ namespace vc {
 namespace host {
 
 bool translateASTToHost(const TranslationUnit &tu,
+                        const std::vector<HostSpirvModule> &modules,
+                        llvm::raw_ostream &os) {
+  HostEmitter e(os, &modules);
+  return e.emit(tu);
+}
+
+bool translateASTToHost(const TranslationUnit &tu,
                         const uint32_t *spirvWords, size_t wordCount,
                         llvm::raw_ostream &os) {
-  HostEmitter e(os, spirvWords, wordCount);
+  // Legacy single-module overload. Without a kernel name we embed under the
+  // generic `__vc_spirv` name and emitLaunch's fallback path loads it with the
+  // launch callee's name as the entry point. Real drivers should pass the
+  // multi-module overload so each kernel embeds under its own name.
+  std::vector<HostSpirvModule> mods;
+  if (spirvWords && wordCount)
+    mods.push_back({std::string(), spirvWords, wordCount});
+  HostEmitter e(os, mods.empty() ? nullptr : &mods);
   return e.emit(tu);
 }
 

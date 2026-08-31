@@ -69,7 +69,17 @@ public:
     std::vector<const ASTNode *> flat;
     flattenDecls(tu.decls, flat);
 
-    // Find the first __global__ function.
+    // Index all functions (kernels + __device__ helpers, including those inside
+    // namespaces) under their mangled device name so call sites resolve. Shared
+    // across all kernels (a kernel may call any device helper).
+    for (auto *d : flat) {
+      if (d->getNodeType() == ASTNode::NodeKind::FunctionDecl) {
+        auto *f = static_cast<const FunctionDecl *>(d);
+        funcDecls[deviceFuncName(f)] = f;
+      }
+    }
+
+    // Find the first __global__ function (single-kernel legacy path).
     const FunctionDecl *fn = nullptr;
     for (auto *d : flat) {
       if (d->getNodeType() == ASTNode::NodeKind::FunctionDecl) {
@@ -81,19 +91,25 @@ public:
       (*os) << "// no __global__ kernel found\n";
       return false;
     }
-    kernel = fn;
-    params.assign(fn->params.begin(), fn->params.end());
-    if (fn->body) scanDims(fn->body.get());
+    emitOneForKernel(fn, flat);
+    return true;
+  }
 
-    // Index all functions (kernels + __device__ helpers, including those inside
-    // namespaces) under their mangled device name so call sites resolve. The
-    // Sema pass rewrote scoped call sites to the mangled name already.
-    for (auto *d : flat) {
-      if (d->getNodeType() == ASTNode::NodeKind::FunctionDecl) {
-        auto *f = static_cast<const FunctionDecl *>(d);
-        funcDecls[deviceFuncName(f)] = f;
-      }
-    }
+  // Emit one complete GLSL compute unit for `k`. Resets the per-kernel state
+  // (params, dim flags, subgroup/vote flags, ssbo/scalar param lists) so the
+  // same emitter can produce multiple independent units for a multi-kernel TU.
+  void emitOneForKernel(const FunctionDecl *k,
+                        const std::vector<const ASTNode *> &flat) {
+    kernel = k;
+    params.assign(k->params.begin(), k->params.end());
+    useY = false; useZ = false;
+    scalarParams.clear();
+    ssboParams.clear();
+    usesSubgroup = false;
+    usesVote = false;
+    preStmts.clear();
+    emittingVoteRef = false;
+    if (k->body) scanDims(k->body.get());
 
     emitHeader();
     emitStructDecls(flat);
@@ -104,7 +120,34 @@ public:
     emitVoteDecls();
     emitDeviceFunctions(flat);
     emitBody();
-    return true;
+  }
+
+  // Emit a complete unit for every __global__ in `tu`, each into its own
+  // string buffer. Returns (entryName, source) per kernel in source order.
+  std::vector<glsl::GLSLModule> emitAll(const TranslationUnit &tu) {
+    std::vector<const ASTNode *> flat;
+    flattenDecls(tu.decls, flat);
+    for (auto *d : flat) {
+      if (d->getNodeType() == ASTNode::NodeKind::FunctionDecl) {
+        auto *f = static_cast<const FunctionDecl *>(d);
+        funcDecls[deviceFuncName(f)] = f;
+      }
+    }
+    std::vector<glsl::GLSLModule> out;
+    for (auto *d : flat) {
+      if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
+      auto *f = static_cast<const FunctionDecl *>(d);
+      if (f->deviceAttr != DeviceAttr::Global) continue;
+      std::string src;
+      raw_string_ostream buf(src);
+      raw_ostream *saved = os;
+      os = &buf;
+      emitOneForKernel(f, flat);
+      os = saved;
+      buf.flush();
+      out.push_back({deviceFuncName(f), std::move(src)});
+    }
+    return out;
   }
 
   // Recursively splice NamespaceDecl bodies into `out` (namespaces are
@@ -1003,6 +1046,13 @@ private:
 
 
   void emitBody() {
+    // Each __global__ kernel is emitted as its own .comp unit (see emitAll),
+    // so the entry function is always `main`. glslc then defaults to the
+    // `main` entry point; the host loads each kernel's separate SPIR-V blob
+    // with entryPoint="main" (kernels are distinguished by which blob is
+    // loaded, not by the entry-point name). shaderc's -fentry-point flag is
+    // broken on common distro builds (triggers a glslang built-in parse
+    // error), so we avoid it and rely on `main`.
     (*os) << "void main() {\n";
     if (kernel->body &&
         kernel->body->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
@@ -1555,7 +1605,18 @@ private:
 
 } // namespace
 
+std::vector<glsl::GLSLModule> vc::glsl::translateASTToGLSLSources(const TranslationUnit &tu) {
+  return GLSLEmitter(nulls()).emitAll(tu);
+}
+
 bool vc::glsl::translateASTToGLSL(const TranslationUnit &tu,
                                   raw_ostream &os) {
-  return GLSLEmitter(os).emit(tu);
+  auto mods = translateASTToGLSLSources(tu);
+  if (mods.empty()) {
+    os << "// no __global__ kernel found\n";
+    return false;
+  }
+  // Single-kernel convenience path: emit the first kernel's source verbatim.
+  os << mods.front().source;
+  return true;
 }

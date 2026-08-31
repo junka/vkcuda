@@ -1,0 +1,80 @@
+// test/multi_kernel.vc — multi-kernel single-file demo.
+//
+// The headline feature: ONE .vc file holds TWO (or more) __global__ kernels,
+// each independently launched from host main(). Each kernel lowers to its own
+// GLSL compute unit -> its own SPIR-V module -> its own embedded
+// `__vc_spirv_<name>` array + `__vc_k_<name>` handle + Vulkan pipeline. The
+// runtime already keyed pipelines per-kernel; the compiler now emits all of
+// them instead of just the first.
+//
+//   vcc test/multi_kernel.vc -o build/multi_kernel_sf && ./build/multi_kernel_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// Kernel 1: elementwise add.
+__global__ void vadd(float *a, float *b, float *c, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    c[i] = a[i] + b[i];
+  }
+}
+
+// Kernel 2: elementwise scale by a scalar. A completely separate SPIR-V
+// module/pipeline from vadd — launched through its own handle.
+__global__ void vscale(float *a, float s, float *c, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    c[i] = a[i] * s;
+  }
+}
+
+int main() {
+  vcInit();
+
+  const int N = 64;
+  float hA[64], hB[64], hC[64], hD[64];
+  for (int i = 0; i < N; i++) { hA[i] = 1.0f * i; hB[i] = 2.0f; }
+
+  void *dA = 0, *dB = 0, *dC = 0, *dD = 0;
+  int bytes = N * 4;
+  vcMalloc(&dA, bytes);
+  vcMalloc(&dB, bytes);
+  vcMalloc(&dC, bytes);
+  vcMalloc(&dD, bytes);
+
+  vcMemcpy(dA, hA, bytes, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dB, hB, bytes, VCMemcpyKind::HostToDevice);
+
+  // Launch kernel 1: c = a + b.
+  vadd<<<N, 32>>>(dA, dB, dC, N);
+
+  vcDeviceSynchronize();
+
+  // Launch kernel 2: d = c * 3  (reuses dC as input, writes dD).
+  // NB: scalar kernel args must be variables, not literals — the host backend
+  // takes the address of each scalar arg, and &(literal) is ill-formed C++.
+  float scale = 3.0f;
+  vscale<<<N, 32>>>(dC, scale, dD, N);
+
+  vcDeviceSynchronize();
+
+  vcMemcpy(hC, dC, bytes, VCMemcpyKind::DeviceToHost);
+  vcMemcpy(hD, dD, bytes, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    // After vadd:  hC[i] = i + 2.
+    // After vscale: hD[i] = (i + 2) * 3.
+    if (hC[i] != hA[i] + hB[i]) { ok = 0; }
+    if (hD[i] != (hA[i] + hB[i]) * 3.0f) { ok = 0; }
+  }
+  printf("multi_kernel: %s (2 kernels: vadd + vscale)\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dA);
+  vcFree(dB);
+  vcFree(dC);
+  vcFree(dD);
+  vcShutdown();
+  return ok ? 0 : 1;
+}
