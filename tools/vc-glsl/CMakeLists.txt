@@ -13,5 +13,5 @@ endif()
 
 target_link_libraries(vc-glsl PRIVATE
   VCFrontend
-  LLVMSupport
+  LLVM
 )

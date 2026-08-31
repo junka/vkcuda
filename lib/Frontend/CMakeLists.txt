@@ -23,6 +23,11 @@ if(NOT LLVM_ENABLE_RTTI)
   target_compile_options(VCFrontend PUBLIC -fno-rtti)
 endif()
 
-# Frontend only needs LLVM support headers (ADT, SourceMgr, raw_ostream),
-# which are header-only or in LLVM's support library.
-target_link_libraries(VCFrontend PUBLIC LLVMCore LLVMSupport)
+# Frontend only needs LLVM support headers (ADT, SourceMgr, raw_ostream).
+# Link the single shared libLLVM (the `LLVM` imported target) rather than the
+# static libLLVMSupport.a / libLLVMCore.a: when the MLIR backend is also built,
+# MLIR's imported targets pull in libLLVM.so transitively, and mixing the
+# static support lib with the shared one causes a duplicate registration of
+# LLVM command-line options (e.g. `debug-counter`) at startup -> fatal error.
+# The shared library exports every symbol the frontend needs.
+target_link_libraries(VCFrontend PUBLIC LLVM)

@@ -20,5 +20,5 @@ target_link_libraries(vc PRIVATE
   MLIRSPIRVTarget
   MLIRTranslateLib
   MLIRSupport
-  LLVMSupport
+  LLVM
 )

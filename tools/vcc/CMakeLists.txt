@@ -17,7 +17,7 @@ if(NOT LLVM_ENABLE_RTTI)
   target_compile_options(vcc PRIVATE -fno-rtti)
 endif()
 
-target_link_libraries(vcc PRIVATE VCFrontend LLVMSupport)
+target_link_libraries(vcc PRIVATE VCFrontend LLVM)
 
 # Bake the locations the driver needs at build time so it can invoke g++ with
 # the right -I / .a / -l flags without requiring an install step.
