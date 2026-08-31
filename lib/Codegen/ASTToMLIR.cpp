@@ -29,6 +29,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVTypes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -256,11 +258,16 @@ private:
   //===--------------------------------------------------------------------//
 
   // A slot (local var) yields its memref address; load it when a scalar is
-  // wanted. Index expressions are cast to index for memref indexing.
+  // wanted. Index expressions are cast to index for memref indexing. A
+  // spirv.ptr (a __shared__ scalar slot) loads via spirv.Load.
   Value loadValue(Value v, Location l) {
     if (!v) return v;
     if (auto mr = v.getType().dyn_cast<MemRefType>())
       return builder.create<memref::LoadOp>(l, v, ValueRange{});
+    if (auto ptr = v.getType().dyn_cast<spirv::PointerType>())
+      return builder.create<spirv::LoadOp>(l, ptr.getPointeeType(), v,
+                                          /*memory_access=*/spirv::MemoryAccessAttr(),
+                                          /*alignment=*/IntegerAttr());
     return v;
   }
 
@@ -279,27 +286,84 @@ private:
 
   // Resolve an lvalue (a local-var slot or an array element) to a memref plus
   // its index list for load/store. Function params (block args) are scalars
-  // and are not writable slots, so they fail here.
+  // and are not writable slots, so they fail here. Multi-dimensional indexing
+  // `a[i][j]` is a chain of IndexExprs; we descend to the base memref and
+  // collect every subscript (innermost last), so a memref<16x8xf32> gets two
+  // indices in [i, j] order.
+  //
+  // __shared__ slots live behind a spirv.ptr (Workgroup): a scalar shared slot
+  // is a spirv.ptr<T, Workgroup> (no indices, loaded/stored directly), and a
+  // shared array is spirv.ptr<array<...>, Workgroup> indexed with
+  // spirv.AccessChain. To keep the caller uniform, a shared scalar is returned
+  // as `mem` = the pointer with empty indices (callers detect spirv.ptr and use
+  // spirv.Load/Store), and a shared array element is returned as `mem` = the
+  // AccessChain'd element pointer (spirv.ptr<elem, Workgroup>) with empty
+  // indices — again a plain spirv.Load/Store target.
   bool lvalueAddress(ASTNode *n, Value &mem, SmallVectorImpl<Value> &indices) {
     if (!n) return false;
     if (n->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
       auto *ref = static_cast<DeclRefExpr *>(n);
       auto it = locals.find(ref->name);
-      if (it == locals.end() || !it->second.getType().isa<MemRefType>())
-        return false;
-      mem = it->second; // a 0-d memref slot
-      return true;
+      if (it == locals.end()) return false;
+      mem = it->second;
+      // A 0-d memref slot (local scalar) or a spirv.ptr scalar shared slot.
+      return mem.getType().isa<MemRefType>() ||
+             mem.getType().isa<spirv::PointerType>();
     }
     if (n->getNodeType() == ASTNode::NodeKind::IndexExpr) {
-      auto *ie = static_cast<IndexExpr *>(n);
-      mem = visitExpr(ie->base.get());
-      if (!mem || !mem.getType().isa<MemRefType>()) return false;
-      Value idx = loadValue(visitExpr(ie->index.get()), loc(ie->index.get()));
-      if (!idx) return false;
-      if (!idx.getType().isIndex())
-        idx = builder.create<arith::IndexCastOp>(loc(ie->index.get()),
-                                                 builder.getIndexType(), idx);
-      indices.push_back(idx);
+      SmallVector<IndexExpr *, 4> chain;
+      ASTNode *cur = n;
+      while (cur && cur->getNodeType() == ASTNode::NodeKind::IndexExpr) {
+        auto *ie = static_cast<IndexExpr *>(cur);
+        chain.push_back(ie);
+        cur = ie->base.get();
+      }
+      // The chain root must resolve to an addressable memory object. A subscript
+      // of a non-array value (e.g. indexing a loaded scalar) is rejected.
+      Value base = visitExpr(cur);
+      if (!base) return false;
+      // Shared array: spirv.ptr<array<...>, Workgroup>. Build a spirv.AccessChain
+      // over the indices (outermost-first) and return the element pointer.
+      if (base.getType().isa<spirv::PointerType>()) {
+        SmallVector<Value> idxVals;
+        for (auto *ie : llvm::reverse(chain)) {
+          Value idx = loadValue(visitExpr(ie->index.get()),
+                                loc(ie->index.get()));
+          if (!idx) return false;
+          // spirv.AccessChain indices are signless integers.
+          if (idx.getType().isIndex())
+            idx = builder.create<arith::IndexCastOp>(
+                loc(ie->index.get()), builder.getI32Type(), idx);
+          else if (!idx.getType().isSignlessInteger())
+            idx = builder.create<arith::TruncIOp>(
+                loc(ie->index.get()), builder.getI32Type(), idx);
+          idxVals.push_back(idx);
+        }
+        // Element type of the deepest array.
+        mlir::Type pointee =
+            base.getType().cast<spirv::PointerType>().getPointeeType();
+        mlir::Type elemTy = pointee;
+        while (auto arr = elemTy.dyn_cast<spirv::ArrayType>())
+          elemTy = arr.getElementType();
+        spirv::PointerType elemPtr = spirv::PointerType::get(
+            elemTy, base.getType().cast<spirv::PointerType>().getStorageClass());
+        mem = builder.create<spirv::AccessChainOp>(loc(n), elemPtr, base,
+                                                    idxVals);
+        // Element pointer: callers use spirv.Load/Store on it directly.
+        indices.clear();
+        return true;
+      }
+      // memref array (kernel arg or local alloca).
+      if (!base.getType().isa<MemRefType>()) return false;
+      mem = base;
+      for (auto *ie : llvm::reverse(chain)) {
+        Value idx = loadValue(visitExpr(ie->index.get()), loc(ie->index.get()));
+        if (!idx) return false;
+        if (!idx.getType().isIndex())
+          idx = builder.create<arith::IndexCastOp>(loc(ie->index.get()),
+                                                   builder.getIndexType(), idx);
+        indices.push_back(idx);
+      }
       return true;
     }
     return false;
@@ -310,6 +374,12 @@ private:
     Value mem;
     SmallVector<Value> indices;
     if (!lvalueAddress(n, mem, indices)) return Value();
+    // A spirv.ptr (shared scalar slot or shared array element via AccessChain)
+    // loads via spirv.Load.
+    if (auto ptr = mem.getType().dyn_cast<spirv::PointerType>())
+      return builder.create<spirv::LoadOp>(l, ptr.getPointeeType(), mem,
+                                          /*memory_access=*/spirv::MemoryAccessAttr(),
+                                          /*alignment=*/IntegerAttr());
     return builder.create<memref::LoadOp>(l, mem, indices);
   }
 
@@ -317,6 +387,17 @@ private:
   void storeTo(Value mem, ArrayRef<Value> indices, Value v, Location l) {
     if (!v) return;
     v = loadValue(v, l);
+    // A spirv.ptr (shared scalar slot or shared array element) stores via
+    // spirv.Store. The stored value must match the pointee element type.
+    if (mem.getType().isa<spirv::PointerType>()) {
+      mlir::Type elem = mem.getType().cast<spirv::PointerType>().getPointeeType();
+      if (v.getType() != elem)
+        v = castValue(v, elem, l);
+      builder.create<spirv::StoreOp>(l, mem, v,
+                                     /*memory_access=*/spirv::MemoryAccessAttr(),
+                                     /*alignment=*/IntegerAttr());
+      return;
+    }
     mlir::Type elem = mem.getType().cast<MemRefType>().getElementType();
     if (v.getType() != elem) {
       if (v.getType().isIndex() && elem.isSignlessInteger())
@@ -383,6 +464,49 @@ private:
     builder.restoreInsertionPoint(saved);
     locals[v->name] = addr;
     return addr;
+  }
+
+  // Create (once, by symbol name) a module-scope SPIR-V GlobalVariable in the
+  // Workgroup storage class for a __shared__ variable, and return a
+  // spirv.mlir.addressof of it at the current insertion point.
+  //
+  // Why spirv.GlobalVariable and not memref.global: stock MLIR's GPUToSPIRV /
+  // MemRefToSPIRV passes do NOT legalize memref.global (a module-scope
+  // memref.global with Workgroup storage is left as an unlegalizable op and
+  // fails `failed to legalize operation 'memref.global'`). The working idiom is
+  // a spirv.GlobalVariable + spirv.mlir.addressof, with spirv.Load / spirv.Store
+  // / spirv.AccessChain on the resulting !spirv.ptr<..., Workgroup>. So shared
+  // memory is emitted directly in the spirv dialect; the VCToGPU stage hoists
+  // the GlobalVariable into the gpu.module (memref globals are hoisted the same
+  // way) so it survives Stage 1 cleanup and is carried into the spirv.module by
+  // GPUToSPIRV.
+  //
+  // The symbol is namespaced (`__vc_shared_<name>`) to avoid clashing with user
+  // symbols; the same global is reused across kernels that declare a __shared__
+  // var of the same name and shape.
+  Value getOrCreateSharedGlobal(llvm::StringRef name, ArrayRef<int64_t> shape,
+                                mlir::Type elemTy, Location l) {
+    std::string sym = ("__vc_shared_") + name.str();
+    // The pointee type: the element for a scalar, or a spirv.array wrapping the
+    // element for a (multi-dimensional) shared array. spirv.array is row-major
+    // and nested for multi-dim (`float s[16][8]` -> array<16 x array<8 x f32>>).
+    mlir::Type pointee = elemTy;
+    if (!shape.empty()) {
+      for (auto dim : llvm::reverse(shape))
+        pointee = spirv::ArrayType::get(pointee, dim);
+    }
+    spirv::PointerType ptrTy =
+        spirv::PointerType::get(pointee, spirv::StorageClass::Workgroup);
+
+    if (!module.lookupSymbol(sym)) {
+      auto saved = builder.saveInsertionPoint();
+      builder.setInsertionPointToStart(module.getBody());
+      builder.create<spirv::GlobalVariableOp>(l, TypeAttr::get(ptrTy),
+                                              builder.getStringAttr(sym),
+                                              /*initializer=*/FlatSymbolRefAttr());
+      builder.restoreInsertionPoint(saved);
+    }
+    return builder.create<spirv::AddressOfOp>(l, ptrTy, sym);
   }
 
   // Put two operands on a common type for a binop: float stays float, and if
@@ -517,29 +641,57 @@ private:
       if (!d) break;
       // Locals become stack allocations tagged with the SPIR-V Function
       // storage class; MemRefToSPIRV refuses to lower allocas whose memory
-      // space is not exactly #spirv.storage_class<Function>. __shared__ would
-      // map to the Workgroup storage class (TODO).
+      // space is not exactly #spirv.storage_class<Function>. __shared__
+      // maps to the Workgroup storage class (block-visible shared memory):
+      // SPIR-V models workgroup memory as module-scope Variables, not per-
+      // thread allocas, so __shared__ decls become memref.global symbols
+      // fetched via memref.get_global in the body.
       mlir::Type ty = cvtType(d->type);
-      // An array declarator (`float a[16]`) gets an N-element slot; a scalar
-      // decl uses a 0-d memref as a mutable slot.
-      int64_t sz = (!d->arrayDims.empty() && d->arrayDims[0] > 0)
-                       ? d->arrayDims[0]
-                       : 0;
-      MemRefType slotTy;
-      if (sz > 0)
-        slotTy = MemRefType::get(
-            ArrayRef<int64_t>{sz}, ty, MemRefLayoutAttrInterface(),
-            spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
-      else
-        slotTy = MemRefType::get(
-            ArrayRef<int64_t>{}, ty, MemRefLayoutAttrInterface(),
-            spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
+      if (!ty) { error(d, "unsupported local type"); break; }
+      // Build the memref shape from arrayDims. A scalar decl (no arrayDims)
+      // uses a 0-d memref as a mutable slot; `float a[16]` -> memref<16xf32>;
+      // `float a[16][8]` -> memref<16x8xf32>. An unsized dimension
+      // (extern __shared__ T s[], arrayDims={0}) is not supported here.
+      SmallVector<int64_t, 4> shape;
+      for (int64_t dim : d->arrayDims) {
+        if (dim <= 0) {
+          error(d, "unsized __shared__ array (extern __shared__ T s[]) is not "
+                   "supported by the MLIR backend; give it an explicit size");
+          shape.push_back(1); // keep going so the slot has a valid type
+        } else {
+          shape.push_back(dim);
+        }
+      }
+      if (d->isShared) {
+        // Module-scope global in Workgroup storage, fetched per use.
+        Value addr = getOrCreateSharedGlobal(d->name, shape, ty, l);
+        locals[d->name] = addr;
+        // __shared__ decls may not have a non-constant initializer in CUDA
+        // (no host-visible init); ignore any initializer for the global.
+        break;
+      }
+      MemRefType slotTy = MemRefType::get(
+          shape, ty, MemRefLayoutAttrInterface(),
+          spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
+      // Hoist the allocation to the function entry block: a memref.alloca
+      // emitted inside an scf region (loops/if) may not survive the
+      // structured-CFG -> SPIR-V legalization cleanly.
+      OpBuilder::InsertPoint savedIp;
+      bool hoisted = false;
+      if (entryBlock && builder.getInsertionBlock() != entryBlock) {
+        savedIp = builder.saveInsertionPoint();
+        builder.setInsertionPointToStart(entryBlock);
+        hoisted = true;
+      }
       Value addr = builder.create<memref::AllocaOp>(l, slotTy);
+      if (hoisted) builder.restoreInsertionPoint(savedIp);
       locals[d->name] = addr;
       if (d->init) {
         if (d->init->getNodeType() == ASTNode::NodeKind::InitListExpr) {
           auto *il = static_cast<InitListExpr *>(d->init.get());
-          for (size_t i = 0; i < il->elements.size() && sz > 0; ++i) {
+          int64_t total = 1;
+          for (int64_t dim : shape) total *= dim;
+          for (size_t i = 0; i < il->elements.size() && (int64_t)i < total; ++i) {
             SmallVector<Value, 1> idx;
             idx.push_back(builder.create<arith::ConstantOp>(
                 l, builder.getIndexType(), builder.getIndexAttr(i)));
@@ -849,18 +1001,15 @@ private:
       return castValue(visitExpr(c->sub.get()), to, l);
     }
     case ASTNode::NodeKind::IndexExpr: {
-      // base[idx] where base is a memref arg / slot.
+      // base[idx...] where base is a memref arg / slot or a shared spirv.ptr.
+      // Reuses lvalueAddress so multi-dimensional `a[i][j]` collects every
+      // subscript into one load, and so shared-array indexing (spirv.AccessChain
+      // + spirv.Load) is handled uniformly.
       auto *ie = static_cast<IndexExpr *>(n);
-      Value base = visitExpr(ie->base.get());
-      if (!base) return error(ie->base.get(), "could not evaluate index base");
-      if (!base.getType().isa<MemRefType>())
-        return error(n, "subscript of non-array value");
-      Value idx = loadValue(visitExpr(ie->index.get()), loc(ie->index.get()));
-      if (!idx) return error(ie->index.get(), "could not evaluate subscript");
-      if (!idx.getType().isIndex())
-        idx = builder.create<arith::IndexCastOp>(loc(ie->index.get()),
-                                                 builder.getIndexType(), idx);
-      return builder.create<memref::LoadOp>(l, base, ValueRange{idx});
+      Value loaded = loadLValue(ie, l);
+      if (!loaded)
+        return error(ie, "subscript of non-array value");
+      return loaded;
     }
     case ASTNode::NodeKind::MemberAccessExpr: {
       // threadIdx.x / blockIdx.x / blockDim.x / gridDim.x

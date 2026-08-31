@@ -1,0 +1,29 @@
+// test/MLIR/shared.vc — __shared__ workgroup memory lowering.
+//
+// `__shared__` declarations must NOT become per-thread memref.allocas in the
+// Workgroup storage class (the SPIR-V conversion refuses to legalize those).
+// Instead ASTToMLIR emits a module-scope spirv.GlobalVariable in the Workgroup
+// storage class, referenced in the body via spirv.mlir.addressof, with
+// spirv.AccessChain (for arrays) + spirv.Load / spirv.Store on the resulting
+// !spirv.ptr<..., Workgroup>. This test checks those ops show up in the MLIR.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+//
+// CHECK-DAG: spirv.GlobalVariable @__vc_shared_s : !spirv.ptr<i32, Workgroup>
+// CHECK-DAG: spirv.GlobalVariable @__vc_shared_Tile : !spirv.ptr<!spirv.array<16 x !spirv.array<16 x i32>>, Workgroup>
+// CHECK-DAG: spirv.mlir.addressof @__vc_shared_s
+// CHECK-DAG: spirv.mlir.addressof @__vc_shared_Tile
+// CHECK-DAG: spirv.AccessChain
+// CHECK-DAG: spirv.Store "Workgroup"
+// CHECK-DAG: spirv.Load "Workgroup"
+
+__global__ void k(int *out, int n) {
+  __shared__ int s;
+  __shared__ int Tile[16][16];
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+  s = tx;
+  Tile[ty][tx] = tx + ty;
+  __syncthreads();
+  out[0] = s + Tile[ty][tx];
+}

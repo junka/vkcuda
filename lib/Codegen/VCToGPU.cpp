@@ -21,7 +21,9 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -152,6 +154,23 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
 
     fn.erase();
     k.erase();
+  }
+
+  // Hoist any module-scope workgroup-memory globals into the gpu.module.
+  // GPUToSPIRV only legalizes symbols visible inside the gpu.module it clones,
+  // and the stage-1 cleanup erases everything at the outer module scope that is
+  // not the gpu.module itself. __shared__ variables are emitted (by ASTToMLIR)
+  // as spirv.GlobalVariable in the Workgroup storage class at module scope;
+  // moving them here (before the gpu.func) keeps spirv.mlir.addressof
+  // references resolvable through Stage 2. (memref.global is hoisted too, in
+  // case any remain, for the same reason.)
+  SmallVector<Operation *> globals;
+  module.walk([&](Operation *op) {
+    if (isa<spirv::GlobalVariableOp, memref::GlobalOp>(op))
+      globals.push_back(op);
+  });
+  for (Operation *g : globals) {
+    g->moveBefore(&gpuModule.getBody()->front());
   }
 }
 

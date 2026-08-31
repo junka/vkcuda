@@ -62,6 +62,12 @@ void runLoweringPipeline(ModuleOp module) {
   // spirv-lower-abi-attrs then materializes the spirv.entry_point_abi /
   // spirv.interface_var_abi attributes into SPIR-V globals and the entry
   // point operation.
+  //
+  // __shared__ workgroup memory is already emitted as spirv.GlobalVariable +
+  // spirv.mlir.addressof + spirv.Load/Store by ASTToMLIR (see
+  // getOrCreateSharedGlobal), so it needs no extra pass here; the
+  // spirv.GlobalVariable hoisted into gpu.module is carried into the
+  // spirv.module by the clone.
   pm.addPass(createConvertGPUToSPIRVPass());
   // spirv-lower-abi-attrs runs on spirv.module (the op produced by the pass
   // above), not on the top-level module.
