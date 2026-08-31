@@ -1,0 +1,30 @@
+// test/MLIR/break_continue.vc — break/continue lowering to scf.
+//
+// scf has no goto, so break/continue are modeled by threading two i1 flags
+// (break-requested, continue-requested) through the loop body as memref
+// slots. Every statement in the body is guarded by `if (!break && !continue)`
+// so code after a break/continue is skipped within the iteration; the loop's
+// while-condition becomes `cond && !break`.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+//
+// CHECK: vc.kernel
+// CHECK: scf.while
+// CHECK: scf.condition
+// The break sets a flag true; check we store `true` to a flag slot inside
+// the loop body.
+// CHECK: arith.constant true
+// CHECK: memref.store
+// Each body statement is guarded by an scf.if on the pending flags.
+// CHECK: scf.if
+
+__global__ void k(int *out, int n) {
+  int tid = threadIdx.x;
+  int sum = 0;
+  for (int i = 0; i < n; i++) {
+    if (i == 5) break;
+    if (i == 2) continue;
+    sum += i;
+  }
+  out[tid] = sum;
+}

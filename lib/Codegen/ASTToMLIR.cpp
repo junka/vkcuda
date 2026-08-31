@@ -32,6 +32,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
 
 using namespace vc;
@@ -53,6 +54,25 @@ class ASTToMLIRImpl {
   Block *entryBlock = nullptr;
   // Return type of the function currently being emitted (None for void).
   mlir::Type currentRetTy;
+  // Set when any diagnostic error is emitted, so the driver can fail.
+  bool hadError = false;
+
+  //--- Loop break/continue state -----------------------------------------//
+  // scf has no goto, so break/continue are modeled by threading two i1 flags
+  // through the loop body as memref slots: `breakReq` (a break was requested)
+  // and `contReq` (a continue was requested). Every statement in the body is
+  // guarded by `if (!breakReq && !contReq)` so code after a break/continue is
+  // skipped. The flags are reset to false at the top of each iteration; the
+  // loop's while-condition becomes `cond && !breakReq`.
+  unsigned loopDepth = 0;
+  // Per-active-loop flag slots, indexed by loopDepth-1.
+  SmallVector<Value, 4> breakFlags;
+  SmallVector<Value, 4> continueFlags;
+  // Insertion point to resume at when emitting the step/body guard (set by
+  // emitGuardedStmt for the current innermost loop).
+  // True while emitting statements that should be suppressed after break/
+  // continue; when set, statements emit under an scf.if guard.
+  bool guarding = false;
 
 public:
   ASTToMLIRImpl(MLIRContext &c)
@@ -79,10 +99,43 @@ public:
     return module;
   }
 
+  bool failed() const { return hadError; }
+
 private:
   Location loc(const ASTNode *n) {
     return FileLineColLoc::get(&ctx, "<vc>", n ? n->getLoc().line : 0,
                                n ? n->getLoc().col : 0);
+  }
+
+  // Report an unsupported/unsupported AST construct at `n` and mark the
+  // translation as failed. Returns an empty Value so callers can write
+  // `return error(n, "...");` in expression position.
+  Value error(const ASTNode *n, const llvm::Twine &msg) {
+    hadError = true;
+    emitError(loc(n), msg);
+    return Value();
+  }
+
+  static const char *nodeKindName(ASTNode::NodeKind k) {
+    switch (k) {
+    case ASTNode::NodeKind::IntegerLiteral: return "integer literal";
+    case ASTNode::NodeKind::FloatLiteral: return "float literal";
+    case ASTNode::NodeKind::BoolLiteral: return "bool literal";
+    case ASTNode::NodeKind::CharLiteral: return "char literal";
+    case ASTNode::NodeKind::StringLiteral: return "string literal";
+    case ASTNode::NodeKind::DeclRefExpr: return "decl ref";
+    case ASTNode::NodeKind::IndexExpr: return "index expr";
+    case ASTNode::NodeKind::MemberAccessExpr: return "member access";
+    case ASTNode::NodeKind::CallExpr: return "call";
+    case ASTNode::NodeKind::UnaryExpr: return "unary expr";
+    case ASTNode::NodeKind::BinaryExpr: return "binary expr";
+    case ASTNode::NodeKind::ConditionalExpr: return "conditional expr";
+    case ASTNode::NodeKind::CStyleCastExpr: return "cast";
+    case ASTNode::NodeKind::InitListExpr: return "init list";
+    case ASTNode::NodeKind::SizeOfExpr: return "sizeof";
+    case ASTNode::NodeKind::LaunchExpr: return "launch";
+    default: return "node";
+    }
   }
 
   void visitTopLevel(const ASTNode *n) {
@@ -94,9 +147,21 @@ private:
       if (fn->deviceAttr == DeviceAttr::Global ||
           fn->deviceAttr == DeviceAttr::Device)
         buildFunction(fn);
+      return;
     }
     // KernelDecl is handled when its FunctionDecl is built (we emit a
     // vc.kernel wrapper there).
+    if (n->getNodeType() == ASTNode::NodeKind::KernelDecl) return;
+    // Top-level constructs the MLIR backend does not yet model. These would
+    // otherwise vanish silently; surface them so the user knows the shader
+    // is missing the construct.
+    if (n->getNodeType() == ASTNode::NodeKind::StructDecl ||
+        n->getNodeType() == ASTNode::NodeKind::NamespaceDecl ||
+        n->getNodeType() == ASTNode::NodeKind::EnumDecl ||
+        n->getNodeType() == ASTNode::NodeKind::TypedefDecl)
+      error(n, std::string("MLIR backend does not support top-level ") +
+                  nodeKindName(n->getNodeType()) +
+                  "; construct dropped from device code");
   }
 
   mlir::Type cvtType(const vc::Type *t) {
@@ -418,7 +483,12 @@ private:
         builder.restoreInsertionPoint(saved);
         return; // remainder was emitted inside the guard
       }
-      visitStmt(s);
+      // Inside a loop body, guard each statement against an earlier
+      // break/continue in the same iteration so it is skipped.
+      if (loopDepth > 0 && guarding)
+        emitGuarded(s);
+      else
+        visitStmt(s);
       ++from;
     }
   }
@@ -498,13 +568,28 @@ private:
       emitDo(static_cast<DoStmt *>(n));
       break;
     case ASTNode::NodeKind::BreakStmt:
+      // Handled inside loop bodies via loop-carried exit flags when a loop is
+      // active; a bare break outside a loop is unreachable in valid C.
+      if (loopDepth == 0)
+        error(n, "'break' outside of a loop is not supported");
+      else
+        emitBreak(n);
+      break;
     case ASTNode::NodeKind::ContinueStmt:
+      if (loopDepth == 0)
+        error(n, "'continue' outside of a loop is not supported");
+      else
+        emitContinue(n);
+      break;
     case ASTNode::NodeKind::SwitchStmt:
     case ASTNode::NodeKind::CaseStmt:
-      // TODO: break/continue/switch need loop-structure tracking (scf has no
-      // goto; switch lowers to a chain of scf.if once needed).
+      // TODO: switch lowers to a chain of scf.if once needed.
+      error(n, std::string("MLIR backend does not support ") +
+                  nodeKindName(n->getNodeType()) + "; statement dropped");
       break;
     default:
+      error(n, std::string("MLIR backend cannot lower ") +
+                  nodeKindName(n->getNodeType()) + " statement; dropped");
       break;
     }
   }
@@ -527,7 +612,7 @@ private:
   void emitFor(const ForStmt *s) {
     // for (init; cond; step) lowers to
     //   init;
-    //   scf.while { cond } do { body; step }
+    //   scf.while { cond && !breakReq } do { body; step }
     // which preserves C evaluation semantics exactly (cond/step may depend on
     // locals through memref slots). A tighter scf.for lowering could be
     // added later once cond is a canonical `i < bound` form.
@@ -537,35 +622,80 @@ private:
     // (each call also makes that block the insertion point).
     Location l = loc(s);
     if (s->init) visitStmt(s->init.get());
+    Value brkFlag = makeFlagSlot(l);
+    Value cntFlag = makeFlagSlot(l);
+    breakFlags.push_back(brkFlag);
+    continueFlags.push_back(cntFlag);
+    ++loopDepth;
     auto whileOp = builder.create<scf::WhileOp>(l, TypeRange{}, ValueRange{});
 
     auto saved = builder.saveInsertionPoint();
     builder.createBlock(&whileOp.getBefore());
+    // Reset the continue flag at the top of each iteration (a continue only
+    // suppresses the rest of ONE iteration); break persists to exit.
+    storeFlag(cntFlag, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(false)), l);
     Value cond = s->cond ? toI1(visitExpr(s->cond.get()), l)
                          : builder.create<arith::ConstantOp>(
                                l, builder.getBoolAttr(true));
-    if (!cond) return;
-    builder.create<scf::ConditionOp>(l, cond, ValueRange{});
+    if (!cond) { builder.restoreInsertionPoint(saved); return; }
+    Value notBrk = builder.create<arith::XOrIOp>(
+        l, loadFlag(brkFlag, l),
+        builder.create<arith::ConstantOp>(l, builder.getBoolAttr(true)));
+    Value keep = builder.create<arith::AndIOp>(l, cond, notBrk);
+    builder.create<scf::ConditionOp>(l, keep, ValueRange{});
     builder.createBlock(&whileOp.getAfter());
+    bool prevGuard = guarding;
+    guarding = true;
     if (s->body) visitStmt(s->body.get());
-    if (s->step) (void)visitExpr(s->step.get());
+    // The step runs unless a break was requested (continue only skips to the
+    // step, then the next iteration's condition).
+    guarding = prevGuard;
+    if (s->step) {
+      Value notBrk2 = builder.create<arith::XOrIOp>(
+          l, loadFlag(brkFlag, l),
+          builder.create<arith::ConstantOp>(l, builder.getBoolAttr(true)));
+      auto ifOp = builder.create<scf::IfOp>(l, TypeRange{}, notBrk2, false);
+      auto s2 = builder.saveInsertionPoint();
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      (void)visitExpr(s->step.get());
+      builder.restoreInsertionPoint(s2);
+    }
     builder.create<scf::YieldOp>(l);
     builder.restoreInsertionPoint(saved);
+    breakFlags.pop_back();
+    continueFlags.pop_back();
+    --loopDepth;
   }
 
   void emitWhile(const WhileStmt *s) {
     Location l = loc(s);
+    Value brkFlag = makeFlagSlot(l);
+    Value cntFlag = makeFlagSlot(l);
+    breakFlags.push_back(brkFlag);
+    continueFlags.push_back(cntFlag);
+    ++loopDepth;
     auto whileOp = builder.create<scf::WhileOp>(l, TypeRange{}, ValueRange{});
 
     auto saved = builder.saveInsertionPoint();
     builder.createBlock(&whileOp.getBefore());
+    storeFlag(cntFlag, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(false)), l);
     Value cond = toI1(visitExpr(s->cond.get()), l);
-    if (!cond) return;
-    builder.create<scf::ConditionOp>(l, cond, ValueRange{});
+    if (!cond) { builder.restoreInsertionPoint(saved); return; }
+    Value notBrk = builder.create<arith::XOrIOp>(
+        l, loadFlag(brkFlag, l),
+        builder.create<arith::ConstantOp>(l, builder.getBoolAttr(true)));
+    Value keep = builder.create<arith::AndIOp>(l, cond, notBrk);
+    builder.create<scf::ConditionOp>(l, keep, ValueRange{});
     builder.createBlock(&whileOp.getAfter());
+    bool prevGuard = guarding;
+    guarding = true;
     if (s->body) visitStmt(s->body.get());
+    guarding = prevGuard;
     builder.create<scf::YieldOp>(l);
     builder.restoreInsertionPoint(saved);
+    breakFlags.pop_back();
+    continueFlags.pop_back();
+    --loopDepth;
   }
 
   void emitDo(const DoStmt *s) {
@@ -580,21 +710,97 @@ private:
     builder.create<memref::StoreOp>(
         l, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(true)),
         flag);
+    Value brkFlag = makeFlagSlot(l);
+    Value cntFlag = makeFlagSlot(l);
+    breakFlags.push_back(brkFlag);
+    continueFlags.push_back(cntFlag);
+    ++loopDepth;
     auto whileOp = builder.create<scf::WhileOp>(l, TypeRange{}, ValueRange{});
 
     auto saved = builder.saveInsertionPoint();
     builder.createBlock(&whileOp.getBefore());
+    storeFlag(cntFlag, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(false)), l);
     Value first = builder.create<memref::LoadOp>(l, flag, ValueRange{});
     builder.create<memref::StoreOp>(
         l, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(false)),
         flag);
     Value cond = s->cond ? toI1(visitExpr(s->cond.get()), l) : Value();
-    if (!cond) return;
+    if (!cond) { builder.restoreInsertionPoint(saved); return; }
+    Value notBrk = builder.create<arith::XOrIOp>(
+        l, loadFlag(brkFlag, l),
+        builder.create<arith::ConstantOp>(l, builder.getBoolAttr(true)));
     Value pass = builder.create<arith::OrIOp>(l, first, cond);
+    pass = builder.create<arith::AndIOp>(l, pass, notBrk);
     builder.create<scf::ConditionOp>(l, pass, ValueRange{});
     builder.createBlock(&whileOp.getAfter());
+    bool prevGuard = guarding;
+    guarding = true;
     if (s->body) visitStmt(s->body.get());
+    guarding = prevGuard;
     builder.create<scf::YieldOp>(l);
+    builder.restoreInsertionPoint(saved);
+    breakFlags.pop_back();
+    continueFlags.pop_back();
+    --loopDepth;
+  }
+
+  //--- break/continue ------------------------------------------------------//
+
+  Value makeFlagSlot(const Location &l) {
+    auto flagTy =
+        MemRefType::get(ArrayRef<int64_t>{}, builder.getI1Type(),
+                        MemRefLayoutAttrInterface(),
+                        spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
+    Value slot = builder.create<memref::AllocaOp>(l, flagTy);
+    builder.create<memref::StoreOp>(
+        l, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(false)), slot);
+    return slot;
+  }
+
+  Value loadFlag(Value slot, const Location &l) {
+    return builder.create<memref::LoadOp>(l, slot, ValueRange{});
+  }
+
+  void storeFlag(Value slot, Value v, const Location &l) {
+    builder.create<memref::StoreOp>(l, v, slot);
+  }
+
+  // A break/continue sets the innermost loop's flag true. Subsequent guarded
+  // statements in this iteration are skipped (see emitGuarded).
+  void emitBreak(const ASTNode *n) {
+    Location l = loc(n);
+    Value slot = breakFlags.back();
+    storeFlag(slot, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(true)),
+              l);
+  }
+  void emitContinue(const ASTNode *n) {
+    Location l = loc(n);
+    Value slot = continueFlags.back();
+    storeFlag(slot, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(true)),
+              l);
+  }
+
+  // Whether the innermost loop has a break/continue pending this iteration.
+  Value loopPending(const Location &l) {
+    Value brk = loadFlag(breakFlags.back(), l);
+    Value cnt = loadFlag(continueFlags.back(), l);
+    Value any = builder.create<arith::OrIOp>(l, brk, cnt);
+    Value notAny = builder.create<arith::XOrIOp>(
+        l, any, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(true)));
+    return notAny; // true = keep executing this iteration
+  }
+
+  // Emit a statement, guarded by the current loop's break/continue flags so
+  // that code after a break/continue is skipped within the same iteration.
+  void emitGuarded(ASTNode *n) {
+    if (!n) return;
+    if (loopDepth == 0 || !guarding) { visitStmt(n); return; }
+    Location l = loc(n);
+    Value keep = loopPending(l);
+    auto ifOp = builder.create<scf::IfOp>(l, TypeRange{}, keep, /*else=*/false);
+    auto saved = builder.saveInsertionPoint();
+    builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+    visitStmt(n);
     builder.restoreInsertionPoint(saved);
   }
 
@@ -627,7 +833,8 @@ private:
       auto cg = constGlobals.find(name);
       if (cg != constGlobals.end())
         return materializeConstGlobal(cg->second, n);
-      return Value();
+      return error(n, std::string("use of undeclared identifier '") +
+                          name.str() + "' in device code");
     }
     case ASTNode::NodeKind::UnaryExpr:
       return emitUnary(static_cast<UnaryExpr *>(n));
@@ -638,15 +845,18 @@ private:
     case ASTNode::NodeKind::CStyleCastExpr: {
       auto *c = static_cast<CStyleCastExpr *>(n);
       mlir::Type to = cvtType(c->target);
-      if (!to) return Value();
+      if (!to) return error(n, "cast to unsupported type");
       return castValue(visitExpr(c->sub.get()), to, l);
     }
     case ASTNode::NodeKind::IndexExpr: {
       // base[idx] where base is a memref arg / slot.
       auto *ie = static_cast<IndexExpr *>(n);
       Value base = visitExpr(ie->base.get());
-      if (!base || !base.getType().isa<MemRefType>()) return Value();
+      if (!base) return error(ie->base.get(), "could not evaluate index base");
+      if (!base.getType().isa<MemRefType>())
+        return error(n, "subscript of non-array value");
       Value idx = loadValue(visitExpr(ie->index.get()), loc(ie->index.get()));
+      if (!idx) return error(ie->index.get(), "could not evaluate subscript");
       if (!idx.getType().isIndex())
         idx = builder.create<arith::IndexCastOp>(loc(ie->index.get()),
                                                  builder.getIndexType(), idx);
@@ -675,7 +885,8 @@ private:
           return builder.create<arith::IndexCastOp>(
               l, builder.getI32Type(), idxV);
       }
-      return Value();
+      return error(n, "MLIR backend does not support member access "
+                      "other than threadIdx/blockIdx/blockDim/gridDim");
     }
     case ASTNode::NodeKind::CallExpr: {
       auto *c = static_cast<CallExpr *>(n);
@@ -691,7 +902,7 @@ private:
           SmallVector<Value> args;
           for (auto &a : c->args) {
             Value av = visitExpr(a.get());
-            if (!av) return Value();
+            if (!av) return error(a.get(), "could not evaluate call argument");
             args.push_back(loadValue(av, loc(a.get())));
           }
           auto call = builder.create<func::CallOp>(l, fit->second, args);
@@ -700,10 +911,12 @@ private:
           return call.getResult(0);
         }
       }
-      return Value();
+      return error(n, "MLIR backend does not support this call "
+                      "(unknown callee or builtin); call dropped");
     }
     default:
-      return Value();
+      return error(n, std::string("MLIR backend cannot lower ") +
+                          nodeKindName(n->getNodeType()));
     }
   }
 
@@ -738,10 +951,12 @@ private:
     case UnaryOp::PostDec: {
       // Operand must be a slot (assignment-like side effect).
       Value addr = v;
-      if (!addr || !addr.getType().isa<MemRefType>()) return Value();
+      if (!addr || !addr.getType().isa<MemRefType>())
+        return error(u, "++/-- requires an lvalue slot");
       mlir::Type elem = addr.getType().cast<MemRefType>().getElementType();
       Value cur = builder.create<memref::LoadOp>(l, addr, ValueRange{});
-      if (!elem.isIntOrIndex()) return Value();
+      if (!elem.isIntOrIndex() && !elem.isF32())
+        return error(u, "++/-- on non-scalar element type");
       Value one = elem.isF32()
                       ? builder.create<arith::ConstantOp>(
                             l, builder.getFloatAttr(elem, 1.0))
@@ -769,16 +984,19 @@ private:
     Location l = loc(b);
     if (b->op == BinaryOp::Assign) {
       Value rhs = visitExpr(b->rhs.get());
-      if (!rhs) return Value();
+      if (!rhs) return error(b->rhs.get(), "could not evaluate assignment RHS");
       Value mem;
       SmallVector<Value> indices;
       if (lvalueAddress(b->lhs.get(), mem, indices))
         storeTo(mem, indices, rhs, l);
+      else
+        error(b->lhs.get(), "assignment LHS is not an assignable lvalue");
       return rhs;
     }
     Value lhs = visitExpr(b->lhs.get());
     Value rhs = visitExpr(b->rhs.get());
-    if (!lhs || !rhs) return Value();
+    if (!lhs) return error(b->lhs.get(), "could not evaluate binary LHS");
+    if (!rhs) return error(b->rhs.get(), "could not evaluate binary RHS");
 
     switch (b->op) {
     case BinaryOp::LAnd:
@@ -847,7 +1065,7 @@ private:
       return builder.create<arith::CmpIOp>(l, p, lhs, rhs);
     }
     default:
-      return Value();
+      return error(b, "MLIR backend does not support this binary operator");
     }
   }
 
@@ -856,7 +1074,9 @@ private:
     Value cond = toI1(visitExpr(c->cond.get()), loc(c->cond.get()));
     Value tv = loadValue(visitExpr(c->thenExpr.get()), loc(c->thenExpr.get()));
     Value fv = loadValue(visitExpr(c->elseExpr.get()), loc(c->elseExpr.get()));
-    if (!tv || !fv) return Value();
+    if (!cond) return error(c->cond.get(), "could not evaluate ?: condition");
+    if (!tv) return error(c->thenExpr.get(), "could not evaluate ?: true arm");
+    if (!fv) return error(c->elseExpr.get(), "could not evaluate ?: false arm");
     if (tv.getType() != fv.getType()) {
       // Fold to the wider integer type when they differ.
       mlir::Type tt = tv.getType(), ft = fv.getType();
@@ -879,5 +1099,12 @@ private:
 OwningOpRef<ModuleOp> vc::codegen::translateASTToMLIR(const TranslationUnit &tu,
                                                       MLIRContext &ctx) {
   ASTToMLIRImpl impl(ctx);
-  return impl.translate(tu);
+  ModuleOp module = impl.translate(tu);
+  if (impl.failed()) {
+    // A diagnostic was emitted for an unsupported construct; signal failure
+    // so the driver does not report success on a partial shader.
+    module.erase();
+    return OwningOpRef<ModuleOp>();
+  }
+  return OwningOpRef<ModuleOp>(module);
 }
