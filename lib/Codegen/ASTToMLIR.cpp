@@ -171,7 +171,13 @@ private:
     if (isa<BuiltinType>(t)) {
       switch (cast<BuiltinType>(t)->builtin) {
       case BuiltinTypeKind::Void: return builder.getNoneType();
-      case BuiltinTypeKind::Bool: return builder.getI1Type();
+      // Bool lowers to i32, not i1: SPIR-V has no storage for 1-bit values, so
+      // a `memref<i1, Function>` slot (a bool local) fails to legalize its
+      // memref.store through GPUToSPIRV. Representing bool as i32 everywhere
+      // (slot, parameter, literal) keeps storage legal; truthiness is recovered
+      // via toI1 (cmpi != 0) at branch/logical-op points, and i1 comparison
+      // results are widened back to i32 on store via castValue (extsi).
+      case BuiltinTypeKind::Bool: return builder.getI32Type();
       case BuiltinTypeKind::Int32: case BuiltinTypeKind::UInt32:
         return builder.getI32Type();
       case BuiltinTypeKind::Int64: case BuiltinTypeKind::UInt64:
@@ -515,6 +521,19 @@ private:
     l = loadValue(l, lc);
     r = loadValue(r, lc);
     if (l.getType() == r.getType()) return {l, r};
+    // Mixed int/float: promote the integer side to the float type so a float
+    // op (e.g. `TILE * scale` where TILE is int, scale is float) lowers to
+    // arith.mulf instead of crashing arith.muli on an f32 operand.
+    if (l.getType().isF32() && r.getType().isIntOrIndex()) {
+      if (r.getType().isIndex())
+        r = builder.create<arith::IndexCastOp>(lc, builder.getI32Type(), r);
+      return {l, builder.create<arith::SIToFPOp>(lc, builder.getF32Type(), r)};
+    }
+    if (r.getType().isF32() && l.getType().isIntOrIndex()) {
+      if (l.getType().isIndex())
+        l = builder.create<arith::IndexCastOp>(lc, builder.getI32Type(), l);
+      return {builder.create<arith::SIToFPOp>(lc, builder.getF32Type(), l), r};
+    }
     if (l.getType().isF32() || r.getType().isF32()) return {l, r};
     if (l.getType().isIndex() && r.getType().isIntOrIndex()) {
       if (!r.getType().isIndex())
@@ -570,15 +589,29 @@ private:
   // Statements
   //===--------------------------------------------------------------------//
 
-  // A bare `if (c) return;` (no else, no value). Lowered by wrap-around
-  // (see emitStatements): structured CFG regions cannot contain a return.
-  static bool isBareReturnIf(const ASTNode *n) {
+  // An `if (c) ... return;` with no else whose then-block ends in a return
+  // (a bare `return;` or a `{ stmts; return; }`). Structured CFG (scf.if) has
+  // no goto, so a return inside an scf.if is illegal; emitStatements lowers
+  // these by wrap-around: the then-block (with its side effects) runs under
+  // the original condition, and everything after the if runs under !c (the
+  // fall-through path), which preserves C semantics — `if (c) { side; return;
+  // } rest` is equivalent to `if (c) { side; } else { rest; }` since `rest`
+  // only ever runs when c is false.
+  static bool endsWithReturn(const ASTNode *t) {
+    if (!t) return false;
+    if (t->getNodeType() == ASTNode::NodeKind::ReturnStmt) return true;
+    if (t->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
+      auto &ss = static_cast<const CompoundStmt *>(t)->statements;
+      if (ss.empty()) return false;
+      return ss.back()->getNodeType() == ASTNode::NodeKind::ReturnStmt;
+    }
+    return false;
+  }
+  static bool isReturnIf(const ASTNode *n) {
     if (!n || n->getNodeType() != ASTNode::NodeKind::IfStmt) return false;
     auto *iff = static_cast<const IfStmt *>(n);
     if (iff->elseStmt) return false;
-    const ASTNode *t = iff->thenStmt.get();
-    return t && t->getNodeType() == ASTNode::NodeKind::ReturnStmt &&
-           static_cast<const ReturnStmt *>(t)->value == nullptr;
+    return endsWithReturn(iff->thenStmt.get());
   }
 
   // Emit stmts[from..end). Structured CFG ops (scf.if) have no goto, so an
@@ -590,20 +623,26 @@ private:
   void emitStatements(const std::vector<NodePtr> &stmts, size_t from) {
     while (from < stmts.size()) {
       ASTNode *s = stmts[from].get();
-      if (isBareReturnIf(s)) {
-        if (from + 1 >= stmts.size()) break; // trailing guard: tail return
-        auto *iff = static_cast<const IfStmt *>(s);
+      if (isReturnIf(s)) {
+        auto *iff = static_cast<IfStmt *>(s);
         Location l = loc(iff);
         Value cond = toI1(visitExpr(iff->cond.get()), l);
         if (!cond) return;
+        // `if (c) { side; return; } rest`  ==>  `if (c) { side; } else { rest; }`
+        // (rest only runs when c is false, matching the early return). A
+        // trailing guard with no rest is just `if (c) { side; }`.
+        bool hasRest = from + 1 < stmts.size();
         auto saved = builder.saveInsertionPoint();
-        Value notCond = builder.create<arith::XOrIOp>(
-            l, cond,
-            builder.create<arith::ConstantOp>(l, builder.getBoolAttr(true)));
-        auto ifOp =
-            builder.create<scf::IfOp>(l, TypeRange{}, notCond, false);
+        auto ifOp = builder.create<scf::IfOp>(l, TypeRange{}, cond, hasRest);
+        // Then: the if's then-block minus its trailing return (the return is
+        // implicit — the block falls through to the scf.if's end, and rest is
+        // in the else so it is skipped, exactly as a return would).
         builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
-        emitStatements(stmts, from + 1);
+        emitThenWithoutTrailingReturn(iff->thenStmt.get());
+        if (hasRest) {
+          builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+          emitStatements(stmts, from + 1);
+        }
         builder.restoreInsertionPoint(saved);
         return; // remainder was emitted inside the guard
       }
@@ -615,6 +654,26 @@ private:
         visitStmt(s);
       ++from;
     }
+  }
+
+  // Emit an if-then-block (a bare ReturnStmt or a CompoundStmt) skipping its
+  // trailing ReturnStmt: the return is modeled by the wrap-around in
+  // emitStatements, not by an actual (illegal) return inside the scf.if.
+  void emitThenWithoutTrailingReturn(ASTNode *thenBlock) {
+    if (!thenBlock) return;
+    if (thenBlock->getNodeType() == ASTNode::NodeKind::ReturnStmt) return;
+    if (thenBlock->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
+      auto &ss = static_cast<CompoundStmt *>(thenBlock)->statements;
+      // Emit all but the last if it is the trailing return.
+      size_t upto = ss.size();
+      if (upto > 0 &&
+          ss[upto - 1]->getNodeType() == ASTNode::NodeKind::ReturnStmt)
+        --upto;
+      for (size_t i = 0; i < upto; ++i)
+        visitStmt(ss[i].get());
+      return;
+    }
+    visitStmt(thenBlock);
   }
 
   void visitStmt(ASTNode *n) {
@@ -976,6 +1035,12 @@ private:
     case ASTNode::NodeKind::CharLiteral:
       return builder.create<arith::ConstantOp>(
           l, builder.getI32IntegerAttr(static_cast<CharLiteral *>(n)->value));
+    case ASTNode::NodeKind::BoolLiteral:
+      // true/false -> i32 1/0 (bool is represented as i32 throughout; see
+      // cvtType). Never i1, which has no SPIR-V storage.
+      return builder.create<arith::ConstantOp>(
+          l, builder.getI32IntegerAttr(
+                 static_cast<BoolLiteral *>(n)->value ? 1 : 0));
     case ASTNode::NodeKind::DeclRefExpr: {
       auto name = static_cast<DeclRefExpr *>(n)->name;
       auto it = locals.find(name);
@@ -999,6 +1064,12 @@ private:
       mlir::Type to = cvtType(c->target);
       if (!to) return error(n, "cast to unsupported type");
       return castValue(visitExpr(c->sub.get()), to, l);
+    }
+    case ASTNode::NodeKind::CommaExpr: {
+      // `(a, b)`: evaluate a for its side effects, discard it, yield b.
+      auto *ce = static_cast<CommaExpr *>(n);
+      (void)visitExpr(ce->lhs.get());
+      return visitExpr(ce->rhs.get());
     }
     case ASTNode::NodeKind::IndexExpr: {
       // base[idx...] where base is a memref arg / slot or a shared spirv.ptr.

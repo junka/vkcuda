@@ -1,0 +1,37 @@
+// test/MLIR/expr_basics.vc — basic expression / type lowering regression.
+//
+// Covers four small but distinct fixes that each previously failed to lower:
+//   1. BoolLiteral (true/false) and bool locals — must NOT use i1 storage
+//      (SPIR-V has no 1-bit store); bool is represented as i32 throughout.
+//   2. CommaExpr `(a, b)` — evaluates a for side effects, yields b.
+//   3. Mixed int/float binary (`TILE * scale` with int TILE, float scale) —
+//      the int side is promoted to f32 so the op is arith.mulf, not a crashing
+//      arith.muli on an f32 operand; `int(...)` then fptosi's back.
+//   4. `if (c) { side; return; } rest` — an early return whose then-block has
+//      side effects before the return: wrap-around keeps the side effects under
+//      c and moves `rest` under !c (no illegal return inside scf.if).
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && test -s %t.spv
+
+__global__ void k(int *out, int n) {
+  int i = threadIdx.x;
+  if (i >= n) return;
+
+  bool even = (i % 2 == 0);
+  bool isOn = true;
+  bool skip = false;
+
+  // Early return WITH a side effect before the return (case 4).
+  if (skip) {
+    out[i] = -1;
+    return;
+  }
+
+  // Mixed int/float promoted to f32, then cast back to int (case 3).
+  const float scale = 0.5f;
+  int base = int(i * scale);
+
+  // Comma operator: write i, then yield 100 for the mask (case 2).
+  int mask = (out[i] = base, (even && isOn) ? 100 : 0);
+  out[i] = i + mask;
+}
