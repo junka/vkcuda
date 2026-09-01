@@ -172,6 +172,22 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
   for (Operation *g : globals) {
     g->moveBefore(&gpuModule.getBody()->front());
   }
+
+  // Hoist __device__ helper functions (func.func) into the gpu.module. Kernels
+  // were consumed above (their func.func erased and re-emitted as gpu.func), so
+  // any func.func left at module scope is a __device__ helper called from a
+  // kernel body via func.call. GPUToSPIRV only sees symbols inside the gpu.module
+  // it clones, and ConvertFuncToSPIRV (run before GPUToSPIRV) turns these
+  // func.func + func.call into spirv.func + spirv.FunctionCall. Without hoisting
+  // the callee, `func.call @helper` fails `does not reference a valid function`.
+  SmallVector<func::FuncOp> helpers;
+  module.walk([&](func::FuncOp f) {
+    if (!f->hasAttr("vc.kernel"))
+      helpers.push_back(f);
+  });
+  for (func::FuncOp f : helpers) {
+    f->moveBefore(&gpuModule.getBody()->front());
+  }
 }
 
 } // namespace

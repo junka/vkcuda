@@ -1,4 +1,6 @@
 /build/
+/build-mlir/
+/build-mlir3/
 *.o
 *.a
 *.so

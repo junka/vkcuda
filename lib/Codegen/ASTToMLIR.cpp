@@ -48,6 +48,9 @@ class ASTToMLIRImpl {
   ModuleOp module;
   // name -> func::FuncOp
   llvm::DenseMap<llvm::StringRef, func::FuncOp> funcTable;
+  // name -> FunctionDecl (for completing default arguments at call sites that
+  // omit trailing defaulted parameters, mirroring the GLSL backend).
+  llvm::DenseMap<llvm::StringRef, const FunctionDecl *> funcDecls;
   // name -> Value (block arg / local memref / alloca)
   llvm::StringMap<Value> locals;
   // name -> __constant__ global VarDecl, materialized lazily per kernel.
@@ -75,6 +78,11 @@ class ASTToMLIRImpl {
   // True while emitting statements that should be suppressed after break/
   // continue; when set, statements emit under an scf.if guard.
   bool guarding = false;
+  // Depth of nested structured regions (scf.if then/else, loop bodies). The
+  // value-return yield chain can only be entered at function top level
+  // (depth 0): inside a region it would have to yield up through the enclosing
+  // scf.if, which the current lowering does not model.
+  unsigned structuredDepth = 0;
 
 public:
   ASTToMLIRImpl(MLIRContext &c)
@@ -226,6 +234,7 @@ private:
     }
     module.push_back(f);
     funcTable[fn->name] = f;
+    funcDecls[fn->name] = fn;
     currentRetTy = retTy;
 
     if (!fn->body) return;
@@ -607,11 +616,35 @@ private:
     }
     return false;
   }
+  // If `t` is a bare `return value;` (or a `{ ...; return value; }` block),
+  // return the value expression; null for a bare `return;` (void). Used to
+  // distinguish value-returning early returns (which need a yield chain) from
+  // void early returns (which use the inverted-wrap-around).
+  static ASTNode *trailingReturnValue(const ASTNode *t) {
+    if (!t) return nullptr;
+    if (t->getNodeType() == ASTNode::NodeKind::ReturnStmt)
+      return static_cast<const ReturnStmt *>(t)->value.get();
+    if (t->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
+      auto &ss = static_cast<const CompoundStmt *>(t)->statements;
+      if (ss.empty()) return nullptr;
+      if (ss.back()->getNodeType() == ASTNode::NodeKind::ReturnStmt)
+        return static_cast<const ReturnStmt *>(ss.back().get())->value.get();
+    }
+    return nullptr;
+  }
   static bool isReturnIf(const ASTNode *n) {
     if (!n || n->getNodeType() != ASTNode::NodeKind::IfStmt) return false;
     auto *iff = static_cast<const IfStmt *>(n);
     if (iff->elseStmt) return false;
     return endsWithReturn(iff->thenStmt.get());
+  }
+  // A value-returning early-return if: `if (c) ... return v;` (no else) where
+  // the trailing return carries a value. Only meaningful inside functions that
+  // return a value; these need a yield chain, not the void wrap-around.
+  static bool isValueReturnIf(const ASTNode *n) {
+    if (!isReturnIf(n)) return false;
+    auto *iff = static_cast<const IfStmt *>(n);
+    return trailingReturnValue(iff->thenStmt.get()) != nullptr;
   }
 
   // Emit stmts[from..end). Structured CFG ops (scf.if) have no goto, so an
@@ -620,9 +653,23 @@ private:
   // REMAINING statements in `scf.if(!c) { ... }`; the function's tail return
   // covers the fall-through path. A trailing guard (last statement) is
   // dropped — both its paths end at the tail return anyway.
+  //
+  // Value-returning early returns (`if (c) return v;`) cannot use the void
+  // wrap-around (the value would be lost); when the enclosing function returns
+  // a value they are lowered as a yield chain: the remaining statements become
+  // the else branch of an scf.if that yields the return value on the taken
+  // path and the fall-through value (recursively) on the other.
   void emitStatements(const std::vector<NodePtr> &stmts, size_t from) {
     while (from < stmts.size()) {
       ASTNode *s = stmts[from].get();
+      // Value-returning early return: needs a yield chain, not the void
+      // wrap-around. Only at function top level (not inside an scf.if region
+      // or loop body) and only in functions that return a value.
+      if (isValueReturnIf(s) && structuredDepth == 0 && currentRetTy &&
+          !currentRetTy.isa<NoneType>()) {
+        emitValueReturnChain(stmts, from);
+        return;
+      }
       if (isReturnIf(s)) {
         auto *iff = static_cast<IfStmt *>(s);
         Location l = loc(iff);
@@ -637,12 +684,14 @@ private:
         // Then: the if's then-block minus its trailing return (the return is
         // implicit — the block falls through to the scf.if's end, and rest is
         // in the else so it is skipped, exactly as a return would).
+        ++structuredDepth;
         builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
         emitThenWithoutTrailingReturn(iff->thenStmt.get());
         if (hasRest) {
           builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
           emitStatements(stmts, from + 1);
         }
+        --structuredDepth;
         builder.restoreInsertionPoint(saved);
         return; // remainder was emitted inside the guard
       }
@@ -654,6 +703,118 @@ private:
         visitStmt(s);
       ++from;
     }
+  }
+
+  // Lower a run of statements starting at a value-returning early-return if
+  // (`if (c) ... return v; [more...] return w;`) into a single scf.if that
+  // yields the function's result: the then branch yields the early return's
+  // value (after its side effects), the else branch yields the fall-through
+  // result (recursively — more early returns nest as further scf.if yields, and
+  // a trailing `return w;` yields w directly). The result becomes the
+  // function's func.return. `if (c1) return v1; if (c2) return v2; return v3;`
+  // lowers to:
+  //   %r = scf.if %c1 -> T { ...; yield %v1 } else {
+  //     %r2 = scf.if %c2 -> T { ...; yield %v2 } else { yield %v3 }
+  //     yield %r2
+  //   }
+  //   return %r
+  void emitValueReturnChain(const std::vector<NodePtr> &stmts, size_t from) {
+    ASTNode *s = stmts[from].get();
+    auto *iff = static_cast<IfStmt *>(s);
+    Location l = loc(iff);
+    Value cond = toI1(visitExpr(iff->cond.get()), l);
+    if (!cond) return;
+    mlir::Type retTy = currentRetTy;
+
+    auto saved = builder.saveInsertionPoint();
+    auto ifOp = builder.create<scf::IfOp>(l, TypeRange{retTy}, cond,
+                                         /*withElse=*/true);
+
+    // Then branch: side effects then yield the early return value.
+    ++structuredDepth;
+    builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+    emitThenWithoutTrailingReturn(iff->thenStmt.get());
+    ASTNode *retValNode = trailingReturnValue(iff->thenStmt.get());
+    Value retVal = visitExpr(retValNode);
+    retVal = loadValue(retVal, loc(retValNode));
+    retVal = castValue(retVal, retTy, loc(retValNode));
+    builder.create<scf::YieldOp>(l, ValueRange{retVal});
+
+    // Else branch: the fall-through statements, recursively.
+    builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+    emitFallThroughToValue(stmts, from + 1, l, retTy);
+    --structuredDepth;
+
+    builder.restoreInsertionPoint(saved);
+    // The scf.if result is the function's return value.
+    builder.create<func::ReturnOp>(l, ValueRange{ifOp.getResult(0)});
+  }
+
+  // Emit the fall-through path after an early return as the else branch of a
+  // yield chain: if the next statement is itself a value-returning early
+  // return, recurse into another scf.if yield; otherwise emit statements
+  // normally and the trailing `return v;` yields v. A missing trailing return
+  // (fell off the end of a value-returning function) yields a zero of retTy.
+  void emitFallThroughToValue(const std::vector<NodePtr> &stmts, size_t from,
+                              Location l, mlir::Type retTy) {
+    if (from >= stmts.size()) {
+      Value zero = builder.create<arith::ConstantOp>(l, retTy,
+                                                    builder.getZeroAttr(retTy));
+      builder.create<scf::YieldOp>(l, ValueRange{zero});
+      return;
+    }
+    ASTNode *s = stmts[from].get();
+    if (isValueReturnIf(s)) {
+      auto *iff = static_cast<IfStmt *>(s);
+      Value cond = toI1(visitExpr(iff->cond.get()), l);
+      if (!cond) {
+        Value zero = builder.create<arith::ConstantOp>(
+            l, retTy, builder.getZeroAttr(retTy));
+        builder.create<scf::YieldOp>(l, ValueRange{zero});
+        return;
+      }
+      auto ifOp = builder.create<scf::IfOp>(l, TypeRange{retTy}, cond, true);
+      // The inner scf.if lives in the current region; after filling its two
+      // sub-regions, resume in the current region to yield its result.
+      auto outerSaved = builder.saveInsertionPoint();
+      ++structuredDepth;
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      emitThenWithoutTrailingReturn(iff->thenStmt.get());
+      ASTNode *retValNode = trailingReturnValue(iff->thenStmt.get());
+      Value retVal = visitExpr(retValNode);
+      retVal = loadValue(retVal, loc(retValNode));
+      retVal = castValue(retVal, retTy, loc(retValNode));
+      builder.create<scf::YieldOp>(l, ValueRange{retVal});
+      builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+      emitFallThroughToValue(stmts, from + 1, l, retTy);
+      --structuredDepth;
+      builder.restoreInsertionPoint(outerSaved);
+      builder.create<scf::YieldOp>(l, ValueRange{ifOp.getResult(0)});
+      return;
+    }
+    // No more early returns: emit statements normally; a trailing ReturnStmt
+    // yields its value, otherwise (fell off end) yield zero.
+    while (from < stmts.size()) {
+      ASTNode *cur = stmts[from].get();
+      if (cur->getNodeType() == ASTNode::NodeKind::ReturnStmt) {
+        auto *r = static_cast<ReturnStmt *>(cur);
+        Value v = r->value ? visitExpr(r->value.get()) : Value();
+        if (v) {
+          v = loadValue(v, loc(r->value.get()));
+          v = castValue(v, retTy, loc(r->value.get()));
+        } else {
+          v = builder.create<arith::ConstantOp>(l, retTy,
+                                                builder.getZeroAttr(retTy));
+        }
+        builder.create<scf::YieldOp>(l, ValueRange{v});
+        return;
+      }
+      visitStmt(cur);
+      ++from;
+    }
+    Value zero = builder.create<arith::ConstantOp>(l, retTy,
+                                                  builder.getZeroAttr(retTy));
+    builder.create<scf::YieldOp>(l, ValueRange{zero});
   }
 
   // Emit an if-then-block (a bare ReturnStmt or a CompoundStmt) skipping its
@@ -813,10 +974,12 @@ private:
     auto ifOp = builder.create<scf::IfOp>(l, TypeRange{}, cond, hasElse);
 
     auto saved = builder.saveInsertionPoint();
+    ++structuredDepth;
     builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
     if (s->thenStmt) visitStmt(s->thenStmt.get());
     builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
     if (hasElse) visitStmt(s->elseStmt.get());
+    --structuredDepth;
     builder.restoreInsertionPoint(saved);
   }
 
@@ -838,6 +1001,7 @@ private:
     breakFlags.push_back(brkFlag);
     continueFlags.push_back(cntFlag);
     ++loopDepth;
+    ++structuredDepth;
     auto whileOp = builder.create<scf::WhileOp>(l, TypeRange{}, ValueRange{});
 
     auto saved = builder.saveInsertionPoint();
@@ -876,6 +1040,7 @@ private:
     breakFlags.pop_back();
     continueFlags.pop_back();
     --loopDepth;
+    --structuredDepth;
   }
 
   void emitWhile(const WhileStmt *s) {
@@ -885,6 +1050,7 @@ private:
     breakFlags.push_back(brkFlag);
     continueFlags.push_back(cntFlag);
     ++loopDepth;
+    ++structuredDepth;
     auto whileOp = builder.create<scf::WhileOp>(l, TypeRange{}, ValueRange{});
 
     auto saved = builder.saveInsertionPoint();
@@ -907,6 +1073,7 @@ private:
     breakFlags.pop_back();
     continueFlags.pop_back();
     --loopDepth;
+    --structuredDepth;
   }
 
   void emitDo(const DoStmt *s) {
@@ -926,6 +1093,7 @@ private:
     breakFlags.push_back(brkFlag);
     continueFlags.push_back(cntFlag);
     ++loopDepth;
+    ++structuredDepth;
     auto whileOp = builder.create<scf::WhileOp>(l, TypeRange{}, ValueRange{});
 
     auto saved = builder.saveInsertionPoint();
@@ -953,6 +1121,7 @@ private:
     breakFlags.pop_back();
     continueFlags.pop_back();
     --loopDepth;
+    --structuredDepth;
   }
 
   //--- break/continue ------------------------------------------------------//
@@ -1124,6 +1293,20 @@ private:
             Value av = visitExpr(a.get());
             if (!av) return error(a.get(), "could not evaluate call argument");
             args.push_back(loadValue(av, loc(a.get())));
+          }
+          // Complete trailing defaulted parameters the call omits, mirroring
+          // the GLSL backend: append each default expression from the callee
+          // signature until the argument count matches the parameter count.
+          auto dit = funcDecls.find(ref->name);
+          if (dit != funcDecls.end()) {
+            const FunctionDecl *calleeFn = dit->second;
+            for (unsigned i = c->args.size(); i < calleeFn->params.size(); ++i) {
+              if (!calleeFn->params[i]->defaultVal) break;
+              Value dv = visitExpr(calleeFn->params[i]->defaultVal.get());
+              if (!dv) return error(calleeFn->params[i]->defaultVal.get(),
+                                   "could not evaluate default argument");
+              args.push_back(loadValue(dv, loc(calleeFn->params[i]->defaultVal.get())));
+            }
           }
           auto call = builder.create<func::CallOp>(l, fit->second, args);
           FunctionType fty = fit->second.getFunctionType();

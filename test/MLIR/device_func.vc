@@ -1,0 +1,49 @@
+// test/MLIR/device_func.vc — __device__ helper functions + value-returning
+// early returns + default arguments, lowered through the MLIR backend.
+//
+// Three things that previously failed and now lower cleanly:
+//   1. A `__device__` helper (clampit) called from a kernel via func.call —
+//      the helper's func.func is hoisted into the gpu.module and
+//      ConvertFuncToSPIRV turns it into spirv.func + spirv.FunctionCall.
+//   2. Value-returning early returns inside the helper (`if (v < lo) return lo;`)
+//      — structured CFG (scf) has no goto, so a return inside an scf.if is
+//      illegal. These are lowered as a yield chain: consecutive
+//      `if (c) return v;` guards become nested scf.if ops that yield the
+//      return value, with the fall-through path in the else branch.
+//   3. Default arguments at the call site — `addto(v)` completes to
+//      `addto(v, 1)` from the callee signature, mirroring the GLSL backend.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+// RUN: mlirc -emit=spirv %s -o %t.spv && test -s %t.spv
+
+// CHECK: func.func @clampit
+// CHECK: scf.if {{.*}} -> (i32) {
+// CHECK:   scf.yield %{{.+}} : i32
+// CHECK: } else {
+// CHECK:   scf.if {{.*}} -> (i32) {
+// CHECK:     scf.yield %{{.+}} : i32
+// CHECK:   } else {
+// CHECK:     scf.yield %{{.+}} : i32
+// CHECK:   }
+// CHECK:   scf.yield %{{.+}} : i32
+// CHECK: }
+// CHECK: return %{{.+}} : i32
+
+__device__ int clampit(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+__device__ int addto(int a, int b = 1) {
+  return a + b;
+}
+
+// CHECK-LABEL: func.func @deviceFuncKernel
+__global__ void deviceFuncKernel(int *out, int n) {
+  int i = threadIdx.x;
+  if (i >= n) return;
+  // CHECK: func.call @clampit
+  // CHECK: func.call @addto
+  out[i] = addto(clampit(i, 2, 5));
+}

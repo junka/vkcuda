@@ -15,6 +15,7 @@
 
 #include "vc/Codegen/Passes.h"
 
+#include "mlir/Conversion/FuncToSPIRV/FuncToSPIRVPass.h"
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include <cstdlib>
@@ -68,6 +69,11 @@ void runLoweringPipeline(ModuleOp module) {
   // getOrCreateSharedGlobal), so it needs no extra pass here; the
   // spirv.GlobalVariable hoisted into gpu.module is carried into the
   // spirv.module by the clone.
+  //
+  // ConvertFuncToSPIRV runs first to turn __device__ helper func.func (hoisted
+  // into gpu.module by VCToGPU) + their func.call sites into spirv.func +
+  // spirv.FunctionCall, which GPUToSPIRV then carries into the spirv.module.
+  pm.addNestedPass<gpu::GPUModuleOp>(createConvertFuncToSPIRVPass());
   pm.addPass(createConvertGPUToSPIRVPass());
   // spirv-lower-abi-attrs runs on spirv.module (the op produced by the pass
   // above), not on the top-level module.
