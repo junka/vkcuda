@@ -1,0 +1,58 @@
+// test/MLIR/builtins.vc — CUDA builtin → SPIR-V lowering for the MLIR backend.
+//
+// Covers the four builtin categories lowered by emitBuiltinCall:
+//   - math intrinsics (__sinf/__cosf/__sqrtf/__fabsf/fminf/fmaxf) -> spirv.GL.*
+//   - atomics: __shared__ atomicAdd -> spirv.AtomicIAdd; SSBO atomicAdd ->
+//     memref.atomic_rmw addi (legalized to spirv.AtomicIAdd by GPUToSPIRV);
+//     SSBO atomicExch -> marked addi, rewritten to spirv.AtomicExchange
+//   - __threadfence / __threadfence_block -> spirv.MemoryBarrier
+//   - __syncthreads_count/and/or -> shared-array reduction + two barriers
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+// RUN: mlirc -emit=spirv %s -o %t.spv && test -s %t.spv
+
+__global__ void k(int *out, int *counter, int n) {
+  int tid = threadIdx.x;
+  if (tid >= n) return;
+
+  // Math intrinsics -> spirv.GL.* (note GLSinOp, lowercase 'in').
+  // CHECK: spirv.GL.Sin
+  // CHECK: spirv.GL.Cos
+  // CHECK: spirv.GL.Sqrt
+  // CHECK: spirv.GL.FAbs
+  float s = __sinf((float)tid) + __cosf((float)tid);
+  s += __sqrtf((float)tid);
+  s += __fabsf(s);
+
+  // __shared__ atomic -> spirv.AtomicIAdd <Workgroup>.
+  __shared__ int sharedSum;
+  // CHECK: spirv.AtomicIAdd <Workgroup>
+  atomicAdd(&sharedSum, 1);
+
+  // SSBO atomicAdd (bare param) -> memref.atomic_rmw addi.
+  // CHECK: memref.atomic_rmw addi
+  atomicAdd(counter, 1);
+
+  // SSBO atomicExch -> marked addi {vc.atomic_kind = "exch"} (rewritten to
+  // spirv.AtomicExchange post-conversion by rewriteMarkedAtomics).
+  // CHECK: memref.atomic_rmw addi {{.*}} {vc.atomic_kind = "exch"}
+  int old = atomicExch(&counter[0], 123);
+
+  // __threadfence -> spirv.MemoryBarrier <Device>.
+  // CHECK: spirv.MemoryBarrier <Device>
+  __threadfence();
+  // __threadfence_block -> spirv.MemoryBarrier <Workgroup>.
+  // CHECK: spirv.MemoryBarrier <Workgroup>
+  __threadfence_block();
+
+  // Vote -> shared-array reduction. Two barriers bracket a thread-0 fold:
+  //   AccessChain voteArr[tid]; store; barrier; if(tid==0){scf.while fold};
+  //   barrier; load voteResult.
+  // CHECK: spirv.AccessChain {{.*}}__vc_shared_voteArr
+  // CHECK: vc.barrier
+  // CHECK: scf.while
+  // CHECK: vc.barrier
+  int c = __syncthreads_count(tid >= 4);
+
+  out[tid] = (int)s + sharedSum + old + c;
+}

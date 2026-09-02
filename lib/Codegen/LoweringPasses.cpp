@@ -18,16 +18,87 @@
 #include "mlir/Conversion/FuncToSPIRV/FuncToSPIRVPass.h"
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include <cstdlib>
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 
 using namespace mlir;
 
 namespace vc::codegen {
+
+// Rewrite atomics that GPUToSPIRV cannot lower directly. MLIR 18's GPUToSPIRV
+// has no lowering for memref.atomic_rmw 'assign' (atomicExch), so ASTToMLIR
+// emits atomicExch on SSBO/global as a 'addi' memref.atomic_rmw carrying
+// {vc.atomic_kind = "exch"}. GPUToSPIRV legalizes that to spirv.AtomicIAdd
+// (dropping the marker attr), so we cannot find it by attribute afterwards.
+//
+// Strategy: before conversion, record per-function the ordinal positions of
+// the marked atomics among ALL memref.atomic_rmw in that function. After
+// conversion, the produced spirv.AtomicIAdd ops appear in the same relative
+// order (only memref.atomic_rmw lowers to spirv.AtomicIAdd; arith.addi lowers
+// to spirv.IAdd), so the k-th spirv.AtomicIAdd in a function corresponds to
+// the k-th source memref.atomic_rmw. Turn each recorded position into a
+// spirv.AtomicExchange (true swap semantics: same ptr/scope/semantics/value).
+static llvm::StringMap<llvm::SmallVector<unsigned>>
+collectMarkedAtomicPositions(ModuleOp module) {
+  // Keyed by the gpu.func symbol name; positions are indices among ALL
+  // atomic ops (memref.atomic_rmw AND spirv.AtomicIAdd, since __shared__
+  // atomics are emitted directly as spirv.AtomicIAdd at the gpu.func layer)
+  // in source order. The post-conversion spirv.AtomicIAdd list has the same
+  // relative order (only these two op kinds lower to spirv.AtomicIAdd;
+  // arith.addi lowers to spirv.IAdd), so the ordinal identifies the op.
+  llvm::StringMap<llvm::SmallVector<unsigned>> out;
+  module.walk([&](gpu::GPUFuncOp fn) {
+    unsigned idx = 0;
+    fn.walk([&](Operation *op) {
+      bool isAtomic =
+          isa<memref::AtomicRMWOp>(op) || isa<spirv::AtomicIAddOp>(op);
+      if (!isAtomic)
+        return;
+      if (auto rmw = dyn_cast<memref::AtomicRMWOp>(op)) {
+        auto kind = rmw->getAttrOfType<StringAttr>("vc.atomic_kind");
+        if (kind && kind.getValue() == "exch")
+          out[fn.getName()].push_back(idx);
+      }
+      ++idx;
+    });
+  });
+  return out;
+}
+
+static void rewriteMarkedAtomics(
+    ModuleOp module,
+    const llvm::StringMap<llvm::SmallVector<unsigned>> &positions) {
+  module.walk([&](spirv::FuncOp fn) {
+    auto it = positions.find(fn.getName());
+    if (it == positions.end())
+      return;
+    const auto &marks = it->second;
+    unsigned idx = 0;
+    SmallVector<spirv::AtomicIAddOp> toConvert;
+    fn.walk([&](spirv::AtomicIAddOp op) {
+      if (marks.size() == toConvert.size())
+        return;
+      if (marks[toConvert.size()] == idx)
+        toConvert.push_back(op);
+      ++idx;
+    });
+    for (spirv::AtomicIAddOp op : toConvert) {
+      OpBuilder b(op);
+      Value result = b.create<spirv::AtomicExchangeOp>(
+          op.getLoc(), op.getType(), op.getPointer(), op.getMemoryScope(),
+          op.getSemantics(), op.getValue());
+      op.replaceAllUsesWith(result);
+      op.erase();
+    }
+  });
+}
+
 
 void runLoweringPipeline(ModuleOp module) {
   MLIRContext &ctx = *module.getContext();
@@ -73,6 +144,11 @@ void runLoweringPipeline(ModuleOp module) {
   // ConvertFuncToSPIRV runs first to turn __device__ helper func.func (hoisted
   // into gpu.module by VCToGPU) + their func.call sites into spirv.func +
   // spirv.FunctionCall, which GPUToSPIRV then carries into the spirv.module.
+  // Before conversion, record where the atomicExch markers are (see
+  // rewriteMarkedAtomics): GPUToSPIRV drops the marker attr when it builds the
+  // spirv.AtomicIAdd, so we match by ordinal position instead.
+  auto markedPositions = collectMarkedAtomicPositions(module);
+
   pm.addNestedPass<gpu::GPUModuleOp>(createConvertFuncToSPIRVPass());
   pm.addPass(createConvertGPUToSPIRVPass());
   // spirv-lower-abi-attrs runs on spirv.module (the op produced by the pass
@@ -86,6 +162,10 @@ void runLoweringPipeline(ModuleOp module) {
   if (failed(pm.run(module))) {
     module.emitError("lowering pipeline failed");
   }
+
+  // Post-conversion rewrite of atomics GPUToSPIRV could not lower directly
+  // (atomicExch on SSBO/global, emitted as a marked AtomicIAdd).
+  rewriteMarkedAtomics(module, markedPositions);
 
   // Keep only the spirv.module: erase the original gpu.module (clone source)
   // and anything else left at module scope.

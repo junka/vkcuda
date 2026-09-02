@@ -1079,14 +1079,15 @@ private:
   void emitDo(const DoStmt *s) {
     // do { body } while (cond) runs the body once, then repeats while cond.
     // A first-iteration flag makes the scf.while condition region start true.
+    // i32 (not i1) storage: SPIR-V has no 1-bit store (see makeFlagSlot).
     Location l = loc(s);
     auto flagTy =
-        MemRefType::get(ArrayRef<int64_t>{}, builder.getI1Type(),
+        MemRefType::get(ArrayRef<int64_t>{}, builder.getI32Type(),
                         MemRefLayoutAttrInterface(),
                         spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
     Value flag = builder.create<memref::AllocaOp>(l, flagTy);
     builder.create<memref::StoreOp>(
-        l, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(true)),
+        l, builder.create<arith::ConstantOp>(l, builder.getI32IntegerAttr(1)),
         flag);
     Value brkFlag = makeFlagSlot(l);
     Value cntFlag = makeFlagSlot(l);
@@ -1099,9 +1100,10 @@ private:
     auto saved = builder.saveInsertionPoint();
     builder.createBlock(&whileOp.getBefore());
     storeFlag(cntFlag, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(false)), l);
-    Value first = builder.create<memref::LoadOp>(l, flag, ValueRange{});
+    Value firstRaw = builder.create<memref::LoadOp>(l, flag, ValueRange{});
+    Value first = toI1(firstRaw, l);
     builder.create<memref::StoreOp>(
-        l, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(false)),
+        l, builder.create<arith::ConstantOp>(l, builder.getI32IntegerAttr(0)),
         flag);
     Value cond = s->cond ? toI1(visitExpr(s->cond.get()), l) : Value();
     if (!cond) { builder.restoreInsertionPoint(saved); return; }
@@ -1126,23 +1128,34 @@ private:
 
   //--- break/continue ------------------------------------------------------//
 
+  // A break/continue flag slot. SPIR-V has no 1-bit storage (a memref<i1>
+  // store fails to legalize through GPUToSPIRV — see cvtType's Bool→i32 note),
+  // so the slot is an i32 holding 0/1. loadFlag bridges back to i1 so the
+  // existing boolean logic at the call sites (XOrIOp/AndIOp/OrIOp on i1) is
+  // unchanged.
   Value makeFlagSlot(const Location &l) {
     auto flagTy =
-        MemRefType::get(ArrayRef<int64_t>{}, builder.getI1Type(),
+        MemRefType::get(ArrayRef<int64_t>{}, builder.getI32Type(),
                         MemRefLayoutAttrInterface(),
                         spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
     Value slot = builder.create<memref::AllocaOp>(l, flagTy);
     builder.create<memref::StoreOp>(
-        l, builder.create<arith::ConstantOp>(l, builder.getBoolAttr(false)), slot);
+        l, builder.create<arith::ConstantOp>(l, builder.getI32IntegerAttr(0)),
+        slot);
     return slot;
   }
 
   Value loadFlag(Value slot, const Location &l) {
-    return builder.create<memref::LoadOp>(l, slot, ValueRange{});
+    Value raw = builder.create<memref::LoadOp>(l, slot, ValueRange{});
+    return toI1(raw, l);
   }
 
   void storeFlag(Value slot, Value v, const Location &l) {
-    builder.create<memref::StoreOp>(l, v, slot);
+    // v is an i1 (truthiness); store as i32 0/1 for SPIR-V storage.
+    Value asI1 = toI1(v, l);
+    Value asI32 = builder.create<arith::ExtUIOp>(
+        l, builder.getI32Type(), asI1);
+    builder.create<memref::StoreOp>(l, asI32, slot);
   }
 
   // A break/continue sets the innermost loop's flag true. Subsequent guarded
@@ -1286,6 +1299,15 @@ private:
           builder.create<vc::BarrierOp>(l);
           return Value();
         }
+        // CUDA builtins (math intrinsics, atomics, fences, votes). These are
+        // NOT __device__ helpers (funcTable miss), so dispatch before the
+        // funcTable lookup. `matched` is set true if `name` is a recognized
+        // builtin (even a void-returning one); the result Value is null for
+        // void builtins.
+        bool matched = false;
+        if (auto bv = emitBuiltinCall(ref->name, c->args, l, matched))
+          return bv;
+        if (matched) return Value();
         auto fit = funcTable.find(ref->name);
         if (fit != funcTable.end()) {
           SmallVector<Value> args;
@@ -1321,6 +1343,526 @@ private:
       return error(n, std::string("MLIR backend cannot lower ") +
                           nodeKindName(n->getNodeType()));
     }
+  }
+
+  //===--------------------------------------------------------------------//
+  // CUDA builtin lowering (math intrinsics, atomics, fences, votes)
+  //===--------------------------------------------------------------------//
+
+  // Dispatch a CUDA builtin call. Sets `matched=true` if `name` is a
+  // recognized builtin (so the caller can return without falling through to
+  // funcTable / the unknown-callee error). Returns the result Value, or null
+  // for void builtins (fences, __syncthreads_* are value-returning though).
+  Value emitBuiltinCall(llvm::StringRef name,
+                        const std::vector<NodePtr> &args, Location l,
+                        bool &matched) {
+    matched = true;
+    if (auto v = emitMathBuiltin(name, args, l)) return v;
+    if (auto v = emitAtomicBuiltin(name, args, l)) return v;
+    if (emitFenceBuiltin(name, l)) return Value();
+    if (auto v = emitVoteBuiltin(name, args, l)) return v;
+    matched = false;
+    return Value();
+  }
+
+  // CUDA math intrinsics -> spirv.GL.* (GLSLstd450). Single-precision only:
+  // __sinf/__cosf/.../sinf/cosf/.../sqrtf/fabsf/fminf/fmaxf/powf/floorf/ceilf/
+  // expf/logf. f32 throughout; int args are promoted via sitofp. Returns null
+  // (and leaves `matched` semantics to the caller) if `name` is not a math
+  // builtin.
+  Value emitMathBuiltin(llvm::StringRef name,
+                        const std::vector<NodePtr> &args, Location l) {
+    // Normalize: strip a leading `__` and a trailing `f` to get the base
+    // (e.g. __sinf -> sin, sqrtf -> sqrt, fabsf -> fabs). Only recognized math
+    // bases are accepted so unrelated names fall through.
+    auto strip = [](llvm::StringRef n) -> llvm::StringRef {
+      if (n.starts_with("__")) n = n.drop_front(2);
+      if (n.ends_with("f") && n.size() > 1) n = n.drop_back();
+      return n;
+    };
+    llvm::StringRef base = strip(name);
+
+    // Unary float math: one f32 arg, result f32.
+    struct UnaryMath { const char *name; };
+    static constexpr llvm::StringRef unaryMath[] = {
+        "sin", "cos", "tan", "asin", "acos", "atan",
+        "sinh", "cosh", "tanh",
+        "exp", "log", "exp2", "log2", "sqrt", "inversesqrt",
+        "fabs", "abs", "floor", "ceil", "round", "sign"};
+    mlir::Type f32 = builder.getF32Type();
+    for (auto m : unaryMath) {
+      if (base != m) continue;
+      if (args.empty()) return Value();
+      Value x = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      if (!x) return Value();
+      x = toF32(x, loc(args[0].get()));
+      if (base == "sin") return builder.create<spirv::GLSinOp>(l, x);
+      if (base == "cos") return builder.create<spirv::GLCosOp>(l, x);
+      if (base == "tan") return builder.create<spirv::GLTanOp>(l, x);
+      if (base == "asin") return builder.create<spirv::GLAsinOp>(l, x);
+      if (base == "acos") return builder.create<spirv::GLAcosOp>(l, x);
+      if (base == "atan") return builder.create<spirv::GLAtanOp>(l, x);
+      if (base == "sinh") return builder.create<spirv::GLSinhOp>(l, x);
+      if (base == "cosh") return builder.create<spirv::GLCoshOp>(l, x);
+      if (base == "tanh") return builder.create<spirv::GLTanhOp>(l, x);
+      if (base == "exp") return builder.create<spirv::GLExpOp>(l, x);
+      if (base == "log") return builder.create<spirv::GLLogOp>(l, x);
+      if (base == "exp2") return builder.create<spirv::GLExpOp>(l, x);
+      if (base == "log2") return builder.create<spirv::GLLogOp>(l, x);
+      if (base == "sqrt") return builder.create<spirv::GLSqrtOp>(l, x);
+      if (base == "inversesqrt") return builder.create<spirv::GLInverseSqrtOp>(l, x);
+      if (base == "fabs" || base == "abs")
+        return builder.create<spirv::GLFAbsOp>(l, x);
+      if (base == "floor") return builder.create<spirv::GLFloorOp>(l, x);
+      if (base == "ceil") return builder.create<spirv::GLCeilOp>(l, x);
+      if (base == "round") return builder.create<spirv::GLRoundOp>(l, x);
+      if (base == "sign") return builder.create<spirv::GLFSignOp>(l, x);
+    }
+    // Binary float math: two f32 args.
+    if (base == "pow" || base == "fmin" || base == "fmax" || base == "fmod") {
+      if (args.size() < 2) return Value();
+      Value a = toF32(loadValue(visitExpr(args[0].get()), loc(args[0].get())),
+                      loc(args[0].get()));
+      Value b = toF32(loadValue(visitExpr(args[1].get()), loc(args[1].get())),
+                      loc(args[1].get()));
+      if (!a || !b) return Value();
+      if (base == "pow") return builder.create<spirv::GLPowOp>(l, a, b);
+      if (base == "fmin") return builder.create<spirv::GLFMinOp>(l, a, b);
+      if (base == "fmax") return builder.create<spirv::GLFMaxOp>(l, a, b);
+      // fmod -> a - b*floor(a/b)
+      Value div = builder.create<arith::DivFOp>(l, a, b);
+      Value fl = builder.create<spirv::GLFloorOp>(l, div);
+      Value prod = builder.create<arith::MulFOp>(l, b, fl);
+      return builder.create<arith::SubFOp>(l, a, prod);
+    }
+    // Ternary: clamp(x, lo, hi) -> GLFClamp.
+    if (base == "clamp") {
+      if (args.size() < 3) return Value();
+      Value x = toF32(loadValue(visitExpr(args[0].get()), loc(args[0].get())),
+                      loc(args[0].get()));
+      Value lo = toF32(loadValue(visitExpr(args[1].get()), loc(args[1].get())),
+                       loc(args[1].get()));
+      Value hi = toF32(loadValue(visitExpr(args[2].get()), loc(args[2].get())),
+                       loc(args[2].get()));
+      if (!x || !lo || !hi) return Value();
+      return builder.create<spirv::GLFClampOp>(l, f32, x, lo, hi);
+    }
+    return Value();
+  }
+
+  // Coerce a scalar value to f32 (sitofp from int/index; f32 unchanged).
+  Value toF32(Value v, Location l) {
+    if (!v) return v;
+    v = loadValue(v, l);
+    mlir::Type ty = v.getType();
+    if (ty.isF32()) return v;
+    if (ty.isIntOrIndex()) {
+      if (ty.isIndex())
+        v = builder.create<arith::IndexCastOp>(l, builder.getI32Type(), v);
+      return builder.create<arith::SIToFPOp>(l, builder.getF32Type(), v);
+    }
+    return v;
+  }
+
+  // CUDA atomic builtins -> spirv.Atomic*. Returns null if `name` is not an
+  // atomic builtin.
+  //
+  // Three first-argument shapes (mirroring the GLSL backend):
+  //   atomicAdd(&shared, v)    — & on a __shared__ scalar: spirv.ptr<_,Workgroup>
+  //   atomicAdd(&arr[i], v)    — & on a __shared__/SSBO array element: AccessChain
+  //   atomicAdd(counter, v)    — bare SSBO param (T*): memref, indexed [0]
+  // The pointer must be a spirv.ptr. __shared__ slots/elements already are;
+  // an SSBO memref element is reached via spirv.AccessChain on the memref's
+  // underlying pointer (the gpu.func arg lowers to a spirv.ptr under GPUToSPIRV,
+  // but at this layer we emit spirv.AccessChain which GPUToSPIRV legalizes on
+  // the memref-as-pointer). scope: Workgroup for __shared__, Device for SSBO.
+  Value emitAtomicBuiltin(llvm::StringRef name,
+                          const std::vector<NodePtr> &args, Location l) {
+    if (!isAtomicName(name)) return Value();
+    if (args.size() < 1) return Value();
+
+    // atomicInc(a)/atomicDec(a) carry no explicit value; default to 1.
+    bool isIncDec = (name == "atomicInc" || name == "atomicDec");
+
+    // Resolve the pointer operand. Two storage shapes are supported:
+    //   - __shared__ scalar/array element  -> spirv.ptr (spirv.Atomic* path)
+    //   - SSBO kernel param / local memref -> memref + indices
+    //     (memref.atomic_rmw path; GPUToSPIRV legalizes it to spirv.Atomic)
+    AtomicPtr ptr = resolveAtomicPtr(args[0].get(), l);
+    if (!ptr.valid()) {
+      error(args[0].get(), "atomic target must be an addressable scalar or "
+                           "array element (__shared__ or SSBO/global)");
+      return Value();
+    }
+
+    // The value operand.
+    Value val;
+    if (isIncDec) {
+      val = builder.create<arith::ConstantOp>(l, builder.getI32Type(),
+                                              builder.getI32IntegerAttr(1));
+    } else {
+      if (args.size() < 2) return Value();
+      val = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
+      if (!val) return Value();
+      val = toI32(val, loc(args[1].get()));
+    }
+
+    // atomicSub has no direct memref.atomic_rmw kind (no 'subi'); lower as
+    // addi(-val). atomicDec likewise = addi(-1).
+    if (name == "atomicSub" || name == "atomicDec") {
+      Value neg = builder.create<arith::ConstantOp>(l, builder.getI32Type(),
+                                                    builder.getI32IntegerAttr(0));
+      val = builder.create<arith::SubIOp>(l, neg, val);
+      name = "atomicAdd";
+    }
+    // atomicXor has no memref.atomic_rmw kind; lower via the spirv path only
+    // (SSBO atomicXor is reported unsupported below).
+    bool wantXor = (name == "atomicXor");
+
+    if (ptr.isMemref) {
+      // memref.atomic_rmw path (SSBO / global).
+      // Kinds available: addi, andi, ori, maxs, maxu, mins, minu, assign.
+      // xori/subi are absent (sub lowered to addi(-v) above; xor unsupported).
+      if (wantXor) {
+        error(args[0].get(), "atomicXor on SSBO/global is not supported in "
+                             "the MLIR backend (no memref.atomic_rmw xori)");
+        return Value();
+      }
+      // atomicExch: memref.atomic_rmw has no 'assign' lowering in MLIR 18's
+      // GPUToSPIRV. Emit it as a marked 'addi' (which DOES legalize) and let
+      // the post-conversion rewrite pass (rewriteMarkedAtomics in
+      // LoweringPasses) turn the resulting spirv.AtomicIAdd into a
+      // spirv.AtomicExchange. The marker survives GPUToSPIRV verbatim.
+      if (name == "atomicExch") {
+        SmallVector<Value> idx = ptr.memrefIndices;
+        if (idx.empty())
+          idx.push_back(builder.create<arith::ConstantOp>(
+              l, builder.getIndexType(), builder.getIndexAttr(0)));
+        for (Value &i : idx)
+          if (!i.getType().isIndex())
+            i = builder.create<arith::IndexCastOp>(l, builder.getIndexType(),
+                                                    i);
+        auto rmw = builder.create<memref::AtomicRMWOp>(
+            l, ptr.elemTy, arith::AtomicRMWKind::addi, val, ptr.memrefBase,
+            idx);
+        rmw->setAttr("vc.atomic_kind", builder.getStringAttr("exch"));
+        return rmw;
+      }
+      using RMW = arith::AtomicRMWKind;
+      RMW kind;
+      if (name == "atomicAdd" || name == "atomicInc") kind = RMW::addi;
+      else if (name == "atomicMin") kind = RMW::mins;
+      else if (name == "atomicMax") kind = RMW::maxs;
+      else if (name == "atomicAnd") kind = RMW::andi;
+      else if (name == "atomicOr")  kind = RMW::ori;
+      else if (name == "atomicExch") kind = RMW::assign;
+      else {
+        error(args[0].get(), "this atomic op on SSBO/global is not supported "
+                             "in the MLIR backend");
+        return Value();
+      }
+      // Bare SSBO param with no index (CUDA `atomicAdd(counter, v)`) means
+      // counter[0]; supply a 0 index.
+      SmallVector<Value> idx = ptr.memrefIndices;
+      if (idx.empty())
+        idx.push_back(builder.create<arith::ConstantOp>(
+            l, builder.getIndexType(), builder.getIndexAttr(0)));
+      // memref.atomic_rmw requires index-typed indices.
+      for (Value &i : idx)
+        if (!i.getType().isIndex())
+          i = builder.create<arith::IndexCastOp>(l, builder.getIndexType(), i);
+      return builder.create<memref::AtomicRMWOp>(l, ptr.elemTy, kind, val,
+                                                 ptr.memrefBase, idx);
+    }
+
+    // spirv.ptr path (__shared__). GPUToSPIRV carries these ops through.
+    spirv::Scope scope = ptr.isShared ? spirv::Scope::Workgroup
+                                      : spirv::Scope::Device;
+    auto semantics = spirv::MemorySemantics::None;
+
+    if (name == "atomicAdd" || name == "atomicInc")
+      return builder.create<spirv::AtomicIAddOp>(l, ptr.elemTy, ptr.spirvAddr,
+                                                 scope, semantics, val);
+    if (name == "atomicSub" || name == "atomicDec")
+      return builder.create<spirv::AtomicISubOp>(l, ptr.elemTy, ptr.spirvAddr,
+                                                 scope, semantics, val);
+    if (name == "atomicMin")
+      return builder.create<spirv::AtomicSMinOp>(l, ptr.elemTy, ptr.spirvAddr,
+                                                 scope, semantics, val);
+    if (name == "atomicMax")
+      return builder.create<spirv::AtomicSMaxOp>(l, ptr.elemTy, ptr.spirvAddr,
+                                                 scope, semantics, val);
+    if (name == "atomicAnd")
+      return builder.create<spirv::AtomicAndOp>(l, ptr.elemTy, ptr.spirvAddr,
+                                                scope, semantics, val);
+    if (name == "atomicOr")
+      return builder.create<spirv::AtomicOrOp>(l, ptr.elemTy, ptr.spirvAddr,
+                                               scope, semantics, val);
+    if (name == "atomicXor")
+      return builder.create<spirv::AtomicXorOp>(l, ptr.elemTy, ptr.spirvAddr,
+                                                scope, semantics, val);
+    if (name == "atomicExch")
+      return builder.create<spirv::AtomicExchangeOp>(l, ptr.elemTy,
+                                                     ptr.spirvAddr, scope,
+                                                     semantics, val);
+    if (name == "atomicCAS") {
+      // atomicCAS(ptr, expected, desired) -> spirv.AtomicCompareExchange.
+      if (args.size() < 3) return Value();
+      Value expected = toI32(loadValue(visitExpr(args[1].get()),
+                                       loc(args[1].get())),
+                             loc(args[1].get()));
+      Value desired = toI32(loadValue(visitExpr(args[2].get()),
+                                      loc(args[2].get())),
+                            loc(args[2].get()));
+      return builder.create<spirv::AtomicCompareExchangeOp>(
+          l, ptr.elemTy, ptr.spirvAddr, scope, semantics, semantics, desired,
+          expected);
+    }
+    return Value();
+  }
+
+  // Resolved atomic target. Exactly one of (spirvAddr) / (memrefBase) is set.
+  struct AtomicPtr {
+    Value spirvAddr;             // spirv.ptr to the element (__shared__)
+    mlir::Type elemTy;           // the element type (i32)
+    bool isShared = false;       // Workgroup scope vs Device (spirv path)
+
+    Value memrefBase;            // memref value (SSBO param / alloca)
+    SmallVector<Value> memrefIndices; // element indices (empty = [0])
+    bool isMemref = false;
+
+    bool valid() const { return spirvAddr || isMemref; }
+  };
+
+  static bool isAtomicName(llvm::StringRef name) {
+    return name == "atomicAdd" || name == "atomicSub" || name == "atomicExch" ||
+           name == "atomicMin" || name == "atomicMax" || name == "atomicInc" ||
+           name == "atomicDec" || name == "atomicCAS" || name == "atomicAnd" ||
+           name == "atomicOr" || name == "atomicXor";
+  }
+
+  // Resolve a CUDA atomic pointer argument (`&x`, `&arr[i]`, or bare `ptr`)
+  // to either a spirv.ptr (__shared__) or a memref + indices (SSBO/global).
+  AtomicPtr resolveAtomicPtr(ASTNode *arg, Location l) {
+    AtomicPtr out;
+    out.elemTy = builder.getI32Type();
+    // Strip a leading `&` (UnaryExpr AddrOf): atomic takes the address of the
+    // lvalue, not its loaded value.
+    ASTNode *inner = arg;
+    if (arg && arg->getNodeType() == ASTNode::NodeKind::UnaryExpr) {
+      auto *u = static_cast<UnaryExpr *>(arg);
+      if (u->op == UnaryOp::AddrOf) inner = u->operand.get();
+    }
+    Value mem;
+    SmallVector<Value> indices;
+    if (!lvalueAddress(inner, mem, indices)) return out;
+
+    // __shared__ scalar/array element: mem is a spirv.ptr to the element.
+    if (auto ptr = mem.getType().dyn_cast<spirv::PointerType>()) {
+      out.spirvAddr = mem;
+      out.elemTy = ptr.getPointeeType();
+      // The pointee may itself be a scalar (shared scalar) or already an
+      // element pointer from spirv.AccessChain (shared array element).
+      mlir::Type pt = ptr.getPointeeType();
+      while (auto arr = pt.dyn_cast<spirv::ArrayType>())
+        pt = arr.getElementType();
+      out.elemTy = pt;
+      out.isShared = (ptr.getStorageClass() == spirv::StorageClass::Workgroup);
+      return out;
+    }
+    // memref (SSBO kernel param or local alloca). memref.atomic_rmw takes the
+    // memref + element indices directly; GPUToSPIRV legalizes it to a
+    // spirv.AccessChain + spirv.Atomic on the StorageBuffer pointer.
+    if (auto mr = mem.getType().dyn_cast<MemRefType>()) {
+      out.memrefBase = mem;
+      out.memrefIndices = indices;
+      out.elemTy = mr.getElementType();
+      out.isMemref = true;
+      return out;
+    }
+    return out;
+  }
+
+  // Coerce a scalar value to i32 (index-cast / trunc / zext as needed).
+  Value toI32(Value v, Location l) {
+    if (!v) return v;
+    v = loadValue(v, l);
+    mlir::Type ty = v.getType();
+    if (ty.isInteger(32)) return v;
+    if (ty.isIndex())
+      return builder.create<arith::IndexCastOp>(l, builder.getI32Type(), v);
+    if (ty.isIntOrIndex() && ty.getIntOrFloatBitWidth() < 32)
+      return builder.create<arith::ExtUIOp>(l, builder.getI32Type(), v);
+    if (ty.isIntOrIndex())
+      return builder.create<arith::TruncIOp>(l, builder.getI32Type(), v);
+    return v;
+  }
+
+  // __threadfence / __threadfence_block -> spirv.MemoryBarrier. Returns true
+  // if `name` was a recognized fence builtin.
+  //
+  // __threadfence       -> scope Device,    semantics AcquireRelease|UniformMemory
+  // __threadfence_block -> scope Workgroup,  semantics AcquireRelease|WorkgroupMemory
+  //
+  // spirv.MemoryBarrier is a memory fence ONLY (it orders memory operations
+  // but is not an execution barrier). CUDA __threadfence is likewise a memory
+  // fence without execution synchronization, so no vc::BarrierOp here. (GLSL
+  // backend lesson: memory note [[vc-threadfence-lowering-no-barrier]].)
+  bool emitFenceBuiltin(llvm::StringRef name, Location l) {
+    if (name == "__threadfence") {
+      builder.create<spirv::MemoryBarrierOp>(
+          l, spirv::Scope::Device,
+          spirv::MemorySemantics::AcquireRelease |
+              spirv::MemorySemantics::UniformMemory);
+      return true;
+    }
+    if (name == "__threadfence_block") {
+      builder.create<spirv::MemoryBarrierOp>(
+          l, spirv::Scope::Workgroup,
+          spirv::MemorySemantics::AcquireRelease |
+              spirv::MemorySemantics::WorkgroupMemory);
+      return true;
+    }
+    return false;
+  }
+
+  // __syncthreads_count/and/or(pred) -> block-wide vote via a shared-array
+  // reduction. CUDA's block-wide votes are NOT warp ops; they reduce a
+  // per-thread predicate across the whole block, so each lane writes its
+  // booleanized predicate to a __shared__ slot, two barriers bracket a
+  // thread-0 fold, and every lane reads the broadcast result. (Mirrors the
+  // GLSL backend's reduction; memory note [[vc-vote-barriers-statement-hoisting]].)
+  //
+  //   count(pred) = #lanes with pred != 0
+  //   and(pred)   = (count == blockDim.x) ? 1 : 0
+  //   or(pred)    = (count != 0) ? 1 : 0
+  //
+  // The call sites in vote.vc are in uniform control flow (kernel top level),
+  // so the two barriers are reached by every lane and do not diverge.
+  Value emitVoteBuiltin(llvm::StringRef name,
+                        const std::vector<NodePtr> &args, Location l) {
+    if (name != "__syncthreads_count" && name != "__syncthreads_and" &&
+        name != "__syncthreads_or")
+      return Value();
+    if (args.size() < 1) return Value();
+
+    // Per-lane predicate, booleanized to i1 then widened to i32 (SPIR-V has no
+    // 1-bit storage; memory note [[vc-mlir-expr-basics-bool-comma-promotion]]).
+    Value pred = toI1(visitExpr(args[0].get()), loc(args[0].get()));
+    if (!pred) return Value();
+    Value predI32 = builder.create<arith::ExtUIOp>(l, builder.getI32Type(), pred);
+
+    // threadIdx.x and blockDim.x as i32.
+    Value tidIdx = builder.create<vc::ThreadIdOp>(l, builder.getIndexType(),
+                                                  vc::Dim::x);
+    Value tid = builder.create<arith::IndexCastOp>(l, builder.getI32Type(),
+                                                   tidIdx);
+    Value bdimIdx = builder.create<vc::BlockDimOp>(l, builder.getIndexType(),
+                                                   vc::Dim::x);
+    Value bdim = builder.create<arith::IndexCastOp>(l, builder.getI32Type(),
+                                                    bdimIdx);
+
+    // __shared__ int voteArr[1024] (CUDA blockDim cap) and __shared__ int voteRes.
+    Value voteArr = getOrCreateSharedGlobal("voteArr", {1024},
+                                            builder.getI32Type(), l);
+    Value voteRes = getOrCreateSharedGlobal("voteResult", {},
+                                            builder.getI32Type(), l);
+
+    // voteArr[tid] = predI32  (spirv.AccessChain over the shared array).
+    spirv::PointerType arrPtrTy = voteArr.getType().cast<spirv::PointerType>();
+    spirv::PointerType elemPtrTy = spirv::PointerType::get(
+        builder.getI32Type(), arrPtrTy.getStorageClass());
+    Value slot = builder.create<spirv::AccessChainOp>(l, elemPtrTy, voteArr,
+                                                      ValueRange{tid});
+    builder.create<spirv::StoreOp>(l, slot, predI32,
+                                   spirv::MemoryAccessAttr(), IntegerAttr());
+
+    // Barrier 1: every lane has written its slot before thread 0 folds.
+    builder.create<vc::BarrierOp>(l);
+
+    // Thread 0 folds voteArr[0..blockDim) into voteRes. Use scf.while:
+    //   %acc = 0; %j = 0;
+    //   while (j < bdim) { acc += voteArr[j]; j += 1; }
+    // The reduction runs inside `if (tid == 0)` so only one lane folds; the
+    // barriers outside the if keep control flow uniform.
+    Value zero = builder.create<arith::ConstantOp>(l, builder.getI32Type(),
+                                                   builder.getI32IntegerAttr(0));
+    Value isT0 = builder.create<arith::CmpIOp>(l, arith::CmpIPredicate::eq,
+                                               tid, zero);
+
+    auto saved = builder.saveInsertionPoint();
+    auto ifOp = builder.create<scf::IfOp>(l, TypeRange{}, isT0,
+                                          /*withElse=*/false);
+    builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+
+    // scf.while carrying (j, acc). The before-block args are the loop-carried
+    // values (seeded by the WhileOp operands); the after-block args are the
+    // values yielded by ConditionOp. After building both regions, the builder
+    // is left inside the after-block; repoint it to just after the WhileOp so
+    // the fold below stays inside the scf.if's then-block.
+    auto whileOp = builder.create<scf::WhileOp>(
+        l, TypeRange{builder.getI32Type(), builder.getI32Type()},
+        ValueRange{zero, zero});
+    // before-region: condition = j < bdim; yield (j, acc) to the after-block.
+    // The before-block's args are the loop-carried values (matching the
+    // WhileOp's result types); createBlock seeds an empty block, so add them.
+    Block *beforeBlock = builder.createBlock(&whileOp.getBefore());
+    beforeBlock->addArgument(builder.getI32Type(), l);
+    beforeBlock->addArgument(builder.getI32Type(), l);
+    {
+      Value j = beforeBlock->getArgument(0);
+      Value acc = beforeBlock->getArgument(1);
+      Value cond = builder.create<arith::CmpIOp>(l, arith::CmpIPredicate::slt,
+                                                 j, bdim);
+      builder.create<scf::ConditionOp>(l, cond, ValueRange{j, acc});
+    }
+    // after-region: load voteArr[j], acc += v, j += 1; yield (j+1, acc+v).
+    Block *afterBlock = builder.createBlock(&whileOp.getAfter());
+    afterBlock->addArgument(builder.getI32Type(), l);
+    afterBlock->addArgument(builder.getI32Type(), l);
+    {
+      Value j = afterBlock->getArgument(0);
+      Value acc = afterBlock->getArgument(1);
+      Value jslot = builder.create<spirv::AccessChainOp>(l, elemPtrTy,
+                                                          voteArr, ValueRange{j});
+      Value v = builder.create<spirv::LoadOp>(l, builder.getI32Type(), jslot,
+                                              spirv::MemoryAccessAttr(),
+                                              IntegerAttr());
+      Value newAcc = builder.create<arith::AddIOp>(l, acc, v);
+      Value one = builder.create<arith::ConstantOp>(l, builder.getI32Type(),
+                                                    builder.getI32IntegerAttr(1));
+      Value newJ = builder.create<arith::AddIOp>(l, j, one);
+      builder.create<scf::YieldOp>(l, ValueRange{newJ, newAcc});
+    }
+    // Continue emitting inside the then-block, right after the WhileOp.
+    builder.setInsertionPointAfter(whileOp);
+
+    Value count = whileOp.getResult(1);
+    // Compute the vote result from the count.
+    Value res;
+    if (name == "__syncthreads_count") {
+      res = count;
+    } else if (name == "__syncthreads_and") {
+      Value all = builder.create<arith::CmpIOp>(l, arith::CmpIPredicate::eq,
+                                                count, bdim);
+      res = builder.create<arith::ExtUIOp>(l, builder.getI32Type(), all);
+    } else { // __syncthreads_or
+      Value any = builder.create<arith::CmpIOp>(l, arith::CmpIPredicate::ne,
+                                                count, zero);
+      res = builder.create<arith::ExtUIOp>(l, builder.getI32Type(), any);
+    }
+    builder.create<spirv::StoreOp>(l, voteRes, res,
+                                   spirv::MemoryAccessAttr(), IntegerAttr());
+
+    builder.restoreInsertionPoint(saved);
+
+    // Barrier 2: thread 0's write to voteRes is visible to all lanes.
+    builder.create<vc::BarrierOp>(l);
+
+    // Every lane reads the broadcast result.
+    return builder.create<spirv::LoadOp>(l, builder.getI32Type(), voteRes,
+                                         spirv::MemoryAccessAttr(),
+                                         IntegerAttr());
   }
 
   Value emitUnary(const UnaryExpr *u) {
