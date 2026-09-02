@@ -28,6 +28,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 
 using namespace vc;
 using namespace mlir;
@@ -84,6 +85,114 @@ void rewriteIndexingOps(ModuleOp module, IRRewriter &rw) {
   }
 }
 
+// Lower a gpu.func kernel's scalar (non-memref) arguments to a single SPIR-V
+// push-constant struct, matching the GLSL backend + runtime ABI: pointer
+// (memref) args get consecutive StorageBuffer bindings (skipping scalars);
+// scalar args are packed into one `spirv.GlobalVariable` in the PushConstant
+// storage class, read in the kernel prologue via addressof + AccessChain +
+// Load. This is necessary because MLIR's GPUToSPIRV lowering has no path that
+// materializes a by-value scalar arg as a push-constant global — it would
+// leave the scalar as a StorageBuffer binding, which the runtime does not
+// populate (it pushes scalars via vkCmdPushConstants, not descriptor writes),
+// so the kernel would read garbage and run off the end.
+//
+// Field layout mirrors the runtime's buildLayout: scalar args appear in the
+// push-constant struct in source order, each 4-byte-aligned (the runtime
+// rounds scalar size up to 4 bytes). Pointer bindings count up from 0 over
+// pointer args only.
+static void lowerScalarArgsToPushConstant(gpu::GPUFuncOp gpuFn,
+                                          OpBuilder &builder) {
+  // Partition args: which are scalar (to move into the PC block) vs pointer
+  // (memref, to keep as interface variables).
+  SmallVector<Type> scalarTys;
+  SmallVector<unsigned> scalarArgIdxs;
+  SmallVector<unsigned> pointerArgIdxs;
+  TypeRange inputTys = gpuFn.getFunctionType().getInputs();
+  for (auto [i, ty] : llvm::enumerate(inputTys)) {
+    if (isa<ShapedType>(ty))
+      pointerArgIdxs.push_back(i);
+    else {
+      scalarArgIdxs.push_back(i);
+      scalarTys.push_back(ty);
+    }
+  }
+  if (scalarArgIdxs.empty()) {
+    // No scalars: just (re-)assign pointer bindings in order.
+    for (auto [slot, _] : llvm::enumerate(pointerArgIdxs))
+      gpuFn.setArgAttr(slot, spirv::getInterfaceVarABIAttrName(),
+                       spirv::getInterfaceVarABIAttr(/*descSet=*/0, slot,
+                                                     std::nullopt,
+                                                     gpuFn.getContext()));
+    return;
+  }
+
+  // Build the push-constant struct type and a module-scope global for it,
+  // placed inside the gpu.module so GPUToSPIRV carries it into the spirv.module
+  // (same hoisting mechanism as __shared__ globals). The global's type is a
+  // spirv.ptr<struct<...>, PushConstant>; storage class lives on the pointer.
+  //
+  // Member offsets are explicit (each scalar 4-byte-aligned, accumulated in
+  // source order) to mirror the runtime's buildLayout packing and to satisfy
+  // Vulkan's requirement that every Block struct member carry an Offset
+  // decoration — spirv-lower-abi-attrs does not add them for us, and without
+  // them the driver reads garbage (validation rejects the module).
+  SmallVector<uint32_t> offsets;
+  uint32_t off = 0;
+  for (Type ty : scalarTys) {
+    offsets.push_back(off);
+    uint32_t sz = ty.isIntOrFloat() ? (ty.getIntOrFloatBitWidth() / 8) : 4;
+    off += (sz + 3u) & ~3u; // round up to 4 bytes (std140-friendly)
+  }
+  Type pcStructTy = spirv::StructType::get(scalarTys, offsets);
+  std::string pcName = ("__vc_pc_" + gpuFn.getName()).str();
+  Type pcPtrTy =
+      spirv::PointerType::get(pcStructTy, spirv::StorageClass::PushConstant);
+  auto pcVar = builder.create<spirv::GlobalVariableOp>(
+      gpuFn.getLoc(), TypeAttr::get(pcPtrTy), builder.getStringAttr(pcName),
+      /*initializer=*/FlatSymbolRefAttr());
+  pcVar->moveBefore(gpuFn);
+
+  // In the kernel prologue, load each scalar field and replace the original
+  // block argument's uses with the loaded value. AccessChain takes SSA index
+  // values, so materialize the field index as a spirv.Constant i32.
+  OpBuilder body(gpuFn.getBody());
+  body.setInsertionPointToStart(&gpuFn.getBody().front());
+  Value pcAddr = body.create<spirv::AddressOfOp>(gpuFn.getLoc(), pcPtrTy, pcName);
+  for (auto [fieldIdx, argIdx] : llvm::enumerate(scalarArgIdxs)) {
+    Value idxVal = body.create<spirv::ConstantOp>(
+        gpuFn.getLoc(), body.getI32Type(),
+        body.getI32IntegerAttr(static_cast<int32_t>(fieldIdx)));
+    Value fieldPtr = body.create<spirv::AccessChainOp>(
+        gpuFn.getLoc(),
+        spirv::PointerType::get(scalarTys[fieldIdx],
+                                spirv::StorageClass::PushConstant),
+        pcAddr, ValueRange{idxVal});
+    Value loaded =
+        body.create<spirv::LoadOp>(gpuFn.getLoc(), scalarTys[fieldIdx], fieldPtr);
+    gpuFn.getArgument(argIdx).replaceAllUsesWith(loaded);
+  }
+
+  // Erase the scalar block args (back-to-front so indices stay valid) and
+  // rebuild the function type over the remaining (pointer) args.
+  llvm::BitVector erase(inputTys.size());
+  for (unsigned i : scalarArgIdxs) erase.set(i);
+  gpuFn.getBody().front().eraseArguments(erase);
+
+  SmallVector<Type> newInputs;
+  for (unsigned i : pointerArgIdxs) newInputs.push_back(inputTys[i]);
+  Type newFnTy = FunctionType::get(builder.getContext(), newInputs,
+                                   gpuFn.getFunctionType().getResults());
+  gpuFn.setFunctionTypeAttr(TypeAttr::get(newFnTy));
+
+  // Assign StorageBuffer bindings to the surviving pointer args in order.
+  // After eraseArguments the pointer args occupy slots 0..N-1 in source order.
+  for (auto [slot, _] : llvm::enumerate(pointerArgIdxs))
+    gpuFn.setArgAttr(slot, spirv::getInterfaceVarABIAttrName(),
+                     spirv::getInterfaceVarABIAttr(/*descSet=*/0, slot,
+                                                   std::nullopt,
+                                                   gpuFn.getContext()));
+}
+
 // Packs every vc.kernel (and its target func) into one gpu.module as gpu.func.
 void packKernels(ModuleOp module, IRRewriter &rw) {
   SmallVector<vc::KernelOp> kernels;
@@ -120,24 +229,6 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
                    spirv::getEntryPointABIAttr(module.getContext(),
                                                {32, 1, 1}));
 
-    // KernelFuncSignatureConversion inside GPUToSPIRV splits each gpu.func
-    // argument into a SPIR-V interface variable. Every argument must carry a
-    // spirv.interface_var_abi, otherwise its memref value is left unconverted
-    // and the body patterns fail on an unknown SSA value. Bindings count up
-    // from 0. A memref carries its own storage class in the memref type, so
-    // the ABI attr must omit it (the attr cannot specify a storage class on a
-    // non-scalar); plain scalar args get an explicit StorageBuffer binding.
-    for (auto [i, argType] : llvm::enumerate(fn.getFunctionType().getInputs())) {
-      std::optional<spirv::StorageClass> storageClass =
-          argType.isa<ShapedType>()
-              ? std::optional<spirv::StorageClass>{}
-              : spirv::StorageClass::StorageBuffer;
-      gpuFn.setArgAttr(
-          i, spirv::getInterfaceVarABIAttrName(),
-          spirv::getInterfaceVarABIAttr(/*descSet=*/0, /*binding=*/i,
-                                        storageClass, module.getContext()));
-    }
-
     // Move the body over, then rewrite func.return -> gpu.return.
     gpuFn.getBody().takeBody(fn.getBody());
     SmallVector<func::ReturnOp> returns;
@@ -151,6 +242,12 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
       rw.setInsertionPointToEnd(&gpuFn.getBody().front());
       rw.create<gpu::ReturnOp>(k.getLoc());
     }
+
+    // Lower scalar (non-memref) args to a push-constant struct and assign
+    // StorageBuffer bindings to pointer args in order. Done after takeBody
+    // because it rewrites the kernel body (loads scalars from the PC global)
+    // and reshapes the gpu.func signature. See lowerScalarArgsToPushConstant.
+    lowerScalarArgsToPushConstant(gpuFn, rw);
 
     fn.erase();
     k.erase();

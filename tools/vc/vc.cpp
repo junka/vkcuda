@@ -1,16 +1,20 @@
 //===- vc.cpp - Compiler driver -------------------------------------------===//
 //
 // Usage:
-//   vc <input.vc> [-emit=ast|mlir|spirv] [-o <out.spv>]
+//   vc <input.vc> [-emit=ast|mlir|spirv|host|full] [-o <out>]
 //
 // Pipeline: lex+parse -> AST -> (Sema) -> MLIR(VC) -> lower -> SPIR-V.
-// The SPIR-V emission reuses MLIR's spirv-to-binary translation. With the
-// VC->gpu lowering still scaffolded, -emit=mlir is the most useful mode
-// until that pass lands.
+// The SPIR-V emission reuses MLIR's spirv-to-binary translation.
+//   -emit=ast    dump the parsed AST
+//   -emit=mlir   dump the VC-dialect MLIR (default)
+//   -emit=spirv  lower + serialize to a .spv binary
+//   -emit=host   lower + serialize, then print the embedded host C++ (no link)
+//   -emit=full   lower + serialize + embed + drive g++ -> standalone executable
 //
 //===----------------------------------------------------------------------===//
 
 #include "vc/Codegen/Passes.h"
+#include "vc/Codegen/HostLink.h"
 #include "vc/Dialect/VC/Dialect.h"
 #include "vc/Frontend/AST.h"
 #include "vc/Frontend/ASTDumper.h"
@@ -44,7 +48,7 @@ using namespace vc;
 using namespace mlir;
 
 namespace {
-enum class EmitKind { AST, MLIR, SPIRV };
+enum class EmitKind { AST, MLIR, SPIRV, Host, Full };
 } // namespace
 
 static bool loadSource(const std::string &path, llvm::SourceMgr &sm) {
@@ -64,7 +68,7 @@ int main(int argc, char **argv) {
   llvm::cl::opt<std::string> inputFilename(llvm::cl::Positional,
       llvm::cl::desc("<input .vc file>"), llvm::cl::Required);
   llvm::cl::opt<std::string> emit("emit",
-      llvm::cl::desc("output kind (ast|mlir|spirv)"),
+      llvm::cl::desc("output kind (ast|mlir|spirv|host|full)"),
       llvm::cl::init("mlir"));
   llvm::cl::opt<std::string> outputFilename("o",
       llvm::cl::desc("output filename"), llvm::cl::init("-"));
@@ -77,6 +81,8 @@ int main(int argc, char **argv) {
   EmitKind kind = EmitKind::MLIR;
   if (emit == "ast") kind = EmitKind::AST;
   else if (emit == "spirv") kind = EmitKind::SPIRV;
+  else if (emit == "host") kind = EmitKind::Host;
+  else if (emit == "full") kind = EmitKind::Full;
   else if (emit != "mlir") {
     llvm::errs() << "unknown -emit=" << emit << "\n";
     return 1;
@@ -143,16 +149,46 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  std::error_code ec;
-  auto out = std::make_unique<llvm::ToolOutputFile>(
-      outputFilename, ec, llvm::sys::fs::OF_None);
-  if (ec) {
-    llvm::errs() << "cannot open " << outputFilename << ": " << ec.message()
-                 << "\n";
+  // -emit=spirv: write the single SPIR-V binary and stop. (A SPIR-V file
+  // can't concatenate multiple entry points across kernels, so like the GLSL
+  // driver we only write the first kernel's module — but MLIR emits one
+  // binary with one OpEntryPoint per kernel, so the whole binary is written.)
+  if (kind == EmitKind::SPIRV) {
+    std::error_code ec;
+    auto out = std::make_unique<llvm::ToolOutputFile>(
+        outputFilename, ec, llvm::sys::fs::OF_None);
+    if (ec) {
+      llvm::errs() << "cannot open " << outputFilename << ": " << ec.message()
+                   << "\n";
+      return 1;
+    }
+    out->os().write(reinterpret_cast<const char *>(binary.data()),
+                    binary.size() * sizeof(uint32_t));
+    out->keep();
+    return 0;
+  }
+
+  // -emit=host / -emit=full: build one HostSpirvModule per __global__ kernel.
+  // MLIR emits a single SPIR-V binary carrying one OpEntryPoint per kernel
+  // named after the kernel symbol, so every module shares the same `binary`
+  // (its lifetime outlives linkHostExecutable) and sets `entryPoint` to the
+  // kernel name — vcLoadKernel then loads that entry point out of the shared
+  // binary. (The GLSL backend instead emits one .spv per kernel with entry
+  // "main"; see ASTToHost/HostLink.)
+  std::vector<host::HostSpirvModule> hostModules;
+  for (const auto &d : tu.decls) {
+    if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
+    auto *fn = static_cast<FunctionDecl *>(d.get());
+    if (fn->deviceAttr != DeviceAttr::Global)
+      continue;
+    hostModules.push_back({fn->name.str(), binary.data(), binary.size(),
+                           /*entryPoint=*/fn->name.str()});
+  }
+  if (hostModules.empty()) {
+    llvm::errs() << "no __global__ kernel found in " << inputFilename << "\n";
     return 1;
   }
-  out->os().write(reinterpret_cast<const char *>(binary.data()),
-                  binary.size() * sizeof(uint32_t));
-  out->keep();
-  return 0;
+
+  return host::linkHostExecutable(tu, hostModules, outputFilename,
+                                  kind == EmitKind::Host);
 }

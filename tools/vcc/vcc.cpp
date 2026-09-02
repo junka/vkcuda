@@ -17,6 +17,7 @@
 
 #include "vc/Codegen/ASTToGLSL.h"
 #include "vc/Codegen/ASTToHost.h"
+#include "vc/Codegen/HostLink.h"
 #include "vc/Frontend/AST.h"
 #include "vc/Frontend/ASTDumper.h"
 #include "vc/Frontend/Lexer.h"
@@ -199,66 +200,9 @@ int main(int argc, char **argv) {
     }
   }
 
-  // 4. Host subset -> C++ (embedding one SPIR-V module per kernel)
-  std::string cppSource;
-  raw_string_ostream cppOS(cppSource);
-  if (!host::translateASTToHost(tu, hostModules, cppOS)) {
-    errs() << "no host main() found in " << inputFilename
-           << " (single-file mode needs an int main())\n";
-    return 1;
-  }
-  cppOS.flush();
-
-  if (kind == EmitKind::Host) {
-    outs() << cppSource;
-    return 0;
-  }
-
-  // 5. g++ compiles the .cpp -> executable, linking VCRuntime + Vulkan.
-  //    VC_RUNTIME_LIB / VC_INCLUDE_DIR / VC_VULKAN_LIBS are baked in at build
-  //    time by CMake so the driver knows where libVCRuntime.a and the headers
-  //    live without requiring an install.
-  std::string gpp = findTool("g++");
-  if (gpp.empty()) gpp = "/usr/bin/g++";
-  if (!sys::fs::exists(gpp)) {
-    errs() << "error: g++ not found\n";
-    return 1;
-  }
-
-  SmallString<128> cppPath;
-  sys::fs::createTemporaryFile("vchost", "cpp", cppPath);
-  {
-    std::error_code ec;
-    raw_fd_ostream cppFile(cppPath, ec);
-    if (ec) { errs() << "cannot write host temp: " << ec.message() << "\n";
-              return 1; }
-    cppFile << cppSource;
-  }
-
-  SmallVector<StringRef, 16> args;
-  args.push_back(gpp);
-  args.push_back("-std=c++20");
-  args.push_back("-O2");
-  args.push_back("-I" VC_INCLUDE_DIR);
-  args.push_back(cppPath);
-  args.push_back(VC_RUNTIME_LIB);
-  args.push_back(VC_VULKAN_LIBS);
-  args.push_back("-o");
-  args.push_back(outputFilename);
-
-  int grc = sys::ExecuteAndWait(gpp, args, std::nullopt, std::nullopt);
-  if (grc != 0) {
-    errs() << "g++ failed (rc=" << grc << ")\n--- generated host C++ ---\n"
-           << cppSource;
-    sys::fs::remove(cppPath);
-    return 1;
-  }
-  sys::fs::remove(cppPath);
-  size_t totalSpv = 0;
-  for (const auto &m : hostModules) totalSpv += m.wordCount * sizeof(uint32_t);
-  outs() << "built " << outputFilename << " (" << cppSource.size()
-         << " bytes host C++, " << totalSpv << " bytes SPIR-V across "
-         << hostModules.size() << " kernel"
-         << (hostModules.size() == 1 ? "" : "s") << ")\n";
-  return 0;
+  // 4 + 5. Host subset -> C++ (embedding one SPIR-V module per kernel) ->
+  //       g++ links it against libVCRuntime + Vulkan into the executable.
+  //       Shared with the MLIR driver via host::linkHostExecutable.
+  return host::linkHostExecutable(tu, hostModules, outputFilename,
+                                  kind == EmitKind::Host);
 }

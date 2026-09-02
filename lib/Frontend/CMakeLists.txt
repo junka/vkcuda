@@ -9,6 +9,7 @@ add_library(VCFrontend STATIC
   Sema.cpp
   ../Codegen/ASTToGLSL.cpp
   ../Codegen/ASTToHost.cpp
+  ../Codegen/HostLink.cpp
 )
 
 target_include_directories(VCFrontend PUBLIC
@@ -31,3 +32,16 @@ endif()
 # LLVM command-line options (e.g. `debug-counter`) at startup -> fatal error.
 # The shared library exports every symbol the frontend needs.
 target_link_libraries(VCFrontend PUBLIC LLVM)
+
+# HostLink.cpp (the shared host-C++ + g++ linking stage) needs the baked-in
+# VCRuntime/header/Vulkan locations to invoke g++ at runtime; the driver
+# binaries inherit these via VCCodegen/VCFrontend too. VCRuntime is always
+# built (not MLIR-gated), so $<TARGET_FILE:VCRuntime> resolves in every config.
+file(TO_CMAKE_PATH "${VC_INCLUDE_DIR}" VC_INCLUDE_DIR_ABS)
+set(VC_RUNTIME_LIB_PATH "$<TARGET_FILE:VCRuntime>")
+set(VC_VULKAN_LIB_FLAG "-lvulkan")
+target_compile_definitions(VCFrontend PRIVATE
+  VC_INCLUDE_DIR="${VC_INCLUDE_DIR_ABS}"
+  VC_RUNTIME_LIB="${VC_RUNTIME_LIB_PATH}"
+  VC_VULKAN_LIBS="${VC_VULKAN_LIB_FLAG}"
+)

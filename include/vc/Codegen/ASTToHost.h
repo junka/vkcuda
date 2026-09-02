@@ -30,11 +30,18 @@ namespace host {
 /// (the GLSL entry-function name = the `__global__` kernel's mangled device
 /// name, e.g. `vadd` or `ns_kernel`). The host backend embeds each module as a
 /// separate `static const uint32_t __vc_spirv_<name>[]` and loads it via
-/// `vcLoadKernel(..., "<name>", ...)` at the matching launch site.
+/// `vcLoadKernel(..., "<entryPoint>", ...)` at the matching launch site.
+///
+/// `entryPoint` is the SPIR-V entry-point name passed to vcLoadKernel. The
+/// GLSL backend emits one .comp module per kernel with entry "main", so it
+/// leaves `entryPoint` empty (resolved to "main"). The MLIR backend emits a
+/// single SPIR-V binary with one OpEntryPoint per kernel named after the
+/// kernel symbol, so it fills `entryPoint` with the kernel name.
 struct HostSpirvModule {
   std::string kernelName;
   const uint32_t *words = nullptr;
   size_t wordCount = 0;
+  std::string entryPoint;
 };
 
 /// Emit a self-contained C++ source for the host subset of `tu` to `os`.

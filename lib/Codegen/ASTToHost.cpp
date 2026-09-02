@@ -38,6 +38,11 @@ class HostEmitter {
   // kernelName -> embed variable name (`__vc_spirv_<name>`), built once from
   // `modules` so emitLaunch can pick the right byte array for each launch.
   llvm::StringMap<std::string> spirvVarForKernel;
+  // kernelName -> SPIR-V entry-point name passed to vcLoadKernel. Empty
+  // `modules` entries resolve to "main" (the GLSL backend's per-kernel .comp
+  // convention); the MLIR backend fills this with the kernel symbol name
+  // (its single binary carries one OpEntryPoint per kernel so named).
+  llvm::StringMap<std::string> entryPointForKernel;
   // Name -> Type* for every variable declared in the host functions being
   // emitted. Used to classify launch args as Pointer vs Scalar: a DeclRefExpr
   // arg whose declaration has a PointerType is a device pointer (vcMalloc
@@ -62,6 +67,8 @@ public:
         spirvVarForKernel[m.kernelName] =
             m.kernelName.empty() ? "__vc_spirv"
                                  : "__vc_spirv_" + m.kernelName;
+        entryPointForKernel[m.kernelName] =
+            m.entryPoint.empty() ? "main" : m.entryPoint;
       }
     }
   }
@@ -923,9 +930,10 @@ private:
     // anywhere in the user's main(); this guard runs after it. The SPIR-V
     // module and entry name are keyed by the kernel's device symbol name
     // (kname), which keys both the embedded `__vc_spirv_<kname>` array and the
-    // host-side load handle. The SPIR-V entry point itself is always "main"
-    // (each kernel is its own .comp module; see ASTToGLSL emitBody), so the
-    // entryPoint argument to vcLoadKernel is the literal "main".
+    // host-side load handle. The SPIR-V entry point is "main" for the GLSL
+    // backend (each kernel is its own .comp module; see ASTToGLSL emitBody)
+    // and the kernel symbol name for the MLIR backend (one binary, one
+    // OpEntryPoint per kernel so named) — resolved via entryPointForKernel.
     std::string kname = launchHandleName(l->callee.get());
     std::string spirvVar;
     if (spirvVarForKernel.count(kname))
@@ -934,10 +942,14 @@ private:
       spirvVar = spirvVarForKernel[""];
     else
       spirvVar = "__vc_spirv";
+    std::string entryPt =
+        entryPointForKernel.count(kname)    ? entryPointForKernel[kname]
+        : entryPointForKernel.count("")     ? entryPointForKernel[""]
+                                            : "main";
     pad(indent + 1);
     os << "if (!__vc_k_" << kname
        << ") vcLoadKernel(" << spirvVar << ", " << spirvVar
-       << "_len, \"main\", &__vc_k_" << kname << ");\n";
+       << "_len, \"" << entryPt << "\", &__vc_k_" << kname << ");\n";
     pad(indent + 1);
     os << "VCKernelArg __args[" << l->args.size() << "] = {";
     for (unsigned i = 0; i < l->args.size(); ++i) {
