@@ -19,6 +19,7 @@
 
 #include "vc/Dialect/VC/Ops.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -193,6 +194,98 @@ static void lowerScalarArgsToPushConstant(gpu::GPUFuncOp gpuFn,
                                                    gpuFn.getContext()));
 }
 
+// Replaces the compile-time `gpu.block_dim` (which GPUToSPIRV would lower to a
+// literal `spirv.Constant <abi size>`, baking the workgroup size at compile
+// time) with a read of a SPIR-V specialization constant. The runtime sets the
+// block size via Vulkan specialization constants with SpecId 0/1/2 = x/y/z
+// (lib/Runtime/VCRuntime.cpp getPipeline), mirroring the GLSL backend's
+// `layout(local_size_x_id = 0, ...)` + `gl_WorkGroupSize`. Without this, every
+// MLIR kernel runs with the hardcoded LocalSize 32x1x1 regardless of the
+// launch's block parameter, so any kernel launched with block != 32 computes
+// the wrong blockDim and runs off the end (sync block=64, matmul 16x16, ...).
+//
+// Emits, per gpu.module (shared by all kernels):
+//   spirv.SpecConstant @__vc_wg_x spec_id(0) = 32 : i32
+//   spirv.SpecConstant @__vc_wg_y spec_id(1) = 1  : i32
+//   spirv.SpecConstant @__vc_wg_z spec_id(2) = 1  : i32
+// and rewrites each `gpu.block_dim <dim>` to:
+//   %v = spirv.mlir.referenceof @__vc_wg_<dim> : i32
+//   %idx = arith.index_cast %v : i32 to index
+//
+// The `OpDecorate %gl_WorkGroupSize BuiltIn WorkgroupSize` that Vulkan requires
+// to make the spec constants actually drive the hardware workgroup size is NOT
+// expressible in MLIR's spirv dialect (SpecConstantCompositeOp carries no
+// built_in decoration, and LocalSizeId's IdRef operands can't be serialized via
+// ExecutionModeOp's ArrayAttr values). It is injected by patching the serialized
+// SPIR-V binary in the vc driver (see vc.cpp). The placeholder LocalSize 1x1x1
+// from the entry_point_abi is overridden by the WorkgroupSize builtin at run
+// time, exactly as in the GLSL backend's shader.
+static void lowerWorkgroupSizeToSpecConstants(gpu::GPUModuleOp gpuModule,
+                                              OpBuilder &builder) {
+  MLIRContext *ctx = builder.getContext();
+  Type i32 = builder.getI32Type();
+
+  // Create the three scalar spec constants once per gpu.module.
+  struct SpecConst {
+    const char *name;
+    unsigned specId;
+    int32_t defVal;
+  };
+  const SpecConst scs[3] = {
+      {"__vc_wg_x", 0, 32}, {"__vc_wg_y", 1, 1}, {"__vc_wg_z", 2, 1}};
+  // Create in reverse order (z, y, x) and moveBefore front each time, so the
+  // final module order is x, y, z (each moveBefore pushes to the front, so the
+  // last-pushed x ends up first). Track z (the last in module order) so the
+  // composite below can be placed after all three.
+  spirv::SpecConstantOp zConst;
+  for (const SpecConst &sc : llvm::reverse(scs)) {
+    auto specConst = builder.create<spirv::SpecConstantOp>(
+        gpuModule.getLoc(), builder.getStringAttr(sc.name),
+        builder.getI32IntegerAttr(sc.defVal));
+    specConst->setAttr("spec_id", builder.getI32IntegerAttr(sc.specId));
+    specConst->moveBefore(&gpuModule.getBody()->front());
+    if (sc.specId == 2) zConst = specConst;
+  }
+  // Module order is now: __vc_wg_x, __vc_wg_y, __vc_wg_z, <rest>.
+
+  // The WorkgroupSize builtin: a SpecConstantComposite of the three spec
+  // constants. Named gl_WorkGroupSize so the binary patch in the vc driver can
+  // locate it by OpName and inject `OpDecorate <id> BuiltIn WorkgroupSize`
+  // (the MLIR spirv dialect can't attach that decoration from IR). The actual
+  // hardware workgroup size is driven by this builtin's spec-constant values,
+  // which the runtime populates via specialization info at pipeline creation.
+  // Placed *after* the three scalar spec constants: the spirv serializer
+  // resolves the composite's constituent symbol-refs to already-emitted
+  // constant result IDs, so all scalars must precede it.
+  Type v3i32 = VectorType::get({3}, i32);
+  SmallVector<Attribute> constituents = {
+      FlatSymbolRefAttr::get(ctx, "__vc_wg_x"),
+      FlatSymbolRefAttr::get(ctx, "__vc_wg_y"),
+      FlatSymbolRefAttr::get(ctx, "__vc_wg_z")};
+  auto wgComposite = builder.create<spirv::SpecConstantCompositeOp>(
+      gpuModule.getLoc(), TypeAttr::get(v3i32),
+      builder.getStringAttr("gl_WorkGroupSize"),
+      builder.getArrayAttr(constituents));
+  wgComposite->moveAfter(zConst);
+
+  // Rewrite every gpu.block_dim in every gpu.func to a referenceof + index_cast.
+  SmallVector<gpu::BlockDimOp> dims;
+  gpuModule.walk([&](gpu::BlockDimOp op) { dims.push_back(op); });
+  for (gpu::BlockDimOp op : dims) {
+    gpu::Dimension dim = op.getDimension();
+    const char *name =
+        dim == gpu::Dimension::x ? "__vc_wg_x"
+        : dim == gpu::Dimension::y ? "__vc_wg_y"
+                                   : "__vc_wg_z";
+    OpBuilder b(op);
+    Value ref = b.create<spirv::ReferenceOfOp>(op.getLoc(), i32, name);
+    Value idx = b.create<arith::IndexCastOp>(op.getLoc(),
+                                             builder.getIndexType(), ref);
+    op.replaceAllUsesWith(idx);
+    op.erase();
+  }
+}
+
 // Packs every vc.kernel (and its target func) into one gpu.module as gpu.func.
 void packKernels(ModuleOp module, IRRewriter &rw) {
   SmallVector<vc::KernelOp> kernels;
@@ -221,13 +314,16 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
     rw.setInsertionPointToStart(gpuModule.getBody());
     auto gpuFn = rw.create<gpu::GPUFuncOp>(k.getLoc(), fn.getName(),
                                            fn.getFunctionType());
-    // Mark the entry point: gpu.kernel + the SPIR-V launch ABI. The entry
-    // point ABI needs the three fragment dims; use the launch's block size
-    // (32x1x1 default) until host launch parameters are threaded through.
+    // Mark the entry point: gpu.kernel + the SPIR-V launch ABI. The workgroup
+    // size here is a placeholder (1x1x1): the actual block size is supplied at
+    // run time via specialization constants (SpecId 0/1/2), wired up by
+    // lowerWorkgroupSizeToSpecConstants + the vc driver's binary patch that
+    // decorates the gl_WorkGroupSize spec-composite BuiltIn. LocalSize is
+    // overridden by that builtin, exactly as in the GLSL backend's shader.
     gpuFn->setAttr(gpu::GPUDialect::getKernelFuncAttrName(), rw.getUnitAttr());
     gpuFn->setAttr(spirv::getEntryPointABIAttrName(),
                    spirv::getEntryPointABIAttr(module.getContext(),
-                                               {32, 1, 1}));
+                                               {1, 1, 1}));
 
     // Move the body over, then rewrite func.return -> gpu.return.
     gpuFn.getBody().takeBody(fn.getBody());
@@ -252,6 +348,12 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
     fn.erase();
     k.erase();
   }
+
+  // Replace gpu.block_dim with specialization-constant reads so the block size
+  // is set at run time (via Vulkan spec constants) rather than baked to the
+  // placeholder LocalSize. Creates the spec constants + rewrites the ops.
+  if (gpuModule)
+    lowerWorkgroupSizeToSpecConstants(gpuModule, rw);
 
   // Hoist any module-scope workgroup-memory globals into the gpu.module.
   // GPUToSPIRV only legalizes symbols visible inside the gpu.module it clones,

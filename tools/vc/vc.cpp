@@ -41,8 +41,11 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/ADT/SmallVector.h"
 
 #include <memory>
+#include <optional>
+#include <string>
 
 using namespace vc;
 using namespace mlir;
@@ -50,6 +53,105 @@ using namespace mlir;
 namespace {
 enum class EmitKind { AST, MLIR, SPIRV, Host, Full };
 } // namespace
+
+// Patch the serialized SPIR-V binary to decorate the `gl_WorkGroupSize`
+// SpecConstantComposite with BuiltIn WorkgroupSize. This is what makes the
+// runtime-supplied specialization constants (SpecId 0/1/2 = block x/y/z) drive
+// the actual hardware workgroup size, mirroring the GLSL backend's
+// `layout(local_size_x_id = 0, ...)` -> `gl_WorkGroupSize` builtin.
+//
+// Why a binary patch: MLIR's spirv dialect has no way to attach a BuiltIn
+// decoration to a SpecConstantComposite from IR (SpecConstantCompositeOp
+// carries no built_in attr; only GlobalVariableOp does, and WorkgroupSize must
+// be a spec-constant composite, not a variable). The serializer thus emits the
+// composite + its scalar SpecId decorations but omits the WorkgroupSize builtin
+// decoration. We inject it by name: locate the OpName record for
+// "gl_WorkGroupSize", read its target <id>, then insert an OpDecorate
+// <id> BuiltIn WorkgroupSize instruction.
+//
+// Insertion point: SPIR-V's logical layout puts all OpDecorate records in an
+// annotation section that follows the debug section (OpName / ...) and the
+// entry-point header (OpCapability ... OpExecutionMode). The serializer already
+// emits a valid block of OpDecorate records there, so we insert ours
+// immediately before the first existing OpDecorate to keep the layout valid
+// (verified by spirv-val).
+static void patchWorkgroupSizeBuiltin(SmallVectorImpl<uint32_t> &binary) {
+  // OpName = opcode 5; OpDecorate = opcode 71; BuiltIn decoration = 11;
+  // BuiltIn.WorkgroupSize = 25.
+  constexpr uint32_t kOpName = 5;
+  constexpr uint32_t kOpDecorate = 71;
+  constexpr uint32_t kDecorationBuiltIn = 11;
+  constexpr uint32_t kBuiltinWorkgroupSize = 25;
+
+  if (binary.size() < 5)
+    return;
+
+  // Walk instructions to find `OpName <id> "gl_WorkGroupSize"`.
+  // OpName record: [wordCount|opcode, target_id, name...]. The name is the
+  // remaining (wordCount - 2) words, null-padded to a word boundary.
+  size_t i = 5;
+  std::optional<uint32_t> wgsizeId;
+  while (i < binary.size()) {
+    uint32_t word = binary[i];
+    uint32_t opcode = word & 0xFFFF;
+    uint32_t wordCount = word >> 16;
+    if (wordCount == 0)
+      break; // malformed
+    if (opcode == kOpName && wordCount >= 3 && i + wordCount <= binary.size()) {
+      uint32_t targetId = binary[i + 1];
+      // Reassemble the name string from the trailing words.
+      std::string name;
+      for (uint32_t w = 2; w < wordCount; ++w) {
+        uint32_t val = binary[i + w];
+        for (int b = 0; b < 4; ++b) {
+          char c = static_cast<char>((val >> (8 * b)) & 0xFF);
+          if (c == 0)
+            goto name_done;
+          name.push_back(c);
+        }
+      }
+    name_done:
+      if (name == "gl_WorkGroupSize") {
+        wgsizeId = targetId;
+        break;
+      }
+    }
+    i += wordCount;
+  }
+
+  if (!wgsizeId)
+    return; // No gl_WorkGroupSize in this module (no kernels / not patched).
+
+  // Build the OpDecorate instruction: OpDecorate <target_id> BuiltIn
+  // WorkgroupSize -> 4 words: [4<<16|71, target_id, 11, 25].
+  uint32_t decor[4] = {(4u << 16) | kOpDecorate, *wgsizeId,
+                       kDecorationBuiltIn, kBuiltinWorkgroupSize};
+  // SPIR-V layout (logical): OpCapability, OpExtension, OpExtInstImport,
+  // OpMemoryModel, OpEntryPoint, OpExecutionMode, then a debug section
+  // (OpName / OpMemberName / OpString / OpLine / ...), then annotations
+  // (OpDecorate / OpMemberDecorate / OpGroupDecorate / ...), then types &
+  // constants, then functions. OpDecorate must land in the annotation section,
+  // i.e. after all OpName lines. The serializer already emits a valid block of
+  // OpDecorate records there, so the simplest correct insertion is right
+  // before the first existing OpDecorate.
+  size_t insertPos = 0;
+  size_t j = 5;
+  while (j < binary.size()) {
+    uint32_t w = binary[j];
+    uint32_t op = w & 0xFFFF;
+    uint32_t wc = w >> 16;
+    if (wc == 0)
+      break;
+    if (op == kOpDecorate) {
+      insertPos = j;
+      break;
+    }
+    j += wc;
+  }
+  if (insertPos == 0)
+    return; // No existing OpDecorate — unexpected; don't risk a bad patch.
+  binary.insert(binary.begin() + insertPos, decor, decor + 4);
+}
 
 static bool loadSource(const std::string &path, llvm::SourceMgr &sm) {
   auto buf = llvm::MemoryBuffer::getFileOrSTDIN(path);
@@ -148,6 +250,12 @@ int main(int argc, char **argv) {
     llvm::errs() << "spirv translation failed\n";
     return 1;
   }
+
+  // Decorate the gl_WorkGroupSize spec-composite BuiltIn WorkgroupSize so the
+  // runtime's specialization constants (SpecId 0/1/2) drive the hardware
+  // workgroup size. See patchWorkgroupSizeBuiltin for why this is a binary
+  // patch rather than an IR-level decoration.
+  patchWorkgroupSizeBuiltin(binary);
 
   // -emit=spirv: write the single SPIR-V binary and stop. (A SPIR-V file
   // can't concatenate multiple entry points across kernels, so like the GLSL
