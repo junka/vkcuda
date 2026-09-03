@@ -53,10 +53,34 @@ class ASTToMLIRImpl {
   llvm::DenseMap<llvm::StringRef, const FunctionDecl *> funcDecls;
   // name -> Value (block arg / local memref / alloca)
   llvm::StringMap<Value> locals;
+  // name -> the AST-level Type of the variable/param. Needed to resolve struct
+  // field access: `result[i].f` requires knowing `result` is a `Result*` so the
+  // field's byte offset can be looked up in recordLayouts. Scalars/pointers to
+  // builtin types are not consulted, so a missing entry is non-fatal for them.
+  llvm::StringMap<const vc::Type *> localTypes;
   // name -> __constant__ global VarDecl, materialized lazily per kernel.
   llvm::StringMap<const VarDecl *> constGlobals;
   // Entry block of the function being emitted (for hoisting const slots).
   Block *entryBlock = nullptr;
+  //--- Struct layout (for `Result*`-style SSBO field access) -------------//
+  // The MLIR backend does not emit struct definitions (spirv.module needs no
+  // record type declaration for raw-offset field access). Instead, each
+  // top-level StructDecl is recorded as a layout: per-field byte offset (std430
+  // packing) + total stride. A `Struct*` kernel arg is scalarized to a
+  // memref<?xi8> SSBO; `result[i].field` lowers to a byte-offset store/load at
+  // i*stride + fieldOffset. This is enough for the common "struct-as-output-
+  // buffer" pattern (vectors.vc's `Result*`); it does not model struct value
+  // passing, local structs, or nested records.
+  struct FieldLayout {
+    std::string name;
+    mlir::Type type;
+    uint32_t offset;
+  };
+  struct StructLayout {
+    std::vector<FieldLayout> fields;
+    uint32_t stride; // sizeof, rounded up to the struct's max field alignment
+  };
+  llvm::StringMap<StructLayout> recordLayouts;
   // Return type of the function currently being emitted (None for void).
   mlir::Type currentRetTy;
   // Set when any diagnostic error is emitted, so the driver can fail.
@@ -162,16 +186,75 @@ private:
     // KernelDecl is handled when its FunctionDecl is built (we emit a
     // vc.kernel wrapper there).
     if (n->getNodeType() == ASTNode::NodeKind::KernelDecl) return;
+    // Struct definitions are recorded as byte layouts (recordLayouts) so a
+    // `Struct*` kernel arg can be scalarized to memref<?xi8> and field access
+    // lowered to byte-offset stores/loads. No IR is emitted for the struct
+    // itself — the spirv.module needs no record type declaration for raw-offset
+    // access. (See cvtType's PointerType<RecordType> handling and the
+    // MemberAccessExpr lvalue path.)
+    if (n->getNodeType() == ASTNode::NodeKind::StructDecl) {
+      recordStructLayout(static_cast<const StructDecl *>(n));
+      return;
+    }
     // Top-level constructs the MLIR backend does not yet model. These would
     // otherwise vanish silently; surface them so the user knows the shader
     // is missing the construct.
-    if (n->getNodeType() == ASTNode::NodeKind::StructDecl ||
-        n->getNodeType() == ASTNode::NodeKind::NamespaceDecl ||
+    if (n->getNodeType() == ASTNode::NodeKind::NamespaceDecl ||
         n->getNodeType() == ASTNode::NodeKind::EnumDecl ||
         n->getNodeType() == ASTNode::NodeKind::TypedefDecl)
       error(n, std::string("MLIR backend does not support top-level ") +
                   nodeKindName(n->getNodeType()) +
                   "; construct dropped from device code");
+  }
+
+  // Compute a std430-style byte layout for a struct: each field is placed at
+  // its natural alignment (rounding the running offset up), and the struct
+  // stride is the total size rounded up to the max field alignment. f32/i32
+  // align to 4, f64/i64 to 8. Array fields (e.g. `float v[2]`) use the element
+  // type's alignment times the element count. This mirrors how the GLSL
+  // backend lays out `struct Result { float f; int i; int u; double d; int64_t l; }`
+  // under std430 (f@0, i@4, u@8, d@16, l@24, stride=32) so the host's
+  // sizeof(Result) matches.
+  void recordStructLayout(const StructDecl *sd) {
+    if (recordLayouts.count(sd->name)) return;
+    StructLayout layout;
+    uint32_t off = 0;
+    uint32_t maxAlign = 1;
+    for (const FieldDecl *f : sd->fields) {
+      mlir::Type fty = cvtType(f->type);
+      if (!fty) {
+        // Unsupported field type (e.g. a nested struct): skip but keep the
+        // struct resolvable; field access to it will error at use site.
+        continue;
+      }
+      uint32_t align = fieldAlignment(fty);
+      uint32_t size = fieldSize(fty, f->arrayDims);
+      off = (off + align - 1) & ~(align - 1);
+      layout.fields.push_back({f->name.str(), fty, off});
+      off += size;
+      if (align > maxAlign) maxAlign = align;
+    }
+    layout.stride = (off + maxAlign - 1) & ~(maxAlign - 1);
+    if (layout.stride == 0) layout.stride = maxAlign;
+    recordLayouts[sd->name] = std::move(layout);
+  }
+
+  // Alignment (bytes) of an MLIR element type under std430.
+  uint32_t fieldAlignment(mlir::Type ty) {
+    if (auto vty = ty.dyn_cast<mlir::VectorType>())
+      ty = vty.getElementType();
+    if (ty.isIntOrFloat())
+      return ty.getIntOrFloatBitWidth() / 8;
+    return 4;
+  }
+  // Size (bytes) of a field, accounting for trailing array dims.
+  uint32_t fieldSize(mlir::Type ty, const std::vector<int64_t> &arrayDims) {
+    if (auto vty = ty.dyn_cast<mlir::VectorType>())
+      ty = vty.getElementType();
+    uint32_t elem = ty.isIntOrFloat() ? (ty.getIntOrFloatBitWidth() / 8) : 4;
+    uint32_t total = elem;
+    for (int64_t d : arrayDims) total *= (d > 0 ? (uint32_t)d : 1);
+    return total;
   }
 
   mlir::Type cvtType(const vc::Type *t) {
@@ -195,6 +278,19 @@ private:
       case BuiltinTypeKind::Float64: return builder.getF64Type();
       }
     }
+    // CUDA-style vector types (float4, int3, ...): a vector lives only as an
+    // SSA register value, never as a memref element (GPUToSPIRV cannot legalize
+    // memref.load/store on memref<?xvector<...>>). A vector *local* becomes a
+    // 0-d memref<vector<...>> Function-storage slot — that shape DOES legalize
+    // (the existing scalar local path uses the same 0-d memref form). A vector
+    // *pointer* (float4*) is scalarized to memref<?xELEM> in the PointerType
+    // branch below, so vectors never appear as SSBO element types.
+    if (isa<vc::VectorType>(t)) {
+      auto *v = cast<vc::VectorType>(t);
+      mlir::Type elem = cvtType(v->elem);
+      if (!elem) return mlir::Type();
+      return mlir::VectorType::get({v->count}, elem);
+    }
     if (isa<PointerType>(t)) {
       // pointer-to-T  ->  memref<?xT> in the StorageBuffer (global device
       // memory) storage class; MemRefToSPIRV requires a SPIR-V storage class
@@ -202,7 +298,36 @@ private:
       // The 1-D dynamic memref gets a static strided<[1], offset: 0> layout,
       // which getVulkanElementPtr needs to emit an element pointer (it refuses
       // dynamic strides/offsets).
-      mlir::Type pointee = cvtType(cast<PointerType>(t)->pointee);
+      //
+      // A pointer-to-vector (float4*) is scalarized: the memref element type is
+      // the vector's *element* type (f32), not the vector itself. memref<
+      // ?xvector<4xf32>> would fail to legalize its loads/stores through
+      // GPUToSPIRV; memref<?xf32> with manual 4-wide CompositeConstruct/
+      // CompositeExtract at access sites is the legal path. (Full vector-
+      // pointer dereference — `float4* p; p[i]` — is not yet implemented; the
+      // current demos only dereference struct pointers and scalar pointers.)
+      //
+      // A pointer-to-struct (Result*) is scalarized to memref<?xi32>: the
+      // struct has no MLIR type (we don't emit a spirv struct), and field
+      // access is byte-offset stores/loads keyed on recordLayouts. i32 (4-byte)
+      // granularity covers f32/i32 fields directly; i64/f64 fields are split
+      // into lo/hi i32 stores via shift+mask (see storeStructField/loadStructField).
+      // The runtime binds the whole device buffer as one raw SSBO, so any
+      // element width works as long as the shader's std430 field offsets match
+      // the host C++ struct layout (they do — both follow the same rules).
+      const vc::Type *pointeeTy = cast<PointerType>(t)->pointee;
+      mlir::Type pointee;
+      if (isa<RecordType>(pointeeTy)) {
+        // Struct pointer: use i32 as the granular element type (4-byte units).
+        // recordLayouts holds byte offsets; access sites divide by 4 to get the
+        // i32 slot index. i64/f64 fields span two slots and are split.
+        pointee = builder.getI32Type();
+      } else {
+        pointee = cvtType(pointeeTy);
+        if (auto vty = pointee.dyn_cast<mlir::VectorType>()) {
+          pointee = vty.getElementType();
+        }
+      }
       auto layout = mlir::StridedLayoutAttr::get(
           &ctx, /*offset=*/0, ArrayRef<int64_t>{/*stride=*/1});
       return MemRefType::get(
@@ -245,10 +370,13 @@ private:
     // locals/entryBlock are per-function state (binding args below).
     entryBlock = entry;
     locals.clear();
+    localTypes.clear();
 
     // Bind parameters to block args.
-    for (unsigned i = 0; i < fn->params.size(); ++i)
+    for (unsigned i = 0; i < fn->params.size(); ++i) {
       locals[fn->params[i]->name] = entry->getArgument(i);
+      localTypes[fn->params[i]->name] = fn->params[i]->type;
+    }
 
     // Route the body through emitStatements so trailing bare-return guards
     // (`if (c) return;`) are wrapped in inverted scf.if instead of emitting
@@ -886,6 +1014,7 @@ private:
         // Module-scope global in Workgroup storage, fetched per use.
         Value addr = getOrCreateSharedGlobal(d->name, shape, ty, l);
         locals[d->name] = addr;
+        localTypes[d->name] = d->type;
         // __shared__ decls may not have a non-constant initializer in CUDA
         // (no host-visible init); ignore any initializer for the global.
         break;
@@ -906,6 +1035,7 @@ private:
       Value addr = builder.create<memref::AllocaOp>(l, slotTy);
       if (hoisted) builder.restoreInsertionPoint(savedIp);
       locals[d->name] = addr;
+      localTypes[d->name] = d->type;
       if (d->init) {
         if (d->init->getNodeType() == ASTNode::NodeKind::InitListExpr) {
           auto *il = static_cast<InitListExpr *>(d->init.get());
@@ -1287,8 +1417,52 @@ private:
           return builder.create<arith::IndexCastOp>(
               l, builder.getI32Type(), idxV);
       }
+      // Vector swizzle read: base is a vector value, member is one of
+      // x/y/z/w (single component -> scalar extract) or a multi-char swizzle
+      // like xy/xyz/xz (-> vector shuffle selecting a subset). The GLSL backend
+      // emits these verbatim (GLSL native); here we lower to spirv ops since
+      // the MLIR/spirv dialect has no swizzle sugar.
+      Value base = visitExpr(m->base.get());
+      if (base) base = loadValue(base, l);
+      if (base && base.getType().isa<mlir::VectorType>()) {
+        auto vty = base.getType().cast<mlir::VectorType>();
+        unsigned srcN = vty.getNumElements();
+        // Map swizzle chars to element indices.
+        auto charToIdx = [](char c) -> int {
+          switch (c) {
+          case 'x': case 'r': case 's': return 0;
+          case 'y': case 'g': case 't': return 1;
+          case 'z': case 'b': case 'p': return 2;
+          case 'w': case 'a': case 'q': return 3;
+          default: return -1;
+          }
+        };
+        llvm::StringRef sw = m->member;
+        SmallVector<int32_t, 4> idxs;
+        bool ok = true;
+        for (char c : sw) {
+          int i = charToIdx(c);
+          if (i < 0 || (unsigned)i >= srcN) { ok = false; break; }
+          idxs.push_back(i);
+        }
+        if (ok && !idxs.empty()) {
+          if (idxs.size() == 1) {
+            // Single component -> CompositeExtract to a scalar.
+            return builder.create<spirv::CompositeExtractOp>(
+                l, vty.getElementType(), base,
+                builder.getI32ArrayAttr(idxs));
+          }
+          // Multi-component -> VectorShuffle selecting `idxs` from base,based
+          // (same vector as both inputs).
+          mlir::VectorType resTy =
+              mlir::VectorType::get({(int64_t)idxs.size()}, vty.getElementType());
+          return builder.create<spirv::VectorShuffleOp>(
+              l, resTy, base, base, builder.getI32ArrayAttr(idxs));
+        }
+      }
       return error(n, "MLIR backend does not support member access "
-                      "other than threadIdx/blockIdx/blockDim/gridDim");
+                      "other than threadIdx/blockIdx/blockDim/gridDim "
+                      "and vector swizzles");
     }
     case ASTNode::NodeKind::CallExpr: {
       auto *c = static_cast<CallExpr *>(n);
@@ -1298,6 +1472,39 @@ private:
         if (ref->name == "__syncthreads") {
           builder.create<vc::BarrierOp>(l);
           return Value();
+        }
+        // Vector constructors: float4(...) / int3(...) / make_float4(...) /
+        // uint4(...) / double2(...) / long4(...) / float3(...) / float2(...).
+        // CUDA's make_<vec> drops the "make_" prefix to yield the vec name.
+        // These lower to spirv.CompositeConstruct over the (casted) scalar
+        // args; the result is a vector<NxELEM> SSA value (never stored in a
+        // memref — see cvtType's VectorType note). Dispatch before the
+        // builtin/funcTable lookup so a user __device__ helper named e.g.
+        // `int4` would not be shadowed (no such helpers exist in practice).
+        llvm::StringRef ctorName = ref->name;
+        if (ctorName.starts_with("make_"))
+          ctorName = ctorName.substr(5);
+        mlir::Type vecElemTy;
+        unsigned vecCount = 0;
+        if (vectorCtorInfo(ctorName, vecElemTy, vecCount)) {
+          if (c->args.empty())
+            return error(n, "vector constructor needs at least one argument");
+          SmallVector<Value> parts;
+          for (auto &a : c->args) {
+            Value av = loadValue(visitExpr(a.get()), loc(a.get()));
+            if (!av)
+              return error(a.get(), "could not evaluate vector ctor argument");
+            av = castValue(av, vecElemTy, loc(a.get()));
+            parts.push_back(av);
+          }
+          // Single-arg broadcast: float4(1.0) -> CompositeConstruct of the same
+          // value N times.
+          if (parts.size() == 1 && vecCount > 1)
+            parts.assign(vecCount, parts[0]);
+          if (parts.size() != vecCount)
+            return error(n, "vector constructor argument count mismatch");
+          mlir::VectorType vty = mlir::VectorType::get({vecCount}, vecElemTy);
+          return builder.create<spirv::CompositeConstructOp>(l, vty, parts);
         }
         // CUDA builtins (math intrinsics, atomics, fences, votes). These are
         // NOT __device__ helpers (funcTable miss), so dispatch before the
@@ -1349,6 +1556,38 @@ private:
   // CUDA builtin lowering (math intrinsics, atomics, fences, votes)
   //===--------------------------------------------------------------------//
 
+  // Recognize a CUDA-style vector constructor name (float4, int3, uint2,
+  // double2, long4, ...) and return its element MLIR type + component count.
+  // Mirrors Parser::makeVectorType's base table. Returns false for non-vector
+  // names. Used by the CallExpr handler to lower `float4(a,b,c,d)` and
+  // `make_float4(...)` to spirv.CompositeConstruct.
+  bool vectorCtorInfo(llvm::StringRef name, mlir::Type &elemTy,
+                      unsigned &count) {
+    struct Base { const char *prefix; BuiltinTypeKind kind; };
+    static constexpr Base bases[] = {
+        {"float", BuiltinTypeKind::Float32},
+        {"int", BuiltinTypeKind::Int32},
+        {"uint", BuiltinTypeKind::UInt32},
+        {"double", BuiltinTypeKind::Float64},
+        {"bool", BuiltinTypeKind::Bool},
+        {"long", BuiltinTypeKind::Int64},
+        {"ulong", BuiltinTypeKind::UInt64},
+        {"half", BuiltinTypeKind::Float16},
+    };
+    for (const Base &b : bases) {
+      llvm::StringRef p = b.prefix;
+      if (name.size() == p.size() + 1 && name.starts_with(p)) {
+        char d = name.back();
+        if (d >= '2' && d <= '4') {
+          elemTy = cvtType(new BuiltinType(b.kind));
+          count = d - '0';
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   // Dispatch a CUDA builtin call. Sets `matched=true` if `name` is a
   // recognized builtin (so the caller can return without falling through to
   // funcTable / the unknown-callee error). Returns the result Value, or null
@@ -1372,6 +1611,60 @@ private:
   // builtin.
   Value emitMathBuiltin(llvm::StringRef name,
                         const std::vector<NodePtr> &args, Location l) {
+    // Geometric builtins on float vectors: dot(a,b) and cross(a,b). The spirv
+    // dialect has no GLDot/GLCross (MLIR 18's SPIRVGLOps only covers the
+    // GLSLstd450 arithmetic set), so these are expanded with elementary
+    // spirv.CompositeExtract + arith.mulf/addf/subf + spirv.CompositeConstruct.
+    // dot: N-dim inner product -> scalar f32. cross: 3-dim cross product ->
+    // vector<3xf32>. (CUDA __f variants are not stripped here; vectors.vc uses
+    // the bare `dot`/`cross` spellings.)
+    if (name == "dot" && args.size() == 2) {
+      Value a = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      Value b = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
+      if (!a || !b) return Value();
+      auto vty = a.getType().dyn_cast<mlir::VectorType>();
+      if (!vty || vty != b.getType()) return Value();
+      mlir::Type elem = vty.getElementType();
+      unsigned n = vty.getNumElements();
+      if (n == 0) return Value();
+      Value sum;
+      for (unsigned i = 0; i < n; ++i) {
+        Value ai = builder.create<spirv::CompositeExtractOp>(
+            l, elem, a, builder.getI32ArrayAttr({(int32_t)i}));
+        Value bi = builder.create<spirv::CompositeExtractOp>(
+            l, elem, b, builder.getI32ArrayAttr({(int32_t)i}));
+        Value prod = builder.create<arith::MulFOp>(l, ai, bi);
+        sum = sum ? (Value)builder.create<arith::AddFOp>(l, sum, prod) : prod;
+      }
+      return sum;
+    }
+    if (name == "cross" && args.size() == 2) {
+      Value a = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      Value b = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
+      if (!a || !b) return Value();
+      auto vty = a.getType().dyn_cast<mlir::VectorType>();
+      if (!vty || vty != b.getType() || vty.getNumElements() != 3)
+        return Value();
+      mlir::Type elem = vty.getElementType();
+      auto ext = [&](Value v, int i) {
+        return builder.create<spirv::CompositeExtractOp>(l, elem, v,
+            builder.getI32ArrayAttr({(int32_t)i}));
+      };
+      Value ax = ext(a, 0), ay = ext(a, 1), az = ext(a, 2);
+      Value bx = ext(b, 0), by = ext(b, 1), bz = ext(b, 2);
+      // c.x = a.y*b.z - a.z*b.y ; c.y = a.z*b.x - a.x*b.z ; c.z = a.x*b.y - a.y*b.x
+      Value cx = builder.create<arith::SubFOp>(l,
+          builder.create<arith::MulFOp>(l, ay, bz),
+          builder.create<arith::MulFOp>(l, az, by));
+      Value cy = builder.create<arith::SubFOp>(l,
+          builder.create<arith::MulFOp>(l, az, bx),
+          builder.create<arith::MulFOp>(l, ax, bz));
+      Value cz = builder.create<arith::SubFOp>(l,
+          builder.create<arith::MulFOp>(l, ax, by),
+          builder.create<arith::MulFOp>(l, ay, bx));
+      return builder.create<spirv::CompositeConstructOp>(l, vty,
+          ValueRange{cx, cy, cz});
+    }
     // Normalize: strip a leading `__` and a trailing `f` to get the base
     // (e.g. __sinf -> sin, sqrtf -> sqrt, fabsf -> fabs). Only recognized math
     // bases are accepted so unrelated names fall through.
@@ -1925,11 +2218,200 @@ private:
     }
   }
 
+  // Store `rhs` into struct field `m` (e.g. `result[i].f = rhs`). Returns true
+  // if handled (the LHS was a struct-pointer field access), false to fall
+  // through to the generic lvalue path. The base of `m` is either a DeclRefExpr
+  // (a `Result*` param/local) or an IndexExpr (`result[i]`, indexing the SSBO
+  // view memref<?xi32>). The struct name is recovered from localTypes[basevar],
+  // the field's byte offset from recordLayouts, and the store is an i32-slot
+  // memref.store (f32/i32) or a lo/hi pair (i64/f64 via shift+mask).
+  bool storeStructField(const MemberAccessExpr *m, Value rhs, Location l) {
+    if (!m->base) return false;
+    // Resolve the base variable name and optional element index.
+    ASTNode *base = m->base.get();
+    NodePtr indexExpr; // (unused; we read index from IndexExpr directly)
+    ASTNode *indexNode = nullptr;
+    if (base->getNodeType() == ASTNode::NodeKind::IndexExpr) {
+      auto *ie = static_cast<IndexExpr *>(base);
+      indexNode = ie->index.get();
+      base = ie->base.get();
+    }
+    if (!base || base->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+      return false;
+    auto *ref = static_cast<DeclRefExpr *>(base);
+    auto tit = localTypes.find(ref->name);
+    if (tit == localTypes.end()) return false;
+    const vc::Type *t = tit->second;
+    // Peel pointer to the struct.
+    if (!t || !isa<PointerType>(t)) return false;
+    const vc::Type *pointee = cast<PointerType>(t)->pointee;
+    if (!pointee || !isa<RecordType>(pointee)) return false;
+    auto *rec = cast<RecordType>(pointee);
+    auto lit = recordLayouts.find(rec->decl->name);
+    if (lit == recordLayouts.end()) return false;
+    const StructLayout &layout = lit->second;
+    // Find the field.
+    const FieldLayout *fld = nullptr;
+    for (const auto &f : layout.fields)
+      if (f.name == m->member) { fld = &f; break; }
+    if (!fld) return false;
+
+    // Base SSBO memref (result) — must be the memref<?xi32> view.
+    auto sit = locals.find(ref->name);
+    if (sit == locals.end()) return false;
+    Value mem = sit->second;
+    if (!mem.getType().isa<MemRefType>()) return false;
+
+    // Byte offset = elementIndex * structStride + fieldOffset.
+    Value byteOff = builder.create<arith::ConstantOp>(
+        l, builder.getI32Type(),
+        builder.getI32IntegerAttr((int32_t)fld->offset));
+    if (indexNode) {
+      Value idx = loadValue(visitExpr(indexNode), loc(indexNode));
+      if (!idx) return false;
+      idx = castValue(idx, builder.getI32Type(), l);
+      Value strideConst = builder.create<arith::ConstantOp>(
+          l, builder.getI32Type(), builder.getI32IntegerAttr((int32_t)layout.stride));
+      Value elemOff = builder.create<arith::MulIOp>(l, idx, strideConst);
+      byteOff = builder.create<arith::AddIOp>(l, byteOff, elemOff);
+    }
+    // i32 slot index = byteOff / 4.
+    Value slotIdx = builder.create<arith::ShRSIOp>(
+        l, byteOff,
+        builder.create<arith::ConstantOp>(l, builder.getI32Type(),
+                                          builder.getI32IntegerAttr(2)));
+    slotIdx = castValue(slotIdx, builder.getIndexType(), l);
+
+    rhs = loadValue(rhs, l);
+    mlir::Type fty = fld->type;
+    unsigned bytes = fty.isIntOrFloat() ? (fty.getIntOrFloatBitWidth() / 8) : 4;
+    if (bytes <= 4) {
+      // f32/i32/bool: store the value's bit pattern into a single i32 slot.
+      // This is a BITCAST (reinterpret bits), not a numeric conversion — the
+      // host reads the same bits back as the field's C type (float f reads the
+      // f32 bit pattern written here). arith.bitcast f32->i32 preserves bits.
+      Value v = rhs;
+      if (v.getType().isF32() || v.getType().isF16())
+        v = builder.create<arith::BitcastOp>(l, builder.getI32Type(), v);
+      else
+        v = castValue(rhs, builder.getI32Type(), l);
+      builder.create<memref::StoreOp>(l, v, mem, ValueRange{slotIdx});
+    } else {
+      // i64/f64: store the bit pattern split into lo/hi i32 across two slots.
+      // Again bitcast (not numeric convert) so the host reads the raw f64/i64
+      // bits. arith.bitcast f64->i64, then shift+mask into two i32 halves.
+      Value asI64 = rhs;
+      if (rhs.getType().isF64())
+        asI64 = builder.create<arith::BitcastOp>(l, builder.getI64Type(), rhs);
+      else
+        asI64 = castValue(rhs, builder.getI64Type(), l);
+      Value mask = builder.create<arith::ConstantOp>(
+          l, builder.getI64Type(),
+          builder.getI64IntegerAttr(0xFFFFFFFFll));
+      Value lo64 = builder.create<arith::AndIOp>(l, asI64, mask);
+      Value hi64 = builder.create<arith::ShRUIOp>(
+          l, asI64,
+          builder.create<arith::ConstantOp>(l, builder.getI64Type(),
+                                            builder.getI64IntegerAttr(32)));
+      Value lo = builder.create<arith::TruncIOp>(l, builder.getI32Type(), lo64);
+      Value hi = builder.create<arith::TruncIOp>(l, builder.getI32Type(), hi64);
+      Value one = builder.create<arith::ConstantOp>(
+          l, builder.getIndexType(), builder.getIndexAttr(1));
+      Value slotHi = builder.create<arith::AddIOp>(l, slotIdx, one);
+      builder.create<memref::StoreOp>(l, lo, mem, ValueRange{slotIdx});
+      builder.create<memref::StoreOp>(l, hi, mem, ValueRange{slotHi});
+    }
+    return true;
+  }
+
   Value emitBinary(const BinaryExpr *b) {
     Location l = loc(b);
     if (b->op == BinaryOp::Assign) {
+      // Vector swizzle write: `sw.xy = rhs`, `sw.xz = float2(...)` where `sw`
+      // is a vector local slot and the LHS member is a multi-char swizzle.
+      // SPIR-V has no swizzle-store: lower as load-current + CompositeInsert
+      // each written component + store-back. (Single-component write like
+      // `sw.x = v` also works through this path.)
+      if (b->lhs && b->lhs->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+        auto *m = static_cast<MemberAccessExpr *>(b->lhs.get());
+        if (m->base &&
+            m->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+          auto *base = static_cast<DeclRefExpr *>(m->base.get());
+          auto slotIt = locals.find(base->name);
+          if (slotIt != locals.end() &&
+              slotIt->second.getType().isa<MemRefType>() &&
+              slotIt->second.getType()
+                  .cast<MemRefType>()
+                  .getElementType()
+                  .isa<mlir::VectorType>()) {
+            Value rhs = visitExpr(b->rhs.get());
+            if (!rhs)
+              return error(b->rhs.get(),
+                           "could not evaluate swizzle-assignment RHS");
+            rhs = loadValue(rhs, l);
+            Value slot = slotIt->second;
+            mlir::VectorType slotVty = slot.getType()
+                                           .cast<MemRefType>()
+                                           .getElementType()
+                                           .cast<mlir::VectorType>();
+            Value cur = builder.create<memref::LoadOp>(l, slot, ValueRange{});
+            // Resolve which components of `cur` the swizzle names.
+            auto charToIdx = [](char c) -> int {
+              switch (c) {
+              case 'x': case 'r': case 's': return 0;
+              case 'y': case 'g': case 't': return 1;
+              case 'z': case 'b': case 'p': return 2;
+              case 'w': case 'a': case 'q': return 3;
+              default: return -1;
+              }
+            };
+            llvm::StringRef sw = m->member;
+            SmallVector<int32_t, 4> dstIdxs;
+            bool ok = !sw.empty();
+            for (char c : sw) {
+              int i = charToIdx(c);
+              if (i < 0 || (unsigned)i >= slotVty.getNumElements()) {
+                ok = false;
+                break;
+              }
+              dstIdxs.push_back(i);
+            }
+            if (!ok)
+              return error(b->lhs.get(), "invalid vector swizzle on LHS");
+            // Pull each source component from rhs. rhs may be a vector of the
+            // swizzle width, or a scalar broadcast to all written components.
+            Value updated = cur;
+            for (size_t i = 0; i < dstIdxs.size(); ++i) {
+              Value part;
+              if (rhs.getType().isa<mlir::VectorType>()) {
+                part = builder.create<spirv::CompositeExtractOp>(
+                    l, rhs.getType().cast<mlir::VectorType>().getElementType(),
+                    rhs, builder.getI32ArrayAttr({(int32_t)i}));
+              } else {
+                part = castValue(rhs, slotVty.getElementType(), l);
+              }
+              updated = builder.create<spirv::CompositeInsertOp>(
+                  l, slotVty, part, updated,
+                  builder.getI32ArrayAttr({dstIdxs[i]}));
+            }
+            builder.create<memref::StoreOp>(l, updated, slot);
+            return rhs;
+          }
+        }
+      }
       Value rhs = visitExpr(b->rhs.get());
       if (!rhs) return error(b->rhs.get(), "could not evaluate assignment RHS");
+      // Struct field write: `result[i].field = rhs` (or `result.field` for a
+      // scalar struct ptr). `result` is a memref<?xi32> SSBO view of the struct
+      // buffer; the field's byte offset (from recordLayouts) becomes an i32
+      // slot index (offset/4), plus i*struct_stride/4 for the element. i64/f64
+      // fields are split into lo/hi i32 stores. See cvtType's PointerType<
+      // RecordType> note.
+      if (b->lhs &&
+          b->lhs->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+        auto *m = static_cast<MemberAccessExpr *>(b->lhs.get());
+        if (storeStructField(m, rhs, l)) return rhs;
+      }
       Value mem;
       SmallVector<Value> indices;
       if (lvalueAddress(b->lhs.get(), mem, indices))
@@ -1955,7 +2437,14 @@ private:
     }
 
     std::tie(lhs, rhs) = commonize(lhs, rhs, l);
-    bool isFloat = lhs.getType().isF32();
+    // Float vs int dispatch keys off the (scalar) element type, so the same
+    // path handles vec+vec and scalar+scalar: arith.addf on vector<4xf32>
+    // legalizes to spirv.FAdd via convert-arith-to-spirv, and arith.addi on
+    // vector<4xi32> to spirv.IAdd.
+    mlir::Type elemTy = lhs.getType();
+    if (auto vty = elemTy.dyn_cast<mlir::VectorType>())
+      elemTy = vty.getElementType();
+    bool isFloat = elemTy.isF32() || elemTy.isF64();
     switch (b->op) {
     case BinaryOp::Add:
       return isFloat ? (Value)builder.create<arith::AddFOp>(l, lhs, rhs)

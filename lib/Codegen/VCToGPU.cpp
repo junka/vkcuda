@@ -52,8 +52,19 @@ gpu::Dimension toGpuDim(vc::Dim dim) {
 // signature conversion cannot map the kernel arguments and memref.load/store
 // on them fails to legalize (<UNKNOWN SSA VALUE>).
 spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context) {
+  // Int64/Float64/Float16 capabilities are advertised so 64-bit integer
+  // (`long`, `long4`) and double (`double`, `double2`) and half (`__half`)
+  // types legalize. Vulkan's core Shader capability already covers i32/f32;
+  // the wider/narrower widths need their own capabilities declared or the
+  // spirv.module's vce triple won't advertise them and GPUToSPIRV refuses to
+  // legalize the ops (spirv.CompositeConstruct on vector<2xf64> fails with
+  // "explicitly marked illegal"). Runtime advertises these via the device's
+  // VkPhysicalDeviceFeatures (the runtime enables shaderFloat64/shaderInt64
+  // when the driver supports them; see VCRuntime device feature selection).
   auto triple = spirv::VerCapExtAttr::get(
-      spirv::Version::V_1_0, {spirv::Capability::Shader},
+      spirv::Version::V_1_0,
+      {spirv::Capability::Shader, spirv::Capability::Float64,
+       spirv::Capability::Int64, spirv::Capability::Float16},
       {spirv::Extension::SPV_KHR_storage_buffer_storage_class}, context);
   return spirv::TargetEnvAttr::get(triple,
                                    spirv::getDefaultResourceLimits(context));
