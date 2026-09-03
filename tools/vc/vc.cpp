@@ -45,6 +45,7 @@
 
 #include <memory>
 #include <optional>
+#include <functional>
 #include <string>
 
 using namespace vc;
@@ -283,15 +284,45 @@ int main(int argc, char **argv) {
   // kernel name — vcLoadKernel then loads that entry point out of the shared
   // binary. (The GLSL backend instead emits one .spv per kernel with entry
   // "main"; see ASTToHost/HostLink.)
+  //
+  // The kernel symbol is the MANGLED device name (`ns::kernel` -> `ns_kernel`)
+  // because the MLIR backend's buildFunction registers the func.func under that
+  // mangled name (mirroring the host launchHandleName), and the serialized
+  // OpEntryPoint carries the same symbol. A bare `fn->name` would mismatch the
+  // spirv entry point and the host's launch handle. Kernels nested in
+  // namespaces are found by recursing into NamespaceDecl bodies.
+  auto deviceSymName = [](const FunctionDecl *fn) -> std::string {
+    if (!fn->nsName.empty()) {
+      std::string out;
+      llvm::StringRef rest = fn->nsName;
+      while (!rest.empty()) {
+        auto pair = rest.split("::");
+        if (!out.empty()) out += '_';
+        out += pair.first.str();
+        rest = pair.second;
+      }
+      return out + "_" + fn->name.str();
+    }
+    return fn->name.str();
+  };
   std::vector<host::HostSpirvModule> hostModules;
-  for (const auto &d : tu.decls) {
-    if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
-    auto *fn = static_cast<FunctionDecl *>(d.get());
-    if (fn->deviceAttr != DeviceAttr::Global)
-      continue;
-    hostModules.push_back({fn->name.str(), binary.data(), binary.size(),
-                           /*entryPoint=*/fn->name.str()});
-  }
+  std::function<void(const std::vector<NodePtr> &)> collectKernels =
+      [&](const std::vector<NodePtr> &decls) {
+        for (const auto &d : decls) {
+          if (d->getNodeType() == ASTNode::NodeKind::NamespaceDecl) {
+            collectKernels(static_cast<const NamespaceDecl *>(d.get())->decls);
+            continue;
+          }
+          if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
+          auto *fn = static_cast<FunctionDecl *>(d.get());
+          if (fn->deviceAttr != DeviceAttr::Global)
+            continue;
+          std::string sym = deviceSymName(fn);
+          hostModules.push_back({sym, binary.data(), binary.size(),
+                                 /*entryPoint=*/sym});
+        }
+      };
+  collectKernels(tu.decls);
   if (hostModules.empty()) {
     llvm::errs() << "no __global__ kernel found in " << inputFilename << "\n";
     return 1;

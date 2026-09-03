@@ -47,10 +47,14 @@ class ASTToMLIRImpl {
   OpBuilder builder;
   ModuleOp module;
   // name -> func::FuncOp
-  llvm::DenseMap<llvm::StringRef, func::FuncOp> funcTable;
+  // NOTE: keys are std::string (not StringRef) because mangled device names
+  // (`ns_func`) are computed strings that outlive no AST node — a StringRef
+  // key would dangle once buildFunction returns. Top-level bare names are also
+  // stored as std::string for uniformity.
+  std::map<std::string, func::FuncOp> funcTable;
   // name -> FunctionDecl (for completing default arguments at call sites that
   // omit trailing defaulted parameters, mirroring the GLSL backend).
-  llvm::DenseMap<llvm::StringRef, const FunctionDecl *> funcDecls;
+  std::map<std::string, const FunctionDecl *> funcDecls;
   // name -> Value (block arg / local memref / alloca)
   llvm::StringMap<Value> locals;
   // name -> the AST-level Type of the variable/param. Needed to resolve struct
@@ -60,6 +64,15 @@ class ASTToMLIRImpl {
   llvm::StringMap<const vc::Type *> localTypes;
   // name -> __constant__ global VarDecl, materialized lazily per kernel.
   llvm::StringMap<const VarDecl *> constGlobals;
+  // name -> enum constant value. Unscoped enums are flattened at the top level
+  // (and inside namespaces, mangled as `ns_NAME`): each EnumDecl's constants
+  // are registered here so a bare `TILE`/`ADD`/`ns::CONST` DeclRefExpr folds to
+  // an integer literal. GLSL emits `const int NAME=val;` and lets glslc resolve
+  // the name; the spirv module has no such decl, so we fold at codegen time.
+  llvm::StringMap<int64_t> enumConstants;
+  // Persisted namespace-prefix strings so the recursive StringRefs in
+  // visitTopLevel stay valid for the lifetime of the walk.
+  std::vector<std::unique_ptr<std::string>> nsPrefixStore;
   // Entry block of the function being emitted (for hoisting const slots).
   Block *entryBlock = nullptr;
   //--- Struct layout (for `Result*`-style SSBO field access) -------------//
@@ -75,6 +88,7 @@ class ASTToMLIRImpl {
     std::string name;
     mlir::Type type;
     uint32_t offset;
+    std::vector<int64_t> arrayDims; // trailing array dims (e.g. v[2] -> {2})
   };
   struct StructLayout {
     std::vector<FieldLayout> fields;
@@ -172,7 +186,11 @@ private:
     }
   }
 
-  void visitTopLevel(const ASTNode *n) {
+  // Dispatch a top-level (or namespace-nested) declaration. `nsPrefix` is the
+  // mangled device namespace prefix (empty at top level; `ns`/`outer_inner`
+  // inside namespaces) — used to mangle enum constants and (via stampNamespace
+  // on FunctionDecl) device function names so `ns::f`/`ns::CONST` resolve.
+  void visitTopLevel(const ASTNode *n, StringRef nsPrefix = StringRef()) {
     if (!n) return;
     if (n->getNodeType() == ASTNode::NodeKind::FunctionDecl) {
       auto *fn = static_cast<const FunctionDecl *>(n);
@@ -196,15 +214,53 @@ private:
       recordStructLayout(static_cast<const StructDecl *>(n));
       return;
     }
+    // Typedef aliases are resolved at use sites via cvtType (TypedefType branch);
+    // no IR is emitted for the declaration itself (mirrors GLSL, which has no
+    // typedef — emit resolves to the underlying type spelling).
+    if (n->getNodeType() == ASTNode::NodeKind::TypedefDecl)
+      return;
+    // Enum: register each constant into enumConstants so bare `ADD`/`TILE`
+    // DeclRefExprs fold to integer literals at use sites. Inside a namespace
+    // the key is mangled `ns_NAME` (mirrors Sema's mangleScoped). No IR is
+    // emitted — the spirv module has no enum/const-int decl, so GLSL's
+    // `const int NAME=val;` approach has no analogue here.
+    if (n->getNodeType() == ASTNode::NodeKind::EnumDecl) {
+      auto *e = static_cast<const EnumDecl *>(n);
+      for (const auto &c : e->constants) {
+        if (nsPrefix.empty())
+          enumConstants[c.name] = c.value;
+        else
+          enumConstants[nsPrefix.str() + "_" + c.name.str()] = c.value;
+      }
+      return;
+    }
+    // Namespace: recurse into the body with an extended prefix. Namespaces are
+    // transparent on the device side (GLSL flattens them too); each member is
+    // visited as if top-level, with names mangled `ns_member`. Nested
+    // namespaces chain: `outer::inner::f` -> `outer_inner_f`.
+    if (n->getNodeType() == ASTNode::NodeKind::NamespaceDecl) {
+      auto *ns = static_cast<const NamespaceDecl *>(n);
+      std::string inner = nsPrefix.empty()
+                              ? ns->name.str()
+                              : (nsPrefix.str() + "_" + ns->name.str());
+      // Persist the prefix string so the recursive StringRef is stable.
+      nsPrefixStore.push_back(std::make_unique<std::string>(std::move(inner)));
+      for (auto &d : ns->decls)
+        visitTopLevel(d.get(), *nsPrefixStore.back());
+      return;
+    }
+    // __constant__ globals (VarDecl with isConstant) are pre-registered into
+    // constGlobals by translate() and read at use sites; no IR is emitted for
+    // the declaration here. Non-constant top-level VarDecls (host globals) are
+    // not device-visible and are ignored.
+    if (n->getNodeType() == ASTNode::NodeKind::VarDecl)
+      return;
     // Top-level constructs the MLIR backend does not yet model. These would
     // otherwise vanish silently; surface them so the user knows the shader
     // is missing the construct.
-    if (n->getNodeType() == ASTNode::NodeKind::NamespaceDecl ||
-        n->getNodeType() == ASTNode::NodeKind::EnumDecl ||
-        n->getNodeType() == ASTNode::NodeKind::TypedefDecl)
-      error(n, std::string("MLIR backend does not support top-level ") +
-                  nodeKindName(n->getNodeType()) +
-                  "; construct dropped from device code");
+    error(n, std::string("MLIR backend does not support top-level ") +
+                nodeKindName(n->getNodeType()) +
+                "; construct dropped from device code");
   }
 
   // Compute a std430-style byte layout for a struct: each field is placed at
@@ -230,7 +286,7 @@ private:
       uint32_t align = fieldAlignment(fty);
       uint32_t size = fieldSize(fty, f->arrayDims);
       off = (off + align - 1) & ~(align - 1);
-      layout.fields.push_back({f->name.str(), fty, off});
+      layout.fields.push_back({f->name.str(), fty, off, f->arrayDims});
       off += size;
       if (align > maxAlign) maxAlign = align;
     }
@@ -259,6 +315,11 @@ private:
 
   mlir::Type cvtType(const vc::Type *t) {
     if (!t) return mlir::Type();
+    // typedef alias: resolve to the underlying type recursively. Sema keeps the
+    // TypedefType on params/locals (e.g. `weight_t wgt`); without this, buildFunction
+    // would get a null arg type and crash. Mirrors Sema's resolveTypedefs.
+    if (isa<vc::TypedefType>(t))
+      return cvtType(cast<vc::TypedefType>(t)->decl->underlying);
     if (isa<BuiltinType>(t)) {
       switch (cast<BuiltinType>(t)->builtin) {
       case BuiltinTypeKind::Void: return builder.getNoneType();
@@ -337,8 +398,32 @@ private:
     return mlir::Type();
   }
 
+  // The device-side symbol name for a function: a namespace member `ns::func`
+  // becomes `ns_func` (nested `outer::inner::func` -> `outer_inner_func`), so
+  // the host's launchHandleName (`math::fill` -> `math_fill`) and the device
+  // func.func symbol agree. Top-level free functions keep their name. Mirrors
+  // GLSL's deviceFuncName and Sema's mangledFuncName. (Method mangling for
+  // class.vc is left to a later pass.)
+  static std::string deviceFuncName(const FunctionDecl *f) {
+    if (!f->nsName.empty()) {
+      std::string out;
+      llvm::StringRef rest = f->nsName;
+      while (!rest.empty()) {
+        auto pair = rest.split("::");
+        if (!out.empty()) out += '_';
+        out += pair.first.str();
+        rest = pair.second;
+      }
+      return out + "_" + f->name.str();
+    }
+    return f->name.str();
+  }
+
   void buildFunction(const FunctionDecl *fn) {
     if (!fn) return;
+    // Mangled device symbol (ns_func); the host launch resolves `ns::func` to
+    // the same key, and scoped call sites (`ns::func(...)`) look it up here.
+    std::string symName = deviceFuncName(fn);
     // Function signature
     SmallVector<mlir::Type> argTypes;
     for (auto *p : fn->params)
@@ -352,14 +437,14 @@ private:
       results = TypeRange{};
     FunctionType fty = builder.getFunctionType(argTypes, results);
 
-    auto f = func::FuncOp::create(loc(fn), fn->name, fty);
+    auto f = func::FuncOp::create(loc(fn), symName, fty);
     if (fn->deviceAttr == DeviceAttr::Global) {
       // Mark as a kernel entry point.
       f->setAttr("vc.kernel", builder.getUnitAttr());
     }
     module.push_back(f);
-    funcTable[fn->name] = f;
-    funcDecls[fn->name] = fn;
+    funcTable[symName] = f;
+    funcDecls[symName] = fn;
     currentRetTy = retTy;
 
     if (!fn->body) return;
@@ -391,7 +476,7 @@ private:
     // For kernels, emit a vc.kernel wrapper referencing this function.
     if (fn->deviceAttr == DeviceAttr::Global) {
       builder.setInsertionPointToStart(module.getBody());
-      auto symRef = SymbolRefAttr::get(&ctx, fn->name, {});
+      auto symRef = SymbolRefAttr::get(&ctx, symName, {});
       builder.create<vc::KernelOp>(loc(fn), symRef);
     }
   }
@@ -460,6 +545,45 @@ private:
         auto *ie = static_cast<IndexExpr *>(cur);
         chain.push_back(ie);
         cur = ie->base.get();
+      }
+      // Struct array-field element: `pts[i].v[k]` = IndexExpr(MemberAccessExpr(
+      // pts[i], "v"), k). The member `v` is an array field; its slot address is
+      // fieldOffset + elemIdx*stride + k*elemSize, all in bytes, then /4 for the
+      // i32 slot. Resolve via structFieldAddr with extraByteOff = k*elemSize.
+      // (Only single-subscript array fields occur in the demos; multi-dim would
+      // need the extra offset accumulated across the chain.)
+      if (cur && cur->getNodeType() == ASTNode::NodeKind::MemberAccessExpr &&
+          chain.size() == 1) {
+        auto *ma = static_cast<MemberAccessExpr *>(cur);
+        ASTNode *kNode = chain[0]->index.get();
+        Value kv = loadValue(visitExpr(kNode), loc(kNode));
+        if (kv) {
+          kv = castValue(kv, builder.getI32Type(), loc(kNode));
+          // Element size: resolve the field type to its scalar width. The field
+          // is an array (float v[2] -> scalar f32 + arrayDims {2}); element size
+          // = scalar width.
+          Value fieldMem, slotIdx;
+          mlir::Type fieldTy;
+          std::vector<int64_t> adims;
+          if (structFieldAddr(ma, loc(cur), Value(), fieldMem, slotIdx,
+                              fieldTy, &adims) &&
+              !adims.empty()) {
+            unsigned elemBytes =
+                fieldTy.isIntOrFloat() ? (fieldTy.getIntOrFloatBitWidth() / 8) : 4;
+            Value elemSize = builder.create<arith::ConstantOp>(
+                loc(cur), builder.getI32Type(),
+                builder.getI32IntegerAttr((int32_t)elemBytes));
+            Value extra = builder.create<arith::MulIOp>(loc(cur), kv, elemSize);
+            // Re-resolve with the extra offset to get the element's slot.
+            if (structFieldAddr(ma, loc(cur), extra, fieldMem, slotIdx,
+                                fieldTy)) {
+              mem = fieldMem;
+              indices.clear();
+              indices.push_back(slotIdx);
+              return true;
+            }
+          }
+        }
       }
       // The chain root must resolve to an addressable memory object. A subscript
       // of a non-array value (e.g. indexing a loaded scalar) is rejected.
@@ -798,6 +922,18 @@ private:
         emitValueReturnChain(stmts, from);
         return;
       }
+      // A value-returning switch (`switch(c){case..: return v; ...}`) at the
+      // top level of a value-returning function: lower the whole switch to a
+      // single yielding scf.if chain whose result is the function return, so
+      // case-body returns become yields (a spirv.ReturnValue cannot live
+      // inside an scf.if region in a value-returning function).
+      if (s->getNodeType() == ASTNode::NodeKind::SwitchStmt &&
+          structuredDepth == 0 && currentRetTy &&
+          !currentRetTy.isa<NoneType>() &&
+          isValueReturnSwitch(static_cast<SwitchStmt *>(s))) {
+        emitValueReturnSwitch(static_cast<SwitchStmt *>(s));
+        return;
+      }
       if (isReturnIf(s)) {
         auto *iff = static_cast<IfStmt *>(s);
         Location l = loc(iff);
@@ -945,6 +1081,265 @@ private:
     builder.create<scf::YieldOp>(l, ValueRange{zero});
   }
 
+  //===-- switch lowering ------------------------------------------------===//
+  //
+  // `switch (cond) { case V: stmts; break; ...; default: stmts; }` lowers to
+  // a chain of scf.if (the spirv dialect has a Switch op, but our target's
+  // GPUToSPIRV path + the small/dynamic case sets in the demos make an scf.if
+  // chain simpler). C switch body is a flat statement list where Case/Default
+  // are labels and Break ends a case's run — first group the body statements
+  // into per-case buckets, then emit one scf.if per case (cond == val -> that
+  // bucket), with `default` as the final else tail. No fallthrough is modeled
+  // (every case in the demos ends with break or return); a case without an
+  // explicit terminator would fall through to the next bucket's statements,
+  // which this lowering does NOT do (recorded limitation).
+
+  struct CaseBucket {
+    Value val;            // empty => default
+    bool isDefault = false;
+    std::vector<ASTNode *> stmts;
+  };
+
+  // Group a switch body's flat statement list into per-case buckets. A case's
+  // body is its `CaseStmt::sub` (the statement following the label) plus any
+  // subsequent sibling statements up to the next Case/Default/Break (C
+  // fallthrough into the next label's statements is NOT modeled — every case
+  // in the demos ends with break or return). Returns the buckets in source
+  // order; sets `defOut` to the default bucket index (-1 if none). Statements
+  // before the first label are emitted inline into the current region (rare
+  // dead code).
+  SmallVector<CaseBucket, 8>
+  collectSwitchBuckets(const ASTNode *body, Location l, int &defOut) {
+    defOut = -1;
+    SmallVector<CaseBucket, 8> buckets;
+    const std::vector<NodePtr> *bodyStmts = nullptr;
+    if (body && body->getNodeType() == ASTNode::NodeKind::CompoundStmt)
+      bodyStmts = &static_cast<const CompoundStmt *>(body)->statements;
+    CaseBucket *cur = nullptr;
+    if (bodyStmts) {
+      for (const auto &s : *bodyStmts) {
+        if (s->getNodeType() == ASTNode::NodeKind::CaseStmt) {
+          auto *cs = static_cast<CaseStmt *>(s.get());
+          CaseBucket b;
+          if (!cs->value) { b.isDefault = true; }
+          else b.val = loadValue(visitExpr(cs->value.get()), l);
+          // The case body starts with the label's `sub`: a single statement or
+          // a CompoundStmt (unwrap the latter into individual statements).
+          if (cs->sub) {
+            if (cs->sub->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
+              for (const auto &sub :
+                   static_cast<CompoundStmt *>(cs->sub.get())->statements)
+                b.stmts.push_back(sub.get());
+            } else {
+              b.stmts.push_back(cs->sub.get());
+            }
+          }
+          buckets.push_back(std::move(b));
+          cur = &buckets.back();
+          if (cur->isDefault) defOut = buckets.size() - 1;
+        } else if (s->getNodeType() == ASTNode::NodeKind::BreakStmt) {
+          // Break ends the current case's statement run (no fallthrough).
+          cur = nullptr;
+        } else {
+          // A sibling statement belonging to the current case (after its `sub`).
+          // If no case is active (statement before the first label), emit it
+          // inline before the switch chain (rare; switch-in-C allows dead code
+          // before the first case).
+          if (cur) cur->stmts.push_back(s.get());
+          else visitStmt(s.get());
+        }
+      }
+    }
+    return buckets;
+  }
+
+  // A switch is a value-returning construct when its default case (or, with
+  // no default, the fall-through off-the-end) yields a value — i.e. every
+  // reachable case ends in `return v;`. We require a default that returns a
+  // value (the common `switch { ...; default: return 0; }` shape) so the
+  // yield chain always has a value on every path.
+  bool isValueReturnSwitch(SwitchStmt *sw) {
+    if (!sw->body ||
+        sw->body->getNodeType() != ASTNode::NodeKind::CompoundStmt)
+      return false;
+    int defIdx = -1;
+    Location l = loc(sw);
+    // Evaluate case values into a throwaway builder position is not needed for
+    // the predicate; but collectSwitchBuckets calls visitExpr for case values.
+    // To avoid emitting IR during a predicate query, do a lightweight AST walk.
+    const auto &ss = static_cast<CompoundStmt *>(sw->body.get())->statements;
+    bool anyDefault = false;
+    bool defaultReturnsValue = false;
+    for (const auto &s : ss) {
+      if (s->getNodeType() != ASTNode::NodeKind::CaseStmt) continue;
+      auto *cs = static_cast<CaseStmt *>(s.get());
+      if (!cs->value) {
+        anyDefault = true;
+        defaultReturnsValue = trailingReturnValue(cs->sub.get()) != nullptr;
+      }
+    }
+    (void)defIdx; (void)l;
+    return anyDefault && defaultReturnsValue;
+  }
+
+  // Void/general switch emission: each case body is emitted with visitStmt
+  // (case-body `return` becomes func.ReturnOp, legal in void functions; in a
+  // value-returning function this path is NOT taken — emitValueReturnSwitch
+  // is used instead). break inside a case body is a no-op (each case lives in
+  // its own scf.if then-region, so no fallthrough); loopDepth + a breakFlag
+  // are pushed so a `break` reached inside a case body does not trip the
+  // "break outside loop" error.
+  void emitSwitch(SwitchStmt *sw) {
+    Location l = loc(sw);
+    Value cond = loadValue(visitExpr(sw->cond.get()), l);
+    if (!cond) return;
+    int defIdx = -1;
+    auto buckets = collectSwitchBuckets(sw->body.get(), l, defIdx);
+
+    Value brkFlag = makeFlagSlot(l);
+    breakFlags.push_back(brkFlag);
+    ++loopDepth;
+    ++structuredDepth;
+
+    std::function<void(unsigned)> emitChain = [&](unsigned i) {
+      if (i < buckets.size()) {
+        CaseBucket &b = buckets[i];
+        // Skip the default here; it goes to the innermost else.
+        if (b.isDefault) { emitChain(i + 1); return; }
+        Value eq = builder.create<arith::CmpIOp>(
+            l, arith::CmpIPredicate::eq, cond, b.val);
+        bool hasElse = (i + 1 < buckets.size()) || defIdx >= 0;
+        auto ifOp = builder.create<scf::IfOp>(l, TypeRange{}, eq, hasElse);
+        auto saved = builder.saveInsertionPoint();
+        builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+        for (ASTNode *st : b.stmts) visitStmt(st);
+        if (hasElse) {
+          builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+          if (i + 1 < buckets.size()) emitChain(i + 1);
+          else if (defIdx >= 0)
+            for (ASTNode *st : buckets[defIdx].stmts) visitStmt(st);
+        }
+        builder.restoreInsertionPoint(saved);
+      }
+    };
+    // If the first bucket is the default (switch starting with default:),
+    // emit it unconditionally then the rest — rare; handled by treating the
+    // default as the innermost else only when it's not the leading bucket.
+    if (buckets.size() > 0 && buckets[0].isDefault) {
+      // Leading default: run its statements, then a chain over the rest.
+      for (ASTNode *st : buckets[0].stmts) visitStmt(st);
+      // Re-emit remaining cases as a chain with no default tail.
+      int savedDef = defIdx;
+      defIdx = -1;
+      // Build a sub-chain starting at 1 by offsetting; simplest is to recurse
+      // with a slice via a lambda that skips index 0.
+      std::function<void(unsigned)> emitRest = [&](unsigned i) {
+        if (i < buckets.size()) {
+          CaseBucket &b = buckets[i];
+          if (b.isDefault) { emitRest(i + 1); return; }
+          Value eq = builder.create<arith::CmpIOp>(
+              l, arith::CmpIPredicate::eq, cond, b.val);
+          bool hasElse = (i + 1 < buckets.size());
+          auto ifOp = builder.create<scf::IfOp>(l, TypeRange{}, eq, hasElse);
+          auto saved = builder.saveInsertionPoint();
+          builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+          for (ASTNode *st : b.stmts) visitStmt(st);
+          if (hasElse) {
+            builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+            emitRest(i + 1);
+          }
+          builder.restoreInsertionPoint(saved);
+        }
+      };
+      emitRest(1);
+      (void)savedDef;
+    } else {
+      emitChain(0);
+    }
+
+    --structuredDepth;
+    --loopDepth;
+    breakFlags.pop_back();
+  }
+
+  // Value-returning switch: lower the whole switch to a single scf.if chain
+  // that yields the function's result type. Each case's body is emitted
+  // without its trailing `return v;`, then yields v; the default is the
+  // innermost else yield. The chain's result is returned by func.ReturnOp.
+  void emitValueReturnSwitch(SwitchStmt *sw) {
+    Location l = loc(sw);
+    Value cond = loadValue(visitExpr(sw->cond.get()), l);
+    if (!cond) return;
+    mlir::Type retTy = currentRetTy;
+    int defIdx = -1;
+    // collectSwitchBuckets emits case-value IR into the current region (fine —
+    // those constants live before the scf.if). Case bodies are NOT emitted by
+    // collect; they're handled per-bucket below.
+    auto buckets = collectSwitchBuckets(sw->body.get(), l, defIdx);
+
+    // Helper: emit a bucket's body (statements 0..n-2, then the last minus its
+    // trailing return) and return the value its trailing `return v;` carries,
+    // cast to retTy. Used for both case and default buckets.
+    auto emitBucketBodyAndValue = [&](CaseBucket &b) -> Value {
+      for (size_t k = 0; k + 1 < b.stmts.size(); ++k)
+        visitStmt(b.stmts[k]);
+      if (!b.stmts.empty())
+        emitThenWithoutTrailingReturn(b.stmts.back());
+      ASTNode *retNode = b.stmts.empty() ? nullptr
+                          : trailingReturnValue(b.stmts.back());
+      Value rv = retNode ? visitExpr(retNode) : Value();
+      if (rv) { rv = loadValue(rv, loc(retNode)); rv = castValue(rv, retTy, loc(retNode)); }
+      else rv = builder.create<arith::ConstantOp>(l, retTy,
+                                                  builder.getZeroAttr(retTy));
+      return rv;
+    };
+
+    ++structuredDepth;
+    // Build the case list (non-default buckets in source order).
+    SmallVector<unsigned, 8> caseIdx;
+    for (unsigned i = 0; i < buckets.size(); ++i)
+      if (!buckets[i].isDefault) caseIdx.push_back(i);
+
+    // emitChain(i): emit, in the CURRENT insertion region, the value of the
+    // switch from case i onward — either an scf.if (cond==val -> yield caseVal,
+    // else -> recurse) whose result is returned, or (at the tail) the default
+    // bucket's body + value (or zero). The caller yields the returned value in
+    // its own region.
+    std::function<Value(unsigned)> emitChain = [&](unsigned i) -> Value {
+      if (i < caseIdx.size()) {
+        CaseBucket &b = buckets[caseIdx[i]];
+        Value eq = builder.create<arith::CmpIOp>(
+            l, arith::CmpIPredicate::eq, cond, b.val);
+        auto ifOp = builder.create<scf::IfOp>(l, TypeRange{retTy}, eq,
+                                              /*withElse=*/true);
+        auto saved = builder.saveInsertionPoint();
+        // Then: case body, yield its return value (in the then region).
+        builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+        Value thenVal = emitBucketBodyAndValue(b);
+        builder.create<scf::YieldOp>(l, ValueRange{thenVal});
+        // Else: recurse — emits the rest in the else region and returns its
+        // value, which we yield here in the else region before restoring.
+        builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+        Value elseVal = emitChain(i + 1);
+        builder.create<scf::YieldOp>(l, ValueRange{elseVal});
+        builder.restoreInsertionPoint(saved);
+        return ifOp.getResult(0);
+      }
+      // Innermost tail (emitted in the parent's else region): the default
+      // bucket's body + value, or zero if no default.
+      if (defIdx >= 0) {
+        CaseBucket &d = buckets[defIdx];
+        return emitBucketBodyAndValue(d);
+      }
+      return builder.create<arith::ConstantOp>(l, retTy,
+                                               builder.getZeroAttr(retTy));
+    };
+    Value res = emitChain(0);
+    --structuredDepth;
+    if (res)
+      builder.create<func::ReturnOp>(l, ValueRange{res});
+  }
+
   // Emit an if-then-block (a bare ReturnStmt or a CompoundStmt) skipping its
   // trailing ReturnStmt: the return is modeled by the wrap-around in
   // emitStatements, not by an actual (illegal) return inside the scf.if.
@@ -1084,10 +1479,12 @@ private:
         emitContinue(n);
       break;
     case ASTNode::NodeKind::SwitchStmt:
+      emitSwitch(static_cast<SwitchStmt *>(n));
+      break;
     case ASTNode::NodeKind::CaseStmt:
-      // TODO: switch lowers to a chain of scf.if once needed.
-      error(n, std::string("MLIR backend does not support ") +
-                  nodeKindName(n->getNodeType()) + "; statement dropped");
+      // A CaseStmt reached outside a SwitchStmt body is unreachable in valid C
+      // (the SwitchStmt handler walks the body directly). No-op rather than
+      // crash if it somehow appears standalone.
       break;
     default:
       error(n, std::string("MLIR backend cannot lower ") +
@@ -1362,6 +1759,13 @@ private:
       auto cg = constGlobals.find(name);
       if (cg != constGlobals.end())
         return materializeConstGlobal(cg->second, n);
+      // Unscoped enum constant — fold to its integer literal. Sema registers
+      // these (top-level or mangled ns_NAME); the spirv module has no `const
+      // int NAME=val;` decl, so we materialize the value at the use site.
+      auto ec = enumConstants.find(name);
+      if (ec != enumConstants.end())
+        return builder.create<arith::ConstantOp>(
+            l, builder.getI32IntegerAttr(static_cast<int32_t>(ec->second)));
       return error(n, std::string("use of undeclared identifier '") +
                           name.str() + "' in device code");
     }
@@ -1383,12 +1787,78 @@ private:
       (void)visitExpr(ce->lhs.get());
       return visitExpr(ce->rhs.get());
     }
+    case ASTNode::NodeKind::SizeOfExpr: {
+      // Sema folds the byte count into `folded` during type checking
+      // (sizeOfType: half=2, int/float=4, long/double/ptr=8, vector=elem*count,
+      // record=sum of field sizes). GLSL emits `const int NAME=val;` and lets
+      // glslc resolve bare names; the MLIR/spirv module has no such decl, so
+      // fold to a literal here. Sizes are small and always fit i32.
+      auto *s = static_cast<SizeOfExpr *>(n);
+      int64_t v = s->folded;
+      if (v == 0) {
+        // Sema could not fold (warned at the Sema pass). Fall back to 0 so the
+        // shader still compiles rather than crashing codegen.
+        v = 0;
+      }
+      return builder.create<arith::ConstantOp>(l, builder.getI32IntegerAttr(
+                                                       static_cast<int32_t>(v)));
+    }
     case ASTNode::NodeKind::IndexExpr: {
       // base[idx...] where base is a memref arg / slot or a shared spirv.ptr.
       // Reuses lvalueAddress so multi-dimensional `a[i][j]` collects every
       // subscript into one load, and so shared-array indexing (spirv.AccessChain
       // + spirv.Load) is handled uniformly.
       auto *ie = static_cast<IndexExpr *>(n);
+      // Struct array-field element read: `pts[i].v[k]` where `v` is a vector
+      // field. The i32 slot holds the element's bit pattern; bitcast back to
+      // the field's scalar element type (f32/i32/...). lvalueAddress resolves
+      // the slot; we just retype the loaded value.
+      if (ie->base && ie->base->getNodeType() ==
+                          ASTNode::NodeKind::MemberAccessExpr) {
+        Value mem;
+        SmallVector<Value, 4> idxs;
+        if (lvalueAddress(ie, mem, idxs) && mem.getType().isa<MemRefType>() &&
+            idxs.size() == 1) {
+          // Confirm this was the struct-array-field path by checking the base
+          // member resolves to a vector field (structFieldAddr-only path sets
+          // a single index; the generic memref path also can, so guard by
+          // re-checking the member is a struct array field).
+          auto *ma = static_cast<MemberAccessExpr *>(ie->base.get());
+          Value fm, si;
+          mlir::Type fty;
+          std::vector<int64_t> adims;
+          if (structFieldAddr(ma, l, Value(), fm, si, fty, &adims) &&
+              !adims.empty()) {
+            mlir::Type elemTy = fty;
+            Value raw = builder.create<memref::LoadOp>(l, mem, idxs);
+            if (elemTy.isF32())
+              return builder.create<arith::BitcastOp>(l, builder.getF32Type(),
+                                                      raw);
+            if (elemTy.isF16())
+              return builder.create<arith::BitcastOp>(l, builder.getF16Type(),
+                                                      raw);
+            if (elemTy.isF64()) {
+              // 8-byte element: load lo+hi and combine (rare for array fields).
+              Value one = builder.create<arith::ConstantOp>(
+                  l, builder.getIndexType(), builder.getIndexAttr(1));
+              Value slotHi = builder.create<arith::AddIOp>(l, idxs[0], one);
+              Value hi = builder.create<memref::LoadOp>(
+                  l, mem, ValueRange{slotHi});
+              Value lo64 = builder.create<arith::ExtUIOp>(
+                  l, builder.getI64Type(), raw);
+              Value hi64 = builder.create<arith::ExtUIOp>(
+                  l, builder.getI64Type(), hi);
+              Value sh = builder.create<arith::ConstantOp>(
+                  l, builder.getI64Type(), builder.getI64IntegerAttr(32));
+              Value hiUp = builder.create<arith::ShLIOp>(l, hi64, sh);
+              Value asI64 = builder.create<arith::OrIOp>(l, lo64, hiUp);
+              return builder.create<arith::BitcastOp>(l, builder.getF64Type(),
+                                                      asI64);
+            }
+            return castValue(raw, elemTy, l);
+          }
+        }
+      }
       Value loaded = loadLValue(ie, l);
       if (!loaded)
         return error(ie, "subscript of non-array value");
@@ -1417,6 +1887,14 @@ private:
           return builder.create<arith::IndexCastOp>(
               l, builder.getI32Type(), idxV);
       }
+      // Struct field read: `pts[i].x` / `result[i].field` where the base is a
+      // pointer-to-struct SSBO. Symmetric to storeStructField's offset math:
+      // byteOff = elemIdx*stride + fieldOffset; slot = byteOff/4; load i32 (or
+      // lo+hi for 8-byte) and bitcast back to the field type. Try this BEFORE
+      // the vector-swizzle path (a struct field of vector type would otherwise
+      // be misread; the demos only read scalar fields this way).
+      if (Value fv = loadStructField(m, l))
+        return fv;
       // Vector swizzle read: base is a vector value, member is one of
       // x/y/z/w (single component -> scalar extract) or a multi-char swizzle
       // like xy/xyz/xz (-> vector shuffle selecting a subset). The GLSL backend
@@ -1515,7 +1993,7 @@ private:
         if (auto bv = emitBuiltinCall(ref->name, c->args, l, matched))
           return bv;
         if (matched) return Value();
-        auto fit = funcTable.find(ref->name);
+        auto fit = funcTable.find(ref->name.str());
         if (fit != funcTable.end()) {
           SmallVector<Value> args;
           for (auto &a : c->args) {
@@ -1526,7 +2004,7 @@ private:
           // Complete trailing defaulted parameters the call omits, mirroring
           // the GLSL backend: append each default expression from the callee
           // signature until the argument count matches the parameter count.
-          auto dit = funcDecls.find(ref->name);
+          auto dit = funcDecls.find(ref->name.str());
           if (dit != funcDecls.end()) {
             const FunctionDecl *calleeFn = dit->second;
             for (unsigned i = c->args.size(); i < calleeFn->params.size(); ++i) {
@@ -1541,6 +2019,62 @@ private:
           FunctionType fty = fit->second.getFunctionType();
           if (fty.getNumResults() == 0) return Value();
           return call.getResult(0);
+        }
+      }
+      // Scoped call `ns::func(args)` (MemberAccessExpr callee with isScope):
+      // mangle to `ns_func` and look up in funcTable, mirroring the host's
+      // launchHandleName and buildFunction's deviceFuncName. The scope chain is
+      // left-nested: MemberAccessExpr(base=MemberAccessExpr(...), member=f) for
+      // `outer::inner::f`, flattened to `outer_inner_f`.
+      if (c->callee &&
+          c->callee->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+        auto *ma = static_cast<MemberAccessExpr *>(c->callee.get());
+        if (ma->isScope) {
+          // Walk the scope chain to collect [outer, inner, ..., func].
+          std::vector<std::string> parts;
+          parts.push_back(ma->member.str());
+          const ASTNode *cur = ma->base.get();
+          while (cur) {
+            if (cur->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+              auto *sub = static_cast<const MemberAccessExpr *>(cur);
+              parts.push_back(sub->member.str());
+              cur = sub->base.get();
+            } else if (cur->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+              parts.push_back(static_cast<const DeclRefExpr *>(cur)->name.str());
+              break;
+            } else
+              break;
+          }
+          std::reverse(parts.begin(), parts.end());
+          std::string mangled;
+          for (auto &p : parts) {
+            if (!mangled.empty()) mangled += '_';
+            mangled += p;
+          }
+          auto fit = funcTable.find(mangled);
+          if (fit != funcTable.end()) {
+            SmallVector<Value> args;
+            for (auto &a : c->args) {
+              Value av = visitExpr(a.get());
+              if (!av) return error(a.get(), "could not evaluate call argument");
+              args.push_back(loadValue(av, loc(a.get())));
+            }
+            auto dit = funcDecls.find(mangled);
+            if (dit != funcDecls.end()) {
+              const FunctionDecl *calleeFn = dit->second;
+              for (unsigned i = c->args.size(); i < calleeFn->params.size(); ++i) {
+                if (!calleeFn->params[i]->defaultVal) break;
+                Value dv = visitExpr(calleeFn->params[i]->defaultVal.get());
+                if (!dv) return error(calleeFn->params[i]->defaultVal.get(),
+                                     "could not evaluate default argument");
+                args.push_back(loadValue(dv, loc(calleeFn->params[i]->defaultVal.get())));
+              }
+            }
+            auto call = builder.create<func::CallOp>(l, fit->second, args);
+            FunctionType fty = fit->second.getFunctionType();
+            if (fty.getNumResults() == 0) return Value();
+            return call.getResult(0);
+          }
         }
       }
       return error(n, "MLIR backend does not support this call "
@@ -2216,6 +2750,123 @@ private:
       // semantics when struct/array members need them).
       return v;
     }
+  }
+
+  // Resolve the (memref, slotIdx, fieldType) for a struct field access, shared
+  // by loadStructField and the array-field lvalue path. Returns true if `m` is
+  // a `ptr->struct.field` access resolvable to an SSBO slot. `extraByteOff` is
+  // added to the field offset (used for array-field element indexing:
+  // `pts[i].v[k]` adds k*elemSize). On success, `mem` is the SSBO memref,
+  // `slotIdx` is the i32-granular slot index, and `fieldTy` is the field's
+  // MLIR type.
+  bool structFieldAddr(const MemberAccessExpr *m, Location l,
+                       Value extraByteOff, Value &mem, Value &slotIdx,
+                       mlir::Type &fieldTy,
+                       std::vector<int64_t> *arrayDimsOut = nullptr) {
+    if (!m->base) return false;
+    ASTNode *base = m->base.get();
+    ASTNode *indexNode = nullptr;
+    if (base->getNodeType() == ASTNode::NodeKind::IndexExpr) {
+      auto *ie = static_cast<IndexExpr *>(base);
+      indexNode = ie->index.get();
+      base = ie->base.get();
+    }
+    if (!base || base->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+      return false;
+    auto *ref = static_cast<DeclRefExpr *>(base);
+    auto tit = localTypes.find(ref->name);
+    if (tit == localTypes.end()) return false;
+    const vc::Type *t = tit->second;
+    if (!t || !isa<PointerType>(t)) return false;
+    const vc::Type *pointee = cast<PointerType>(t)->pointee;
+    if (!pointee || !isa<RecordType>(pointee)) return false;
+    auto *rec = cast<RecordType>(pointee);
+    auto lit = recordLayouts.find(rec->decl->name);
+    if (lit == recordLayouts.end()) return false;
+    const StructLayout &layout = lit->second;
+    const FieldLayout *fld = nullptr;
+    for (const auto &f : layout.fields)
+      if (f.name == m->member) { fld = &f; break; }
+    if (!fld) return false;
+    if (arrayDimsOut) *arrayDimsOut = fld->arrayDims;
+
+    auto sit = locals.find(ref->name);
+    if (sit == locals.end()) return false;
+    mem = sit->second;
+    if (!mem.getType().isa<MemRefType>()) return false;
+    fieldTy = fld->type;
+
+    // byteOff = fieldOffset + elemIdx*stride + extraByteOff
+    Value byteOff = builder.create<arith::ConstantOp>(
+        l, builder.getI32Type(),
+        builder.getI32IntegerAttr((int32_t)fld->offset));
+    if (indexNode) {
+      Value idx = loadValue(visitExpr(indexNode), loc(indexNode));
+      if (!idx) return false;
+      idx = castValue(idx, builder.getI32Type(), l);
+      Value strideConst = builder.create<arith::ConstantOp>(
+          l, builder.getI32Type(),
+          builder.getI32IntegerAttr((int32_t)layout.stride));
+      Value elemOff = builder.create<arith::MulIOp>(l, idx, strideConst);
+      byteOff = builder.create<arith::AddIOp>(l, byteOff, elemOff);
+    }
+    if (extraByteOff)
+      byteOff = builder.create<arith::AddIOp>(l, byteOff, extraByteOff);
+    slotIdx = builder.create<arith::ShRSIOp>(
+        l, byteOff,
+        builder.create<arith::ConstantOp>(l, builder.getI32Type(),
+                                          builder.getI32IntegerAttr(2)));
+    slotIdx = castValue(slotIdx, builder.getIndexType(), l);
+    return true;
+  }
+
+  // Load a scalar struct field `pts[i].x` / `result[i].f`. Returns the field
+  // value in its native type (bitcast from the i32 slot's bit pattern, mirroring
+  // storeStructField). Returns null if `m` is not a struct-pointer field access
+  // or the field is an array (array fields are read element-wise via the
+  // IndexExpr lvalue path, not as a whole).
+  Value loadStructField(const MemberAccessExpr *m, Location l) {
+    if (!m->base) return Value();
+    // Reject array fields: `pts[i].v` (v is float[2]) is not a scalar load; it
+    // is only meaningful when indexed (`pts[i].v[0]`), handled by the IndexExpr
+    // lvalue path. Array-ness lives in FieldDecl::arrayDims (the field's MLIR
+    // type is the scalar element, not a vector).
+    Value mem, slotIdx;
+    mlir::Type fieldTy;
+    std::vector<int64_t> adims;
+    if (!structFieldAddr(m, l, Value(), mem, slotIdx, fieldTy, &adims))
+      return Value();
+    if (!adims.empty())
+      return Value(); // array field read as a whole — not supported here.
+    unsigned bytes =
+        fieldTy.isIntOrFloat() ? (fieldTy.getIntOrFloatBitWidth() / 8) : 4;
+    if (bytes <= 4) {
+      // f32/i32/bool: load the i32 slot and bitcast back to the field type.
+      Value raw = builder.create<memref::LoadOp>(
+          l, builder.getI32Type(), mem, ValueRange{slotIdx});
+      if (fieldTy.isF32())
+        return builder.create<arith::BitcastOp>(l, builder.getF32Type(), raw);
+      if (fieldTy.isF16())
+        return builder.create<arith::BitcastOp>(l, builder.getF16Type(), raw);
+      return castValue(raw, fieldTy, l);
+    }
+    // i64/f64: load lo+hi i32 slots, combine into i64, bitcast back.
+    Value lo = builder.create<memref::LoadOp>(
+        l, builder.getI32Type(), mem, ValueRange{slotIdx});
+    Value one = builder.create<arith::ConstantOp>(
+        l, builder.getIndexType(), builder.getIndexAttr(1));
+    Value slotHi = builder.create<arith::AddIOp>(l, slotIdx, one);
+    Value hi = builder.create<memref::LoadOp>(
+        l, builder.getI32Type(), mem, ValueRange{slotHi});
+    Value lo64 = builder.create<arith::ExtUIOp>(l, builder.getI64Type(), lo);
+    Value hi64 = builder.create<arith::ExtUIOp>(l, builder.getI64Type(), hi);
+    Value sh = builder.create<arith::ConstantOp>(
+        l, builder.getI64Type(), builder.getI64IntegerAttr(32));
+    Value hiUp = builder.create<arith::ShLIOp>(l, hi64, sh);
+    Value asI64 = builder.create<arith::OrIOp>(l, lo64, hiUp);
+    if (fieldTy.isF64())
+      return builder.create<arith::BitcastOp>(l, builder.getF64Type(), asI64);
+    return castValue(asI64, fieldTy, l);
   }
 
   // Store `rhs` into struct field `m` (e.g. `result[i].f = rhs`). Returns true
