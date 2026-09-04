@@ -25,6 +25,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
@@ -75,6 +76,11 @@ class ASTToMLIRImpl {
   std::vector<std::unique_ptr<std::string>> nsPrefixStore;
   // Entry block of the function being emitted (for hoisting const slots).
   Block *entryBlock = nullptr;
+  // Set when any CUDA warp/subgroup intrinsic (warpSize, __shfl_*, __ballot_sync,
+  // __anySync, __allSync, __syncwarp, __activemask) is lowered. The subgroup
+  // spirv ops require SPIR-V 1.3 + GroupNonUniform* capabilities; VCToGPU reads
+  // the `vc.uses_subgroup` module attr this drives to bump the target env.
+  bool usesSubgroup = false;
   //--- Struct layout (for `Result*`-style SSBO field access) -------------//
   // The MLIR backend does not emit struct definitions (spirv.module needs no
   // record type declaration for raw-offset field access). Instead, each
@@ -131,6 +137,7 @@ public:
     ctx.getOrLoadDialect<memref::MemRefDialect>();
     ctx.getOrLoadDialect<scf::SCFDialect>();
     ctx.getOrLoadDialect<spirv::SPIRVDialect>();
+    ctx.getOrLoadDialect<gpu::GPUDialect>();
   }
 
   ModuleOp translate(const TranslationUnit &tu) {
@@ -148,6 +155,11 @@ public:
   }
 
   bool failed() const { return hadError; }
+
+  // True if device code referenced a warp/subgroup intrinsic (warpSize,
+  // __shfl_*, __ballot_sync, __anySync, __allSync, __syncwarp, __activemask),
+  // so the driver can bump the SPIR-V target env to 1.3 + subgroup caps.
+  bool usedSubgroup() const { return usesSubgroup; }
 
 private:
   Location loc(const ASTNode *n) {
@@ -776,6 +788,21 @@ private:
     return builder.create<spirv::AddressOfOp>(l, ptrTy, sym);
   }
 
+  // Materialize the subgroup size (CUDA `warpSize`) as an i32 SSA value.
+  // Emitted as gpu.subgroup_size (returns index); GPUToSPIRV's
+  // SingleDimLaunchConfigConversion lowers it to a spirv GlobalVariable
+  // decorated `BuiltIn SubgroupSize` + a Load, creating the builtin global the
+  // same way it creates WorkgroupId/LocalInvocationId (so the built_in
+  // decoration lands in the op's Properties struct, which the serializer
+  // requires — a hand-built {builtin = ...} dict attr is rejected). The result
+  // is index-cast to i32 (VC ints are 32-bit). Flips usesSubgroup so VCToGPU
+  // bumps the target env to 1.3 + subgroup caps.
+  Value getSubgroupSize(Location l) {
+    usesSubgroup = true;
+    Value sz = builder.create<gpu::SubgroupSizeOp>(l, builder.getIndexType());
+    return builder.create<arith::IndexCastOp>(l, builder.getI32Type(), sz);
+  }
+
   // Put two operands on a common type for a binop: float stays float, and if
   // one side is index the other is promoted to index (indexing arithmetic).
   std::pair<Value, Value> commonize(Value l, Value r, Location lc) {
@@ -835,13 +862,26 @@ private:
       return builder.create<arith::SIToFPOp>(lc, to, v);
     if (from.isIntOrIndex() && to.isF64())
       return builder.create<arith::SIToFPOp>(lc, to, v);
+    if (from.isIntOrIndex() && to.isF16())
+      return builder.create<arith::SIToFPOp>(lc, to, v);
     if (from.isF32() && to.isSignlessInteger())
       return builder.create<arith::FPToSIOp>(lc, to, v);
     if (from.isF64() && to.isSignlessInteger())
       return builder.create<arith::FPToSIOp>(lc, to, v);
+    if (from.isF16() && to.isSignlessInteger())
+      return builder.create<arith::FPToSIOp>(lc, to, v);
     if (from.isF32() && to.isF64())
       return builder.create<arith::ExtFOp>(lc, to, v);
     if (from.isF64() && to.isF32())
+      return builder.create<arith::TruncFOp>(lc, to, v);
+    // f16 ↔ wider floats: widen with ExtFOp, narrow with TruncFOp.
+    if (from.isF16() && to.isF32())
+      return builder.create<arith::ExtFOp>(lc, to, v);
+    if (from.isF16() && to.isF64())
+      return builder.create<arith::ExtFOp>(lc, to, v);
+    if (from.isF32() && to.isF16())
+      return builder.create<arith::TruncFOp>(lc, to, v);
+    if (from.isF64() && to.isF16())
       return builder.create<arith::TruncFOp>(lc, to, v);
     return v;
   }
@@ -1766,6 +1806,12 @@ private:
       if (ec != enumConstants.end())
         return builder.create<arith::ConstantOp>(
             l, builder.getI32IntegerAttr(static_cast<int32_t>(ec->second)));
+      // warpSize — the runtime subgroup size. Lowered to the spirv SubgroupSize
+      // builtin (a module-scope Input global of i32), not a constant: the
+      // device's subgroup size is adaptive (32 on typical GPUs, but not
+      // guaranteed), mirroring the GLSL backend's `int(gl_SubgroupSize)`.
+      if (name == "warpSize")
+        return getSubgroupSize(l);
       return error(n, std::string("use of undeclared identifier '") +
                           name.str() + "' in device code");
     }
@@ -2134,6 +2180,11 @@ private:
     if (auto v = emitAtomicBuiltin(name, args, l)) return v;
     if (emitFenceBuiltin(name, l)) return Value();
     if (auto v = emitVoteBuiltin(name, args, l)) return v;
+    // emitWarpBuiltin handles void __syncwarp (returns null with warpMatched
+    // set), so dispatch it before the matched=false fallback.
+    bool warpMatched = false;
+    if (auto v = emitWarpBuiltin(name, args, l, warpMatched)) return v;
+    if (warpMatched) return Value();
     matched = false;
     return Value();
   }
@@ -2692,6 +2743,123 @@ private:
                                          IntegerAttr());
   }
 
+  // Lower a CUDA warp intrinsic to its spirv subgroup counterpart. CUDA warp
+  // intrinsics take a leading `mask` argument (active-lane bitmask); subgroups
+  // have no such concept (ops apply to active invocations), so the mask is
+  // dropped. Layout per intrinsic (mirrors the GLSL backend's emitWarpIntrinsic
+  // in ASTToGLSL.cpp:801):
+  //   __syncwarp(mask?)               -> spirv.ControlBarrier Subgroup (void)
+  //   __activemask()                  -> GroupNonUniformBallot(true).x  -> i32
+  //   __ballot_sync(mask, pred)       -> GroupNonUniformBallot(pred).x  -> i32
+  //   __anySync(mask, pred)           -> GroupNonUniformLogicalOr Reduce(pred) -> i32
+  //   __allSync(mask, pred)           -> GroupNonUniformLogicalAnd Reduce(pred) -> i32
+  //   __shfl_sync(mask, v, lane)      -> GroupNonUniformShuffle(v, lane)
+  //   __shfl_up_sync(mask, v, d)      -> GroupNonUniformShuffleUp(v, d)
+  //   __shfl_down_sync(mask, v, d)    -> GroupNonUniformShuffleDown(v, d)
+  //   __shfl_xor_sync(mask, v, lm)    -> GroupNonUniformShuffleXor(v, lm)
+  // __ballot_sync/__activemask return a 32-bit bitmask in CUDA; GroupNonUniform
+  // Ballot returns vector<4xi32>, so CompositeExtract component 0 yields the
+  // low 32 bits (correct for subgroup<=32). Vote results are i1; VC bool is
+  // i32, so ExtUI back to i32. `warpMatched` is set true for any recognized
+  // intrinsic (including void __syncwarp, which returns a null Value). Returns
+  // null (and leaves warpMatched false) if `name` is not a warp intrinsic.
+  Value emitWarpBuiltin(llvm::StringRef name,
+                        const std::vector<NodePtr> &args, Location l,
+                        bool &warpMatched) {
+    warpMatched = false;
+    auto i1toi32 = [&](Value v) {
+      return builder.create<arith::ExtUIOp>(l, builder.getI32Type(), v);
+    };
+    // ballot: args[0]=mask (dropped), args[1]=predicate (or true for
+    // __activemask). Returns the low 32 bits of the uvec4 ballot.
+    auto ballotLow = [&](Value predI1) -> Value {
+      mlir::VectorType v4i32 =
+          mlir::VectorType::get({4}, builder.getI32Type());
+      Value v = builder.create<spirv::GroupNonUniformBallotOp>(
+          l, v4i32, spirv::Scope::Subgroup, predI1);
+      return builder.create<spirv::CompositeExtractOp>(
+          l, builder.getI32Type(), v, builder.getI32ArrayAttr({0}));
+    };
+
+    if (name == "__syncwarp") {
+      warpMatched = true;
+      usesSubgroup = true;
+      // subgroupBarrier = ControlBarrier(Subgroup, Subgroup, None): an
+      // execution+memory sync scoped to the subgroup. MemorySemantics None is
+      // fine for a pure execution barrier (CUDA __syncwarp is a warp sync).
+      builder.create<spirv::ControlBarrierOp>(
+          l, spirv::Scope::Subgroup, spirv::Scope::Subgroup,
+          spirv::MemorySemantics::None);
+      return Value();
+    }
+    if (name == "__activemask") {
+      warpMatched = true;
+      usesSubgroup = true;
+      Value t = builder.create<spirv::ConstantOp>(
+          l, builder.getI1Type(), builder.getBoolAttr(true));
+      return ballotLow(t);
+    }
+    if (name == "__ballot_sync") {
+      warpMatched = true;
+      usesSubgroup = true;
+      // args[0]=mask (dropped), args[1]=predicate
+      if (args.size() < 2)
+        return error(nullptr, "__ballot_sync needs (mask, predicate)");
+      Value pred = toI1(visitExpr(args[1].get()), l);
+      return ballotLow(pred);
+    }
+    if (name == "__anySync") {
+      warpMatched = true;
+      usesSubgroup = true;
+      if (args.size() < 2)
+        return error(nullptr, "__anySync needs (mask, predicate)");
+      Value pred = toI1(visitExpr(args[1].get()), l);
+      Value r = builder.create<spirv::GroupNonUniformLogicalOrOp>(
+          l, builder.getI1Type(), spirv::Scope::Subgroup,
+          spirv::GroupOperation::Reduce, pred, Value());
+      return i1toi32(r);
+    }
+    if (name == "__allSync") {
+      warpMatched = true;
+      usesSubgroup = true;
+      if (args.size() < 2)
+        return error(nullptr, "__allSync needs (mask, predicate)");
+      Value pred = toI1(visitExpr(args[1].get()), l);
+      Value r = builder.create<spirv::GroupNonUniformLogicalAndOp>(
+          l, builder.getI1Type(), spirv::Scope::Subgroup,
+          spirv::GroupOperation::Reduce, pred, Value());
+      return i1toi32(r);
+    }
+    // __shfl* family: args[0]=mask (dropped), args[1]=value, args[2]=index/
+    // delta, optional args[3]=width (dropped). The value keeps its type; the
+    // index/delta is i32 (CUDA int). GroupNonUniformShuffle* are pure and
+    // result-typed == value type.
+    if (name == "__shfl_sync" || name == "__shfl_up_sync" ||
+        name == "__shfl_down_sync" || name == "__shfl_xor_sync") {
+      warpMatched = true;
+      usesSubgroup = true;
+      if (args.size() < 3)
+        return error(nullptr, "warp shuffle needs (mask, value, index)");
+      Value val = loadValue(visitExpr(args[1].get()), l);
+      Value idx = loadValue(visitExpr(args[2].get()), l);
+      // Shuffle ops require an i32 index (not index type).
+      if (idx.getType().isIndex())
+        idx = builder.create<arith::IndexCastOp>(l, builder.getI32Type(), idx);
+      if (name == "__shfl_sync")
+        return builder.create<spirv::GroupNonUniformShuffleOp>(
+            l, val.getType(), spirv::Scope::Subgroup, val, idx);
+      if (name == "__shfl_up_sync")
+        return builder.create<spirv::GroupNonUniformShuffleUpOp>(
+            l, val.getType(), spirv::Scope::Subgroup, val, idx);
+      if (name == "__shfl_down_sync")
+        return builder.create<spirv::GroupNonUniformShuffleDownOp>(
+            l, val.getType(), spirv::Scope::Subgroup, val, idx);
+      return builder.create<spirv::GroupNonUniformShuffleXorOp>(
+          l, val.getType(), spirv::Scope::Subgroup, val, idx);
+    }
+    return Value();
+  }
+
   Value emitUnary(const UnaryExpr *u) {
     Location l = loc(u);
     Value v = visitExpr(u->operand.get());
@@ -3095,7 +3263,7 @@ private:
     mlir::Type elemTy = lhs.getType();
     if (auto vty = elemTy.dyn_cast<mlir::VectorType>())
       elemTy = vty.getElementType();
-    bool isFloat = elemTy.isF32() || elemTy.isF64();
+    bool isFloat = elemTy.isF32() || elemTy.isF64() || elemTy.isF16();
     switch (b->op) {
     case BinaryOp::Add:
       return isFloat ? (Value)builder.create<arith::AddFOp>(l, lhs, rhs)
@@ -3191,5 +3359,9 @@ OwningOpRef<ModuleOp> vc::codegen::translateASTToMLIR(const TranslationUnit &tu,
     module.erase();
     return OwningOpRef<ModuleOp>();
   }
+  // Flag subgroup usage so VCToGPU can bump the SPIR-V target env to 1.3 and
+  // advertise the GroupNonUniform* capabilities the lowered warp ops need.
+  if (impl.usedSubgroup())
+    module->setAttr("vc.uses_subgroup", UnitAttr::get(&ctx));
   return OwningOpRef<ModuleOp>(module);
 }
