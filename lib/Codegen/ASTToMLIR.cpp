@@ -63,6 +63,19 @@ class ASTToMLIRImpl {
   // field's byte offset can be looked up in recordLayouts. Scalars/pointers to
   // builtin types are not consulted, so a missing entry is non-fatal for them.
   llvm::StringMap<const vc::Type *> localTypes;
+  // By-value struct parameters (features2's `sumcomp(Vec4 v)`) are scalarized
+  // into N field-typed block args (a memref parameter would carry SSBO-pointer
+  // semantics and fail to legalize as a by-value value). At the callee entry,
+  // those N scalars are stored into a fresh local memref<Nxi32> slot bound to
+  // the param name, so the body's `v.c[k]` field access reuses the same
+  // structFieldAddr/local-struct path as a local `Vec4 v;` decl. This map
+  // records, per param name, the [startArg, count) of the scalarized block args
+  // and the field element types, used to materialize the slot at entry.
+  struct StructParamSlots {
+    unsigned startArg = 0;
+    SmallVector<mlir::Type, 4> fieldTys;
+  };
+  llvm::StringMap<StructParamSlots> structParams;
   // name -> __constant__ global VarDecl, materialized lazily per kernel.
   llvm::StringMap<const VarDecl *> constGlobals;
   // name -> enum constant value. Unscoped enums are flattened at the top level
@@ -101,6 +114,14 @@ class ASTToMLIRImpl {
     uint32_t stride; // sizeof, rounded up to the struct's max field alignment
   };
   llvm::StringMap<StructLayout> recordLayouts;
+  // name -> StructDecl, so a method defined before its class body (class.vc's
+  // `Accumulator::add` precedes `Class Accumulator { ... }`) can still force the
+  // class layout before reading it. Populated as visitTopLevel walks tu.decls.
+  llvm::StringMap<const StructDecl *> structDecls;
+  const StructDecl *lookupStructDecl(StringRef name) const {
+    auto it = structDecls.find(name);
+    return it == structDecls.end() ? nullptr : it->second;
+  }
   // Return type of the function currently being emitted (None for void).
   mlir::Type currentRetTy;
   // Set when any diagnostic error is emitted, so the driver can fail.
@@ -143,6 +164,12 @@ public:
   ModuleOp translate(const TranslationUnit &tu) {
     module = ModuleOp::create(UnknownLoc::get(&ctx));
     builder.setInsertionPointToStart(module.getBody());
+    // First pass: register + lay out every top-level (and nested-in-namespace)
+    // StructDecl/class so a method defined before its class body (class.vc's
+    // `Accumulator::add` precedes `Class Accumulator { ... }`) can resolve the
+    // class layout when buildFunction synthesizes its `_this` parameter.
+    for (auto &d : tu.decls)
+      preRegisterStructs(d.get(), StringRef());
     for (auto &d : tu.decls) {
       // Pre-register __constant__ globals so device code can read them.
       if (d->getNodeType() == ASTNode::NodeKind::VarDecl) {
@@ -152,6 +179,25 @@ public:
       visitTopLevel(d.get());
     }
     return module;
+  }
+
+  // Walk a decl tree collecting StructDecls into structDecls + recordLayouts.
+  // Mirrors visitTopLevel's namespace recursion but only registers records.
+  void preRegisterStructs(const ASTNode *n, StringRef nsPrefix) {
+    if (!n) return;
+    if (n->getNodeType() == ASTNode::NodeKind::StructDecl) {
+      auto *sd = static_cast<const StructDecl *>(n);
+      structDecls[sd->name] = sd;
+      recordStructLayout(sd);
+      return;
+    }
+    if (n->getNodeType() == ASTNode::NodeKind::NamespaceDecl) {
+      auto *ns = static_cast<const NamespaceDecl *>(n);
+      std::string prefix =
+          nsPrefix.empty() ? ns->name.str() : nsPrefix.str() + "::" + ns->name.str();
+      nsPrefixStore.push_back(std::make_unique<std::string>(prefix));
+      for (auto &d : ns->decls) preRegisterStructs(d.get(), *nsPrefixStore.back());
+    }
   }
 
   bool failed() const { return hadError; }
@@ -223,7 +269,9 @@ private:
     // access. (See cvtType's PointerType<RecordType> handling and the
     // MemberAccessExpr lvalue path.)
     if (n->getNodeType() == ASTNode::NodeKind::StructDecl) {
-      recordStructLayout(static_cast<const StructDecl *>(n));
+      auto *sd = static_cast<const StructDecl *>(n);
+      structDecls[sd->name] = sd;
+      recordStructLayout(sd);
       return;
     }
     // Typedef aliases are resolved at use sites via cvtType (TypedefType branch);
@@ -364,6 +412,25 @@ private:
       if (!elem) return mlir::Type();
       return mlir::VectorType::get({v->count}, elem);
     }
+    // A bare struct value (local variable, or a non-pointer parameter): a local
+    // `Accumulator acc;` / `Vec4 v;` / `VcPipeline pipe;` becomes a flat
+    // memref<Nxi32, Function> slot — N = stride/4 i32 slots — reusing the same
+    // byte-offset->slot math (structFieldAddr/loadStructField/storeStructField)
+    // as the Pointer<RecordType> SSBO path below, only with no index*stride
+    // term (one struct, not an array of them). This mirrors how the GLSL backend
+    // treats a local struct as an ordinary variable. By-value struct *function
+    // parameters* are NOT handled here (memref parameters carry SSBO-pointer
+    // semantics); buildFunction scalarizes them into N field-typed args. The
+    // three struct-value demos (features2/class/async_copy) all use 4-byte
+    // fields, so i32 granularity covers them directly with no lo/hi splitting.
+    if (isa<RecordType>(t)) {
+      auto *sd = cast<RecordType>(t)->decl;
+      auto it = recordLayouts.find(sd->name);
+      if (it == recordLayouts.end()) return mlir::Type();
+      int64_t slots = ((int64_t)it->second.stride + 3) / 4; // i32 slots
+      if (slots < 1) slots = 1;
+      return MemRefType::get({slots}, builder.getI32Type());
+    }
     if (isa<PointerType>(t)) {
       // pointer-to-T  ->  memref<?xT> in the StorageBuffer (global device
       // memory) storage class; MemRefToSPIRV requires a SPIR-V storage class
@@ -413,10 +480,12 @@ private:
   // The device-side symbol name for a function: a namespace member `ns::func`
   // becomes `ns_func` (nested `outer::inner::func` -> `outer_inner_func`), so
   // the host's launchHandleName (`math::fill` -> `math_fill`) and the device
-  // func.func symbol agree. Top-level free functions keep their name. Mirrors
-  // GLSL's deviceFuncName and Sema's mangledFuncName. (Method mangling for
-  // class.vc is left to a later pass.)
+  // func.func symbol agree. Top-level free functions keep their name. A class
+  // method `Class::method` becomes `Class_method` (the leading `_this` arg is
+  // synthesized in buildFunction, mirroring GLSL's `inout Class _this`).
   static std::string deviceFuncName(const FunctionDecl *f) {
+    if (f->isMethod && !f->className.empty())
+      return f->className.str() + "_" + f->name.str();
     if (!f->nsName.empty()) {
       std::string out;
       llvm::StringRef rest = f->nsName;
@@ -431,15 +500,155 @@ private:
     return f->name.str();
   }
 
+  // Collect the flat scalar MLIR types of a struct's fields, expanding array
+  // fields element-by-element (e.g. `struct Vec4 { float c[4]; }` -> [f32,f32,
+  // f32,f32]). Used to scalarize a by-value struct function parameter: each
+  // element becomes its own block arg, sidestepping the SSBO-pointer semantics
+  // a memref parameter would carry. Returns empty if the struct isn't laid out
+  // or has an unsupported field (the caller then leaves the param unexpanded).
+  SmallVector<mlir::Type, 4> structFieldScalarTypes(const RecordType *rec) {
+    SmallVector<mlir::Type, 4> out;
+    if (!rec || !rec->decl) return out;
+    auto it = recordLayouts.find(rec->decl->name);
+    if (it == recordLayouts.end()) return out;
+    for (const FieldLayout &f : it->second.fields) {
+      if (f.arrayDims.empty()) {
+        out.push_back(f.type);
+      } else {
+        int64_t n = 1;
+        for (int64_t d : f.arrayDims) n *= (d > 0 ? d : 1);
+        for (int64_t i = 0; i < n; ++i) out.push_back(f.type);
+      }
+    }
+    return out;
+  }
+
+  // At a call site, a by-value struct argument (`sumcomp(v)` where `v` is a
+  // local `Vec4`) must be expanded into N scalar field values matching the
+  // callee's scalarized signature. Reads each field's i32 slot from the local
+  // struct memref and bitcasts back to the field type (mirroring loadStructField
+  // for the <=4-byte case). Returns true and appends to `out` on success; false
+  // if `arg` isn't a local struct value (the caller falls back to a plain arg).
+  bool expandStructArg(ASTNode *arg, SmallVectorImpl<Value> &out, Location l) {
+    if (!arg || arg->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+      return false;
+    auto *ref = static_cast<DeclRefExpr *>(arg);
+    auto tit = localTypes.find(ref->name);
+    if (tit == localTypes.end()) return false;
+    const vc::Type *t = tit->second;
+    if (!t || !isa<RecordType>(t)) return false;
+    auto *rec = cast<RecordType>(t);
+    auto layIt = recordLayouts.find(rec->decl->name);
+    if (layIt == recordLayouts.end()) return false;
+    auto sit = locals.find(ref->name);
+    if (sit == locals.end()) return false;
+    Value mem = sit->second;
+    if (!mem.getType().isa<MemRefType>()) return false;
+    const StructLayout &layout = layIt->second;
+    for (const FieldLayout &fld : layout.fields) {
+      int64_t n = 1;
+      for (int64_t d : fld.arrayDims) n *= (d > 0 ? d : 1);
+      for (int64_t e = 0; e < n; ++e) {
+        Value off = builder.create<arith::ConstantOp>(
+            l, builder.getIndexType(),
+            builder.getIndexAttr((int64_t)(fld.offset / 4 + e)));
+        Value slotIdx = off;
+        Value raw = builder.create<memref::LoadOp>(l, builder.getI32Type(), mem,
+                                                    ValueRange{slotIdx});
+        mlir::Type fty = fld.type;
+        if (fty.isF32())
+          out.push_back(builder.create<arith::BitcastOp>(l, fty, raw));
+        else if (fty.isF16())
+          out.push_back(builder.create<arith::BitcastOp>(l, fty, raw));
+        else
+          out.push_back(castValue(raw, fty, l));
+      }
+    }
+    return true;
+  }
+
   void buildFunction(const FunctionDecl *fn) {
     if (!fn) return;
-    // Mangled device symbol (ns_func); the host launch resolves `ns::func` to
-    // the same key, and scoped call sites (`ns::func(...)`) look it up here.
+    // Mangled device symbol (ns_func, or Class_method for a class method); the
+    // host launch resolves `ns::func` / `obj.method` to the same key.
     std::string symName = deviceFuncName(fn);
-    // Function signature
+
+    // A class method is never emitted as a func.func here: SPIR-V cannot pass
+    // the Function-storage struct memref `_this` as a by-ref parameter through
+    // func.call (FuncToSPIRV + GPUToSPIRV leave an unrealized_conversion_cast
+    // they can't legalize for memref args). Instead, method call sites INLINE
+    // the body with `_this` bound to the caller's object (see the non-scope
+    // MemberAccessExpr callee path in visitExpr). We still register the decl in
+    // funcDecls so the call site can find + inline it.
+    if (fn->isMethod && !fn->className.empty()) {
+      funcDecls[symName] = fn;
+      return;
+    }
+
+    // A class method takes a leading `_this` parameter: the class record as a
+    // flat memref<Nxi32> slot (NOT by-value scalars — methods mutate `this->f`
+    // and the caller's object must see the writes, so the slot is passed by
+    // reference). The memref arg is a Function-storage slot the caller allocas;
+    // it is NOT an SSBO pointer (it carries no StorageBuffer storage class),
+    // so func.call passing + ConvertFuncToSPIRV legalize it as a plain pointer
+    // to a Function variable. Mirrors GLSL's `inout Class _this`.
+    bool isMethod = fn->isMethod && !fn->className.empty();
+    mlir::Type thisTy;
+    const RecordType *thisRec = nullptr;
+    if (isMethod) {
+      // Ensure the class layout is recorded before reading it (the class
+      // StructDecl may appear later in tu.decls than this method, as in
+      // class.vc where `Accumulator::add` precedes the `Class Accumulator`
+      // body — recordStructLayout is idempotent, so this is safe regardless).
+      if (auto *sd = lookupStructDecl(fn->className))
+        recordStructLayout(sd);
+      auto *sd = new StructDecl(fn->getLoc(), fn->className);
+      thisRec = new RecordType(sd);
+      // Build the _this memref<Nxi32> with an explicit Function storage class
+      // so it matches the caller's alloca slot type exactly — FuncToSPIRV then
+      // lowers the parameter to a spirv.ptr<array<Nxi32>, Function> and the
+      // call's argument type agrees. A bare memref<Nxi32> (no storage class)
+      // is rejected by FuncToSPIRV's function-signature conversion, which
+      // drops the function definition and leaves the call dangling.
+      mlir::Type baseTy = cvtType(thisRec);
+      if (auto mty = baseTy.dyn_cast<MemRefType>()) {
+        thisTy = MemRefType::get(
+            mty.getShape(), mty.getElementType(), MemRefLayoutAttrInterface(),
+            spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
+      } else {
+        thisTy = baseTy;
+      }
+    }
+
+    // Function signature. By-value struct parameters are scalarized into N
+    // field-typed args (see structParams / structFieldScalarTypes); a memref
+    // parameter would carry SSBO-pointer semantics and fail to legalize as a
+    // by-value value. Non-struct params keep their cvtType result.
     SmallVector<mlir::Type> argTypes;
-    for (auto *p : fn->params)
-      argTypes.push_back(cvtType(p->type));
+    if (isMethod && thisTy)
+      argTypes.push_back(thisTy);
+    structParams.clear();
+    for (auto *p : fn->params) {
+      if (p->type && isa<RecordType>(p->type)) {
+        auto scalars = structFieldScalarTypes(cast<RecordType>(p->type));
+        if (!scalars.empty()) {
+          StructParamSlots sp;
+          sp.startArg = argTypes.size();
+          sp.fieldTys = scalars;
+          for (mlir::Type st : scalars) argTypes.push_back(st);
+          structParams[p->name] = std::move(sp);
+          continue;
+        }
+      }
+      mlir::Type pt = cvtType(p->type);
+      if (!pt) {
+        // Unsupported param type — skip cleanly rather than feed a null type to
+        // getFunctionType (which would crash FuncOp::create).
+        error(p, "unsupported parameter type in device function");
+        continue;
+      }
+      argTypes.push_back(pt);
+    }
     mlir::Type retTy = cvtType(fn->returnType);
     // A void function has an empty result list (SPIR-V entry points must not
     // declare a `none` result); the LLVM-style none type is an interior
@@ -469,10 +678,73 @@ private:
     locals.clear();
     localTypes.clear();
 
-    // Bind parameters to block args.
+    // Bind the synthesized `_this` (methods): the leading block arg is the
+    // caller's memref<Nxi32> slot for the object; register it as a bare
+    // RecordType local so `this->sum` / `_this.sum` resolve through the local-
+    // struct field path.
+    unsigned argIdx = 0;
+    if (isMethod && thisTy) {
+      locals["_this"] = entry->getArgument(argIdx);
+      localTypes["_this"] = thisRec;
+      ++argIdx;
+    }
+
+    // Bind parameters to block args. A by-value struct param (in structParams)
+    // is materialized as a fresh local memref<Nxi32> alloca at the entry, with
+    // each scalarized block arg stored into the corresponding i32 slot (bitcast
+    // f32->i32 to preserve the field's bit pattern, mirroring storeStructField).
+    // The body then treats `v` exactly like a local `Vec4 v;` decl.
     for (unsigned i = 0; i < fn->params.size(); ++i) {
-      locals[fn->params[i]->name] = entry->getArgument(i);
-      localTypes[fn->params[i]->name] = fn->params[i]->type;
+      const ParamDecl *p = fn->params[i];
+      auto spit = structParams.find(p->name);
+      if (spit != structParams.end()) {
+        const StructParamSlots &sp = spit->second;
+        // Alloca the struct's flat i32 slot at the entry.
+        if (!isa<RecordType>(p->type)) continue;
+        auto *rec = cast<RecordType>(p->type);
+        auto layIt = recordLayouts.find(rec->decl->name);
+        if (layIt == recordLayouts.end()) continue;
+        int64_t slots = ((int64_t)layIt->second.stride + 3) / 4;
+        if (slots < 1) slots = 1;
+        MemRefType slotTy = MemRefType::get(
+            {slots}, builder.getI32Type(), MemRefLayoutAttrInterface(),
+            spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
+        Value slot = builder.create<memref::AllocaOp>(loc(p), slotTy);
+        locals[p->name] = slot;
+        localTypes[p->name] = p->type;
+        // Store each scalarized field arg into its slot.
+        auto lit = recordLayouts.find(rec->decl->name);
+        const StructLayout &layout = lit->second;
+        unsigned scalarIdx = 0;
+        for (const FieldLayout &fld : layout.fields) {
+          int64_t n = 1;
+          for (int64_t d : fld.arrayDims) n *= (d > 0 ? d : 1);
+          for (int64_t e = 0; e < n; ++e) {
+            if (scalarIdx >= sp.fieldTys.size()) break;
+            Value arg = entry->getArgument(sp.startArg + scalarIdx);
+            Value one = builder.create<arith::ConstantOp>(
+                loc(p), builder.getIndexType(),
+                builder.getIndexAttr((int64_t)(fld.offset / 4 + e)));
+            Value slotIdx = one;
+            Value v = arg;
+            mlir::Type fty = fld.type;
+            if (fty.isF32() || fty.isF16())
+              v = builder.create<arith::BitcastOp>(loc(p),
+                                                    builder.getI32Type(), v);
+            else
+              v = castValue(v, builder.getI32Type(), loc(p));
+            builder.create<memref::StoreOp>(loc(p), v, slot,
+                                            ValueRange{slotIdx});
+            ++scalarIdx;
+          }
+        }
+        argIdx = sp.startArg + sp.fieldTys.size();
+        continue;
+      }
+      if (argIdx < entry->getNumArguments())
+        locals[p->name] = entry->getArgument(argIdx);
+      localTypes[p->name] = p->type;
+      ++argIdx;
     }
 
     // Route the body through emitStatements so trailing bare-return guards
@@ -618,12 +890,19 @@ private:
                 loc(ie->index.get()), builder.getI32Type(), idx);
           idxVals.push_back(idx);
         }
-        // Element type of the deepest array.
+        // Result type: peel exactly one array dimension per provided index
+        // (NOT all dimensions). A full chain (e.g. `voteArr[i]` on a 1-D
+        // array) yields a scalar element ptr; a partial chain (e.g. `buf[slot]`
+        // on a `T[2][64]` shared array) yields a row ptr `ptr<array<64xf32>>`,
+        // which a further AccessChain / cooperative-copy loop can index.
         mlir::Type pointee =
             base.getType().cast<spirv::PointerType>().getPointeeType();
         mlir::Type elemTy = pointee;
-        while (auto arr = elemTy.dyn_cast<spirv::ArrayType>())
+        for (size_t i = 0, e = chain.size(); i < e; ++i) {
+          auto arr = elemTy.dyn_cast<spirv::ArrayType>();
+          if (!arr) break;
           elemTy = arr.getElementType();
+        }
         spirv::PointerType elemPtr = spirv::PointerType::get(
             elemTy, base.getType().cast<spirv::PointerType>().getStorageClass());
         mem = builder.create<spirv::AccessChainOp>(loc(n), elemPtr, base,
@@ -688,6 +967,15 @@ private:
                    elem.getIntOrFloatBitWidth())
         v = builder.create<arith::ExtSIOp>(l, elem, v);
     }
+    // Struct slot store: the memref is the flat i32 view of a struct (SSBO or
+    // local value), and `v` is the field's native type (e.g. `v.c[0] = 1.0f`
+    // stores an f32 into an i32 slot). This is a BITCAST (preserve bits), not a
+    // numeric conversion — the host reads the same bit pattern back as the
+    // field's C type, mirroring storeStructField. Covers f32/f16 -> i32. (i64/f64
+    // array-field stores are not exercised by the demos and stay unsupported.)
+    if (v.getType() != elem && elem.isInteger(32) &&
+        (v.getType().isF32() || v.getType().isF16()))
+      v = builder.create<arith::BitcastOp>(l, elem, v);
     if (indices.empty())
       builder.create<memref::StoreOp>(l, v, mem);
     else
@@ -1244,8 +1532,15 @@ private:
     std::function<void(unsigned)> emitChain = [&](unsigned i) {
       if (i < buckets.size()) {
         CaseBucket &b = buckets[i];
-        // Skip the default here; it goes to the innermost else.
-        if (b.isDefault) { emitChain(i + 1); return; }
+        // The default case is the tail of the else chain: emit its body here
+        // (this position is reachable only when no earlier case matched), then
+        // stop. (It must not recurse, since no case follows the default in a
+        // well-formed switch — and recursing would drop the default body, the
+        // bug that left `default: s=300;` unemitted and s stuck at 0.)
+        if (b.isDefault) {
+          for (ASTNode *st : b.stmts) visitStmt(st);
+          return;
+        }
         Value eq = builder.create<arith::CmpIOp>(
             l, arith::CmpIPredicate::eq, cond, b.val);
         bool hasElse = (i + 1 < buckets.size()) || defIdx >= 0;
@@ -1435,6 +1730,12 @@ private:
       // uses a 0-d memref as a mutable slot; `float a[16]` -> memref<16xf32>;
       // `float a[16][8]` -> memref<16x8xf32>. An unsized dimension
       // (extern __shared__ T s[], arrayDims={0}) is not supported here.
+      //
+      // A bare struct-value decl (`Accumulator acc;`) returns a 1-D
+      // memref<Nxi32> from cvtType (the struct's flat i32 slot layout); its
+      // arrayDims are empty, so we adopt the cvtType result's own shape rather
+      // than building a 0-d slot. Struct *arrays* (`Accumulator acc[2];`) prepend
+      // the array dims onto that shape.
       SmallVector<int64_t, 4> shape;
       for (int64_t dim : d->arrayDims) {
         if (dim <= 0) {
@@ -1445,9 +1746,24 @@ private:
           shape.push_back(dim);
         }
       }
+      // If the element type is itself a struct memref (cvtType returned a 1-D
+      // memref<Nxi32> for a bare RecordType), splice its leading dimension in
+      // front of our array dims so a plain `acc;` is memref<Nxi32> (not a 0-d
+      // slot of memrefs) and `acc[2];` is memref<2xNxi32>.
+      mlir::Type elemTy = ty;
+      if (auto mty = ty.dyn_cast<MemRefType>()) {
+        if (d->type && isa<RecordType>(d->type)) {
+          // Adopt the struct's own i32-slot shape, then any outer array dims.
+          SmallVector<int64_t, 4> combined;
+          for (int64_t d2 : mty.getShape()) combined.push_back(d2);
+          for (int64_t d2 : shape) combined.push_back(d2);
+          shape = combined;
+          elemTy = mty.getElementType();
+        }
+      }
       if (d->isShared) {
         // Module-scope global in Workgroup storage, fetched per use.
-        Value addr = getOrCreateSharedGlobal(d->name, shape, ty, l);
+        Value addr = getOrCreateSharedGlobal(d->name, shape, elemTy, l);
         locals[d->name] = addr;
         localTypes[d->name] = d->type;
         // __shared__ decls may not have a non-constant initializer in CUDA
@@ -1455,7 +1771,7 @@ private:
         break;
       }
       MemRefType slotTy = MemRefType::get(
-          shape, ty, MemRefLayoutAttrInterface(),
+          shape, elemTy, MemRefLayoutAttrInterface(),
           spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
       // Hoist the allocation to the function entry block: a memref.alloca
       // emitted inside an scf region (loops/if) may not survive the
@@ -2043,6 +2359,10 @@ private:
         if (fit != funcTable.end()) {
           SmallVector<Value> args;
           for (auto &a : c->args) {
+            // A by-value struct argument is scalarized into N field scalars
+            // matching the callee's scalarized signature (see buildFunction).
+            if (expandStructArg(a.get(), args, loc(a.get())))
+              continue;
             Value av = visitExpr(a.get());
             if (!av) return error(a.get(), "could not evaluate call argument");
             args.push_back(loadValue(av, loc(a.get())));
@@ -2121,6 +2441,124 @@ private:
             if (fty.getNumResults() == 0) return Value();
             return call.getResult(0);
           }
+        } else {
+          // Object method call `obj.method(args)` (non-scope MemberAccessExpr
+          // callee). The method is `Class_method` taking `this` as its leading
+          // parameter (see buildFunction / deviceFuncName). SPIR-V's
+          // func.call cannot pass a Function-storage struct memref as a by-ref
+          // parameter (FuncToSPIRV + GPUToSPIRV leave an
+          // unrealized_conversion_cast they can't legalize for memref args), so
+          // the MLIR backend INLINES the method body at the call site with
+          // `_this` bound to the caller's object slot — a method that mutates
+          // `this->field` then writes directly to the caller's object, matching
+          // C++ reference semantics. (The method is still emitted as a
+          // func.func for completeness, but never func.called.) This mirrors
+          // how the GLSL backend's `inout Class _this` achieves by-ref.
+          std::string suffix = "_" + ma->member.str();
+          const FunctionDecl *methodFn = nullptr;
+          for (auto &kv : funcDecls) {
+            if (kv.first.ends_with(suffix) && kv.second->isMethod) {
+              if (methodFn) { methodFn = nullptr; break; } // ambiguous
+              methodFn = kv.second;
+            }
+          }
+          if (methodFn && methodFn->body) {
+            // Resolve the object's memref slot + record type.
+            Value base = visitExpr(ma->base.get());
+            if (!base)
+              return error(ma->base.get(),
+                           "could not evaluate method-call object");
+            // Recover the object's record type from localTypes (base must be a
+            // DeclRefExpr to a local struct value).
+            const RecordType *objRec = nullptr;
+            if (ma->base &&
+                ma->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+              auto *ref = static_cast<DeclRefExpr *>(ma->base.get());
+              auto tit = localTypes.find(ref->name);
+              if (tit != localTypes.end() && tit->second &&
+                  isa<RecordType>(tit->second))
+                objRec = cast<RecordType>(tit->second);
+            }
+            if (!objRec)
+              return error(ma->base.get(),
+                           "method call on a non-struct object is unsupported");
+
+            // Evaluate the explicit arguments (and complete defaulted ones)
+            // into values BEFORE swapping in the method's parameter bindings,
+            // so argument expressions still see the caller's scope.
+            SmallVector<Value> argVals;
+            SmallVector<const ParamDecl *> boundParams;
+            for (auto &a : c->args) {
+              if (expandStructArg(a.get(), argVals, loc(a.get())))
+                continue;
+              Value av = visitExpr(a.get());
+              if (!av) return error(a.get(), "could not evaluate call argument");
+              argVals.push_back(loadValue(av, loc(a.get())));
+            }
+            unsigned ai = 0;
+            for (auto *p : methodFn->params) {
+              if (ai < argVals.size()) {
+                boundParams.push_back(p);
+                ++ai;
+              } else if (p->defaultVal) {
+                Value dv = visitExpr(p->defaultVal.get());
+                if (!dv) return error(p->defaultVal.get(),
+                                     "could not evaluate default argument");
+                argVals.push_back(loadValue(dv, loc(p->defaultVal.get())));
+                boundParams.push_back(p);
+              } else
+                break;
+            }
+
+            // Save the caller's per-function symbol state; the inlined body
+            // gets a fresh scope with `_this` + the method's params bound.
+            llvm::StringMap<Value> savedLocals = locals;
+            llvm::StringMap<const vc::Type *> savedLocalTypes = localTypes;
+            auto savedRetTy = currentRetTy;
+            unsigned savedLoopDepth = loopDepth;
+            unsigned savedStructuredDepth = structuredDepth;
+            mlir::Type methodRetTy = cvtType(methodFn->returnType);
+            currentRetTy = methodRetTy;
+
+            // Bind `_this` to the caller's object slot.
+            locals.clear();
+            localTypes.clear();
+            locals["_this"] = base;
+            localTypes["_this"] = objRec;
+            // Bind the method's parameters to fresh slots holding the arg
+            // values (by value; the demos' methods don't mutate their params).
+            for (unsigned i = 0; i < boundParams.size() && i < argVals.size();
+                 ++i) {
+              const ParamDecl *p = boundParams[i];
+              mlir::Type pt = cvtType(p->type);
+              if (!pt) continue;
+              MemRefType slotTy = MemRefType::get(
+                  {}, pt, MemRefLayoutAttrInterface(),
+                  spirv::StorageClassAttr::get(&ctx,
+                                                spirv::StorageClass::Function));
+              Value slot = builder.create<memref::AllocaOp>(loc(p), slotTy);
+              locals[p->name] = slot;
+              localTypes[p->name] = p->type;
+              storeValue(slot, argVals[i], loc(p));
+            }
+
+            if (methodFn->body &&
+                methodFn->body->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
+              auto *cs = static_cast<CompoundStmt *>(methodFn->body.get());
+              for (auto &s : cs->statements) visitStmt(s.get());
+            } else if (methodFn->body)
+              visitStmt(methodFn->body.get());
+
+            // Restore the caller's scope.
+            locals = savedLocals;
+            localTypes = savedLocalTypes;
+            currentRetTy = savedRetTy;
+            loopDepth = savedLoopDepth;
+            structuredDepth = savedStructuredDepth;
+            // A void method yields nothing; a value-returning method would need
+            // a result binding, but the demos' methods are all void.
+            return Value();
+          }
         }
       }
       return error(n, "MLIR backend does not support this call "
@@ -2185,6 +2623,10 @@ private:
     bool warpMatched = false;
     if (auto v = emitWarpBuiltin(name, args, l, warpMatched)) return v;
     if (warpMatched) return Value();
+    // VC async-copy approximation (vcMemcpyAsync / vcPipeline*).
+    bool asyncMatched = false;
+    if (auto v = emitAsyncCopyBuiltin(name, args, l, asyncMatched)) return v;
+    if (asyncMatched) return Value();
     matched = false;
     return Value();
   }
@@ -2860,6 +3302,149 @@ private:
     return Value();
   }
 
+  // VC async-copy approximation (mirrors GLSL emitAsyncCopyCall in
+  // ASTToGLSL.cpp:923). Vulkan/SPIR-V has no TMA hardware, so vcMemcpyAsync is
+  // a SOFTWARE cooperative copy: every workgroup thread copies a contiguous
+  // segment of length nElems/blockDim.x, followed by a barrier. The pipeline
+  // sync token (VcPipeline) carries no real state — vcPipeline* are plain
+  // barrier() wrappers. All these builtins are void.
+  //
+  //   vcPipelineProducerCommit/ConsumerWait/ConsumerCommit(pipe) -> BarrierOp
+  //   vcMemcpyAsync(dst, src, nElems, pipe):
+  //     dst = shared array element (buf[slot]) -> spirv.ptr Workgroup
+  //     src = device pointer expr, typically `in + offset` (BinOp::Add); split
+  //           into base (memref<?xf32> kernel arg) + offset (i32). A bare
+  //           indexable source uses offset 0.
+  //     n = nElems / blockDim.x;  base = threadIdx.x * n
+  //     scf.for i in 0..n: dst[base+i] = src[offset + base + i]
+  //     BarrierOp
+  Value emitAsyncCopyBuiltin(llvm::StringRef name,
+                             const std::vector<NodePtr> &args, Location l,
+                             bool &matched) {
+    matched = false;
+    if (name == "vcPipelineProducerCommit" ||
+        name == "vcPipelineConsumerWait" ||
+        name == "vcPipelineConsumerCommit") {
+      matched = true;
+      builder.create<vc::BarrierOp>(l);
+      return Value();
+    }
+    if (name != "vcMemcpyAsync")
+      return Value();
+    matched = true;
+    if (args.size() < 3) {
+      error(args.empty() ? nullptr : args[0].get(),
+            "vcMemcpyAsync needs (dst, src, nElems[, pipe])");
+      return Value();
+    }
+
+    // dst: shared array element like buf[slot] -> spirv.ptr (Workgroup).
+    Value dstMem;
+    SmallVector<Value> dstIdx;
+    if (!lvalueAddress(args[0].get(), dstMem, dstIdx) ||
+        !dstMem.getType().isa<spirv::PointerType>()) {
+      error(args[0].get(),
+            "vcMemcpyAsync dst must be a __shared__ array element");
+      return Value();
+    }
+    spirv::PointerType dstPtrTy =
+        dstMem.getType().cast<spirv::PointerType>();
+    spirv::StorageClass dstSC = dstPtrTy.getStorageClass();
+    // The dst lvalue may be `buf[slot]` — a row pointer `ptr<array<64xf32>>`,
+    // not yet a scalar element. Drill down to the innermost scalar element type;
+    // the loop's per-element AccessChain walks the remaining array dimensions.
+    mlir::Type dstElemTy = dstPtrTy.getPointeeType();
+    while (auto arr = dstElemTy.dyn_cast<spirv::ArrayType>())
+      dstElemTy = arr.getElementType();
+    spirv::PointerType dstElemPtrTy =
+        spirv::PointerType::get(dstElemTy, dstSC);
+
+    // src: split `in + offset` into base (memref<?xf32>) + offset (i32).
+    ASTNode *srcArg = args[1].get();
+    Value srcBase;
+    Value off = builder.create<arith::ConstantOp>(l, builder.getI32Type(),
+                                                  builder.getI32IntegerAttr(0));
+    if (srcArg && srcArg->getNodeType() == ASTNode::NodeKind::BinaryExpr) {
+      auto *b = static_cast<BinaryExpr *>(srcArg);
+      if (b->op == BinaryOp::Add) {
+        srcBase = visitExpr(b->lhs.get());
+        Value ov = loadValue(visitExpr(b->rhs.get()), loc(b->rhs.get()));
+        if (ov)
+          off = castValue(ov, builder.getI32Type(), loc(b->rhs.get()));
+      }
+    }
+    if (!srcBase)
+      srcBase = visitExpr(srcArg);
+    if (!srcBase || !srcBase.getType().isa<MemRefType>()) {
+      error(args[1].get(),
+            "vcMemcpyAsync src must be an indexable device pointer");
+      return Value();
+    }
+    MemRefType srcMTy = srcBase.getType().cast<MemRefType>();
+    mlir::Type srcElemTy = srcMTy.getElementType();
+
+    // nElems as i32; blockDim / tid as i32.
+    Value nElems = loadValue(visitExpr(args[2].get()), loc(args[2].get()));
+    if (nElems)
+      nElems = castValue(nElems, builder.getI32Type(), loc(args[2].get()));
+    if (!nElems) return Value();
+
+    Value bdimIdx = builder.create<vc::BlockDimOp>(l, builder.getIndexType(),
+                                                   vc::Dim::x);
+    Value bdim = builder.create<arith::IndexCastOp>(l, builder.getI32Type(),
+                                                    bdimIdx);
+    Value tidIdx = builder.create<vc::ThreadIdOp>(l, builder.getIndexType(),
+                                                  vc::Dim::x);
+    Value tid = builder.create<arith::IndexCastOp>(l, builder.getI32Type(),
+                                                   tidIdx);
+
+    // n = nElems / blockDim.x ;  base = tid * n
+    Value n = builder.create<arith::DivSIOp>(l, nElems, bdim);
+    Value base = builder.create<arith::MulIOp>(l, tid, n);
+
+    // scf.for i = 0..n step 1: dst[base+i] = src[offset + base + i].
+    Value zero = builder.create<arith::ConstantOp>(l, builder.getI32Type(),
+                                                   builder.getI32IntegerAttr(0));
+    Value lb = builder.create<arith::ConstantOp>(l, builder.getIndexType(),
+                                                 builder.getIndexAttr(0));
+    Value ubIdx = builder.create<arith::IndexCastOp>(l, builder.getIndexType(),
+                                                     n);
+    Value step = builder.create<arith::ConstantOp>(l, builder.getIndexType(),
+                                                   builder.getIndexAttr(1));
+    auto saved = builder.saveInsertionPoint();
+    // scf::ForOp's builder creates the body block pre-terminated with an
+    // scf.yield (empty iterArgs); set the insertion point to the block start
+    // so emitted ops land before that terminator.
+    auto forOp = builder.create<scf::ForOp>(l, lb, ubIdx, step, ValueRange{});
+    builder.setInsertionPointToStart(forOp.getBody());
+    {
+      Value i = builder.create<arith::IndexCastOp>(l, builder.getI32Type(),
+                                                   forOp.getInductionVar());
+      // dst index (i32) -> spirv.AccessChain over the shared array ptr.
+      Value dstOff = builder.create<arith::AddIOp>(l, base, i);
+      Value dstAddr = builder.create<spirv::AccessChainOp>(
+          l, dstElemPtrTy, dstMem, ValueRange{dstOff});
+      // src index (index) -> memref.load.
+      Value srcIdxI32 = builder.create<arith::AddIOp>(l, off, dstOff);
+      Value srcIdx = builder.create<arith::IndexCastOp>(l,
+                                                        builder.getIndexType(),
+                                                        srcIdxI32);
+      Value val = builder.create<memref::LoadOp>(l, srcBase, ValueRange{srcIdx});
+      // Store with the shared element type (coerce if src elem differs, e.g.
+      // matching bit widths across address spaces).
+      if (val.getType() != dstElemTy)
+        val = castValue(val, dstElemTy, l);
+      builder.create<spirv::StoreOp>(l, dstAddr, val,
+                                     spirv::MemoryAccessAttr(),
+                                     IntegerAttr());
+    }
+    builder.restoreInsertionPoint(saved);
+
+    // Trailing barrier: every lane's copy is visible before consumption.
+    builder.create<vc::BarrierOp>(l);
+    return Value();
+  }
+
   Value emitUnary(const UnaryExpr *u) {
     Location l = loc(u);
     Value v = visitExpr(u->operand.get());
@@ -2945,10 +3530,27 @@ private:
     auto tit = localTypes.find(ref->name);
     if (tit == localTypes.end()) return false;
     const vc::Type *t = tit->second;
-    if (!t || !isa<PointerType>(t)) return false;
-    const vc::Type *pointee = cast<PointerType>(t)->pointee;
-    if (!pointee || !isa<RecordType>(pointee)) return false;
-    auto *rec = cast<RecordType>(pointee);
+    if (!t) return false;
+    // Two struct-access shapes share this path:
+    //  - SSBO: `Result* r; r[i].f` — t is PointerType<RecordType>, the base
+    //    memref is the memref<?xi32> SSBO view, and the element index multiplies
+    //    the struct stride into the byte offset.
+    //  - Local struct value: `Accumulator acc; acc.sum` / `v.c[k]` — t is a bare
+    //    RecordType, the base memref is the local memref<Nxi32, Function> slot,
+    //    and there is no index*stride term (a single struct, base is a plain
+    //    DeclRefExpr so indexNode stays null).
+    const RecordType *rec = nullptr;
+    bool isLocalStruct = false;
+    if (isa<PointerType>(t)) {
+      const vc::Type *pointee = cast<PointerType>(t)->pointee;
+      if (!pointee || !isa<RecordType>(pointee)) return false;
+      rec = cast<RecordType>(pointee);
+    } else if (isa<RecordType>(t)) {
+      rec = cast<RecordType>(t);
+      isLocalStruct = true;
+    } else {
+      return false;
+    }
     auto lit = recordLayouts.find(rec->decl->name);
     if (lit == recordLayouts.end()) return false;
     const StructLayout &layout = lit->second;
@@ -2964,11 +3566,13 @@ private:
     if (!mem.getType().isa<MemRefType>()) return false;
     fieldTy = fld->type;
 
-    // byteOff = fieldOffset + elemIdx*stride + extraByteOff
+    // byteOff = fieldOffset + (elemIdx*stride for SSBO array) + extraByteOff
     Value byteOff = builder.create<arith::ConstantOp>(
         l, builder.getI32Type(),
         builder.getI32IntegerAttr((int32_t)fld->offset));
-    if (indexNode) {
+    // The index*stride term applies only to SSBO struct arrays (`r[i]`); a
+    // local struct value has no outer element index.
+    if (indexNode && !isLocalStruct) {
       Value idx = loadValue(visitExpr(indexNode), loc(indexNode));
       if (!idx) return false;
       idx = castValue(idx, builder.getI32Type(), l);
@@ -3061,11 +3665,21 @@ private:
     auto tit = localTypes.find(ref->name);
     if (tit == localTypes.end()) return false;
     const vc::Type *t = tit->second;
-    // Peel pointer to the struct.
-    if (!t || !isa<PointerType>(t)) return false;
-    const vc::Type *pointee = cast<PointerType>(t)->pointee;
-    if (!pointee || !isa<RecordType>(pointee)) return false;
-    auto *rec = cast<RecordType>(pointee);
+    if (!t) return false;
+    // SSBO struct pointer (`Result* r; r[i].f = ...`) or a bare local struct
+    // value (`acc.sum = ...`); see structFieldAddr for the shape distinction.
+    const RecordType *rec = nullptr;
+    bool isLocalStruct = false;
+    if (isa<PointerType>(t)) {
+      const vc::Type *pointee = cast<PointerType>(t)->pointee;
+      if (!pointee || !isa<RecordType>(pointee)) return false;
+      rec = cast<RecordType>(pointee);
+    } else if (isa<RecordType>(t)) {
+      rec = cast<RecordType>(t);
+      isLocalStruct = true;
+    } else {
+      return false;
+    }
     auto lit = recordLayouts.find(rec->decl->name);
     if (lit == recordLayouts.end()) return false;
     const StructLayout &layout = lit->second;
@@ -3075,17 +3689,19 @@ private:
       if (f.name == m->member) { fld = &f; break; }
     if (!fld) return false;
 
-    // Base SSBO memref (result) — must be the memref<?xi32> view.
+    // Base memref — the SSBO memref<?xi32> view, or a local struct's
+    // memref<Nxi32, Function> slot.
     auto sit = locals.find(ref->name);
     if (sit == locals.end()) return false;
     Value mem = sit->second;
     if (!mem.getType().isa<MemRefType>()) return false;
 
-    // Byte offset = elementIndex * structStride + fieldOffset.
+    // Byte offset = elementIndex * structStride + fieldOffset. The element term
+    // is SSBO-only (local struct has no outer index).
     Value byteOff = builder.create<arith::ConstantOp>(
         l, builder.getI32Type(),
         builder.getI32IntegerAttr((int32_t)fld->offset));
-    if (indexNode) {
+    if (indexNode && !isLocalStruct) {
       Value idx = loadValue(visitExpr(indexNode), loc(indexNode));
       if (!idx) return false;
       idx = castValue(idx, builder.getI32Type(), l);
