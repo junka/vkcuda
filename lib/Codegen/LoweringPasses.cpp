@@ -44,7 +44,7 @@ namespace vc::codegen {
 // to spirv.IAdd), so the k-th spirv.AtomicIAdd in a function corresponds to
 // the k-th source memref.atomic_rmw. Turn each recorded position into a
 // spirv.AtomicExchange (true swap semantics: same ptr/scope/semantics/value).
-static llvm::StringMap<llvm::SmallVector<unsigned>>
+static llvm::StringMap<llvm::SmallVector<std::pair<unsigned, StringRef>>>
 collectMarkedAtomicPositions(ModuleOp module) {
   // Keyed by the gpu.func symbol name; positions are indices among ALL
   // atomic ops (memref.atomic_rmw AND spirv.AtomicIAdd, since __shared__
@@ -52,7 +52,8 @@ collectMarkedAtomicPositions(ModuleOp module) {
   // in source order. The post-conversion spirv.AtomicIAdd list has the same
   // relative order (only these two op kinds lower to spirv.AtomicIAdd;
   // arith.addi lowers to spirv.IAdd), so the ordinal identifies the op.
-  llvm::StringMap<llvm::SmallVector<unsigned>> out;
+  // The second element is the marker kind ("exch" or "xor").
+  llvm::StringMap<llvm::SmallVector<std::pair<unsigned, StringRef>>> out;
   module.walk([&](gpu::GPUFuncOp fn) {
     unsigned idx = 0;
     fn.walk([&](Operation *op) {
@@ -62,8 +63,8 @@ collectMarkedAtomicPositions(ModuleOp module) {
         return;
       if (auto rmw = dyn_cast<memref::AtomicRMWOp>(op)) {
         auto kind = rmw->getAttrOfType<StringAttr>("vc.atomic_kind");
-        if (kind && kind.getValue() == "exch")
-          out[fn.getName()].push_back(idx);
+        if (kind && (kind.getValue() == "exch" || kind.getValue() == "xor"))
+          out[fn.getName()].push_back({idx, kind.getValue()});
       }
       ++idx;
     });
@@ -73,7 +74,8 @@ collectMarkedAtomicPositions(ModuleOp module) {
 
 static void rewriteMarkedAtomics(
     ModuleOp module,
-    const llvm::StringMap<llvm::SmallVector<unsigned>> &positions) {
+    const llvm::StringMap<llvm::SmallVector<std::pair<unsigned, StringRef>>>
+        &positions) {
   module.walk([&](spirv::FuncOp fn) {
     auto it = positions.find(fn.getName());
     if (it == positions.end())
@@ -84,15 +86,23 @@ static void rewriteMarkedAtomics(
     fn.walk([&](spirv::AtomicIAddOp op) {
       if (marks.size() == toConvert.size())
         return;
-      if (marks[toConvert.size()] == idx)
+      if (marks[toConvert.size()].first == idx)
         toConvert.push_back(op);
       ++idx;
     });
-    for (spirv::AtomicIAddOp op : toConvert) {
+    for (unsigned i = 0; i < toConvert.size(); ++i) {
+      spirv::AtomicIAddOp op = toConvert[i];
+      StringRef kind = marks[i].second;
       OpBuilder b(op);
-      Value result = b.create<spirv::AtomicExchangeOp>(
-          op.getLoc(), op.getType(), op.getPointer(), op.getMemoryScope(),
-          op.getSemantics(), op.getValue());
+      Value result;
+      if (kind == "xor")
+        result = b.create<spirv::AtomicXorOp>(
+            op.getLoc(), op.getType(), op.getPointer(), op.getMemoryScope(),
+            op.getSemantics(), op.getValue());
+      else // "exch"
+        result = b.create<spirv::AtomicExchangeOp>(
+            op.getLoc(), op.getType(), op.getPointer(), op.getMemoryScope(),
+            op.getSemantics(), op.getValue());
       op.replaceAllUsesWith(result);
       op.erase();
     }

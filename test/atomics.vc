@@ -6,6 +6,7 @@
 //   - atomicAdd(&shared, v)  : strip `&`
 //   - atomicAdd(&arr[i], v)  : strip `&`, keep index
 //   - atomicExch / atomicCAS / atomicMin / atomicInc
+//   - atomicXor on SSBO (marked-addi -> spirv.AtomicXor rewrite)
 //
 // One kernel does everything: each of N threads atomically increments a global
 // counter (-> N), atomically bumps a histogram bucket (hist[i%BUCKETS]), and
@@ -19,7 +20,7 @@
 #include "vc/Runtime/VCRuntime.h"
 
 __global__ void atomicKernel(int *counter, int *hist, int *blockSums,
-                             int *scratch, int N, int BUCKETS) {
+                             int *scratch, int *xorSlot, int N, int BUCKETS) {
   int tid = threadIdx.x;
   int i = blockIdx.x * blockDim.x + tid;
 
@@ -37,6 +38,10 @@ __global__ void atomicKernel(int *counter, int *hist, int *blockSums,
     atomicAdd(&hist[i % BUCKETS], 1);
     // Shared-scalar atomic (strip `&`).
     atomicAdd(&sharedSum, 1);
+    // atomicXor on SSBO: each thread XORs its bit into xorSlot[0]. After N
+    // threads, xorSlot holds the XOR of 0..N-1. Exercises the marked-addi ->
+    // spirv.AtomicXor post-conversion rewrite (no memref.atomic_rmw xori).
+    atomicXor(&xorSlot[0], i);
   }
   __syncthreads();
 
@@ -58,29 +63,34 @@ int main() {
   const int BUCKETS = 8;
   const int numBlocks = (N + block - 1) / block;
 
-  void *dCounter = 0, *dHist = 0, *dBlockSums = 0, *dScratch = 0;
+  void *dCounter = 0, *dHist = 0, *dBlockSums = 0, *dScratch = 0, *dXor = 0;
   vcMalloc(&dCounter, 4);
   vcMalloc(&dHist, BUCKETS * 4);
   vcMalloc(&dBlockSums, numBlocks * 4);
   vcMalloc(&dScratch, 4);
+  vcMalloc(&dXor, 4);
 
   int zero = 0;
   vcMemcpy(dCounter, &zero, 4, VCMemcpyKind::HostToDevice);
   int zeros[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   vcMemcpy(dHist, zeros, BUCKETS * 4, VCMemcpyKind::HostToDevice);
   vcMemcpy(dScratch, &zero, 4, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dXor, &zero, 4, VCMemcpyKind::HostToDevice);
 
-  atomicKernel<<<N, block>>>(dCounter, dHist, dBlockSums, dScratch, N, BUCKETS);
+  atomicKernel<<<N, block>>>(dCounter, dHist, dBlockSums, dScratch, dXor, N,
+                              BUCKETS);
   vcDeviceSynchronize();
 
   int counterResult = 0;
   int hHist[8];
   int hBlockSums[4];
   int scratchResult = 0;
+  int xorResult = 0;
   vcMemcpy(&counterResult, dCounter, 4, VCMemcpyKind::DeviceToHost);
   vcMemcpy(hHist, dHist, BUCKETS * 4, VCMemcpyKind::DeviceToHost);
   vcMemcpy(hBlockSums, dBlockSums, numBlocks * 4, VCMemcpyKind::DeviceToHost);
   vcMemcpy(&scratchResult, dScratch, 4, VCMemcpyKind::DeviceToHost);
+  vcMemcpy(&xorResult, dXor, 4, VCMemcpyKind::DeviceToHost);
 
   // Verify: counter == N (each of N threads added 1; thread 0's atomicExch old
   // value was 0, adding nothing).
@@ -108,12 +118,19 @@ int main() {
   // Verify: scratch slot now holds 123 (written by atomicExch).
   if (scratchResult != 123) ok = 0;
 
+  // Verify: xorSlot holds XOR of 0..N-1. For N=64 (a power of two) the running
+  // XOR of 0..n-1 is 0; compute the general value so other N still check.
+  int xorExpect = 0;
+  for (int i = 0; i < N; i++) xorExpect ^= i;
+  if (xorResult != xorExpect) ok = 0;
+
   printf("atomics: %s\n", ok ? "PASS" : "FAIL");
 
   vcFree(dCounter);
   vcFree(dHist);
   vcFree(dBlockSums);
   vcFree(dScratch);
+  vcFree(dXor);
   vcShutdown();
   return ok ? 0 : 1;
 }

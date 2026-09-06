@@ -2874,25 +2874,22 @@ private:
       val = builder.create<arith::SubIOp>(l, neg, val);
       name = "atomicAdd";
     }
-    // atomicXor has no memref.atomic_rmw kind; lower via the spirv path only
-    // (SSBO atomicXor is reported unsupported below).
+    // atomicXor has no memref.atomic_rmw kind; on SSBO/global emit a marked
+    // 'addi' (same trick as atomicExch below) and let rewriteMarkedAtomics
+    // turn the spirv.AtomicIAdd into a spirv.AtomicXor post-conversion.
     bool wantXor = (name == "atomicXor");
 
     if (ptr.isMemref) {
       // memref.atomic_rmw path (SSBO / global).
       // Kinds available: addi, andi, ori, maxs, maxu, mins, minu, assign.
-      // xori/subi are absent (sub lowered to addi(-v) above; xor unsupported).
-      if (wantXor) {
-        error(args[0].get(), "atomicXor on SSBO/global is not supported in "
-                             "the MLIR backend (no memref.atomic_rmw xori)");
-        return Value();
-      }
-      // atomicExch: memref.atomic_rmw has no 'assign' lowering in MLIR 18's
-      // GPUToSPIRV. Emit it as a marked 'addi' (which DOES legalize) and let
-      // the post-conversion rewrite pass (rewriteMarkedAtomics in
-      // LoweringPasses) turn the resulting spirv.AtomicIAdd into a
-      // spirv.AtomicExchange. The marker survives GPUToSPIRV verbatim.
-      if (name == "atomicExch") {
+      // xori/subi are absent (sub lowered to addi(-v) above).
+      // atomicXor & atomicExch: memref.atomic_rmw has no 'xori'/'assign'
+      // lowering in MLIR 18's GPUToSPIRV. Emit each as a marked 'addi' (which
+      // DOES legalize) and let the post-conversion rewrite pass
+      // (rewriteMarkedAtomics in LoweringPasses) turn the resulting
+      // spirv.AtomicIAdd into a spirv.AtomicXor / spirv.AtomicExchange. The
+      // marker survives GPUToSPIRV verbatim.
+      if (wantXor || name == "atomicExch") {
         SmallVector<Value> idx = ptr.memrefIndices;
         if (idx.empty())
           idx.push_back(builder.create<arith::ConstantOp>(
@@ -2904,7 +2901,8 @@ private:
         auto rmw = builder.create<memref::AtomicRMWOp>(
             l, ptr.elemTy, arith::AtomicRMWKind::addi, val, ptr.memrefBase,
             idx);
-        rmw->setAttr("vc.atomic_kind", builder.getStringAttr("exch"));
+        rmw->setAttr("vc.atomic_kind",
+                     builder.getStringAttr(wantXor ? "xor" : "exch"));
         return rmw;
       }
       using RMW = arith::AtomicRMWKind;
