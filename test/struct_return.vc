@@ -1,0 +1,67 @@
+// test/struct_return.vc — __device__ functions returning a struct by value.
+//
+// Exercises spirv::StructType as a func.func result + func.call result: a
+// device helper builds a local struct and returns it, the caller binds it to
+// a fresh local struct and reads its fields. The MLIR backend lowers the
+// return value via spirv.CompositeConstruct (fields read from the local
+// flat memref<Nxi32> slot) and the call site via spirv.CompositeExtract into
+// a spilled result slot. Covers scalar-field and array-field structs.
+//
+//   vc test/struct_return.vc -emit=full -o build/struct_return_m && ./build/struct_return_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+struct Vec2 { float x; float y; };
+struct Vec4 { float c[4]; };
+
+__device__ Vec2 make2(float a, float b) {
+  Vec2 v;
+  v.x = a;
+  v.y = b;
+  return v;
+}
+
+__device__ Vec4 make4(float a) {
+  Vec4 v;
+  v.c[0] = a;
+  v.c[1] = a + 1.0f;
+  v.c[2] = a + 2.0f;
+  v.c[3] = a + 3.0f;
+  return v;
+}
+
+__global__ void structReturnKernel(float *out) {
+  int i = threadIdx.x;
+  Vec2 r = make2((float)i, (float)(i + 1));
+  Vec4 s = make4((float)i);
+  // r.x + r.y = 2i+1 ; s.c[0..3] = 4i+6 ; total = 6i+7
+  out[i] = (r.x + r.y) + (s.c[0] + s.c[1] + s.c[2] + s.c[3]);
+}
+
+int main() {
+  vcInit();
+  const int n = 32;
+  void *dOut = 0;
+  vcMalloc(&dOut, n * 4);
+
+  structReturnKernel<<<n, 32>>>(dOut);
+  vcDeviceSynchronize();
+
+  float h[32] = {0};
+  vcMemcpy(h, dOut, n * 4, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < n; i++) {
+    float expect = 6.0f * i + 7.0f;
+    if (h[i] != expect) {
+      ok = 0;
+      printf("  mismatch i=%d got=%.1f expect=%.1f\n", i, h[i], expect);
+    }
+  }
+  printf("struct_return: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

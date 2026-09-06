@@ -164,6 +164,11 @@ class ASTToMLIRImpl {
   }
   // Return type of the function currently being emitted (None for void).
   mlir::Type currentRetTy;
+  // When the current function returns a struct (spirv::StructType result),
+  // this is the record type so the return-statement can CompositeConstruct
+  // fields and the call site can CompositeExtract them.
+  bool currentRetIsStruct = false;
+  const RecordType *currentRetRecord = nullptr;
   // Set when any diagnostic error is emitted, so the driver can fail.
   bool hadError = false;
 
@@ -625,6 +630,18 @@ private:
     return out;
   }
 
+  // The MLIR type for a by-value struct RETURN value. Unlike a local struct
+  // (flat memref<Nxi32>) or a by-value param (scalarized into N block args),
+  // a return value is a single SSA value, so it uses spirv::StructType over
+  // the flat field types. Whether this legalizes through FuncToSPIRV +
+  // GPUToSPIRV (as a func.func result + func.call result + CompositeExtract)
+  // is the open question this path probes.
+  mlir::Type structReturnType(const RecordType *rec) {
+    auto tys = structFieldScalarTypes(rec);
+    if (tys.empty()) return mlir::Type();
+    return spirv::StructType::get(tys);
+  }
+
   // At a call site, a by-value struct argument (`sumcomp(v)` where `v` is a
   // local `Vec4`) must be expanded into N scalar field values matching the
   // callee's scalarized signature. Reads each field's i32 slot from the local
@@ -667,6 +684,20 @@ private:
       }
     }
     return true;
+  }
+
+  // Build the SSA value for a `return <struct-value>;` statement. The operand
+  // is a local struct (flat memref<Nxi32>); read each field (reusing
+  // expandStructArg's slot math) and CompositeConstruct them into the
+  // function's spirv::StructType return type. Returns null on failure.
+  Value buildStructReturnValue(ASTNode *retValNode, Location l) {
+    SmallVector<Value, 4> fields;
+    if (!expandStructArg(retValNode, fields, l) || fields.empty())
+      return Value();
+    if (!currentRetTy || !currentRetTy.isa<spirv::StructType>())
+      return Value();
+    return builder.create<spirv::CompositeConstructOp>(
+        l, currentRetTy, fields);
   }
 
   void buildFunction(const FunctionDecl *fn) {
@@ -751,7 +782,27 @@ private:
       }
       argTypes.push_back(pt);
     }
-    mlir::Type retTy = cvtType(fn->returnType);
+    mlir::Type retTy;
+    // A struct return value uses spirv::StructType (a single SSA value the
+    // caller CompositeExtracts from), NOT the flat memref<Nxi32> local form.
+    const RecordType *retRec =
+        (fn->returnType && isa<RecordType>(fn->returnType))
+            ? cast<RecordType>(fn->returnType)
+            : nullptr;
+    if (retRec) {
+      retTy = structReturnType(retRec);
+      // Ensure the layout is registered (the struct decl may follow the
+      // function in source order).
+      if (!retTy && lookupStructDecl(retRec->decl->name)) {
+        recordStructLayout(lookupStructDecl(retRec->decl->name));
+        retTy = structReturnType(retRec);
+      }
+    } else {
+      retTy = cvtType(fn->returnType);
+    }
+    currentRetTy = retTy;
+    currentRetIsStruct = (bool)retRec;
+    currentRetRecord = retRec;
     // A void function has an empty result list (SPIR-V entry points must not
     // declare a `none` result); the LLVM-style none type is an interior
     // convenience only.
@@ -768,7 +819,6 @@ private:
     module.push_back(f);
     funcTable[symName] = f;
     funcDecls[symName] = fn;
-    currentRetTy = retTy;
 
     if (!fn->body) return;
 
@@ -1506,6 +1556,27 @@ private:
   // Store into a memref slot, bridging index<->int / widening ints.
   void storeTo(Value mem, ArrayRef<Value> indices, Value v, Location l) {
     if (!v) return;
+    // Struct-value copy: `v` is a local struct memref (e.g. the result of a
+    // struct-returning call) and `mem` is the destination struct slot. Copy
+    // element-by-element (both are flat i32 views of the same struct shape).
+    if (v.getType().isa<MemRefType>() && mem.getType().isa<MemRefType>() &&
+        indices.empty()) {
+      auto src = v.getType().cast<MemRefType>();
+      auto dst = mem.getType().cast<MemRefType>();
+      if (src.getElementType() == dst.getElementType() &&
+          src.hasStaticShape() && dst.hasStaticShape() &&
+          src.getNumElements() == dst.getNumElements()) {
+        int64_t n = src.getNumElements();
+        for (int64_t i = 0; i < n; ++i) {
+          Value idx = builder.create<arith::ConstantOp>(
+              l, builder.getIndexType(), builder.getIndexAttr(i));
+          Value val = builder.create<memref::LoadOp>(l, builder.getI32Type(),
+                                                     v, ValueRange{idx});
+          builder.create<memref::StoreOp>(l, val, mem, ValueRange{idx});
+        }
+        return;
+      }
+    }
     v = loadValue(v, l);
     // A spirv.ptr (shared scalar slot or shared array element) stores via
     // spirv.Store. The stored value must match the pointee element type.
@@ -2328,6 +2399,19 @@ private:
       break;
     case ASTNode::NodeKind::ReturnStmt: {
       auto *r = static_cast<ReturnStmt *>(n);
+      // Struct return: the value is a local struct (flat memref<Nxi32>).
+      // Read each field's slot and CompositeConstruct into the spirv::StructType
+      // return value. (Only the trivial single-return path is supported; early
+      // returns inside control flow fall through to the generic path below and
+      // will fail — recorded as a limitation.)
+      if (currentRetIsStruct && r->value) {
+        Value sv = buildStructReturnValue(r->value.get(), l);
+        if (sv) {
+          builder.create<func::ReturnOp>(l, ValueRange(sv));
+          break;
+        }
+        // Fall through to emit a clear error below.
+      }
       Value v = r->value ? visitExpr(r->value.get()) : Value();
       if (v) {
         v = loadValue(v, loc(r->value.get()));
@@ -3437,7 +3521,30 @@ private:
           auto call = builder.create<func::CallOp>(l, fit->second, args);
           FunctionType fty = fit->second.getFunctionType();
           if (fty.getNumResults() == 0) return Value();
-          return call.getResult(0);
+          Value res = call.getResult(0);
+          // A struct-returning callee yields a spirv::StructType SSA value.
+          // Spill it into a fresh local struct memref so the caller can bind
+          // it like any other local struct (field reads reuse the slot path).
+          if (res.getType().isa<spirv::StructType>()) {
+            auto stty = res.getType().cast<spirv::StructType>();
+            unsigned n = stty.getNumElements();
+            MemRefType slotTy = MemRefType::get(
+                {(int64_t)n}, builder.getI32Type(),
+                MemRefLayoutAttrInterface(),
+                spirv::StorageClassAttr::get(&ctx,
+                                             spirv::StorageClass::Function));
+            Value slot = builder.create<memref::AllocaOp>(l, slotTy);
+            for (unsigned i = 0; i < n; ++i) {
+              mlir::Type ety = stty.getElementType(i);
+              Value fv = builder.create<spirv::CompositeExtractOp>(
+                  l, ety, res, builder.getI32ArrayAttr({(int32_t)i}));
+              Value idx = builder.create<arith::ConstantOp>(
+                  l, builder.getIndexType(), builder.getIndexAttr((int64_t)i));
+              storeTo(slot, {idx}, fv, l);
+            }
+            return slot;
+          }
+          return res;
         }
       }
       // Scoped call `ns::func(args)` (MemberAccessExpr callee with isScope):
