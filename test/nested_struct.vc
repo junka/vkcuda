@@ -1,0 +1,89 @@
+// test/nested_struct.vc — nested struct-by-value field access.
+//
+// Regression for the MLIR backend's nested-struct limitation: `o.in.a` (a
+// MemberAccessExpr whose base is another MemberAccessExpr resolving to a
+// nested-struct-by-value field) used to fail with "member access other than
+// threadIdx/.../swizzle" (read) or "assignment LHS is not an assignable lvalue"
+// (write). The layout side also mis-sized a nested field at 4 bytes instead of
+// the inner struct's stride.
+//
+// Fixed by:
+//  - recordStructLayout: a bare-RecordType field force-registers the inner
+//    struct's layout (forward references resolve) and sizes/aligns the field by
+//    the inner stride; FieldLayout carries `nestedRec` so access can recurse.
+//  - resolveStructFieldChain: walks `o.in.a` recursively — each nested field
+//    contributes its byte offset, the outermost member is looked up in the
+//    innermost struct's layout. structFieldAddr/loadStructField/storeStructField
+//    all delegate to it.
+//
+// Covers: 3-level nesting, local struct nested write+read, SSBO nested write
+// (`out[i].in.a = ...`), SSBO nested read (`o[i].in.a`).
+//
+//   vcc test/nested_struct.vc -o build/nested_struct_sf && ./build/nested_struct_sf
+//   vc  test/nested_struct.vc -emit=full -o build/nested_struct_m && ./build/nested_struct_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+struct Inner { int a; int b; };
+struct Outer { Inner in; int c; };
+struct Deep  { Outer o; int d; }; // 3-level: Deep.o.in.a
+
+__global__ void nestedKernel(int *out, Outer *ssbo) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i == 0) {
+    // Local nested write + read.
+    Outer v;
+    v.in.a = 11;
+    v.in.b = 22;
+    v.c = 33;
+    out[0] = v.in.a + v.in.b + v.c; // 66
+
+    // 3-level nesting.
+    Deep dd;
+    dd.o.in.a = 111;
+    dd.o.in.b = 222;
+    dd.o.c = 333;
+    dd.d = 444;
+    out[1] = dd.o.in.a + dd.o.in.b + dd.o.c + dd.d; // 1110
+
+    // SSBO nested write: out[i].in.a = ...
+    ssbo[0].in.a = 10;
+    ssbo[0].in.b = 20;
+    ssbo[0].c = 30;
+    ssbo[1].in.a = 40;
+    ssbo[1].in.b = 50;
+    ssbo[1].c = 60;
+  }
+}
+
+int main() {
+  vcInit();
+
+  void *dOut = 0, *dSsbo = 0;
+  vcMalloc(&dOut, 8);
+  vcMalloc(&dSsbo, 24); // 2 x Outer (12 bytes each)
+
+  nestedKernel<<<1, 32>>>(dOut, dSsbo);
+  vcDeviceSynchronize();
+
+  int out[2] = {0, 0};
+  vcMemcpy(out, dOut, 8, VCMemcpyKind::DeviceToHost);
+  int ssbo[6] = {0, 0, 0, 0, 0, 0};
+  vcMemcpy(ssbo, dSsbo, 24, VCMemcpyKind::DeviceToHost);
+
+  int okLocal = (out[0] == 66);
+  int okDeep = (out[1] == 1110);
+  int okSsboWrite = (ssbo[0] == 10 && ssbo[1] == 20 && ssbo[2] == 30 &&
+                     ssbo[3] == 40 && ssbo[4] == 50 && ssbo[5] == 60);
+
+  int ok = okLocal && okDeep && okSsboWrite;
+  printf("nested_struct: %s (local=%d deep=%d ssbo=%d %d %d %d %d %d)\n",
+         ok ? "PASS" : "FAIL", out[0], out[1],
+         ssbo[0], ssbo[1], ssbo[2], ssbo[3], ssbo[4], ssbo[5]);
+
+  vcFree(dOut);
+  vcFree(dSsbo);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

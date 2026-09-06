@@ -148,6 +148,10 @@ class ASTToMLIRImpl {
     mlir::Type type;
     uint32_t offset;
     std::vector<int64_t> arrayDims; // trailing array dims (e.g. v[2] -> {2})
+    // For a nested-struct-by-value field (`Inner in;` inside `Outer`), the inner
+    // record type so access sites can recurse into Inner's layout at the
+    // accumulated byte offset. Null for scalar/vector/array fields.
+    const RecordType *nestedRec = nullptr;
   };
   struct StructLayout {
     std::vector<FieldLayout> fields;
@@ -417,26 +421,69 @@ private:
   // sizeof(Result) matches.
   void recordStructLayout(const StructDecl *sd) {
     if (recordLayouts.count(sd->name)) return;
+    // Reserve a placeholder so a self-referential (or mutually recursive) struct
+    // by-value field terminates: a `struct Node { Node next; }` is ill-formed C++
+    // anyway (infinite size), and we'd rather report a 0-stride than loop.
+    recordLayouts[sd->name].stride = 0;
     StructLayout layout;
     uint32_t off = 0;
     uint32_t maxAlign = 1;
     for (const FieldDecl *f : sd->fields) {
+      // A nested struct-by-value field (`Inner in;` in `Outer`): force-register
+      // Inner's layout (so a forward-declared Inner — defined later in the source
+      // — still resolves), then size/align the field by Inner's stride. The
+      // field's MLIR "type" is Inner's flat memref<Nxi32> form (matching cvtType's
+      // bare-RecordType branch), and nestedRec lets access sites recurse into
+      // Inner's own field layout at the accumulated byte offset.
+      if (f->type && isa<RecordType>(f->type) && f->arrayDims.empty()) {
+        auto *innerRec = cast<RecordType>(f->type);
+        const StructDecl *innerSd = lookupStructDecl(innerRec->decl->name);
+        if (innerSd) recordStructLayout(innerSd);
+        auto innerIt = recordLayouts.find(innerRec->decl->name);
+        if (innerIt != recordLayouts.end() && innerIt->second.stride > 0) {
+          const StructLayout &innerLayout = innerIt->second;
+          uint32_t align = fieldAlignmentStruct(innerLayout);
+          uint32_t size = innerLayout.stride;
+          off = (off + align - 1) & ~(align - 1);
+          mlir::Type fty = MemRefType::get(
+              {(int64_t)((innerLayout.stride + 3) / 4)}, builder.getI32Type());
+          layout.fields.push_back(
+              {f->name.str(), fty, off, f->arrayDims, innerRec});
+          off += size;
+          if (align > maxAlign) maxAlign = align;
+          continue;
+        }
+        // Inner layout unavailable: fall through to the generic path (will skip).
+      }
       mlir::Type fty = cvtType(f->type);
       if (!fty) {
-        // Unsupported field type (e.g. a nested struct): skip but keep the
-        // struct resolvable; field access to it will error at use site.
+        // Unsupported field type: skip but keep the struct resolvable; field
+        // access to it will error at use site.
         continue;
       }
       uint32_t align = fieldAlignment(fty);
       uint32_t size = fieldSize(fty, f->arrayDims);
       off = (off + align - 1) & ~(align - 1);
-      layout.fields.push_back({f->name.str(), fty, off, f->arrayDims});
+      layout.fields.push_back({f->name.str(), fty, off, f->arrayDims, nullptr});
       off += size;
       if (align > maxAlign) maxAlign = align;
     }
     layout.stride = (off + maxAlign - 1) & ~(maxAlign - 1);
     if (layout.stride == 0) layout.stride = maxAlign;
     recordLayouts[sd->name] = std::move(layout);
+  }
+
+  // Alignment of a whole struct under std430 = the max alignment of its fields.
+  uint32_t fieldAlignmentStruct(const StructLayout &layout) {
+    uint32_t a = 1;
+    for (const FieldLayout &f : layout.fields) {
+      uint32_t fa = f.nestedRec
+                        ? fieldAlignmentStruct(
+                              recordLayouts.lookup(f.nestedRec->decl->name))
+                        : fieldAlignment(f.type);
+      if (fa > a) a = fa;
+    }
+    return a;
   }
 
   // Alignment (bytes) of an MLIR element type under std430.
@@ -5250,18 +5297,72 @@ private:
   // `pts[i].v[k]` adds k*elemSize). On success, `mem` is the SSBO memref,
   // `slotIdx` is the i32-granular slot index, and `fieldTy` is the field's
   // MLIR type.
-  bool structFieldAddr(const MemberAccessExpr *m, Location l,
-                       Value extraByteOff, Value &mem, Value &slotIdx,
-                       mlir::Type &fieldTy,
-                       std::vector<int64_t> *arrayDimsOut = nullptr) {
+  // Resolve a (possibly nested) struct field access chain to the base memref
+  // and an accumulated byte offset. Handles `o.in.a` (MemberAccessExpr whose
+  // base is another MemberAccessExpr resolving to a nested-struct-by-value
+  // field) by recursing: each nested-struct field contributes its byte offset,
+  // and the outermost member is looked up in the innermost struct's layout.
+  //
+  // On success returns true and sets:
+  //  - mem: the base memref (SSBO memref<?xi32> or local memref<Nxi32>)
+  //  - byteOff: accumulated i32 byte offset (field offsets summed)
+  //  - fld: the innermost field's layout (for type/arrayDims/nestedRec)
+  //  - isLocalStruct: whether the base is a local struct value (no index*stride)
+  //  - indexNode: the outer SSBO element index (`r[i].f`), or null
+  // `extraByteOff` (caller-supplied, e.g. `pts[i].v[k]`'s k*elemSize) is added
+  // to the result so callers compose naturally.
+  bool resolveStructFieldChain(const MemberAccessExpr *m, Location l,
+                               Value extraByteOff, Value &mem, Value &byteOff,
+                               const FieldLayout *&fld, bool &isLocalStruct,
+                               ASTNode *&indexNode) {
     if (!m->base) return false;
     ASTNode *base = m->base.get();
-    ASTNode *indexNode = nullptr;
+    indexNode = nullptr;
+    // Peel a single IndexExpr (SSBO element index `r[i].f`).
     if (base->getNodeType() == ASTNode::NodeKind::IndexExpr) {
       auto *ie = static_cast<IndexExpr *>(base);
       indexNode = ie->index.get();
       base = ie->base.get();
     }
+
+    // Recursive case: base is itself a MemberAccessExpr resolving to a nested
+    // struct field (`o.in.a`: base = `o.in`). Resolve the inner access first,
+    // then look up the outer member in the inner struct's layout.
+    if (base && base->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+      auto *innerMa = static_cast<MemberAccessExpr *>(base);
+      Value innerByteOff;
+      const FieldLayout *innerFld = nullptr;
+      bool innerLocal = false;
+      ASTNode *innerIdx = nullptr;
+      if (!resolveStructFieldChain(innerMa, l, Value(), mem, innerByteOff,
+                                   innerFld, innerLocal, innerIdx))
+        return false;
+      // The inner field must be a nested struct to recurse into it.
+      if (!innerFld || !innerFld->nestedRec) return false;
+      auto innerLayoutIt = recordLayouts.find(innerFld->nestedRec->decl->name);
+      if (innerLayoutIt == recordLayouts.end()) return false;
+      const StructLayout &innerLayout = innerLayoutIt->second;
+      const FieldLayout *outerFld = nullptr;
+      for (const auto &f : innerLayout.fields)
+        if (f.name == m->member) { outerFld = &f; break; }
+      if (!outerFld) return false;
+      fld = outerFld;
+      isLocalStruct = innerLocal;
+      // The SSBO element index lives on the innermost (base) access only; an
+      // inner indexNode was already folded into innerByteOff by the recursion.
+      // indexNode for the *outer* level is null (nested member access has no
+      // extra index term — `o.in.a` indexes nothing at the `.a` level).
+      Value off = builder.create<arith::ConstantOp>(
+          l, builder.getI32Type(),
+          builder.getI32IntegerAttr((int32_t)outerFld->offset));
+      off = builder.create<arith::AddIOp>(l, off, innerByteOff);
+      if (extraByteOff)
+        off = builder.create<arith::AddIOp>(l, off, extraByteOff);
+      byteOff = off;
+      return true;
+    }
+
+    // Base case: base is a DeclRefExpr naming a struct variable.
     if (!base || base->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
       return false;
     auto *ref = static_cast<DeclRefExpr *>(base);
@@ -5278,7 +5379,7 @@ private:
     //    and there is no index*stride term (a single struct, base is a plain
     //    DeclRefExpr so indexNode stays null).
     const RecordType *rec = nullptr;
-    bool isLocalStruct = false;
+    isLocalStruct = false;
     if (isa<PointerType>(t)) {
       const vc::Type *pointee = cast<PointerType>(t)->pointee;
       if (!pointee || !isa<RecordType>(pointee)) return false;
@@ -5292,20 +5393,18 @@ private:
     auto lit = recordLayouts.find(rec->decl->name);
     if (lit == recordLayouts.end()) return false;
     const StructLayout &layout = lit->second;
-    const FieldLayout *fld = nullptr;
+    fld = nullptr;
     for (const auto &f : layout.fields)
       if (f.name == m->member) { fld = &f; break; }
     if (!fld) return false;
-    if (arrayDimsOut) *arrayDimsOut = fld->arrayDims;
 
     auto sit = locals.find(ref->name);
     if (sit == locals.end()) return false;
     mem = sit->second;
     if (!mem.getType().isa<MemRefType>()) return false;
-    fieldTy = fld->type;
 
     // byteOff = fieldOffset + (elemIdx*stride for SSBO array) + extraByteOff
-    Value byteOff = builder.create<arith::ConstantOp>(
+    Value off = builder.create<arith::ConstantOp>(
         l, builder.getI32Type(),
         builder.getI32IntegerAttr((int32_t)fld->offset));
     // The index*stride term applies only to SSBO struct arrays (`r[i]`); a
@@ -5318,10 +5417,28 @@ private:
           l, builder.getI32Type(),
           builder.getI32IntegerAttr((int32_t)layout.stride));
       Value elemOff = builder.create<arith::MulIOp>(l, idx, strideConst);
-      byteOff = builder.create<arith::AddIOp>(l, byteOff, elemOff);
+      off = builder.create<arith::AddIOp>(l, off, elemOff);
     }
     if (extraByteOff)
-      byteOff = builder.create<arith::AddIOp>(l, byteOff, extraByteOff);
+      off = builder.create<arith::AddIOp>(l, off, extraByteOff);
+    byteOff = off;
+    return true;
+  }
+
+  bool structFieldAddr(const MemberAccessExpr *m, Location l,
+                       Value extraByteOff, Value &mem, Value &slotIdx,
+                       mlir::Type &fieldTy,
+                       std::vector<int64_t> *arrayDimsOut = nullptr) {
+    Value byteOff;
+    const FieldLayout *fld = nullptr;
+    bool isLocalStruct = false;
+    ASTNode *indexNode = nullptr;
+    if (!resolveStructFieldChain(m, l, extraByteOff, mem, byteOff, fld,
+                                 isLocalStruct, indexNode))
+      return false;
+    if (!fld) return false;
+    if (arrayDimsOut) *arrayDimsOut = fld->arrayDims;
+    fieldTy = fld->type;
     slotIdx = builder.create<arith::ShRSIOp>(
         l, byteOff,
         builder.create<arith::ConstantOp>(l, builder.getI32Type(),
@@ -5388,66 +5505,16 @@ private:
   // memref.store (f32/i32) or a lo/hi pair (i64/f64 via shift+mask).
   bool storeStructField(const MemberAccessExpr *m, Value rhs, Location l) {
     if (!m->base) return false;
-    // Resolve the base variable name and optional element index.
-    ASTNode *base = m->base.get();
-    NodePtr indexExpr; // (unused; we read index from IndexExpr directly)
-    ASTNode *indexNode = nullptr;
-    if (base->getNodeType() == ASTNode::NodeKind::IndexExpr) {
-      auto *ie = static_cast<IndexExpr *>(base);
-      indexNode = ie->index.get();
-      base = ie->base.get();
-    }
-    if (!base || base->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
-      return false;
-    auto *ref = static_cast<DeclRefExpr *>(base);
-    auto tit = localTypes.find(ref->name);
-    if (tit == localTypes.end()) return false;
-    const vc::Type *t = tit->second;
-    if (!t) return false;
-    // SSBO struct pointer (`Result* r; r[i].f = ...`) or a bare local struct
-    // value (`acc.sum = ...`); see structFieldAddr for the shape distinction.
-    const RecordType *rec = nullptr;
-    bool isLocalStruct = false;
-    if (isa<PointerType>(t)) {
-      const vc::Type *pointee = cast<PointerType>(t)->pointee;
-      if (!pointee || !isa<RecordType>(pointee)) return false;
-      rec = cast<RecordType>(pointee);
-    } else if (isa<RecordType>(t)) {
-      rec = cast<RecordType>(t);
-      isLocalStruct = true;
-    } else {
-      return false;
-    }
-    auto lit = recordLayouts.find(rec->decl->name);
-    if (lit == recordLayouts.end()) return false;
-    const StructLayout &layout = lit->second;
-    // Find the field.
+    // Resolve the (possibly nested) field chain to base memref + byte offset.
+    Value mem, byteOff;
     const FieldLayout *fld = nullptr;
-    for (const auto &f : layout.fields)
-      if (f.name == m->member) { fld = &f; break; }
+    bool isLocalStruct = false;
+    ASTNode *indexNode = nullptr;
+    if (!resolveStructFieldChain(m, l, Value(), mem, byteOff, fld,
+                                 isLocalStruct, indexNode))
+      return false;
     if (!fld) return false;
 
-    // Base memref — the SSBO memref<?xi32> view, or a local struct's
-    // memref<Nxi32, Function> slot.
-    auto sit = locals.find(ref->name);
-    if (sit == locals.end()) return false;
-    Value mem = sit->second;
-    if (!mem.getType().isa<MemRefType>()) return false;
-
-    // Byte offset = elementIndex * structStride + fieldOffset. The element term
-    // is SSBO-only (local struct has no outer index).
-    Value byteOff = builder.create<arith::ConstantOp>(
-        l, builder.getI32Type(),
-        builder.getI32IntegerAttr((int32_t)fld->offset));
-    if (indexNode && !isLocalStruct) {
-      Value idx = loadValue(visitExpr(indexNode), loc(indexNode));
-      if (!idx) return false;
-      idx = castValue(idx, builder.getI32Type(), l);
-      Value strideConst = builder.create<arith::ConstantOp>(
-          l, builder.getI32Type(), builder.getI32IntegerAttr((int32_t)layout.stride));
-      Value elemOff = builder.create<arith::MulIOp>(l, idx, strideConst);
-      byteOff = builder.create<arith::AddIOp>(l, byteOff, elemOff);
-    }
     // i32 slot index = byteOff / 4.
     Value slotIdx = builder.create<arith::ShRSIOp>(
         l, byteOff,
