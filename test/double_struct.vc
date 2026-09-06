@@ -1,0 +1,72 @@
+// test/double_struct.vc — double / i64 struct fields with arithmetic.
+//
+// Regression for the MLIR backend's float-literal typing: a bare `1.5` literal
+// used to be emitted as f32, so `double x = 1.5;` or `(double)i + 1.5` mixed
+// f64 and f32 operands and failed `arith.addf` type checking. The root cause
+// was NOT struct-specific — any double arithmetic with a bare literal broke —
+// but it surfaced through struct field stores/reads (`s.d = ...; s.d * 2.0`).
+//
+// Fixed by:
+//  - FloatLiteral emission: bare literal -> f64 (double), `1.5f` -> f32. The
+//    parser already set isFloat32 only for the f/F suffix; the emitter just
+//    honored it.
+//  - commonize: C usual arithmetic conversions for float widths — if either
+//    side is wider (f64), widen the other (ExtFOp); int partners promote to
+//    the float type (SIToFPOp) at whatever width the float side is.
+//  - storeTo: float width reconciliation at the store site (TruncFOp f64->f32
+//    for `float x = 0.0;`, ExtFOp for the reverse), and an f64->f32 narrowing
+//    before the i32-slot bitcast for struct array-field stores (`v.c[0]=1.0`).
+//
+// Single kernel: a separate pre-existing bug (host codegen infinite loop when
+// two kernels each declare a local struct) is out of scope here.
+//
+//   vcc test/double_struct.vc -o build/double_struct_sf && ./build/double_struct_sf
+//   vc  test/double_struct.vc -emit=full -o build/double_struct_m && ./build/double_struct_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+struct DBox { double d; int y; };     // 8-byte field + 4-byte field
+struct LBox { long x; int y; };       // i64 field + i32 field
+
+__global__ void doubleStructKernel(double *dblOut, int *intOut) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i == 0) {
+    // double field: store through lo/hi i32 slots, reassemble for arithmetic
+    // with another bare (f64) literal.
+    DBox d;
+    d.d = (double)i + 1.5;            // 1.5 (bare literal -> f64)
+    d.y = 7;
+    dblOut[0] = d.d * 2.0 + (double)d.y; // 1.5*2 + 7 = 10.0
+
+    // i64 field (>2^29, does not fit in i32): reassemble lo+hi before cast.
+    LBox l;
+    l.x = 1000000003L;
+    l.y = 42;
+    intOut[0] = (int)l.x + l.y;       // 1000000045
+  }
+}
+
+int main() {
+  vcInit();
+
+  void *dDbl = 0, *dInt = 0;
+  vcMalloc(&dDbl, 8);
+  vcMalloc(&dInt, 4);
+
+  doubleStructKernel<<<1, 32>>>(dDbl, dInt);
+  vcDeviceSynchronize();
+
+  double hd = 0;
+  vcMemcpy(&hd, dDbl, 8, VCMemcpyKind::DeviceToHost);
+  int hi = 0;
+  vcMemcpy(&hi, dInt, 4, VCMemcpyKind::DeviceToHost);
+
+  int ok = (hd == 10.0) && (hi == 1000000045);
+  printf("double_struct: %s (dbl=%.3f lng=%d)\n", ok ? "PASS" : "FAIL", hd, hi);
+
+  vcFree(dDbl);
+  vcFree(dInt);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

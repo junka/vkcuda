@@ -966,16 +966,28 @@ private:
                v.getType().getIntOrFloatBitWidth() <
                    elem.getIntOrFloatBitWidth())
         v = builder.create<arith::ExtSIOp>(l, elem, v);
+      else if (v.getType().isa<mlir::FloatType>() &&
+               elem.isa<mlir::FloatType>())
+        // Float width reconciliation: a bare `0.0` literal (f64) stored into a
+        // `float` local (f32) narrows via TruncFOp; an `f`-suffixed literal
+        // stored into a double widens via ExtFOp. castValue handles both.
+        v = castValue(v, elem, l);
     }
     // Struct slot store: the memref is the flat i32 view of a struct (SSBO or
     // local value), and `v` is the field's native type (e.g. `v.c[0] = 1.0f`
     // stores an f32 into an i32 slot). This is a BITCAST (preserve bits), not a
     // numeric conversion — the host reads the same bit pattern back as the
-    // field's C type, mirroring storeStructField. Covers f32/f16 -> i32. (i64/f64
-    // array-field stores are not exercised by the demos and stay unsupported.)
-    if (v.getType() != elem && elem.isInteger(32) &&
-        (v.getType().isF32() || v.getType().isF16()))
-      v = builder.create<arith::BitcastOp>(l, elem, v);
+    // field's C type, mirroring storeStructField. Covers f32/f16 -> i32. A bare
+    // `1.0` literal (f64) stored to a `float` field narrows to f32 first, then
+    // bitcasts to i32 (a `double` array field spanning two i32 slots is still
+    // unsupported — the lo/hi split only lives in storeStructField for scalar
+    // struct fields, not array elements).
+    if (v.getType() != elem && elem.isInteger(32)) {
+      if (v.getType().isF64())
+        v = builder.create<arith::TruncFOp>(l, builder.getF32Type(), v);
+      if (v.getType().isF32() || v.getType().isF16())
+        v = builder.create<arith::BitcastOp>(l, elem, v);
+    }
     if (indices.empty())
       builder.create<memref::StoreOp>(l, v, mem);
     else
@@ -1099,18 +1111,38 @@ private:
     if (l.getType() == r.getType()) return {l, r};
     // Mixed int/float: promote the integer side to the float type so a float
     // op (e.g. `TILE * scale` where TILE is int, scale is float) lowers to
-    // arith.mulf instead of crashing arith.muli on an f32 operand.
-    if (l.getType().isF32() && r.getType().isIntOrIndex()) {
-      if (r.getType().isIndex())
-        r = builder.create<arith::IndexCastOp>(lc, builder.getI32Type(), r);
-      return {l, builder.create<arith::SIToFPOp>(lc, builder.getF32Type(), r)};
+    // arith.mulf instead of crashing arith.muli on an f32 operand. The float
+    // width wins: a double operand (bare `1.5` literal, or a `double` local)
+    // promotes an int partner to f64; an f32 partner promotes to f32.
+    auto promoteIntToFloat = [&](Value &intSide, Value &fltSide) {
+      mlir::Type ft = fltSide.getType();
+      if (intSide.getType().isIndex())
+        intSide = builder.create<arith::IndexCastOp>(lc, builder.getI32Type(),
+                                                     intSide);
+      intSide = builder.create<arith::SIToFPOp>(lc, ft, intSide);
+    };
+    if (l.getType().isa<mlir::FloatType>() && r.getType().isIntOrIndex()) {
+      promoteIntToFloat(r, l);
+      return {l, r};
     }
-    if (r.getType().isF32() && l.getType().isIntOrIndex()) {
-      if (l.getType().isIndex())
-        l = builder.create<arith::IndexCastOp>(lc, builder.getI32Type(), l);
-      return {builder.create<arith::SIToFPOp>(lc, builder.getF32Type(), l), r};
+    if (r.getType().isa<mlir::FloatType>() && l.getType().isIntOrIndex()) {
+      promoteIntToFloat(l, r);
+      return {l, r};
     }
-    if (l.getType().isF32() || r.getType().isF32()) return {l, r};
+    // Mixed float widths (f64 vs f32, f64 vs f16, f32 vs f16): widen the
+    // narrower to the wider (C usual arithmetic conversions). Truncation never
+    // happens here — both sides end up the wider type, and a narrowing store
+    // back to a narrower local happens later via castValue at the store site.
+    if (l.getType().isa<mlir::FloatType>() &&
+        r.getType().isa<mlir::FloatType>()) {
+      unsigned lw = l.getType().getIntOrFloatBitWidth();
+      unsigned rw = r.getType().getIntOrFloatBitWidth();
+      if (lw > rw)
+        r = builder.create<arith::ExtFOp>(lc, l.getType(), r);
+      else if (rw > lw)
+        l = builder.create<arith::ExtFOp>(lc, r.getType(), l);
+      return {l, r};
+    }
     if (l.getType().isIndex() && r.getType().isIntOrIndex()) {
       if (!r.getType().isIndex())
         r = builder.create<arith::IndexCastOp>(lc, builder.getIndexType(), r);
@@ -2093,9 +2125,16 @@ private:
           l, builder.getI32IntegerAttr(
                  static_cast<IntegerLiteral *>(n)->value));
     case ASTNode::NodeKind::FloatLiteral: {
-      double v = static_cast<FloatLiteral *>(n)->value;
+      auto *fl = static_cast<FloatLiteral *>(n);
+      double v = fl->value;
+      // A bare `1.5` literal is double (f64) by C rules; `1.5f` is float (f32).
+      // The parser sets isFloat32 only for the `f`/`F` suffix. Emitting a bare
+      // literal as f32 would make `double x = 1.5;` / `(double)i + 1.5` mix
+      // f64 and f32 operands and fail arith.addf type checking.
+      mlir::Type fltTy = fl->isFloat32 ? builder.getF32Type()
+                                       : builder.getF64Type();
       return builder.create<arith::ConstantOp>(
-          l, builder.getF32Type(), builder.getFloatAttr(builder.getF32Type(), v));
+          l, fltTy, builder.getFloatAttr(fltTy, v));
     }
     case ASTNode::NodeKind::CharLiteral:
       return builder.create<arith::ConstantOp>(
