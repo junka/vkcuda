@@ -709,6 +709,7 @@ NodePtr Parser::makeLiteralFromText(StringRef text, SourceLocation loc) {
   if (looksInt) {
     int64_t v = 0;
     StringRef txt = text;
+    bool isLong = txt.contains('l') || txt.contains('L');
     if (txt.size() > 2 && txt[0] == '0' && (txt[1] == 'x' || txt[1] == 'X')) {
       StringRef hex = txt.substr(2);
       while (!hex.empty() && (hex.back() == 'u' || hex.back() == 'U' ||
@@ -721,7 +722,9 @@ NodePtr Parser::makeLiteralFromText(StringRef text, SourceLocation loc) {
         txt = txt.drop_back();
       txt.getAsInteger(10, v);
     }
-    return NodePtr(new IntegerLiteral(loc, v));
+    auto *il = new IntegerLiteral(loc, v);
+    il->isLong = isLong;
+    return NodePtr(il);
   }
   // Float? (contains '.' or an exponent, optional f/F suffix)
   bool looksFloat = false;
@@ -736,9 +739,15 @@ NodePtr Parser::makeLiteralFromText(StringRef text, SourceLocation loc) {
   if (looksFloat) {
     double v = 0;
     StringRef txt = text;
-    if (txt.ends_with("f") || txt.ends_with("F")) txt = txt.drop_back();
+    bool f32 = false;
+    if (txt.ends_with("f") || txt.ends_with("F")) {
+      txt = txt.drop_back();
+      f32 = true;
+    }
     txt.getAsDouble(v);
-    return NodePtr(new FloatLiteral(loc, v));
+    auto *fl = new FloatLiteral(loc, v);
+    fl->isFloat32 = f32;
+    return NodePtr(fl);
   }
   return nullptr;
 }
@@ -1729,6 +1738,9 @@ NodePtr Parser::parsePrimary() {
     advance();
     int64_t v = 0;
     StringRef txt = t.text;
+    // A `long` suffix (l/L) widens the host-side type; record it before
+    // stripping so the host emitter can re-attach `L` (see IntegerLiteral).
+    bool isLong = txt.contains('l') || txt.contains('L');
     // Hex literal: 0x... -> parse base 16. Strip the 0x prefix and any
     // trailing integer suffix (u/U/l/L) before converting.
     if (txt.size() > 2 && txt[0] == '0' && (txt[1] == 'x' || txt[1] == 'X')) {
@@ -1746,16 +1758,23 @@ NodePtr Parser::parsePrimary() {
         txt = txt.drop_back();
       txt.getAsInteger(10, v);
     }
-    return NodePtr(new IntegerLiteral(toSourceLoc(t), v));
+    auto *il = new IntegerLiteral(toSourceLoc(t), v);
+    il->isLong = isLong;
+    return NodePtr(il);
   }
   case TokKind::float_literal: {
     advance();
     double v = 0;
     StringRef txt = t.text;
-    if (txt.ends_with("f") || txt.ends_with("F"))
+    bool f32 = false;
+    if (txt.ends_with("f") || txt.ends_with("F")) {
       txt = txt.drop_back();
+      f32 = true;
+    }
     txt.getAsDouble(v);
-    return NodePtr(new FloatLiteral(toSourceLoc(t), v));
+    auto *fl = new FloatLiteral(toSourceLoc(t), v);
+    fl->isFloat32 = f32;
+    return NodePtr(fl);
   }
   case TokKind::identifier:
     advance();

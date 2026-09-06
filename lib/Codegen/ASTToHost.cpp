@@ -702,12 +702,26 @@ private:
   void emitHostExpr(const ASTNode *n) {
     if (!n) { os << "/*null*/"; return; }
     switch (n->getNodeType()) {
-    case ASTNode::NodeKind::IntegerLiteral:
-      os << static_cast<const IntegerLiteral *>(n)->value;
+    case ASTNode::NodeKind::IntegerLiteral: {
+      auto *il = static_cast<const IntegerLiteral *>(n);
+      os << il->value;
+      // Re-attach the `long` suffix so a spilled launch arg deduces the right
+      // width, matching a long device parameter.
+      if (il->isLong)
+        os << "L";
       return;
-    case ASTNode::NodeKind::FloatLiteral:
-      os << static_cast<const FloatLiteral *>(n)->value;
+    }
+    case ASTNode::NodeKind::FloatLiteral: {
+      auto *fl = static_cast<const FloatLiteral *>(n);
+      os << fl->value;
+      // Re-attach the single-precision suffix so a spilled launch arg
+      // (`auto x = (2.5f)`) deduces `float`, matching a float device
+      // parameter. Without it the literal is `double` and the device reads
+      // the wrong 4 of 8 bytes.
+      if (fl->isFloat32)
+        os << "f";
       return;
+    }
     case ASTNode::NodeKind::BoolLiteral:
       os << (static_cast<const BoolLiteral *>(n)->value ? "true" : "false");
       return;
@@ -951,10 +965,25 @@ private:
        << ") vcLoadKernel(" << spirvVar << ", " << spirvVar
        << "_len, \"" << entryPt << "\", &__vc_k_" << kname << ");\n";
     pad(indent + 1);
+    // Spill every scalar (non-pointer) launch arg to a synthetic local before
+    // building the __args array. A literal or compound-expression arg is an
+    // rvalue, so `&(expr)` (the previous form) fails to compile with "lvalue
+    // required as unary '&' operand". Materializing each into a named local
+    // gives it an address; `auto` preserves the expression's type (int/float/
+    // long/...) so sizeof matches what the device ABI expects. Pointer args
+    // (vcMalloc handles) are passed by value and need no spill.
+    for (unsigned i = 0; i < l->args.size(); ++i) {
+      if (!isPointerArg(l->args[i].get())) {
+        pad(indent + 1);
+        os << "auto __vc_a" << i << " = (";
+        emitHostExpr(l->args[i].get());
+        os << ");\n";
+      }
+    }
     os << "VCKernelArg __args[" << l->args.size() << "] = {";
     for (unsigned i = 0; i < l->args.size(); ++i) {
       if (i) os << ", ";
-      emitLaunchArg(l->args[i].get(), indent + 1);
+      emitLaunchArg(l->args[i].get(), i, indent + 1);
     }
     os << "};\n";
 
@@ -993,38 +1022,32 @@ private:
     os << "}\n";
   }
 
-  // Classify one launch arg and emit its VCKernelArg initializer.
-  void emitLaunchArg(const ASTNode *arg, unsigned /*indent*/) {
-    // Pointer arg: a DeclRefExpr whose declared type is PointerType. The
-    // variable holds a vcMalloc device handle; pass its value directly.
-    if (arg && arg->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
-      auto *d = static_cast<const DeclRefExpr *>(arg);
-      auto it = hostVarTypes.find(d->name);
-      if (it != hostVarTypes.end() && it->second &&
-          it->second->getKind() == TypeKind::Pointer) {
-        os << "{VCKernelArg::Pointer, ";
-        emitHostExpr(arg); // the handle value
-        os << ", 0}";
-        return;
-      }
+  // True if `arg` is a pointer-typed DeclRefExpr (a vcMalloc device handle):
+  // such args are passed by value, not by address, and need no spill.
+  bool isPointerArg(const ASTNode *arg) {
+    if (!arg || arg->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+      return false;
+    auto *d = static_cast<const DeclRefExpr *>(arg);
+    auto it = hostVarTypes.find(d->name);
+    return it != hostVarTypes.end() && it->second &&
+           it->second->getKind() == TypeKind::Pointer;
+  }
+
+  // Classify one launch arg and emit its VCKernelArg initializer. `idx` is the
+  // arg's position; scalar args were already spilled to `__vc_a<idx>` by
+  // emitLaunch, so we take that local's address (always an lvalue).
+  void emitLaunchArg(const ASTNode *arg, unsigned idx, unsigned /*indent*/) {
+    // Pointer arg: pass the handle value directly (no spill local exists).
+    if (isPointerArg(arg)) {
+      os << "{VCKernelArg::Pointer, ";
+      emitHostExpr(arg);
+      os << ", 0}";
+      return;
     }
-    // Scalar arg: pass address + size. Use sizeof on the declared type when
-    // known; fall back to sizeof(int) for literals/expressions.
-    os << "{VCKernelArg::Scalar, &(";
-    emitHostExpr(arg);
-    os << "), sizeof(";
-    if (arg && arg->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
-      auto *d = static_cast<const DeclRefExpr *>(arg);
-      auto it = hostVarTypes.find(d->name);
-      if (it != hostVarTypes.end() && it->second) {
-        os << cppType(it->second);
-      } else {
-        os << "int";
-      }
-    } else {
-      os << "int";
-    }
-    os << ")}";
+    // Scalar arg: address + size of the spill local. sizeof(__vc_a<idx>) keeps
+    // the expression's real width (int/float/long/...), set by `auto` above.
+    os << "{VCKernelArg::Scalar, &__vc_a" << idx << ", sizeof(__vc_a" << idx
+       << ")}";
   }
 
   // --------------------------------------------------------------------- //

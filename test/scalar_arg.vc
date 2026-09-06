@@ -1,0 +1,43 @@
+// test/scalar_arg.vc — scalar kernel arguments passed as literals.
+//
+// Regression for the host-codegen `&(literal)` bug: a scalar kernel arg given
+// as a literal (not a variable) used to make the host emitter produce `&(7)`,
+// which g++ rejects ("lvalue required as unary '&' operand"). The fix spills
+// each scalar arg to a synthetic local `auto __vc_aK = (expr);` and takes its
+// address. This also exercises the re-attached type suffixes (`f` for float,
+// `L` for long) so `auto` deduces the width matching the device parameter.
+//
+//   vcc test/scalar_arg.vc -o build/scalar_arg_sf && ./build/scalar_arg_sf
+//   vc  test/scalar_arg.vc -emit=full -o build/scalar_arg_m && ./build/scalar_arg_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// Mix of scalar parameter widths so a wrong-width spill is detectable.
+__global__ void scalarArgKernel(float *out, int n, float f, long lg) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i == 0)
+    out[0] = (float)n + f + (float)lg;
+}
+
+int main() {
+  vcInit();
+
+  void *dOut = 0;
+  vcMalloc(&dOut, 4);
+
+  // All three scalar args are LITERALS (the case that used to break):
+  //   n=7   (int),  f=2.5f (float),  lg=100L (long)  ->  109.5
+  scalarArgKernel<<<1, 32>>>(dOut, 7, 2.5f, 100L);
+  vcDeviceSynchronize();
+
+  float h = 0;
+  vcMemcpy(&h, dOut, 4, VCMemcpyKind::DeviceToHost);
+
+  int ok = (h == 109.5f);
+  printf("scalar_arg: %s (got=%.1f expect=109.5)\n", ok ? "PASS" : "FAIL", h);
+
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

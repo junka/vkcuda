@@ -591,6 +591,12 @@ public:
 class IntegerLiteral : public ASTNode {
 public:
   int64_t value;
+  // True if the source spelled a `long` suffix (`l`/`L`). The lexer consumes
+  // integer suffixes without recording them, so this flag is the only record
+  // that the literal was `100L` (long) rather than `100` (int). Host codegen
+  // re-attaches the `L` so a spilled launch arg deduces the right width,
+  // matching a long device parameter.
+  bool isLong = false;
   IntegerLiteral(SourceLocation l, int64_t v) : ASTNode(l), value(v) {}
   NodeKind getNodeType() const override { return NodeKind::IntegerLiteral; }
 };
@@ -598,6 +604,12 @@ public:
 class FloatLiteral : public ASTNode {
 public:
   double value;
+  // True if the source spelled a single-precision suffix (`f`/`F`). The lexer
+  // drops the suffix when building the token text, so this flag is the only
+  // record that the literal was `2.5f` (float) rather than `2.5` (double).
+  // Host codegen relies on it to re-attach the `f` suffix so a spilled launch
+  // arg `auto x = (2.5f)` deduces float, matching a float device parameter.
+  bool isFloat32 = false;
   FloatLiteral(SourceLocation l, double v) : ASTNode(l), value(v) {}
   NodeKind getNodeType() const override { return NodeKind::FloatLiteral; }
 };
