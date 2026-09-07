@@ -1,0 +1,116 @@
+// test/vector_ptr.vc — vector-typed pointer parameters (float4*/int4*/float2*).
+//
+// Regression for the MLIR backend's vector-pointer element access. A `float4*`
+// kernel parameter lowers (by cvtType's PointerType<VectorType> branch) to a
+// SCALARIZED memref<?xf32> — NOT memref<?xvector<4xf32>> — because the latter
+// does not legalize its loads/stores through GPUToSPIRV. So element `i` of the
+// vector array spans N consecutive scalar slots [i*N .. i*N+N-1], and access
+// sites must scatter/gather the N components explicitly:
+//
+//   read  `float4 v = p[i]`  -> load N scalars, CompositeConstruct -> vector
+//   write `p[i] = v`         -> CompositeExtract each component, store N scalars
+//
+// Before this fix, `p[i]` loaded a single f32 and tried to store it into a
+// memref<vector<4xf32>> local slot, failing `memref.store` verification
+// ("type of value matches element type of memref"). The GLSL backend already
+// handled this (float4* -> vec4 array via glslType(pointee)); this brings the
+// MLIR backend to parity.
+//
+// Exercises float4 (read+write-back), int4 (read), and float2 (read) so the
+// N=2 and N=4 widths and the int element type are all covered.
+//
+//   vcc test/vector_ptr.vc -o build/vector_ptr_sf && ./build/vector_ptr_sf
+//   vc  test/vector_ptr.vc -emit=full -o build/vector_ptr_m && ./build/vector_ptr_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// float4*: read element, double each component, write back.
+__global__ void dbl4(float4 *pts, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float4 v = pts[i];
+    v.x = v.x * 2.0f;
+    v.y = v.y * 2.0f;
+    v.z = v.z * 2.0f;
+    v.w = v.w * 2.0f;
+    pts[i] = v;
+  }
+}
+
+// int4*: read element, weighted sum of components.
+__global__ void wsum4(int4 *pts, int *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    int4 v = pts[i];
+    out[i] = v.x + v.y * 2 + v.z * 3 + v.w * 4;
+  }
+}
+
+// float2*: read element, sum components (N=2 path).
+__global__ void sum2(float2 *pts, float *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float2 v = pts[i];
+    out[i] = v.x + v.y;
+  }
+}
+
+int main() {
+  vcInit();
+
+  const int N = 4;
+
+  // --- float4* read+write ---
+  void *dF4 = 0;
+  vcMalloc(&dF4, N * 16);
+  float hF4[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+  vcMemcpy(dF4, hF4, N * 16, VCMemcpyKind::HostToDevice);
+  dbl4<<<N, 32>>>(dF4, N);
+  vcDeviceSynchronize();
+  vcMemcpy(hF4, dF4, N * 16, VCMemcpyKind::DeviceToHost);
+
+  // --- int4* read ---
+  void *dI4 = 0, *dIOut = 0;
+  vcMalloc(&dI4, N * 16);
+  vcMalloc(&dIOut, N * 4);
+  int hI4[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+  vcMemcpy(dI4, hI4, N * 16, VCMemcpyKind::HostToDevice);
+  wsum4<<<N, 32>>>(dI4, dIOut, N);
+  vcDeviceSynchronize();
+  int hIOut[4];
+  vcMemcpy(hIOut, dIOut, N * 4, VCMemcpyKind::DeviceToHost);
+
+  // --- float2* read ---
+  void *dF2 = 0, *dFOut = 0;
+  vcMalloc(&dF2, N * 8);
+  vcMalloc(&dFOut, N * 4);
+  float hF2[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  vcMemcpy(dF2, hF2, N * 8, VCMemcpyKind::HostToDevice);
+  sum2<<<N, 32>>>(dF2, dFOut, N);
+  vcDeviceSynchronize();
+  float hFOut[4];
+  vcMemcpy(hFOut, dFOut, N * 4, VCMemcpyKind::DeviceToHost);
+
+  // Verify.
+  int ok = 1;
+  // float4 doubled: 2,4,6,8 ... 26,28,30,32
+  for (int i = 0; i < 16; i++)
+    if (hF4[i] != 2 * (i + 1)) ok = 0;
+  // int4 weighted: 1+4+9+16=30, 5+12+21+32=70, 9+20+33+48=110, 13+28+45+64=150
+  int iexp[4] = {30, 70, 110, 150};
+  for (int i = 0; i < 4; i++)
+    if (hIOut[i] != iexp[i]) ok = 0;
+  // float2 summed: 3, 7, 11, 15
+  float fexp[4] = {3, 7, 11, 15};
+  for (int i = 0; i < 4; i++)
+    if (hFOut[i] != fexp[i]) ok = 0;
+
+  printf("vector_ptr: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dF4);
+  vcFree(dI4); vcFree(dIOut);
+  vcFree(dF2); vcFree(dFOut);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

@@ -176,10 +176,22 @@ static void lowerScalarArgsToPushConstant(gpu::GPUFuncOp gpuFn,
   std::string pcName = ("__vc_pc_" + gpuFn.getName()).str();
   Type pcPtrTy =
       spirv::PointerType::get(pcStructTy, spirv::StorageClass::PushConstant);
+  // spirv.GlobalVariableOp is module-scope: it must live in the gpu.module
+  // body, NOT inside the gpu.func. The shared IRRewriter's insertion point is
+  // whatever packKernels last left it at (often inside the gpu.func body after
+  // the return rewrite), so set it explicitly to the gpu.module body before
+  // creating the global, then reset into the gpu.func body for the prologue
+  // loads below. Without this, the 3rd+ kernel's pcVar create segfaults
+  // (inserting a module-scope op into a function body) — same stale-insertion-
+  // point class of bug as lowerWorkgroupSizeToSpecConstants (see commit
+  // 3281bec), surfacing here only when the shared rewriter's point drifts into
+  // the func body across iterations.
+  OpBuilder::InsertPoint saved = builder.saveInsertionPoint();
+  builder.setInsertionPoint(gpuFn); // module-scope: just before the gpu.func
   auto pcVar = builder.create<spirv::GlobalVariableOp>(
       gpuFn.getLoc(), TypeAttr::get(pcPtrTy), builder.getStringAttr(pcName),
       /*initializer=*/FlatSymbolRefAttr());
-  pcVar->moveBefore(gpuFn);
+  builder.restoreInsertionPoint(saved);
 
   // In the kernel prologue, load each scalar field and replace the original
   // block argument's uses with the loaded value. AccessChain takes SSA index

@@ -941,6 +941,110 @@ private:
     return builder.create<memref::LoadOp>(l, mem, indices);
   }
 
+  // Read `ptr[idx]` where `ptr` is a vector pointer (`float4*`, `int3*`, ...).
+  // Such a pointer lowers to a scalarized memref<?xELEM> (ELEM = f32/i32/...,
+  // NOT vector<NxELEM>), because memref<?xvector<...>> does not legalize its
+  // loads/stores through GPUToSPIRV. So element `idx` of the vector array
+  // spans N consecutive scalar slots [idx*N .. idx*N+N-1]; load each and
+  // CompositeConstruct them back into a vector<NxELEM>. Returns null if `base`
+  // is not a vector-pointer lvalue (caller falls back to the generic path).
+  Value loadVectorPointerElement(IndexExpr *ie, Location l) {
+    if (!ie->base ||
+        ie->base->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+      return Value();
+    auto *ref = static_cast<DeclRefExpr *>(ie->base.get());
+    auto tit = localTypes.find(ref->name);
+    if (tit == localTypes.end() || !tit->second) return Value();
+    auto *ptrTy = dyn_cast<vc::PointerType>(tit->second);
+    if (!ptrTy) return Value();
+    auto *vecTy = dyn_cast<vc::VectorType>(ptrTy->pointee);
+    if (!vecTy) return Value();
+    // The memref the pointer lowered to.
+    auto lit = locals.find(ref->name);
+    if (lit == locals.end()) return Value();
+    Value mem = lit->second;
+    auto mty = mem.getType().dyn_cast<MemRefType>();
+    if (!mty) return Value();
+    unsigned n = vecTy->count;
+    if (n == 0) return Value();
+
+    // Base index `idx` (as i32 for the slot arithmetic), scaled by N.
+    Value idx = loadValue(visitExpr(ie->index.get()), loc(ie->index.get()));
+    if (!idx) return Value();
+    idx = castValue(idx, builder.getI32Type(), loc(ie->index.get()));
+    Value nConst = builder.create<arith::ConstantOp>(
+        l, builder.getI32Type(), builder.getI32IntegerAttr((int32_t)n));
+    Value baseSlot = builder.create<arith::MulIOp>(l, idx, nConst);
+
+    mlir::Type elemTy = cvtType(vecTy->elem);
+    mlir::VectorType vecMTy = mlir::VectorType::get({(int64_t)n}, elemTy);
+    SmallVector<Value, 4> parts;
+    for (unsigned k = 0; k < n; ++k) {
+      Value off = builder.create<arith::ConstantOp>(
+          l, builder.getI32Type(), builder.getI32IntegerAttr((int32_t)k));
+      Value slot = builder.create<arith::AddIOp>(l, baseSlot, off);
+      Value slotIdx = builder.create<arith::IndexCastOp>(
+          l, builder.getIndexType(), slot);
+      Value part = builder.create<memref::LoadOp>(l, mem, ValueRange{slotIdx});
+      if (part.getType() != elemTy)
+        part = castValue(part, elemTy, l);
+      parts.push_back(part);
+    }
+    return builder.create<spirv::CompositeConstructOp>(l, vecMTy, parts);
+  }
+
+  // Store `val` into `ptr[idx]` where `ptr` is a vector pointer (`float4*`).
+  // Mirror of loadVectorPointerElement: the pointer is scalarized to
+  // memref<?xELEM>, so element `idx` spans N scalar slots [idx*N .. idx*N+N-1];
+  // extract each component from the vector `val` and store it to its slot.
+  // Returns true if handled (caller returns); false if `base` is not a
+  // vector-pointer lvalue (caller falls back to the generic store path).
+  bool storeVectorPointerElement(IndexExpr *ie, Value val, Location l) {
+    if (!val || !ie->base ||
+        ie->base->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+      return false;
+    auto *ref = static_cast<DeclRefExpr *>(ie->base.get());
+    auto tit = localTypes.find(ref->name);
+    if (tit == localTypes.end() || !tit->second) return false;
+    auto *ptrTy = dyn_cast<vc::PointerType>(tit->second);
+    if (!ptrTy) return false;
+    auto *vecTy = dyn_cast<vc::VectorType>(ptrTy->pointee);
+    if (!vecTy) return false;
+    auto lit = locals.find(ref->name);
+    if (lit == locals.end()) return false;
+    Value mem = lit->second;
+    if (!mem.getType().isa<MemRefType>()) return false;
+    unsigned n = vecTy->count;
+    if (n == 0) return false;
+
+    mlir::Type elemTy = cvtType(vecTy->elem);
+    mlir::VectorType vecMTy = mlir::VectorType::get({(int64_t)n}, elemTy);
+    // Coerce val to the expected vector type (e.g. int4 stored via a float4
+    // value is not expected, but scalar->vector broadcast or width mismatch is).
+    if (val.getType() != vecMTy)
+      val = castValue(val, vecMTy, l);
+
+    Value idx = loadValue(visitExpr(ie->index.get()), loc(ie->index.get()));
+    if (!idx) return false;
+    idx = castValue(idx, builder.getI32Type(), loc(ie->index.get()));
+    Value nConst = builder.create<arith::ConstantOp>(
+        l, builder.getI32Type(), builder.getI32IntegerAttr((int32_t)n));
+    Value baseSlot = builder.create<arith::MulIOp>(l, idx, nConst);
+    for (unsigned k = 0; k < n; ++k) {
+      Value off = builder.create<arith::ConstantOp>(
+          l, builder.getI32Type(), builder.getI32IntegerAttr((int32_t)k));
+      Value slot = builder.create<arith::AddIOp>(l, baseSlot, off);
+      Value slotIdx = builder.create<arith::IndexCastOp>(
+          l, builder.getIndexType(), slot);
+      Value part = builder.create<spirv::CompositeExtractOp>(
+          l, elemTy, val, builder.getI32ArrayAttr({(int32_t)k}));
+      if (part.getType() != elemTy)
+        part = castValue(part, elemTy, l);
+      builder.create<memref::StoreOp>(l, part, mem, ValueRange{slotIdx});
+    }
+    return true;
+  }
+
   // Store into a memref slot, bridging index<->int / widening ints.
   void storeTo(Value mem, ArrayRef<Value> indices, Value v, Location l) {
     if (!v) return;
@@ -2259,6 +2363,15 @@ private:
             return castValue(raw, elemTy, l);
           }
         }
+      }
+      // Vector-pointer element read: `float4* p; p[i]` loads N consecutive
+      // scalar slots (the pointer is scalarized to memref<?xELEM>) and
+      // CompositeConstructs them into a vector<NxELEM>. See
+      // loadVectorPointerElement for why the memref can't be <?xvector<...>>.
+      if (ie->base && ie->base->getNodeType() ==
+                          ASTNode::NodeKind::DeclRefExpr) {
+        if (Value v = loadVectorPointerElement(ie, l))
+          return v;
       }
       Value loaded = loadLValue(ie, l);
       if (!loaded)
@@ -3883,6 +3996,14 @@ private:
           b->lhs->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
         auto *m = static_cast<MemberAccessExpr *>(b->lhs.get());
         if (storeStructField(m, rhs, l)) return rhs;
+      }
+      // Vector-pointer element write: `float4* p; p[i] = vec` scatters the
+      // vector's components into N consecutive scalar slots. See
+      // storeVectorPointerElement (mirror of the read path).
+      if (b->lhs &&
+          b->lhs->getNodeType() == ASTNode::NodeKind::IndexExpr) {
+        auto *ie = static_cast<IndexExpr *>(b->lhs.get());
+        if (storeVectorPointerElement(ie, rhs, l)) return rhs;
       }
       Value mem;
       SmallVector<Value> indices;
