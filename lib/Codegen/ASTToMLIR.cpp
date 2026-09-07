@@ -2854,33 +2854,27 @@ private:
     };
     llvm::StringRef base = strip(name);
 
-    // Unary float math: one f32 arg, result f32.
+    // Unary float math. Operates in the operand's NATIVE float width
+    // (toNativeFloat preserves f16/f64; only int/index promotes to f32) so a
+    // `double`/`__half` arg is lowered in its own precision. Sqrt/InverseSqrt/
+    // FAbs/FSign/Floor/Ceil/Round accept any float width (SPIRV_Float); the
+    // transcendental set below is f16/f32-only (SPIRV_Float16or32) so a double
+    // operand is run through runTranscendental (truncate→f32 op→extend).
     struct UnaryMath { const char *name; };
     static constexpr llvm::StringRef unaryMath[] = {
         "sin", "cos", "tan", "asin", "acos", "atan",
         "sinh", "cosh", "tanh",
         "exp", "log", "exp2", "log2", "sqrt", "inversesqrt",
         "fabs", "abs", "floor", "ceil", "round", "sign"};
-    mlir::Type f32 = builder.getF32Type();
     for (auto m : unaryMath) {
       if (base != m) continue;
       if (args.empty()) return Value();
       Value x = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
       if (!x) return Value();
-      x = toF32(x, loc(args[0].get()));
-      if (base == "sin") return builder.create<spirv::GLSinOp>(l, x);
-      if (base == "cos") return builder.create<spirv::GLCosOp>(l, x);
-      if (base == "tan") return builder.create<spirv::GLTanOp>(l, x);
-      if (base == "asin") return builder.create<spirv::GLAsinOp>(l, x);
-      if (base == "acos") return builder.create<spirv::GLAcosOp>(l, x);
-      if (base == "atan") return builder.create<spirv::GLAtanOp>(l, x);
-      if (base == "sinh") return builder.create<spirv::GLSinhOp>(l, x);
-      if (base == "cosh") return builder.create<spirv::GLCoshOp>(l, x);
-      if (base == "tanh") return builder.create<spirv::GLTanhOp>(l, x);
-      if (base == "exp") return builder.create<spirv::GLExpOp>(l, x);
-      if (base == "log") return builder.create<spirv::GLLogOp>(l, x);
-      if (base == "exp2") return builder.create<spirv::GLExpOp>(l, x);
-      if (base == "log2") return builder.create<spirv::GLLogOp>(l, x);
+      mlir::Type origTy = x.getType();
+      x = toNativeFloat(x, loc(args[0].get()));
+      mlir::Type workTy = x.getType();
+      // Any-width ops (SPIRV_Float): emit directly on the native-width value.
       if (base == "sqrt") return builder.create<spirv::GLSqrtOp>(l, x);
       if (base == "inversesqrt") return builder.create<spirv::GLInverseSqrtOp>(l, x);
       if (base == "fabs" || base == "abs")
@@ -2889,35 +2883,94 @@ private:
       if (base == "ceil") return builder.create<spirv::GLCeilOp>(l, x);
       if (base == "round") return builder.create<spirv::GLRoundOp>(l, x);
       if (base == "sign") return builder.create<spirv::GLFSignOp>(l, x);
+      // Transcendentals (SPIRV_Float16or32): no f64 opcode. For f64, run in f32
+      // and extend back; for f16/f32, emit directly.
+      auto run = [&](std::function<Value(Value)> emit) {
+        return runTranscendental(std::move(emit), x, origTy, l);
+      };
+      if (base == "sin") return run([&](Value v) {
+        return builder.create<spirv::GLSinOp>(l, v); });
+      if (base == "cos") return run([&](Value v) {
+        return builder.create<spirv::GLCosOp>(l, v); });
+      if (base == "tan") return run([&](Value v) {
+        return builder.create<spirv::GLTanOp>(l, v); });
+      if (base == "asin") return run([&](Value v) {
+        return builder.create<spirv::GLAsinOp>(l, v); });
+      if (base == "acos") return run([&](Value v) {
+        return builder.create<spirv::GLAcosOp>(l, v); });
+      if (base == "atan") return run([&](Value v) {
+        return builder.create<spirv::GLAtanOp>(l, v); });
+      if (base == "sinh") return run([&](Value v) {
+        return builder.create<spirv::GLSinhOp>(l, v); });
+      if (base == "cosh") return run([&](Value v) {
+        return builder.create<spirv::GLCoshOp>(l, v); });
+      if (base == "tanh") return run([&](Value v) {
+        return builder.create<spirv::GLTanhOp>(l, v); });
+      if (base == "exp") return run([&](Value v) {
+        return builder.create<spirv::GLExpOp>(l, v); });
+      if (base == "log") return run([&](Value v) {
+        return builder.create<spirv::GLLogOp>(l, v); });
+      // exp2/log2: SPIRV has no GLExp2/GLLog2 opcode; approximate via
+      // exp(2*x)/log(x)/log(2). Preserves width via runTranscendental.
+      if (base == "exp2") return run([&](Value v) {
+        Value two = builder.create<arith::ConstantOp>(l, workTy,
+            builder.getFloatAttr(workTy, 2.0));
+        Value e = builder.create<spirv::GLExpOp>(l, v);
+        return builder.create<arith::MulFOp>(l, two, e); });
+      if (base == "log2") return run([&](Value v) {
+        Value ln = builder.create<spirv::GLLogOp>(l, v);
+        Value ln2 = builder.create<arith::ConstantOp>(l, workTy,
+            builder.getFloatAttr(workTy, 0.6931471805599453));
+        return builder.create<arith::DivFOp>(l, ln, ln2); });
     }
-    // Binary float math: two f32 args.
+    // Binary float math: pow (f16/f32 only) and fmin/fmax/fmod (any width).
+    // Operands coerce to the SAME width — the operand's native float width if
+    // either is float, else f32 — so f64 min/max/fmod stay in f64.
     if (base == "pow" || base == "fmin" || base == "fmax" || base == "fmod") {
       if (args.size() < 2) return Value();
-      Value a = toF32(loadValue(visitExpr(args[0].get()), loc(args[0].get())),
-                      loc(args[0].get()));
-      Value b = toF32(loadValue(visitExpr(args[1].get()), loc(args[1].get())),
-                      loc(args[1].get()));
+      Value a = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      Value b = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
       if (!a || !b) return Value();
-      if (base == "pow") return builder.create<spirv::GLPowOp>(l, a, b);
+      // Pick the result width: prefer the wider float operand, else f32.
+      mlir::Type aT = a.getType(), bT = b.getType();
+      mlir::Type resTy = builder.getF32Type();
+      if (aT.isF64() || bT.isF64()) resTy = builder.getF64Type();
+      else if (aT.isF16() || bT.isF16()) resTy = builder.getF16Type();
+      else if (aT.isF32() || bT.isF32()) resTy = builder.getF32Type();
+      a = castValue(a, resTy, loc(args[0].get()));
+      b = castValue(b, resTy, loc(args[1].get()));
+      if (base == "pow") {
+        // Pow is SPIRV_Float16or32: no f64 opcode. Truncate→f32→extend.
+        return runTranscendental(
+            [&](Value va) {
+              Value vb = castValue(b, va.getType(), loc(args[1].get()));
+              return builder.create<spirv::GLPowOp>(l, va, vb);
+            }, a, resTy, l);
+      }
       if (base == "fmin") return builder.create<spirv::GLFMinOp>(l, a, b);
       if (base == "fmax") return builder.create<spirv::GLFMaxOp>(l, a, b);
-      // fmod -> a - b*floor(a/b)
+      // fmod -> a - b*floor(a/b)  (any float width via GLFloorOp)
       Value div = builder.create<arith::DivFOp>(l, a, b);
       Value fl = builder.create<spirv::GLFloorOp>(l, div);
       Value prod = builder.create<arith::MulFOp>(l, b, fl);
       return builder.create<arith::SubFOp>(l, a, prod);
     }
-    // Ternary: clamp(x, lo, hi) -> GLFClamp.
+    // Ternary: clamp(x, lo, hi) -> GLFClamp (any float width).
     if (base == "clamp") {
       if (args.size() < 3) return Value();
-      Value x = toF32(loadValue(visitExpr(args[0].get()), loc(args[0].get())),
-                      loc(args[0].get()));
-      Value lo = toF32(loadValue(visitExpr(args[1].get()), loc(args[1].get())),
-                       loc(args[1].get()));
-      Value hi = toF32(loadValue(visitExpr(args[2].get()), loc(args[2].get())),
-                       loc(args[2].get()));
+      Value x = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      Value lo = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
+      Value hi = loadValue(visitExpr(args[2].get()), loc(args[2].get()));
       if (!x || !lo || !hi) return Value();
-      return builder.create<spirv::GLFClampOp>(l, f32, x, lo, hi);
+      mlir::Type xT = x.getType(), loT = lo.getType(), hiT = hi.getType();
+      mlir::Type resTy = builder.getF32Type();
+      if (xT.isF64() || loT.isF64() || hiT.isF64()) resTy = builder.getF64Type();
+      else if (xT.isF16() || loT.isF16() || hiT.isF16()) resTy = builder.getF16Type();
+      else if (xT.isF32() || loT.isF32() || hiT.isF32()) resTy = builder.getF32Type();
+      x = castValue(x, resTy, loc(args[0].get()));
+      lo = castValue(lo, resTy, loc(args[1].get()));
+      hi = castValue(hi, resTy, loc(args[2].get()));
+      return builder.create<spirv::GLFClampOp>(l, resTy, x, lo, hi);
     }
     return Value();
   }
@@ -2934,6 +2987,39 @@ private:
       return builder.create<arith::SIToFPOp>(l, builder.getF32Type(), v);
     }
     return v;
+  }
+
+  // Width-preserving float coercion for math builtins. Integer/index operands
+  // promote to f32 (CUDA's default); float operands KEEP their width so a
+  // `double`/`__half` argument is lowered in its native precision instead of
+  // being silently truncated to f32 by toF32. This is what lets
+  // `double x = sqrt(d)` compute in f64 (Sqrt's SPIRV_Float constraint accepts
+  // any width) — the old toF32 path forced f32 and lost 29 bits of precision.
+  Value toNativeFloat(Value v, Location l) {
+    if (!v) return v;
+    v = loadValue(v, l);
+    mlir::Type ty = v.getType();
+    if (ty.isa<mlir::FloatType>()) return v; // f16/f32/f64 — keep
+    return toF32(v, l);                      // int/index → f32
+  }
+
+  // The GLSLstd450 transcendental set (sin/cos/tan/asin/acos/atan/sinh/cosh/
+  // tanh/exp/log/pow) is constrained to SPIRV_Float16or32 in the spirv dialect
+  // — no f64 opcode exists. For a double operand we have no native f64 path, so
+  // truncate to f32, run the op, and extend back to f64. This matches what a
+  // GLSL driver does for the f64-limited GLSLstd450 entries and preserves the
+  // operand's storage width at the call site (the result is still f64, just
+  // computed with f32 transcendental precision — documented limitation).
+  Value runTranscendental(
+      std::function<Value(Value)> emit, Value x, mlir::Type origTy,
+      Location l) {
+    Value work = x;
+    if (origTy.isF64())
+      work = builder.create<arith::TruncFOp>(l, builder.getF32Type(), x);
+    Value r = emit(work);
+    if (origTy.isF64())
+      r = builder.create<arith::ExtFOp>(l, origTy, r);
+    return r;
   }
 
   // CUDA atomic builtins -> spirv.Atomic*. Returns null if `name` is not an

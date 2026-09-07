@@ -1,0 +1,139 @@
+// test/math_width.vc — math builtins in f64 and f16 precision.
+//
+// Regression for the MLIR backend's math-builtin width dispatch. Before this
+// fix, emitMathBuiltin force-converted every operand via toF32, so
+//   double x = sqrt(d)   ->  computed sqrt in f32, lost 29 bits of precision
+//   __half x = sqrt(h)   ->  computed sqrt in f32, then truncated back to f16
+// The fix (toNativeFloat) preserves the operand's native float width for ops
+// that accept it (SPIRV_Float: sqrt/fabs/floor/ceil/round/fmin/fmax/clamp/...),
+// and routes the f64 transcendental set (sin/cos/exp/log/pow, which are
+// SPIRV_Float16or32 — no f64 opcode) through runTranscendental: truncate to
+// f32, run, extend back to f64 (f32 transcendental precision, f64 storage).
+//
+// The kernel reads a `double*` SSBO and a `float*` SSBO (host allocates 8-byte
+// doubles and 4-byte floats), does arithmetic in the native width, and stores
+// results back. Host recomputes the same expressions in double precision and
+// compares with tolerance (transcendentals are f32-precision on device).
+//
+//   vcc test/math_width.vc -o build/math_width_sf && ./build/math_width_sf
+//   vc  test/math_width.vc -emit=full -o build/math_width_m && ./build/math_width_m
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+// f64 math: sqrt, floor, fabs, fmin, fmax, clamp (any-width: native f64), plus
+// transcendentals via explicit float cast (GLSL has no sin(double)/pow(double)
+// overloads even with the float64 extension; CUDA code likewise uses sinf or
+// casts). The MLIR backend's runTranscendental does this trunc→f32→extend
+// automatically for bare sin(double); here we cast explicitly so the test runs
+// identically on both backends.
+__global__ void dmath(double *in, double *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  double v = in[i];
+  double s = sqrt(v);            // any-width: native f64
+  double fl = floor(v);          // any-width: native f64
+  double ab = fabs(v);           // any-width: native f64
+  // fmin/fmax on double: GLSL has no min/max(double) overload, so lower via
+  // ternary (stays in true f64 on both backends; MLIR also supports fmin/fmax
+  // natively but the ternary form is portable).
+  double mn = v < 2.5 ? v : 2.5;
+  double mx = v > 0.5 ? v : 0.5;
+  double cl = clamp(v, 0.5, 2.5); // any-width: native f64
+  double sn = sin((float)v);     // transcendental: f32 precision, f64 storage
+  double pw = pow((float)v, 2.0f); // transcendental: f32 precision, f64 storage
+  // Pack into 8 output slots per input so everything round-trips.
+  double base = i * 8.0;
+  out[(int)base + 0] = s;
+  out[(int)base + 1] = fl;
+  out[(int)base + 2] = ab;
+  out[(int)base + 3] = mn;
+  out[(int)base + 4] = mx;
+  out[(int)base + 5] = cl;
+  out[(int)base + 6] = sn;
+  out[(int)base + 7] = pw;
+}
+
+// f16 math: sqrt, fabs, floor. The kernel loads a float (host 4-byte), casts
+// to half, computes in f16, stores back as float. Mixed-precision pattern.
+__global__ void hmath(float *in, float *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  half h = half(in[i]);
+  half s = sqrt(h);              // any-width: native f16
+  half a = fabs(h);              // any-width: native f16
+  half f = floor(h);             // any-width: native f16
+  out[i] = float(s) + float(a) + float(f);
+}
+
+int main() {
+  vcInit();
+
+  const int N = 4;
+
+  // --- f64 path ---
+  void *dDin = 0, *dDout = 0;
+  vcMalloc(&dDin, N * 8);
+  vcMalloc(&dDout, N * 8 * 8);
+  double hDin[4] = {0.5, 1.0, 2.0, 3.0};
+  vcMemcpy(dDin, hDin, N * 8, VCMemcpyKind::HostToDevice);
+  dmath<<<N, 32>>>(dDin, dDout, N);
+  vcDeviceSynchronize();
+  double hDout[32];
+  vcMemcpy(hDout, dDout, N * 8 * 8, VCMemcpyKind::DeviceToHost);
+
+  // --- f16 path ---
+  void *dHin = 0, *dHout = 0;
+  vcMalloc(&dHin, N * 4);
+  vcMalloc(&dHout, N * 4);
+  float hHin[4] = {0.5f, 1.5f, 2.5f, 3.5f};
+  vcMemcpy(dHin, hHin, N * 4, VCMemcpyKind::HostToDevice);
+  hmath<<<N, 32>>>(dHin, dHout, N);
+  vcDeviceSynchronize();
+  float hHout[4];
+  vcMemcpy(hHout, dHout, N * 4, VCMemcpyKind::DeviceToHost);
+
+  // Verify f64: any-width ops should be bit-near-exact (sqrt/floor/fabs/fmin/
+  // fmax/clamp in true f64). Transcendentals (sin/pow) are f32-precision on
+  // device, so allow a wider tolerance.
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    double v = hDin[i];
+    double base = i * 8.0;
+    // any-width ops — tight tolerance (true f64)
+    double expS = sqrt(v), expFl = floor(v), expAb = fabs(v);
+    double expMn = fmin(v, 2.5), expMx = fmax(v, 0.5), expCl = v < 0.5 ? 0.5 : (v > 2.5 ? 2.5 : v);
+    if (fabs(hDout[(int)base + 0] - expS) > 1e-9) { printf("  d sqrt mismatch i=%d got=%f exp=%f\n", i, hDout[(int)base+0], expS); ok = 0; }
+    if (fabs(hDout[(int)base + 1] - expFl) > 1e-9) { printf("  d floor mismatch i=%d got=%f exp=%f\n", i, hDout[(int)base+1], expFl); ok = 0; }
+    if (fabs(hDout[(int)base + 2] - expAb) > 1e-9) { printf("  d fabs mismatch i=%d got=%f exp=%f\n", i, hDout[(int)base+2], expAb); ok = 0; }
+    if (fabs(hDout[(int)base + 3] - expMn) > 1e-9) { printf("  d fmin mismatch i=%d got=%f exp=%f\n", i, hDout[(int)base+3], expMn); ok = 0; }
+    if (fabs(hDout[(int)base + 4] - expMx) > 1e-9) { printf("  d fmax mismatch i=%d got=%f exp=%f\n", i, hDout[(int)base+4], expMx); ok = 0; }
+    if (fabs(hDout[(int)base + 5] - expCl) > 1e-9) { printf("  d clamp mismatch i=%d got=%f exp=%f\n", i, hDout[(int)base+5], expCl); ok = 0; }
+    // transcendentals — f32 precision on device, loose tolerance
+    double expSn = sin(v), expPw = pow(v, 2.0);
+    if (fabs(hDout[(int)base + 6] - expSn) > 1e-4) { printf("  d sin mismatch i=%d got=%f exp=%f\n", i, hDout[(int)base+6], expSn); ok = 0; }
+    if (fabs(hDout[(int)base + 7] - expPw) > 1e-3) { printf("  d pow mismatch i=%d got=%f exp=%f\n", i, hDout[(int)base+7], expPw); ok = 0; }
+  }
+
+  // Verify f16: floor and fabs are exact on integers-ish; sqrt loose (f16).
+  // hHin = 0.5, 1.5, 2.5, 3.5
+  // i=0: sqrt(.5)+fabs(.5)+floor(.5) = .707+.5+0 = 1.207
+  // i=1: sqrt(1.5)+1.5+1 = 1.225+1.5+1 = 3.725
+  // i=2: sqrt(2.5)+2.5+2 = 1.581+2.5+2 = 6.081
+  // i=3: sqrt(3.5)+3.5+3 = 1.871+3.5+3 = 8.371
+  float hExp[4] = {1.207f, 3.725f, 6.081f, 8.371f};
+  for (int i = 0; i < N; i++) {
+    if (hHout[i] < hExp[i] - 0.1f || hHout[i] > hExp[i] + 0.1f) {
+      printf("  h mismatch i=%d got=%f exp~%f\n", i, hHout[i], hExp[i]);
+      ok = 0;
+    }
+  }
+
+  printf("math_width: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dDin); vcFree(dDout);
+  vcFree(dHin); vcFree(dHout);
+  vcShutdown();
+  return ok ? 0 : 1;
+}
