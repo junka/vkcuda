@@ -154,3 +154,44 @@ else()
   message(STATUS "mlir-check disabled (needs VC_ENABLE_MLIR, vc, "
                  "vc-check deps)")
 endif()
+
+# ---------------------------------------------------------------------------
+# End-to-end demo tests (GPU-dependent)
+#
+# `cmake --build build --target vc-e2e-check` builds every self-verifying
+# demo under test/*.vc with BOTH backends (GLSL `vcc`, MLIR `vc -emit=full`),
+# runs each built executable, and checks it prints PASS and exits 0. This is
+# the only automated coverage of the full .vc -> SPIR-V -> run path; the
+# vc-check / mlir-check targets above only exercise syntax/semantics and
+# emitted IR, never a real kernel launch.
+#
+# These tests need a working Vulkan device at run time, so they are OFF by
+# default. Enable with -DVC_RUN_E2E_TESTS=ON (which also makes them visible
+# to `ctest`). When enabled without a GPU, every demo's run step fails with a
+# device-init error rather than the suite silently skipping.
+option(VC_RUN_E2E_TESTS "Build & run GPU end-to-end demo tests (needs a Vulkan device)" OFF)
+find_program(VC_VULKANINFO NAMES vulkaninfo NO_CACHE)
+if(VC_RUN_E2E_TESTS AND Python3_Interpreter_FOUND AND TARGET vcc)
+  set(_vc_e2e_mlirc "")
+  if(TARGET vc)
+    set(_vc_e2e_mlirc "--mlirc" $<TARGET_FILE:vc>)
+  endif()
+  add_custom_target(vc-e2e-check
+    # Fail fast if there is no Vulkan device rather than building 60 exes
+    # first. The gate script honors VC_VULKANINFO (defaults to `vulkaninfo`).
+    COMMAND ${CMAKE_SOURCE_DIR}/test/check_vulkan_device.sh
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_e2e.py
+            --vcc $<TARGET_FILE:vcc>
+            ${_vc_e2e_mlirc}
+            --verbose
+            ${CMAKE_SOURCE_DIR}/test
+    DEPENDS vcc
+    COMMENT "Running end-to-end demo tests (test/*.vc, both backends)"
+    USES_TERMINAL)
+  # Expose to ctest too, so `ctest -R e2e` finds it when the option is on.
+  add_test(NAME vc-e2e-check
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target vc-e2e-check)
+  message(STATUS "vc-e2e-check: enabled (vulkaninfo=${VC_VULKANINFO})")
+else()
+  message(STATUS "vc-e2e-check disabled (set -DVC_RUN_E2E_TESTS=ON to enable)")
+endif()
