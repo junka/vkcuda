@@ -103,15 +103,29 @@ endif()
 # python3 interpreter (stdlib only) as a tiny stand-in for lit.
 # ---------------------------------------------------------------------------
 find_package(Python3)
-# FileCheck usually sits next to the LLVM install that provided LLVM_DIR
-# (<prefix>/lib/cmake/llvm -> <prefix>/bin); fall back to the auto-detected
-# prefix when the build was configured with explicitly-passed -DLLVM_DIR.
+# Locate FileCheck (provided by the same LLVM install we just found).
+#
+# Upstream LLVM lays out <prefix>/lib/cmake/llvm + <prefix>/bin, but Debian
+# flattens this to /usr/lib/llvm-18/cmake + /usr/lib/llvm-18/bin — different
+# depths, so a hardcoded ".." count is unreliable. The canonical source is
+# `llvm-config --bindir`, which reports the exact bin dir for whatever LLVM
+# is on PATH (or the explicit llvm-config-NN). Fall back to a depth guess only
+# if llvm-config is unavailable.
 set(_vc_filecheck_hint "")
-if(LLVM_DIR)
-  # <prefix>/lib/cmake/llvm -> <prefix>/bin
-  get_filename_component(_vc_filecheck_hint "${LLVM_DIR}/../../../bin"
-                         ABSOLUTE)
-elseif(_vc_prefix_hint)
+find_program(_VC_LLVM_CONFIG_FC NAMES llvm-config llvm-config-18 llvm-config-17)
+if(_VC_LLVM_CONFIG_FC)
+  execute_process(COMMAND "${_VC_LLVM_CONFIG_FC}" --bindir
+                  OUTPUT_VARIABLE _vc_llvm_bindir
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(_vc_llvm_bindir)
+    set(_vc_filecheck_hint "${_vc_llvm_bindir}")
+  endif()
+endif()
+if(NOT _vc_filecheck_hint AND LLVM_DIR)
+  # Upstream layout fallback: <prefix>/lib/cmake/llvm -> <prefix>/bin.
+  get_filename_component(_vc_filecheck_hint "${LLVM_DIR}/../../../bin" ABSOLUTE)
+endif()
+if(NOT _vc_filecheck_hint AND _vc_prefix_hint)
   set(_vc_filecheck_hint "${_vc_prefix_hint}/bin")
 endif()
 find_program(VC_FILECHECK NAMES FileCheck HINTS "${_vc_filecheck_hint}"
