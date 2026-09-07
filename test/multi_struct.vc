@@ -1,0 +1,78 @@
+// test/multi_struct.vc — two __global__ kernels each declaring a local struct.
+//
+// Regression for the MLIR backend's multi-kernel + local-struct crash (#6).
+// Symptom: any .vc file with >=2 __global__ kernels where at least one declares
+// a local struct variable crashed during MLIR lowering (packKernels ->
+// lowerWorkgroupSizeToSpecConstants), because the shared IRRewriter's insertion
+// point was left dangling at the func::FuncOp that packKernels erases after
+// takeBody. The first spec-constant create then dereferenced a stale insertion
+// block and segfaulted. Single-kernel struct files never tripped it because the
+// builder's insertion point stayed valid through the single iteration.
+//
+// Fixed by having lowerWorkgroupSizeToSpecConstants set its own insertion point
+// to the gpu.module body before creating the spec constants, rather than
+// inheriting the caller's (possibly stale) builder state.
+//
+// This demo exercises the exact combination: two kernels, both with local
+// struct variables, each launched independently from host main().
+//
+//   vcc test/multi_struct.vc -o build/multi_struct_sf && ./build/multi_struct_sf
+//   vc  test/multi_struct.vc -emit=full -o build/multi_struct_m && ./build/multi_struct_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// Shared struct type used by both kernels (file-scope, named).
+struct Pair {
+  int a;
+  int b;
+};
+
+// Kernel 1: build a local Pair, write fields, emit sum.
+__global__ void ksum(int *out) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i == 0) {
+    Pair p;
+    p.a = 3;
+    p.b = 4;
+    out[0] = p.a + p.b;        // 7
+  }
+}
+
+// Kernel 2: build a local Pair, emit product. A completely separate SPIR-V
+// module/pipeline from ksum; the second local struct is what used to crash
+// the MLIR backend during lowering.
+__global__ void kprod(int *out) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i == 0) {
+    Pair p;
+    p.a = 5;
+    p.b = 6;
+    out[0] = p.a * p.b;        // 30
+  }
+}
+
+int main() {
+  vcInit();
+
+  void *dSum = 0, *dProd = 0;
+  vcMalloc(&dSum, 4);
+  vcMalloc(&dProd, 4);
+
+  ksum<<<1, 32>>>(dSum);
+  vcDeviceSynchronize();
+  kprod<<<1, 32>>>(dProd);
+  vcDeviceSynchronize();
+
+  int sum = 0, prod = 0;
+  vcMemcpy(&sum, dSum, 4, VCMemcpyKind::DeviceToHost);
+  vcMemcpy(&prod, dProd, 4, VCMemcpyKind::DeviceToHost);
+
+  int ok = (sum == 7) && (prod == 30);
+  printf("multi_struct: %s (sum=%d prod=%d)\n", ok ? "PASS" : "FAIL", sum, prod);
+
+  vcFree(dSum);
+  vcFree(dProd);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

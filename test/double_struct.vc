@@ -17,9 +17,6 @@
 //    for `float x = 0.0;`, ExtFOp for the reverse), and an f64->f32 narrowing
 //    before the i32-slot bitcast for struct array-field stores (`v.c[0]=1.0`).
 //
-// Single kernel: a separate pre-existing bug (host codegen infinite loop when
-// two kernels each declare a local struct) is out of scope here.
-//
 //   vcc test/double_struct.vc -o build/double_struct_sf && ./build/double_struct_sf
 //   vc  test/double_struct.vc -emit=full -o build/double_struct_m && ./build/double_struct_m
 
@@ -47,6 +44,25 @@ __global__ void doubleStructKernel(double *dblOut, int *intOut) {
   }
 }
 
+// Second kernel with its own local struct. This used to crash the MLIR backend
+// (multi-kernel + local-struct, #6) and is the reason double_struct.vc was
+// previously single-kernel. Now that #6 is fixed, the two-kernel form exercises
+// both the double/i64 lowering AND the multi-kernel struct path together.
+__global__ void doubleStructKernel2(double *dblOut, int *intOut) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i == 0) {
+    DBox d;
+    d.d = 2.5;                       // bare literal -> f64
+    d.y = 9;
+    dblOut[0] = d.d - 1.0 + (double)d.y; // 2.5 - 1 + 9 = 10.5
+
+    LBox l;
+    l.x = 2000000007L;
+    l.y = 5;
+    intOut[0] = (int)(l.x - l.y);    // 2000000002
+  }
+}
+
 int main() {
   vcInit();
 
@@ -58,11 +74,19 @@ int main() {
   vcDeviceSynchronize();
 
   double hd = 0;
-  vcMemcpy(&hd, dDbl, 8, VCMemcpyKind::DeviceToHost);
   int hi = 0;
+  vcMemcpy(&hd, dDbl, 8, VCMemcpyKind::DeviceToHost);
   vcMemcpy(&hi, dInt, 4, VCMemcpyKind::DeviceToHost);
 
   int ok = (hd == 10.0) && (hi == 1000000045);
+
+  // Second kernel: reuse the same device buffers.
+  doubleStructKernel2<<<1, 32>>>(dDbl, dInt);
+  vcDeviceSynchronize();
+  vcMemcpy(&hd, dDbl, 8, VCMemcpyKind::DeviceToHost);
+  vcMemcpy(&hi, dInt, 4, VCMemcpyKind::DeviceToHost);
+
+  ok = ok && (hd == 10.5) && (hi == 2000000002);
   printf("double_struct: %s (dbl=%.3f lng=%d)\n", ok ? "PASS" : "FAIL", hd, hi);
 
   vcFree(dDbl);

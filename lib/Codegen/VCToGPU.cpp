@@ -253,6 +253,18 @@ static void lowerWorkgroupSizeToSpecConstants(gpu::GPUModuleOp gpuModule,
   MLIRContext *ctx = builder.getContext();
   Type i32 = builder.getI32Type();
 
+  // The spec constants and their composite are module-scope ops that must land
+  // inside the gpu.module. Set the insertion point explicitly rather than
+  // relying on the caller's builder state: packKernels shares one IRRewriter
+  // across both kernel packing and this call, and after the per-kernel loop the
+  // builder's insertion point can be left pointing at a stale/erased op (e.g.
+  // the func::FuncOp that packKernels erases after takeBody). Without this,
+  // builder.create below dereferences a dangling insertion point and segfaults
+  // — this was the root cause of the multi-kernel + local-struct crash: any
+  // second kernel left the builder's insertion block pointing into the just-
+  // erased func body, so the first spec-constant create faulted.
+  builder.setInsertionPointToStart(gpuModule.getBody());
+
   // Create the three scalar spec constants once per gpu.module.
   struct SpecConst {
     const char *name;
