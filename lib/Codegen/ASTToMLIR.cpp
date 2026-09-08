@@ -2846,9 +2846,14 @@ private:
     }
     // Normalize: strip a leading `__` and a trailing `f` to get the base
     // (e.g. __sinf -> sin, sqrtf -> sqrt, fabsf -> fabs). Only recognized math
-    // bases are accepted so unrelated names fall through.
+    // bases are accepted so unrelated names fall through. NOTE: `isinf`/`isnan`
+    // are NOT subject to the trailing-`f` strip (they would become `isin`/`isna`
+    // and fall through); they are matched by their full spelling below.
     auto strip = [](llvm::StringRef n) -> llvm::StringRef {
       if (n.starts_with("__")) n = n.drop_front(2);
+      // Don't strip the trailing `f` from isnan/isinf — those are the real
+      // spellings, not `f`-suffixed float intrinsics.
+      if (n == "isnan" || n == "isinf") return n;
       if (n.ends_with("f") && n.size() > 1) n = n.drop_back();
       return n;
     };
@@ -2865,7 +2870,8 @@ private:
         "sin", "cos", "tan", "asin", "acos", "atan",
         "sinh", "cosh", "tanh",
         "exp", "log", "exp2", "log2", "sqrt", "inversesqrt",
-        "fabs", "abs", "floor", "ceil", "round", "sign"};
+        "fabs", "abs", "floor", "ceil", "round", "trunc", "sign",
+        "isnan", "isinf"};
     for (auto m : unaryMath) {
       if (base != m) continue;
       if (args.empty()) return Value();
@@ -2874,6 +2880,22 @@ private:
       mlir::Type origTy = x.getType();
       x = toNativeFloat(x, loc(args[0].get()));
       mlir::Type workTy = x.getType();
+      // isnan/isinf: spirv.IsNan/IsInf return i1 (bool). Native width (any
+      // SPIRV_Float). Result flows through the existing bool pipeline (i1 is
+      // what comparisons produce too; stored/used as i32 via the usual path).
+      if (base == "isnan") return builder.create<spirv::IsNanOp>(l, x);
+      if (base == "isinf") return builder.create<spirv::IsInfOp>(l, x);
+      // trunc (round toward zero): no spirv.GL opcode. Equivalent to
+      // x >= 0 ? floor(x) : ceil(x) — preserves native float width.
+      if (base == "trunc") {
+        Value zero = builder.create<arith::ConstantOp>(l, workTy,
+            builder.getFloatAttr(workTy, 0.0));
+        Value ge0 = builder.create<arith::CmpFOp>(l,
+            arith::CmpFPredicate::OGE, x, zero);
+        Value fl = builder.create<spirv::GLFloorOp>(l, x);
+        Value ce = builder.create<spirv::GLCeilOp>(l, x);
+        return builder.create<arith::SelectOp>(l, workTy, ge0, fl, ce);
+      }
       // Any-width ops (SPIRV_Float): emit directly on the native-width value.
       if (base == "sqrt") return builder.create<spirv::GLSqrtOp>(l, x);
       if (base == "inversesqrt") return builder.create<spirv::GLInverseSqrtOp>(l, x);
@@ -2971,6 +2993,27 @@ private:
       lo = castValue(lo, resTy, loc(args[1].get()));
       hi = castValue(hi, resTy, loc(args[2].get()));
       return builder.create<spirv::GLFClampOp>(l, resTy, x, lo, hi);
+    }
+    // fma(a, b, c) -> a*b + c, single fused op (spirv.GL.Fma, any float width).
+    // mix(x, y, a) -> x*(1-a) + y*a (spirv.GL.FMix, any float width). Both
+    // preserve native precision: operands coerce to the widest float among them.
+    if (base == "fma" || base == "mix") {
+      if (args.size() < 3) return Value();
+      Value a = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      Value b = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
+      Value c = loadValue(visitExpr(args[2].get()), loc(args[2].get()));
+      if (!a || !b || !c) return Value();
+      mlir::Type aT = a.getType(), bT = b.getType(), cT = c.getType();
+      mlir::Type resTy = builder.getF32Type();
+      if (aT.isF64() || bT.isF64() || cT.isF64()) resTy = builder.getF64Type();
+      else if (aT.isF16() || bT.isF16() || cT.isF16()) resTy = builder.getF16Type();
+      else if (aT.isF32() || bT.isF32() || cT.isF32()) resTy = builder.getF32Type();
+      a = castValue(a, resTy, loc(args[0].get()));
+      b = castValue(b, resTy, loc(args[1].get()));
+      c = castValue(c, resTy, loc(args[2].get()));
+      if (base == "fma")
+        return builder.create<spirv::GLFmaOp>(l, resTy, a, b, c);
+      return builder.create<spirv::GLFMixOp>(l, resTy, a, b, c);
     }
     return Value();
   }

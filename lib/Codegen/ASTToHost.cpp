@@ -161,6 +161,7 @@ private:
       os << line << "\n";
     os << "#include \"vc/Runtime/VCRuntime.h\"\n";
     os << "#include <cstdio>\n";
+    os << "#include <cstring>\n"; // memcpy/memset for host buffer setup
     // The runtime symbols (vcInit, VCKernelArg, ...) live in namespace vc.
     // Bring them into scope so the generated launch calls resolve.
     os << "using namespace vc;\n";

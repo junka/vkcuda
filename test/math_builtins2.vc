@@ -1,0 +1,106 @@
+// test/math_builtins2.vc — additional numeric builtins (fma, mix, trunc,
+// isnan, isinf).
+//
+// Regression for the MLIR backend's numeric-builtin coverage. These previously
+// hard-errored in emitMathBuiltin (no case → fall through to the unknown-callee
+// error). Now lowered:
+//   fma(a,b,c)  -> spirv.GL.Fma   (a*b + c, fused, any float width)
+//   mix(x,y,a)  -> spirv.GL.FMix   (x*(1-a) + y*a, any float width)
+//   trunc(x)    -> x>=0 ? floor(x) : ceil(x)  (round toward zero, no opcode)
+//   isnan(x)    -> spirv.IsNan      (returns i1 bool)
+//   isinf(x)    -> spirv.IsInf      (returns i1 bool)
+// GLSL has all of these natively (they pass through lowerBuiltinCall), so the
+// same source runs on both backends.
+//
+//   vcc test/math_builtins2.vc -o build/math_builtins2_sf && ./build/math_builtins2_sf
+//   vc  test/math_builtins2.vc -emit=full -o build/math_builtins2_m && ./build/math_builtins2_m
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void kmath(float *in, float *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float v = in[i];
+  // fma(v, 2.0, 1.0) = 2v + 1
+  float fm = fma(v, 2.0f, 1.0f);
+  // mix(v, 10.0, 0.25) = v*0.75 + 10.0*0.25 = 0.75v + 2.5
+  float mx = mix(v, 10.0f, 0.25f);
+  // trunc(v): round toward zero. For v=2.7 -> 2.0; v=-1.5 -> -1.0.
+  float tr = trunc(v);
+  out[i * 3 + 0] = fm;
+  out[i * 3 + 1] = mx;
+  out[i * 3 + 2] = tr;
+}
+
+__global__ void kclass(float *in, int *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float v = in[i];
+  // isnan / isinf — pack two bits into one int: bit0 = isnan, bit1 = isinf.
+  int b = 0;
+  if (isnan(v)) b |= 1;
+  if (isinf(v)) b |= 2;
+  out[i] = b;
+}
+
+int main() {
+  vcInit();
+
+  const int N = 4;
+
+  // --- fma/mix/trunc on finite floats ---
+  void *dIn = 0, *dOut = 0;
+  vcMalloc(&dIn, N * 4);
+  vcMalloc(&dOut, N * 4 * 3);
+  float hIn[4] = {2.7f, -1.5f, 3.0f, 0.5f};
+  vcMemcpy(dIn, hIn, N * 4, VCMemcpyKind::HostToDevice);
+  kmath<<<N, 32>>>(dIn, dOut, N);
+  vcDeviceSynchronize();
+  float hOut[12];
+  vcMemcpy(hOut, dOut, N * 4 * 3, VCMemcpyKind::DeviceToHost);
+
+  // --- isnan/isinf on special values ---
+  // IEEE-754 bit patterns: +inf = 0x7f800000, qnan = 0x7fc00000.
+  void *dIn2 = 0, *dOut2 = 0;
+  vcMalloc(&dIn2, N * 4);
+  vcMalloc(&dOut2, N * 4);
+  float hIn2[4];
+  int bits[4] = {0x40490fdb, 0x7f800000, 0x7fc00000, 0x00000000};
+  // 0x40490fdb = 3.14159..., 0x7f800000 = +inf, 0x7fc00000 = qnan, 0 = 0.0
+  for (int i = 0; i < N; i++) memcpy(&hIn2[i], &bits[i], 4);
+  vcMemcpy(dIn2, hIn2, N * 4, VCMemcpyKind::HostToDevice);
+  kclass<<<N, 32>>>(dIn2, dOut2, N);
+  vcDeviceSynchronize();
+  int hOut2[4];
+  vcMemcpy(hOut2, dOut2, N * 4, VCMemcpyKind::DeviceToHost);
+
+  // Verify fma/mix/trunc.
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    float v = hIn[i];
+    float expFm = v * 2.0f + 1.0f;
+    float expMx = v * 0.75f + 2.5f;
+    float expTr = truncf(v);
+    if (fabsf(hOut[i * 3 + 0] - expFm) > 1e-4f) { printf("  fma mismatch i=%d got=%f exp=%f\n", i, hOut[i*3+0], expFm); ok = 0; }
+    if (fabsf(hOut[i * 3 + 1] - expMx) > 1e-4f) { printf("  mix mismatch i=%d got=%f exp=%f\n", i, hOut[i*3+1], expMx); ok = 0; }
+    if (fabsf(hOut[i * 3 + 2] - expTr) > 1e-4f) { printf("  trunc mismatch i=%d got=%f exp=%f\n", i, hOut[i*3+2], expTr); ok = 0; }
+  }
+
+  // Verify isnan/isinf: [3.14 -> 0, +inf -> 2, qnan -> 1, 0.0 -> 0].
+  int expCls[4] = {0, 2, 1, 0};
+  for (int i = 0; i < N; i++) {
+    if (hOut2[i] != expCls[i]) {
+      printf("  isnan/isinf mismatch i=%d got=%d exp=%d\n", i, hOut2[i], expCls[i]);
+      ok = 0;
+    }
+  }
+
+  printf("math_builtins2: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dIn); vcFree(dOut);
+  vcFree(dIn2); vcFree(dOut2);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

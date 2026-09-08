@@ -107,6 +107,7 @@ bool Sema::isMathBuiltin(StringRef name) const {
       "__syncthreads", "sin", "cos", "tan", "asin", "acos", "atan",
       "exp", "log", "pow", "sqrt", "abs", "fabs", "fmin", "fmax", "min", "max",
       "floor", "ceil", "fract", "mix", "clamp", "step", "smoothstep", "mod",
+      "fma", "trunc", "round", "sign", "inversesqrt", "isnan", "isinf",
       "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "expf", "logf",
       "powf", "sqrtf", "fabsf", "fminf", "fmaxf", "floorf", "ceilf", "__sinf",
       "__cosf", "__expf", "__logf", "__powf", "__fabsf",
