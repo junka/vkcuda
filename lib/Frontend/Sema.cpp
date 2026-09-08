@@ -108,6 +108,7 @@ bool Sema::isMathBuiltin(StringRef name) const {
       "exp", "log", "pow", "sqrt", "abs", "fabs", "fmin", "fmax", "min", "max",
       "floor", "ceil", "fract", "mix", "clamp", "step", "smoothstep", "mod",
       "fma", "trunc", "round", "sign", "inversesqrt", "isnan", "isinf",
+      "exp2", "log2", "degrees", "radians",
       "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "expf", "logf",
       "powf", "sqrtf", "fabsf", "fminf", "fmaxf", "floorf", "ceilf", "__sinf",
       "__cosf", "__expf", "__logf", "__powf", "__fabsf",

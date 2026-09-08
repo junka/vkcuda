@@ -1881,7 +1881,9 @@ private:
       // Build the memref shape from arrayDims. A scalar decl (no arrayDims)
       // uses a 0-d memref as a mutable slot; `float a[16]` -> memref<16xf32>;
       // `float a[16][8]` -> memref<16x8xf32>. An unsized dimension
-      // (extern __shared__ T s[], arrayDims={0}) is not supported here.
+      // (extern __shared__ T s[], arrayDims={0}) emits a placeholder size of
+      // 1 here and is sized to the workgroup-x spec constant by a post-
+      // serialize binary patch (patchDynamicSharedArrays in vc.cpp).
       //
       // A bare struct-value decl (`Accumulator acc;`) returns a 1-D
       // memref<Nxi32> from cvtType (the struct's flat i32 slot layout); its
@@ -2899,7 +2901,8 @@ private:
         "sinh", "cosh", "tanh",
         "exp", "log", "exp2", "log2", "sqrt", "inversesqrt",
         "fabs", "abs", "floor", "ceil", "round", "trunc", "sign",
-        "isnan", "isinf"};
+        "isnan", "isinf",
+        "fract", "degrees", "radians"};
     for (auto m : unaryMath) {
       if (base != m) continue;
       if (args.empty()) return Value();
@@ -2961,17 +2964,32 @@ private:
       if (base == "log") return run([&](Value v) {
         return builder.create<spirv::GLLogOp>(l, v); });
       // exp2/log2: SPIRV has no GLExp2/GLLog2 opcode; approximate via
-      // exp(2*x)/log(x)/log(2). Preserves width via runTranscendental.
+      // exp/log + the natural-log-of-2 constant. exp2(x) = 2^x = e^(x·ln2),
+      // log2(x) = ln(x)/ln(2). Preserves width via runTranscendental.
       if (base == "exp2") return run([&](Value v) {
-        Value two = builder.create<arith::ConstantOp>(l, workTy,
-            builder.getFloatAttr(workTy, 2.0));
-        Value e = builder.create<spirv::GLExpOp>(l, v);
-        return builder.create<arith::MulFOp>(l, two, e); });
+        Value ln2 = builder.create<arith::ConstantOp>(l, workTy,
+            builder.getFloatAttr(workTy, 0.6931471805599453));
+        Value scaled = builder.create<arith::MulFOp>(l, v, ln2);
+        return builder.create<spirv::GLExpOp>(l, scaled); });
       if (base == "log2") return run([&](Value v) {
         Value ln = builder.create<spirv::GLLogOp>(l, v);
         Value ln2 = builder.create<arith::ConstantOp>(l, workTy,
             builder.getFloatAttr(workTy, 0.6931471805599453));
         return builder.create<arith::DivFOp>(l, ln, ln2); });
+      // fract(x) = x - floor(x). No GLFract opcode; any float width via
+      // GLFloorOp. (GLSL fract returns the fractional part in [0,1).)
+      if (base == "fract") return run([&](Value v) {
+        Value fl = builder.create<spirv::GLFloorOp>(l, v);
+        return builder.create<arith::SubFOp>(l, v, fl); });
+      // degrees(x) = x * (180/pi); radians(x) = x * (pi/180). No GL opcode.
+      if (base == "degrees") return run([&](Value v) {
+        Value k = builder.create<arith::ConstantOp>(l, workTy,
+            builder.getFloatAttr(workTy, 57.29577951308232));
+        return builder.create<arith::MulFOp>(l, v, k); });
+      if (base == "radians") return run([&](Value v) {
+        Value k = builder.create<arith::ConstantOp>(l, workTy,
+            builder.getFloatAttr(workTy, 0.017453292519943295));
+        return builder.create<arith::MulFOp>(l, v, k); });
     }
     // Binary float math: pow (f16/f32 only) and fmin/fmax/fmod (any width).
     // Operands coerce to the SAME width — the operand's native float width if
@@ -3004,6 +3022,27 @@ private:
       Value fl = builder.create<spirv::GLFloorOp>(l, div);
       Value prod = builder.create<arith::MulFOp>(l, b, fl);
       return builder.create<arith::SubFOp>(l, a, prod);
+    }
+    // step(edge, x) = (x < edge) ? 0 : 1. No GL opcode; any float width.
+    if (base == "step") {
+      if (args.size() < 2) return Value();
+      Value edge = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      Value x = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
+      if (!edge || !x) return Value();
+      mlir::Type eT = edge.getType(), xT = x.getType();
+      mlir::Type resTy = builder.getF32Type();
+      if (eT.isF64() || xT.isF64()) resTy = builder.getF64Type();
+      else if (eT.isF16() || xT.isF16()) resTy = builder.getF16Type();
+      else if (eT.isF32() || xT.isF32()) resTy = builder.getF32Type();
+      edge = castValue(edge, resTy, loc(args[0].get()));
+      x = castValue(x, resTy, loc(args[1].get()));
+      Value cond = builder.create<arith::CmpFOp>(l, arith::CmpFPredicate::OLT,
+                                                 x, edge);
+      Value zero = builder.create<arith::ConstantOp>(l, resTy,
+          builder.getFloatAttr(resTy, 0.0));
+      Value one = builder.create<arith::ConstantOp>(l, resTy,
+          builder.getFloatAttr(resTy, 1.0));
+      return builder.create<arith::SelectOp>(l, resTy, cond, zero, one);
     }
     // Ternary: clamp(x, lo, hi) -> GLFClamp (any float width).
     if (base == "clamp") {
@@ -3042,6 +3081,40 @@ private:
       if (base == "fma")
         return builder.create<spirv::GLFmaOp>(l, resTy, a, b, c);
       return builder.create<spirv::GLFMixOp>(l, resTy, a, b, c);
+    }
+    // smoothstep(e0, e1, x) = t*t*(3-2*t), t = clamp((x-e0)/(e1-e0), 0, 1).
+    // No GL opcode; any float width. e0==e1 is left to produce NaN (matches
+    // GLSL, which leaves the divide-by-zero behavior undefined).
+    if (base == "smoothstep") {
+      if (args.size() < 3) return Value();
+      Value e0 = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      Value e1 = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
+      Value x = loadValue(visitExpr(args[2].get()), loc(args[2].get()));
+      if (!e0 || !e1 || !x) return Value();
+      mlir::Type t0 = e0.getType(), t1 = e1.getType(), t2 = x.getType();
+      mlir::Type resTy = builder.getF32Type();
+      if (t0.isF64() || t1.isF64() || t2.isF64()) resTy = builder.getF64Type();
+      else if (t0.isF16() || t1.isF16() || t2.isF16()) resTy = builder.getF16Type();
+      else if (t0.isF32() || t1.isF32() || t2.isF32()) resTy = builder.getF32Type();
+      e0 = castValue(e0, resTy, loc(args[0].get()));
+      e1 = castValue(e1, resTy, loc(args[1].get()));
+      x = castValue(x, resTy, loc(args[2].get()));
+      Value zero = builder.create<arith::ConstantOp>(l, resTy,
+          builder.getFloatAttr(resTy, 0.0));
+      Value one = builder.create<arith::ConstantOp>(l, resTy,
+          builder.getFloatAttr(resTy, 1.0));
+      Value three = builder.create<arith::ConstantOp>(l, resTy,
+          builder.getFloatAttr(resTy, 3.0));
+      Value two = builder.create<arith::ConstantOp>(l, resTy,
+          builder.getFloatAttr(resTy, 2.0));
+      Value num = builder.create<arith::SubFOp>(l, x, e0);
+      Value den = builder.create<arith::SubFOp>(l, e1, e0);
+      Value t = builder.create<arith::DivFOp>(l, num, den);
+      t = builder.create<spirv::GLFClampOp>(l, resTy, t, zero, one);
+      Value twoT = builder.create<arith::MulFOp>(l, two, t);
+      Value inner = builder.create<arith::SubFOp>(l, three, twoT);
+      Value tT = builder.create<arith::MulFOp>(l, t, t);
+      return builder.create<arith::MulFOp>(l, tT, inner);
     }
     return Value();
   }

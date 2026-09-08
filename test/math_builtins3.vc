@@ -1,0 +1,80 @@
+// test/math_builtins3.vc — third numeric-builtin batch (exp2, log2, fract,
+// step, smoothstep, degrees, radians).
+//
+// Regression for the MLIR backend's numeric-builtin coverage. These previously
+// hard-errored in emitMathBuiltin:
+//   - exp2/log2 had no GLExp2/GLLog2 opcode (SPIR-V has neither); they were
+//     stubbed with a *wrong* formula (exp2(x) := 2*exp(x), which is 2*e^x, not
+//     2^x). Fixed to the identity-preserving form: exp2(x) = e^(x*ln2),
+//     log2(x) = ln(x)/ln2. Width is preserved via runTranscendental.
+//   - fract/degrees/radians had lowering code but were missing from the
+//     unaryMath[] gate array, so the unary block was never entered for them
+//     (the code was dead). Added to the array.
+//   - step/smoothstep are binary/ternary (outside the unary gate) and lower to
+//     arithmetic + GLFloorOp/GLFClampOp compositions (no direct GL opcode).
+//
+//   exp2(x)        = 2^x = e^(x*ln2)           (GLExp + MulF + const ln2)
+//   log2(x)        = ln(x)/ln2                 (GLLog + DivF + const ln2)
+//   fract(x)       = x - floor(x)              (GLFloor + SubF)
+//   step(e,x)      = (x < e) ? 0 : 1           (CmpF + Select)
+//   smoothstep(a,b,x) = t*t*(3-2t), t=clamp((x-a)/(b-a),0,1)  (GLFClamp + arith)
+//   degrees(x)     = x * (180/pi)              (MulF + const)
+//   radians(x)     = x * (pi/180)              (MulF + const)
+//
+// GLSL has all of these natively (exp2/log2/degrees/radians/step/smoothstep/
+// fract are all GLSL builtins; the f-suffixed exp2f/log2f strip to exp2/log2
+// via lowerBuiltinCall), so the same source runs on both backends.
+//
+//   vcc test/math_builtins3.vc -o build/math_builtins3_sf && ./build/math_builtins3_sf
+//   vc  test/math_builtins3.vc -emit=full -o build/math_builtins3_m && ./build/math_builtins3_m
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void kmath(float *out) {
+  int i = threadIdx.x;
+  // One thread computes one result. 7 results, indices 0..6.
+  if (i == 0) out[0] = exp2f((float)i);          // 2^0 = 1
+  if (i == 1) out[1] = log2f(8.0f);              // log2(8) = 3
+  if (i == 2) out[2] = fract(2.75f);             // 0.75
+  if (i == 3) out[3] = step(3.0f, 5.0f);         // 5 >= 3 -> 1
+  if (i == 0) out[4] = smoothstep(0.0f, 1.0f, 0.5f); // 0.5
+  if (i == 1) out[5] = degrees(1.0f);            // 57.29578
+  if (i == 2) out[6] = radians(180.0f);          // 3.1415927
+}
+
+int main() {
+  vcInit();
+
+  const int N = 7;
+  void *dOut = 0;
+  vcMalloc(&dOut, N * 4);
+  float zero[7] = {0,0,0,0,0,0,0};
+  vcMemcpy(dOut, zero, N * 4, VCMemcpyKind::HostToDevice);
+  kmath<<<1, 32>>>(dOut);
+  vcDeviceSynchronize();
+  float h[7];
+  vcMemcpy(h, dOut, N * 4, VCMemcpyKind::DeviceToHost);
+
+  // Expected values (host reference).
+  float want[7] = {1.0f, 3.0f, 0.75f, 1.0f, 0.5f, 57.295780f, 3.1415927f};
+  //                  exp2(0) log2(8) fract  step  smooth  degrees  radians
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    // Transcendentals (exp2, log2) and the trig-derived (degrees, radians) are
+    // f32-precision on device; allow a small relative tolerance.
+    float tol = (i == 0 || i == 1 || i == 5 || i == 6) ? 1e-3f : 1e-4f;
+    if (fabsf(h[i] - want[i]) > tol) {
+      printf("  mismatch i=%d got=%f want=%f\n", i, h[i], want[i]);
+      ok = 0;
+    }
+  }
+
+  printf("math_builtins3: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

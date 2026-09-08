@@ -1,0 +1,58 @@
+// test/MLIR/math_builtins3.vc — third math-builtin batch IR lowering.
+//
+// Covers the builtins that have NO direct spirv.GL opcode, so they lower to
+// arithmetic compositions of a nearby GL op + constants:
+//   exp2(x)  = e^(x*ln2)          -> spirv.GL.Exp over (x * ln2)
+//   log2(x)  = ln(x)/ln2          -> spirv.GL.Log then DivF by ln2
+//   fract(x) = x - floor(x)       -> spirv.GL.Floor + SubF
+//   step(e,x)= (x<e) ? 0 : 1      -> CmpF + Select (no GL op)
+//   smoothstep(a,b,x) = t*t*(3-2t), t=clamp((x-a)/(b-a),0,1)
+//                           -> spirv.GL.FClamp + arithmetic
+//   degrees/radians(x) = x*k      -> MulF by a constant (no GL op)
+//
+// The key regression this locks in: exp2/log2/fract/degrees/radians all route
+// through the unary-math block in emitMathBuiltin. That block is GATED by the
+// unaryMath[] constexpr array — fract/degrees/radians were once missing from
+// it, so their (correctly written) lowering code was dead and they hard-
+// errored. The array now lists them. exp2/log2 were also once stubbed with a
+// *wrong* formula (exp2(x) := 2*exp(x) = 2*e^x, not 2^x); this test pins the
+// correct ln2-scaled form by checking for the 0.693... constant.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+// RUN: mlirc -emit=spirv %s -o %t.spv && test -s %t.spv
+
+__global__ void k(float *out) {
+  int i = threadIdx.x;
+  float x = (float)i;
+
+  // exp2(x) -> spirv.GL.Exp over (x * ln2). The ln2 constant (0.693...) is
+  // the tell that the correct identity (not 2*exp) is being emitted.
+  // CHECK-DAG: arith.constant 0.693147182 : f32
+  // CHECK-DAG: spirv.GL.Exp
+  out[0] = exp2f(x);
+
+  // log2(x) -> spirv.GL.Log then DivF by ln2.
+  // CHECK-DAG: spirv.GL.Log
+  out[1] = log2f(x + 1.0f);
+
+  // fract(x) -> spirv.GL.Floor (the floor in x - floor(x)).
+  // CHECK-DAG: spirv.GL.Floor
+  out[2] = fract(x);
+
+  // step(e, x) -> CmpF (x < e) + Select. No GL op.
+  // CHECK-DAG: arith.cmpf olt
+  // CHECK-DAG: arith.select
+  out[3] = step(3.0f, x);
+
+  // smoothstep(a,b,x) -> spirv.GL.FClamp on t = (x-a)/(b-a).
+  // CHECK-DAG: spirv.GL.FClamp
+  out[4] = smoothstep(0.0f, 1.0f, x);
+
+  // degrees(x) = x * (180/pi) -> constant 57.2957...
+  // CHECK-DAG: arith.constant 57.2957802 : f32
+  out[5] = degrees(x);
+
+  // radians(x) = x * (pi/180) -> constant 0.0174532...
+  // CHECK-DAG: arith.constant 0.0174532924 : f32
+  out[6] = radians(x);
+}
