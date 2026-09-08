@@ -1,0 +1,88 @@
+// test/dyn_shared.vc — extern __shared__ (dynamic / runtime-sized shared
+// memory) on the MLIR backend.
+//
+// CUDA's `extern __shared__ T s[]` declares a shared array whose size is set
+// at launch (the dynamic shared-mem bytes passed to <<<grid, block, nbytes>>>).
+// The GLSL backend has always supported this by sizing the unsized dim to
+// gl_WorkGroupSize.x. The MLIR backend can't express a spec-constant-sized
+// array in IR (spirv::ArrayType only takes a constant count), so it emits a
+// placeholder size of 1 and a post-serialize binary patch
+// (patchDynamicSharedArrays in tools/vc/vc.cpp) rewrites the OpTypeArray
+// length to the __vc_wg_x spec constant (SpecId 0 = block x), relocating the
+// workgroup-size spec constants ahead of the type section so the length
+// operand is a back-reference (SPIR-V forbids forward refs in instruction
+// operands). This test exercises that path on both backends.
+//
+//   vcc test/dyn_shared.vc -o build/dyn_shared_sf && ./build/dyn_shared_sf
+//   vc  test/dyn_shared.vc -emit=full -o build/dyn_shared_m && ./build/dyn_shared_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// Reverse a per-thread value through dynamic shared memory: each lane writes
+// its tid to s[tid], syncs, then reads s[blockDim - 1 - tid]. With a block of
+// 32, lane i should read the value lane (31-i) wrote (== 31-i). The array is
+// unsized in source and sized to blockDim.x at runtime.
+__global__ void kreverse(int *out, int n) {
+  extern __shared__ int s[];
+  int i = threadIdx.x;
+  int bdim = blockDim.x;
+  if (i < bdim) s[i] = i;
+  __syncthreads();
+  if (i < bdim) out[i] = s[bdim - 1 - i];
+}
+
+// A float variant + a second extern __shared__ in the same kernel (exercises
+// multiple dynshared globals sharing / distinct element types).
+__global__ void kscale(float *out, int n) {
+  extern __shared__ float f[];
+  int i = threadIdx.x;
+  int bdim = blockDim.x;
+  if (i < bdim) f[i] = (float)i * 2.0f;
+  __syncthreads();
+  if (i < bdim) out[i] = f[bdim - 1 - i];
+}
+
+int main() {
+  vcInit();
+
+  const int N = 32;
+  int ok = 1;
+
+  // --- kreverse ---
+  void *dOut = 0;
+  vcMalloc(&dOut, N * 4);
+  kreverse<<<1, N>>>(dOut, N);
+  vcDeviceSynchronize();
+  int hOut[32];
+  vcMemcpy(hOut, dOut, N * 4, VCMemcpyKind::DeviceToHost);
+  for (int i = 0; i < N; i++) {
+    int exp = N - 1 - i;
+    if (hOut[i] != exp) {
+      printf("  kreverse mismatch i=%d got=%d exp=%d\n", i, hOut[i], exp);
+      ok = 0;
+    }
+  }
+
+  // --- kscale: f[i] = 2*i, read f[31-i] = 2*(31-i) ---
+  void *dOutF = 0;
+  vcMalloc(&dOutF, N * 4);
+  kscale<<<1, N>>>(dOutF, N);
+  vcDeviceSynchronize();
+  float hOutF[32];
+  vcMemcpy(hOutF, dOutF, N * 4, VCMemcpyKind::DeviceToHost);
+  for (int i = 0; i < N; i++) {
+    float exp = 2.0f * (N - 1 - i);
+    if (fabsf(hOutF[i] - exp) > 1e-4f) {
+      printf("  kscale mismatch i=%d got=%f exp=%f\n", i, hOutF[i], exp);
+      ok = 0;
+    }
+  }
+
+  printf("dyn_shared: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dOut);
+  vcFree(dOutF);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

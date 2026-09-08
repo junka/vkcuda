@@ -842,10 +842,14 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
   // constant-folded to a concrete size; a non-constant dim falls back to 0.
   while (curTok.is(TokKind::l_square)) {
     advance();
-    NodePtr dim = parseExpression();
+    // `[]` with no size expression = unsized (extern __shared__ T s[], or a
+    // function parameter `int p[]`). Record dim 0 and skip the expression.
     int64_t sz = 0;
-    if (!evalConstInt(dim.get(), sz))
-      sz = 0; // unsized / non-constant
+    if (!curTok.is(TokKind::r_square)) {
+      NodePtr dim = parseExpression();
+      if (!evalConstInt(dim.get(), sz))
+        sz = 0; // unsized / non-constant
+    }
     v->arrayDims.push_back(sz);
     expect(TokKind::r_square, "']'");
   }
@@ -1113,6 +1117,28 @@ NodePtr Parser::parseStatement() {
     Type *ty = parseType();
     auto *v = parseVarDecl(ty);
     if (v) v->isShared = true;
+    expect(TokKind::semi, "';'");
+    SourceLocation loc = v ? v->getLoc() : toSourceLoc(curTok);
+    return NodePtr(new DeclStmt(loc, v));
+  }
+  case TokKind::kw_extern: {
+    // `extern __shared__ T s[]` — CUDA dynamic (runtime-sized) shared memory.
+    // `extern` here is not a storage-class on a normal variable; it marks the
+    // shared array as unsized (sized at launch by the runtime). Only take this
+    // path when `extern` is immediately followed by `__shared__`; a plain
+    // `extern int g;` (no __shared__) falls through to the normal declaration
+    // path so Sema can emit its usual device-storage-class diagnostic.
+    if (!lexer.peek().is(TokKind::kw_shared))
+      return parseDeclOrExprStmt();
+    Token t = curTok;
+    advance(); // consume `extern`
+    consume(TokKind::kw_shared); // guaranteed by the peek above
+    Type *ty = parseType();
+    auto *v = parseVarDecl(ty);
+    if (v) {
+      v->isShared = true;
+      v->storageClass = StorageClass::Extern;
+    }
     expect(TokKind::semi, "';'");
     SourceLocation loc = v ? v->getLoc() : toSourceLoc(curTok);
     return NodePtr(new DeclStmt(loc, v));

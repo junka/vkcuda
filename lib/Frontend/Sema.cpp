@@ -689,8 +689,13 @@ void Sema::checkStmt(const ASTNode *n) {
       if (inDevice && v->storageClass == StorageClass::Static)
         error(v, "'static' local variable is not allowed in device code "
                  "(use __shared__ for block-local persistent storage)");
-      if (inDevice && v->storageClass == StorageClass::Extern)
-        error(v, "'extern' local variable is not allowed in device code");
+      // `extern` is allowed in device code ONLY as the CUDA dynamic-shared
+      // spelling `extern __shared__ T s[]` (an unsized workgroup array sized
+      // at launch). A bare `extern` local (no __shared__) still has no device
+      // lowering.
+      if (inDevice && v->storageClass == StorageClass::Extern && !v->isShared)
+        error(v, "'extern' local variable is not allowed in device code "
+                 "(only `extern __shared__ T s[]` is supported)");
       declare(v->name, v);
       if (v->init) {
         Type *initTy = checkExpr(v->init.get());

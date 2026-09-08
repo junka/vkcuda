@@ -1167,16 +1167,32 @@ private:
   // The symbol is namespaced (`__vc_shared_<name>`) to avoid clashing with user
   // symbols; the same global is reused across kernels that declare a __shared__
   // var of the same name and shape.
+  // Emit (or look up) a module-scope Workgroup-storage global for a
+  // __shared__ decl. `shape` holds the array dims; any dim == 0 means
+  // "extern __shared__ T s[]" — an unsized (runtime-sized) dimension. MLIR's
+  // spirv::ArrayType only accepts a constant `unsigned` count, so we cannot
+  // express a spec-constant-sized array from IR. Instead we emit a placeholder
+  // size of 1 for each unsized dim (so the IR type-checks) AND stamp the global
+  // with a recognizable symbol name `__vc_dynshared_<name>`. A post-serialize
+  // binary patch in vc.cpp (patchDynamicSharedArrays) then locates each such
+  // global's OpTypeArray and rewrites its length operand to reference the
+  // `__vc_wg_x` spec constant (spec_id 0 = block x), mirroring how the GLSL
+  // backend sizes `extern __shared__` to `gl_WorkGroupSize.x`.
   Value getOrCreateSharedGlobal(llvm::StringRef name, ArrayRef<int64_t> shape,
-                                mlir::Type elemTy, Location l) {
-    std::string sym = ("__vc_shared_") + name.str();
+                                mlir::Type elemTy, Location l,
+                                bool dynamic = false) {
+    std::string sym = dynamic ? ("__vc_dynshared_") + name.str()
+                              : ("__vc_shared_") + name.str();
     // The pointee type: the element for a scalar, or a spirv.array wrapping the
     // element for a (multi-dimensional) shared array. spirv.array is row-major
     // and nested for multi-dim (`float s[16][8]` -> array<16 x array<8 x f32>>).
+    // An unsized dim (0, only valid for `extern __shared__`) becomes a
+    // placeholder 1 in IR — the real size is patched into the serialized
+    // SPIR-V binary afterward.
     mlir::Type pointee = elemTy;
     if (!shape.empty()) {
       for (auto dim : llvm::reverse(shape))
-        pointee = spirv::ArrayType::get(pointee, dim);
+        pointee = spirv::ArrayType::get(pointee, dim > 0 ? (unsigned)dim : 1u);
     }
     spirv::PointerType ptrTy =
         spirv::PointerType::get(pointee, spirv::StorageClass::Workgroup);
@@ -1873,11 +1889,22 @@ private:
       // than building a 0-d slot. Struct *arrays* (`Accumulator acc[2];`) prepend
       // the array dims onto that shape.
       SmallVector<int64_t, 4> shape;
-      for (int64_t dim : d->arrayDims) {
+      bool hasUnsizedDim = false;
+      for (size_t di = 0; di < d->arrayDims.size(); ++di) {
+        int64_t dim = d->arrayDims[di];
         if (dim <= 0) {
-          error(d, "unsized __shared__ array (extern __shared__ T s[]) is not "
-                   "supported by the MLIR backend; give it an explicit size");
-          shape.push_back(1); // keep going so the slot has a valid type
+          // extern __shared__ T s[]: unsized (runtime-sized) dimension. We
+          // emit a placeholder 1 here and let the post-serialize binary patch
+          // (patchDynamicSharedArrays in vc.cpp) rewrite the array's length
+          // to the __vc_wg_x spec constant. Only the trailing dim may be
+          // unsized (the CUDA form `extern __shared__ T s[]`); a non-trailing
+          // zero is still rejected as malformed.
+          if (di + 1 != d->arrayDims.size()) {
+            error(d, "only the trailing dimension of an extern __shared__ "
+                     "array may be unsized");
+          }
+          hasUnsizedDim = true;
+          shape.push_back(0); // placeholder; rewritten by the binary patch
         } else {
           shape.push_back(dim);
         }
@@ -1899,7 +1926,8 @@ private:
       }
       if (d->isShared) {
         // Module-scope global in Workgroup storage, fetched per use.
-        Value addr = getOrCreateSharedGlobal(d->name, shape, elemTy, l);
+        Value addr = getOrCreateSharedGlobal(d->name, shape, elemTy, l,
+                                             /*dynamic=*/hasUnsizedDim);
         locals[d->name] = addr;
         localTypes[d->name] = d->type;
         // __shared__ decls may not have a non-constant initializer in CUDA

@@ -1,0 +1,24 @@
+// test/MLIR/dyn_shared.vc — extern __shared__ (dynamic shared memory) lowering.
+//
+// `extern __shared__ T s[]` declares an unsized (runtime-sized) workgroup
+// array. MLIR's spirv::ArrayType only takes a constant count, so ASTToMLIR
+// emits a placeholder size of 1 and a recognizable `__vc_dynshared_<name>`
+// symbol. A post-serialize binary patch (patchDynamicSharedArrays in vc.cpp)
+// then rewrites the OpTypeArray length to the __vc_wg_x spec constant. This
+// lit test checks the IR-level placeholder + symbol; the binary patch and the
+// end-to-end sizing are exercised by test/dyn_shared.vc in the e2e suite.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+//
+// CHECK-DAG: spirv.GlobalVariable @__vc_dynshared_s : !spirv.ptr<!spirv.array<1 x i32>, Workgroup>
+// CHECK-DAG: spirv.mlir.addressof @__vc_dynshared_s
+// CHECK-DAG: spirv.AccessChain
+// CHECK-DAG: spirv.Store "Workgroup"
+
+__global__ void k(int *out, int n) {
+  extern __shared__ int s[];
+  int i = threadIdx.x;
+  s[i] = i;
+  __syncthreads();
+  out[i] = s[n - 1 - i];
+}

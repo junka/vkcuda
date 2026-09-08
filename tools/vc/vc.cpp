@@ -154,6 +154,212 @@ static void patchWorkgroupSizeBuiltin(SmallVectorImpl<uint32_t> &binary) {
   binary.insert(binary.begin() + insertPos, decor, decor + 4);
 }
 
+// Patch the serialized SPIR-V binary so each `extern __shared__ T s[]` global
+// (emitted by ASTToMLIR as `@__vc_dynshared_<name>` with a placeholder
+// spirv.array<1 x T>) has its OpTypeArray length operand rewritten to reference
+// the `__vc_wg_x` spec constant (SpecId 0 = block x). This is how the MLIR
+// backend sizes dynamic shared memory to the runtime workgroup size, mirroring
+// the GLSL backend's `shared T s[gl_WorkGroupSize.x]`.
+//
+// Why a binary patch: MLIR's spirv::ArrayType::get only accepts a constant
+// `unsigned` count — there is no IR way to express a spec-constant-sized array.
+// So ASTToMLIR emits a placeholder size of 1 and stamps the global with a
+// recognizable `__vc_dynshared_<name>` symbol; we then rewrite the array's
+// length operand here, post-serialization.
+//
+// Layout fix: MLIR emits the workgroup-size spec constants (`__vc_wg_x/y/z`,
+// `gl_WorkGroupSize`) in the constants section, AFTER the type section. But an
+// OpTypeArray's length operand requires its target id to already be defined
+// (forward references are allowed only for annotations like OpDecorate, not for
+// instruction operands). So we also relocate that contiguous spec-constant
+// block to just before the first dynamic-shared OpTypeArray — the same layout
+// glslc produces for `shared T s[gl_WorkGroupSize.x]`.
+//
+// Safety: rewriting the length operand changes no instruction's word count
+// (OpTypeArray is always [result_id, element_type_id, length_id]), and the
+// relocated spec-constant block only references itself, so no id renumbering is
+// needed and all references stay valid. A static `__shared__ T s[1]` that
+// happens to share the placeholder array type would also be rewritten — but
+// that is benign: it only over-allocates (to workgroup-x elements) and accesses
+// that were in-range stay in-range (spirv-val does not bounds-check array
+// indexing). Real static shared arrays have a distinct type (size != 1).
+static void patchDynamicSharedArrays(SmallVectorImpl<uint32_t> &binary) {
+  // Opcodes / word layouts we decode. For ops that have BOTH a result type and
+  // a result id, SPIR-V lays out [wc|op, result_type_id, result_id, operands...]
+  // (type first, then result). Type-defining ops (TypePointer/TypeArray) have
+  // only a result id: [wc|op, result_id, operands...].
+  constexpr uint32_t kOpName = 5;                  // [wc|op, target_id, name...]
+  constexpr uint32_t kOpTypePointer = 32;          // [wc|op, result_id, SC, elem_id]
+  constexpr uint32_t kOpTypeArray = 28;            // [wc|op, result_id, elem_id, len_id]
+  constexpr uint32_t kOpVariable = 59;             // [wc|op, type_id, result_id, SC, ...]
+  constexpr uint32_t kOpSpecConstant = 50;         // [wc|op, type_id, result_id, value...]
+  constexpr uint32_t kOpSpecConstantComposite = 51; // [wc|op, type_id, result_id, constituents...]
+
+  if (binary.size() < 5)
+    return;
+
+  auto readName = [&](size_t base, uint32_t wordCount, std::string &out) {
+    out.clear();
+    for (uint32_t w = 2; w < wordCount; ++w) {
+      uint32_t val = binary[base + w];
+      for (int b = 0; b < 4; ++b) {
+        char c = static_cast<char>((val >> (8 * b)) & 0xFF);
+        if (c == 0)
+          return;
+        out.push_back(c);
+      }
+    }
+  };
+
+  // Pass 1: collect ids, type-def offsets, variable result-types, and the
+  // offsets of spec-constant instructions (by result id, which is at +2 for
+  // these ops since they carry a result type first).
+  std::optional<uint32_t> wgXId;
+  uint32_t glWgSizeId = 0;
+  llvm::SmallVector<uint32_t, 4> dynVarIds;
+  struct TypeDef { size_t offset; uint32_t opcode; };
+  llvm::DenseMap<uint32_t, TypeDef> typeDefs;
+  llvm::DenseMap<uint32_t, uint32_t> varResultType; // var result_id -> type_id
+  llvm::DenseMap<uint32_t, size_t> specConstOffsets; // result_id -> offset
+
+  size_t i = 5;
+  while (i < binary.size()) {
+    uint32_t word = binary[i];
+    uint32_t opcode = word & 0xFFFF;
+    uint32_t wordCount = word >> 16;
+    if (wordCount == 0 || i + wordCount > binary.size())
+      break;
+    if (opcode == kOpName && wordCount >= 3) {
+      std::string name;
+      readName(i, wordCount, name);
+      uint32_t targetId = binary[i + 1];
+      if (name == "__vc_wg_x")
+        wgXId = targetId;
+      else if (name == "gl_WorkGroupSize")
+        glWgSizeId = targetId;
+      else if (name.starts_with("__vc_dynshared_"))
+        dynVarIds.push_back(targetId);
+    } else if (opcode == kOpTypePointer && wordCount >= 4) {
+      typeDefs[binary[i + 1]] = {i, opcode};
+    } else if (opcode == kOpTypeArray && wordCount >= 4) {
+      typeDefs[binary[i + 1]] = {i, opcode};
+    } else if (opcode == kOpVariable && wordCount >= 4) {
+      // [wc|op, type_id, result_id, storage_class, ...]
+      varResultType[binary[i + 2]] = binary[i + 1];
+    } else if ((opcode == kOpSpecConstant && wordCount >= 4) ||
+               (opcode == kOpSpecConstantComposite && wordCount >= 3)) {
+      // [wc|op, type_id, result_id, ...] — result_id at +2.
+      specConstOffsets[binary[i + 2]] = i;
+    }
+    i += wordCount;
+  }
+
+  if (!wgXId || dynVarIds.empty())
+    return; // nothing to patch
+
+  // Collect the candidate OpTypeArray offsets reachable from each dynshared
+  // variable (var -> ptr -> first array in the element-type chain).
+  auto resolveArrayOff = [&](uint32_t typeId) -> std::optional<size_t> {
+    uint32_t cur = typeId;
+    for (int guard = 0; guard < 16 && cur != 0; ++guard) {
+      auto it = typeDefs.find(cur);
+      if (it == typeDefs.end())
+        break;
+      size_t off = it->second.offset;
+      uint32_t op = it->second.opcode;
+      if (op == kOpTypePointer) {
+        cur = binary[off + 3]; // element_type_id
+        continue;
+      }
+      if (op == kOpTypeArray)
+        return off;
+      break;
+    }
+    return std::nullopt;
+  };
+  llvm::SmallVector<size_t, 4> arrayOffsets;
+  for (uint32_t varId : dynVarIds) {
+    auto it = varResultType.find(varId);
+    if (it == varResultType.end())
+      continue;
+    if (auto off = resolveArrayOff(it->second))
+      arrayOffsets.push_back(*off);
+  }
+  if (arrayOffsets.empty())
+    return;
+  size_t firstArray = *std::min_element(arrayOffsets.begin(), arrayOffsets.end());
+
+  // Locate the contiguous spec-constant block to relocate: starts at
+  // __vc_wg_x and extends through the following SpecConstant/
+  // SpecConstantComposite ops up to and including gl_WorkGroupSize.
+  auto wxIt = specConstOffsets.find(*wgXId);
+  if (wxIt == specConstOffsets.end())
+    return;
+  llvm::SmallVector<size_t, 4> specOffsets;
+  specOffsets.push_back(wxIt->second);
+  {
+    size_t cur = wxIt->second;
+    while (true) {
+      uint32_t wc = binary[cur] >> 16;
+      size_t next = cur + wc;
+      if (next >= binary.size())
+        break;
+      uint32_t w = binary[next];
+      uint32_t op = w & 0xFFFF;
+      uint32_t nwc = w >> 16;
+      if (nwc == 0 || (op != kOpSpecConstant && op != kOpSpecConstantComposite))
+        break;
+      specOffsets.push_back(next);
+      cur = next;
+      if (binary[next + 2] == glWgSizeId) // result_id at +2
+        break;
+    }
+  }
+  std::sort(specOffsets.begin(), specOffsets.end());
+  size_t blkStart = specOffsets.front();
+  size_t blkEnd = blkStart;
+  for (size_t off : specOffsets) {
+    uint32_t wc = binary[off] >> 16;
+    blkEnd = std::max(blkEnd, off + wc);
+  }
+
+  // If the block is already before the first array (no relocation needed),
+  // just rewrite the lengths.
+  if (blkEnd <= firstArray) {
+    for (size_t off : arrayOffsets)
+      binary[off + 3] = *wgXId;
+    return;
+  }
+
+  // Relocate: [0..firstArray) + [spec block] + [firstArray..blkStart) +
+  // [blkEnd..end). This moves the spec-constant block to just before the
+  // first dynamic-shared OpTypeArray.
+  SmallVector<uint32_t, 0> out;
+  out.reserve(binary.size());
+  out.insert(out.end(), binary.begin(), binary.begin() + firstArray);
+  out.insert(out.end(), binary.begin() + blkStart, binary.begin() + blkEnd);
+  out.insert(out.end(), binary.begin() + firstArray, binary.begin() + blkStart);
+  out.insert(out.end(), binary.begin() + blkEnd, binary.end());
+  binary.swap(out);
+
+  // Rewrite each candidate array's length operand. Offsets that were in
+  // [firstArray, blkStart) shifted forward by the block length; those at/after
+  // blkEnd shifted back. (firstArray itself is now the start of the relocated
+  // block, so the arrays that were in [firstArray, blkStart) are now at
+  // [firstArray + blkLen, blkStart + blkLen).)
+  ptrdiff_t blkLen = (ptrdiff_t)(blkEnd - blkStart);
+  for (size_t &off : arrayOffsets) {
+    if (off >= blkEnd)
+      off -= blkLen;
+    else // off was in [firstArray, blkStart)
+      off += blkLen;
+  }
+  for (size_t off : arrayOffsets) {
+    if (off + 3 < binary.size())
+      binary[off + 3] = *wgXId;
+  }
+}
+
 static bool loadSource(const std::string &path, llvm::SourceMgr &sm) {
   auto buf = llvm::MemoryBuffer::getFileOrSTDIN(path);
   if (std::error_code ec = buf.getError()) {
@@ -257,6 +463,11 @@ int main(int argc, char **argv) {
   // workgroup size. See patchWorkgroupSizeBuiltin for why this is a binary
   // patch rather than an IR-level decoration.
   patchWorkgroupSizeBuiltin(binary);
+
+  // Rewrite each `extern __shared__ T s[]` global's placeholder array size to
+  // the workgroup-x spec constant, sizing dynamic shared memory to the runtime
+  // block size. See patchDynamicSharedArrays for why this is a binary patch.
+  patchDynamicSharedArrays(binary);
 
   // -emit=spirv: write the single SPIR-V binary and stop. (A SPIR-V file
   // can't concatenate multiple entry points across kernels, so like the GLSL
