@@ -36,6 +36,14 @@ using VCKernelHandle = VCKernel *;
 struct VCStream;
 using VCStreamHandle = VCStream *;
 
+/// Opaque handle to a recorded command graph (CUDA-Graph-style "record once,
+/// replay many"). A graph captures a sequence of kernel launches and
+/// device-to-device copies issued while recording is active; vcGraphLaunch
+/// replays the whole sequence with a single queue submit. NULL is never a
+/// valid graph handle.
+struct VCGraph;
+using VCGraphHandle = VCGraph *;
+
 /// Error codes mirroring cudaError_t style.
 enum class VCError {
   Success = 0,
@@ -96,6 +104,40 @@ VCError vcStreamDestroy(VCStreamHandle stream);
 
 /// Block until all work queued on `stream` is complete. NULL = default stream.
 VCError vcStreamSynchronize(VCStreamHandle stream);
+
+//----------------------------------------------------------------------------
+// Command graphs (CUDA-Graph-style record/replay)
+//----------------------------------------------------------------------------
+
+/// Create a new empty command graph. The graph owns its own command pool,
+/// descriptor pool, and (after recording) a secondary command buffer, all
+/// released by vcGraphDestroy.
+VCError vcGraphCreate(VCGraphHandle *out);
+
+/// Destroy a graph and all resources it owns. The buffers referenced by
+/// launches recorded into the graph must outlive it (the graph does not
+/// retain them). Safe to call on an un-recorded graph.
+VCError vcGraphDestroy(VCGraphHandle graph);
+
+/// Begin recording on the default stream. While recording is active, every
+/// vcLaunchKernelS / vcMemcpyS targeting the default stream is appended to
+/// the graph instead of submitted. Kernel launches and device-to-device
+/// copies are recorded directly; host-to-device copies allocate a persistent
+/// staging buffer owned by the graph. Must be paired with vcGraphEndRecord.
+VCError vcGraphBeginRecord(VCGraphHandle graph);
+
+/// End recording. Finalizes the graph's recorded command buffer so it is
+/// ready for vcGraphLaunch. Recording must currently be active on this graph.
+VCError vcGraphEndRecord(VCGraphHandle graph);
+
+/// Replay the recorded graph on `stream` (NULL = default stream) as a single
+/// asynchronous queue submit. The graph must have finished recording.
+VCError vcGraphLaunch(VCGraphHandle graph, VCStreamHandle stream);
+
+/// Reset a graph to empty so it can be re-recorded. Destroys the recorded
+/// command buffer, descriptor sets, and staging buffers but keeps the graph
+/// handle valid for a fresh vcGraphBeginRecord.
+VCError vcGraphReset(VCGraphHandle graph);
 
 /// Load a SPIR-V binary (already assembled into a .spv blob) as a kernel.
 /// `entryPoint` names the spir-v entry function (default "main").

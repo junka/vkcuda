@@ -10,6 +10,9 @@
 
 namespace vc {
 
+// Forward decl: defined in the graphs section below; used by shutdown().
+static void resetGraphState(VulkanDevice &dev, VCGraph &g);
+
 //----------------------------------------------------------------------------
 // Error helpers
 //----------------------------------------------------------------------------
@@ -212,6 +215,17 @@ bool Runtime::createPipelineCache() {
 VCError Runtime::shutdown() {
   if (!init_) return VCError::Success;
   vkDeviceWaitIdle(device_->device);
+  for (auto &g : graphs_) {
+    if (!g) continue;
+    resetGraphState(*device_, *g);
+    if (g->secondaryCB && g->commandPool)
+      vkFreeCommandBuffers(device_->device, g->commandPool, 1, &g->secondaryCB);
+    if (g->descriptorPool)
+      vkDestroyDescriptorPool(device_->device, g->descriptorPool, nullptr);
+    if (g->commandPool)
+      vkDestroyCommandPool(device_->device, g->commandPool, nullptr);
+  }
+  graphs_.clear();
   for (auto &s : streams_) if (s) teardownStream(*device_, *s);
   streams_.clear();
   if (defaultStream_) { teardownStream(*device_, *defaultStream_); defaultStream_.reset(); }
@@ -417,6 +431,24 @@ VCError Runtime::freeBuffer(VCBuffer &buf) {
 // Primitive: record vkCmdCopyBuffer(src.buf -> dst.buf) on stream s.
 VCError Runtime::copyDeviceToDevice(VCBuffer &dst, const VCBuffer &src,
                                     size_t bytes, VCStream &s) {
+  // Graph capture: append the copy to the secondary command buffer.
+  if (s.captureTarget) {
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(s.captureTarget->secondaryCB, src.buffer, dst.buffer, 1,
+                    &region);
+    // Make the transfer write visible to subsequent dispatches in the graph.
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(s.captureTarget->secondaryCB,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+    return VCError::Success;
+  }
   VkCommandBuffer cb = beginFrame(s);
   VkBufferCopy region{0, 0, bytes};
   vkCmdCopyBuffer(cb, src.buffer, dst.buffer, 1, &region);
@@ -428,6 +460,20 @@ VCError Runtime::copyDeviceToDevice(VCBuffer &dst, const VCBuffer &src,
 // Stages through a transient host-visible scratch buffer.
 VCError Runtime::copyHostToDevice(VCBuffer &dst, const void *hostSrc,
                                   size_t bytes, VCStream &s) {
+  // Graph capture: allocate a persistent staging buffer owned by the graph
+  // (transient staging would be freed before the graph ever executes), fill
+  // it now, and record the device copy into the secondary command buffer.
+  if (s.captureTarget) {
+    VCGraph &g = *s.captureTarget;
+    auto staging = std::make_unique<VCBuffer>();
+    if (mallocHostBuffer(bytes, *staging) != VCError::Success)
+      return VCError::OutOfMemory;
+    std::memcpy(staging->mapped, hostSrc, bytes);
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(g.secondaryCB, staging->buffer, dst.buffer, 1, &region);
+    g.stagingBuffers.push_back(std::move(staging));
+    return VCError::Success;
+  }
   VCBuffer scratch{};
   if (mallocHostBuffer(bytes, scratch) != VCError::Success)
     return VCError::OutOfMemory;
@@ -445,6 +491,28 @@ VCError Runtime::copyHostToDevice(VCBuffer &dst, const void *hostSrc,
 // the caller can read the result immediately.
 VCError Runtime::copyDeviceToHost(void *hostDst, const VCBuffer &src,
                                   size_t bytes, VCStream &s) {
+  // Graph capture: record a device->staging copy into the secondary command
+  // buffer using a persistent staging buffer owned by the graph. The host
+  // readback is deferred: the caller must synchronize after vcGraphLaunch
+  // and then memcpy from the staging buffer's mapped pointer. We stash the
+  // host destination + staging buffer so vcGraphLaunch can expose them, but
+  // the simple contract is: D2H inside a graph is recorded as a copy to a
+  // graph-owned staging buffer; the caller reads it post-sync via the mapped
+  // pointer stored on the graph.
+  if (s.captureTarget) {
+    VCGraph &g = *s.captureTarget;
+    auto staging = std::make_unique<VCBuffer>();
+    if (mallocHostBuffer(bytes, *staging) != VCError::Success)
+      return VCError::OutOfMemory;
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(g.secondaryCB, src.buffer, staging->buffer, 1, &region);
+    // Record where the host wants the data so a post-launch readback can
+    // deliver it. We can't copy now (the GPU copy hasn't executed).
+    VCBuffer *raw = staging.get();
+    g.d2hReadbacks.push_back({hostDst, raw, bytes});
+    g.stagingBuffers.push_back(std::move(staging));
+    return VCError::Success;
+  }
   VCBuffer scratch{};
   if (mallocHostBuffer(bytes, scratch) != VCError::Success)
     return VCError::OutOfMemory;
@@ -461,6 +529,154 @@ VCError Runtime::copyDeviceToHost(void *hostDst, const VCBuffer &src,
 VCError Runtime::synchronize() {
   if (!init_) return VCError::InitializationError;
   vkDeviceWaitIdle(device_->device);
+  return VCError::Success;
+}
+
+//----------------------------------------------------------------------------
+// Command graphs (record/replay)
+//----------------------------------------------------------------------------
+
+// Size the graph descriptor pool generously: one set per recorded launch that
+// has pointer args, each with up to a handful of SSBO bindings.
+static VkDescriptorPool createGraphDescriptorPool(VkDevice dev) {
+  VkDescriptorPoolSize ps{};
+  ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  ps.descriptorCount = 1024;
+  VkDescriptorPoolCreateInfo dpci{};
+  dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  // FREE_DESCRIPTOR_SET_BIT so resetGraph can free sets without destroying
+  // the pool (allows re-recording).
+  dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+  dpci.maxSets = 256;
+  dpci.poolSizeCount = 1;
+  dpci.pPoolSizes = &ps;
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  vkCreateDescriptorPool(dev, &dpci, nullptr, &pool);
+  return pool;
+}
+
+VCError Runtime::createGraph(VCGraphHandle *out) {
+  if (!init_ || !out) return VCError::InitializationError;
+  auto g = std::make_unique<VCGraph>();
+
+  VkCommandPoolCreateInfo pci{};
+  pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  pci.queueFamilyIndex = device_->computeQueueFamily;
+  if (vkCreateCommandPool(device_->device, &pci, nullptr, &g->commandPool) !=
+      VK_SUCCESS)
+    return VCError::Unknown;
+
+  g->descriptorPool = createGraphDescriptorPool(device_->device);
+  if (!g->descriptorPool) {
+    vkDestroyCommandPool(device_->device, g->commandPool, nullptr);
+    return VCError::Unknown;
+  }
+
+  VkCommandBufferAllocateInfo ai{};
+  ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  ai.commandPool = g->commandPool;
+  ai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+  ai.commandBufferCount = 1;
+  if (vkAllocateCommandBuffers(device_->device, &ai, &g->secondaryCB) !=
+      VK_SUCCESS) {
+    vkDestroyDescriptorPool(device_->device, g->descriptorPool, nullptr);
+    vkDestroyCommandPool(device_->device, g->commandPool, nullptr);
+    return VCError::Unknown;
+  }
+
+  *out = reinterpret_cast<VCGraphHandle>(g.get());
+  graphs_.push_back(std::move(g));
+  return VCError::Success;
+}
+
+// Tear down a graph's recorded contents but keep the handle valid for
+// re-recording. Frees the secondary command buffer's recorded state by
+// resetting it, resets the descriptor pool, drops staging.
+static void resetGraphState(VulkanDevice &dev, VCGraph &g) {
+  if (g.secondaryCB) vkResetCommandBuffer(g.secondaryCB, 0);
+  if (g.descriptorPool)
+    vkResetDescriptorPool(dev.device, g.descriptorPool, 0);
+  g.stagingBuffers.clear();
+  g.d2hReadbacks.clear();
+  g.recorded = false;
+  g.recording = false;
+}
+
+VCError Runtime::destroyGraph(VCGraphHandle graph) {
+  if (!init_ || !graph) return VCError::Success;
+  auto *g = reinterpret_cast<VCGraph *>(graph);
+  // Clear capture on the default stream if this graph is mid-record.
+  if (defaultStream_ && defaultStream_->captureTarget == g)
+    defaultStream_->captureTarget = nullptr;
+  vkDeviceWaitIdle(device_->device);
+  resetGraphState(*device_, *g);
+  if (g->secondaryCB && g->commandPool)
+    vkFreeCommandBuffers(device_->device, g->commandPool, 1, &g->secondaryCB);
+  if (g->descriptorPool)
+    vkDestroyDescriptorPool(device_->device, g->descriptorPool, nullptr);
+  if (g->commandPool)
+    vkDestroyCommandPool(device_->device, g->commandPool, nullptr);
+  for (auto it = graphs_.begin(); it != graphs_.end(); ++it) {
+    if (it->get() == g) { graphs_.erase(it); break; }
+  }
+  return VCError::Success;
+}
+
+VCError Runtime::beginRecord(VCGraph &g) {
+  if (g.recording) return VCError::Unknown; // already recording
+  // Start fresh: drop any previous recording. Only reset if the buffer was
+  // previously recorded (avoid touching a freshly-allocated cb in its
+  // initial state, which some drivers handle poorly on reset).
+  if (g.recorded)
+    resetGraphState(*device_, g);
+  VkCommandBufferBeginInfo bi{};
+  bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  // SIMULTANEOUS_USE lets the same graph be replayed on multiple streams
+  // concurrently (or re-launched before a prior launch finishes).
+  bi.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+  // Secondary command buffers referenced by vkCmdExecuteCommands do not
+  // inherit a render pass (compute-only), but provide an (empty) inheritance
+  // info to satisfy drivers that expect it for secondary level.
+  VkCommandBufferInheritanceInfo inh{};
+  inh.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
+  bi.pInheritanceInfo = &inh;
+  if (vkBeginCommandBuffer(g.secondaryCB, &bi) != VK_SUCCESS)
+    return VCError::Unknown;
+  g.recording = true;
+  defaultStream_->captureTarget = &g;
+  return VCError::Success;
+}
+
+VCError Runtime::endRecord(VCGraph &g) {
+  if (!g.recording) return VCError::Unknown; // not recording
+  if (vkEndCommandBuffer(g.secondaryCB) != VK_SUCCESS) {
+    defaultStream_->captureTarget = nullptr;
+    g.recording = false;
+    return VCError::Unknown;
+  }
+  g.recording = false;
+  g.recorded = true;
+  if (defaultStream_->captureTarget == &g)
+    defaultStream_->captureTarget = nullptr;
+  return VCError::Success;
+}
+
+VCError Runtime::launchGraph(VCGraph &g, VCStream &s) {
+  if (!g.recorded) return VCError::Unknown;
+  // Execute the recorded secondary command buffer inside a primary frame on
+  // the target stream — a single queue submit for the whole graph.
+  VkCommandBuffer cb = beginFrame(s);
+  vkCmdExecuteCommands(cb, 1, &g.secondaryCB);
+  endFrame(s);
+  return VCError::Success;
+}
+
+VCError Runtime::resetGraph(VCGraph &g) {
+  if (defaultStream_ && defaultStream_->captureTarget == &g)
+    defaultStream_->captureTarget = nullptr;
+  vkDeviceWaitIdle(device_->device);
+  resetGraphState(*device_, g);
   return VCError::Success;
 }
 
@@ -610,10 +826,11 @@ VkPipeline Runtime::getPipeline(VCKernel &k, unsigned blockX,
 // Launch
 //----------------------------------------------------------------------------
 
-VCError Runtime::dispatch(VCKernel &k, unsigned wgX, unsigned wgY,
-                          unsigned wgZ, unsigned blockX, unsigned blockY,
-                          unsigned blockZ, const VCKernelArg *args,
-                          int argCount, VCStream &s) {
+VCError Runtime::recordDispatchInto(VkCommandBuffer cb, VkDescriptorPool dpool,
+                                     VCKernel &k, unsigned wgX, unsigned wgY,
+                                     unsigned wgZ, unsigned blockX,
+                                     unsigned blockY, unsigned blockZ,
+                                     const VCKernelArg *args, int argCount) {
   if (!k.shaderModule) return VCError::InvalidKernel;
   VkPipeline pipeline = getPipeline(k, blockX, blockY, blockZ, args, argCount);
   if (!pipeline) return VCError::InvalidKernel;
@@ -623,8 +840,14 @@ VCError Runtime::dispatch(VCKernel &k, unsigned wgX, unsigned wgY,
   bool hasPointer = false;
   for (int i = 0; i < argCount; ++i)
     if (args[i].kind == VCKernelArg::Pointer) { hasPointer = true; break; }
-  if (hasPointer)
-    set = allocFrameDescriptorSet(s, k.descriptorSetLayout);
+  if (hasPointer) {
+    VkDescriptorSetAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool = dpool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &k.descriptorSetLayout;
+    vkAllocateDescriptorSets(device_->device, &ai, &set);
+  }
   if (hasPointer && !set) return VCError::Unknown;
 
   // Write descriptor bindings for pointer args (consecutive binding index).
@@ -667,7 +890,6 @@ VCError Runtime::dispatch(VCKernel &k, unsigned wgX, unsigned wgY,
     }
   }
 
-  VkCommandBuffer cb = beginFrame(s);
   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
   if (set)
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -676,6 +898,41 @@ VCError Runtime::dispatch(VCKernel &k, unsigned wgX, unsigned wgY,
     vkCmdPushConstants(cb, k.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        static_cast<uint32_t>(pcData.size()), pcData.data());
   vkCmdDispatch(cb, wgX, wgY, wgZ);
+  // Make the dispatch's SSBO writes visible to subsequent commands in the
+  // same command buffer (copies, later dispatches). Within a single Vulkan
+  // command buffer, a later vkCmdCopyBuffer/vkCmdDispatch does NOT
+  // automatically see an earlier dispatch's memory writes without a barrier.
+  // For graph capture (secondary cb) this is essential: the recorded ops must
+  // form a correct pipeline. For the normal per-frame path the barrier is
+  // harmless (the submit's fence is the only cross-cb sync the caller needs).
+  VkMemoryBarrier mb{};
+  mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT |
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       0, 1, &mb, 0, nullptr, 0, nullptr);
+  return VCError::Success;
+}
+
+VCError Runtime::dispatch(VCKernel &k, unsigned wgX, unsigned wgY,
+                          unsigned wgZ, unsigned blockX, unsigned blockY,
+                          unsigned blockZ, const VCKernelArg *args,
+                          int argCount, VCStream &s) {
+  // Graph capture: record into the graph's secondary command buffer using its
+  // own descriptor pool, without submitting.
+  if (s.captureTarget) {
+    VCGraph &g = *s.captureTarget;
+    return recordDispatchInto(g.secondaryCB, g.descriptorPool, k, wgX, wgY,
+                              wgZ, blockX, blockY, blockZ, args, argCount);
+  }
+  VkCommandBuffer cb = beginFrame(s);
+  VCError e = recordDispatchInto(cb, s.frames[s.frameIdx].descriptorPool, k,
+                                  wgX, wgY, wgZ, blockX, blockY, blockZ, args,
+                                  argCount);
+  if (e != VCError::Success) return e;
   endFrame(s);
   return VCError::Success;
 }
@@ -762,6 +1019,40 @@ VCError vcStreamDestroy(VCStreamHandle stream) {
 VCError vcStreamSynchronize(VCStreamHandle stream) {
   auto &rt = Runtime::get();
   return rt.streamSynchronize(rt.resolveStream(stream));
+}
+
+//----------------------------------------------------------------------------
+// Command graphs (C API)
+//----------------------------------------------------------------------------
+
+VCError vcGraphCreate(VCGraphHandle *out) {
+  return Runtime::get().createGraph(out);
+}
+
+VCError vcGraphDestroy(VCGraphHandle graph) {
+  return Runtime::get().destroyGraph(graph);
+}
+
+VCError vcGraphBeginRecord(VCGraphHandle graph) {
+  if (!graph) return VCError::InvalidValue;
+  return Runtime::get().beginRecord(*reinterpret_cast<VCGraph *>(graph));
+}
+
+VCError vcGraphEndRecord(VCGraphHandle graph) {
+  if (!graph) return VCError::InvalidValue;
+  return Runtime::get().endRecord(*reinterpret_cast<VCGraph *>(graph));
+}
+
+VCError vcGraphLaunch(VCGraphHandle graph, VCStreamHandle stream) {
+  if (!graph) return VCError::InvalidValue;
+  auto &rt = Runtime::get();
+  return rt.launchGraph(*reinterpret_cast<VCGraph *>(graph),
+                        rt.resolveStream(stream));
+}
+
+VCError vcGraphReset(VCGraphHandle graph) {
+  if (!graph) return VCError::InvalidValue;
+  return Runtime::get().resetGraph(*reinterpret_cast<VCGraph *>(graph));
 }
 
 VCError vcLoadKernel(const uint32_t *spirvWords, size_t wordCount,

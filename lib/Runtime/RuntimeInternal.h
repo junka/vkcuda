@@ -61,6 +61,10 @@ struct VCStream {
   VkCommandPool commandPool = VK_NULL_HANDLE;
   std::vector<StreamFrame> frames;
   size_t frameIdx = 0; // next frame to record into
+  // When non-null, the stream is in graph-capture mode: launches and copies
+  // are appended to this graph's secondary command buffer instead of being
+  // submitted. Set by vcGraphBeginRecord on the default stream.
+  struct VCGraph *captureTarget = nullptr;
 };
 
 /// A loaded kernel: shader module + descriptor/pipeline layouts + a cache of
@@ -80,6 +84,33 @@ struct VCKernel {
   // Cache: key = packed (blockX, blockY, blockZ) -> pipeline. Pipelines are
   // specialized on workgroup size, so one per distinct block shape.
   std::unordered_map<uint64_t, VkPipeline> pipelines;
+};
+
+/// A recorded command graph (CUDA-Graph-style record/replay). While
+/// recording is active on the default stream, launches and D2D copies are
+/// appended to `secondaryCB` and descriptor sets are allocated from
+/// `descriptorPool` (both owned by the graph, surviving across replays).
+/// Host-to-device copies recorded into the graph allocate persistent staging
+/// buffers owned by the graph (transient staging would be freed before the
+/// graph ever executes). The graph is replayed by executing `secondaryCB`
+/// inside a primary command buffer on the target stream.
+struct VCGraph {
+  VkCommandPool commandPool = VK_NULL_HANDLE;       // backs secondaryCB
+  VkCommandBuffer secondaryCB = VK_NULL_HANDLE;     // the recorded commands
+  VkDescriptorPool descriptorPool = VK_NULL_HANDLE; // graph-lifetime sets
+  bool recording = false;
+  bool recorded = false;
+  // Persistent staging for H2D (and D2H) copies recorded into the graph.
+  // These must outlive the graph's replays, so they live here, not as
+  // transient scratch.
+  std::vector<std::unique_ptr<VCBuffer>> stagingBuffers;
+  // D2H copies recorded into the graph: device->staging copy is in the
+  // secondary command buffer, and the host readback (staging.mapped ->
+  // hostDst) must happen after the graph executes + the stream is synced.
+  // vcGraphLaunch does NOT auto-readback (it is async); the caller syncs
+  // then calls vcGraphReadback.
+  struct D2HReadback { void *hostDst; VCBuffer *staging; size_t bytes; };
+  std::vector<D2HReadback> d2hReadbacks;
 };
 
 class Runtime {
@@ -142,12 +173,30 @@ public:
                    unsigned blockX, unsigned blockY, unsigned blockZ,
                    const VCKernelArg *args, int argCount, VCStream &s);
 
+  // Record bind+dispatch into a specific command buffer using a specific
+  // descriptor pool (used by graph capture, which records into a secondary
+  // command buffer instead of submitting).
+  VCError recordDispatchInto(VkCommandBuffer cb, VkDescriptorPool dpool,
+                              VCKernel &k, unsigned wgX, unsigned wgY,
+                              unsigned wgZ, unsigned blockX, unsigned blockY,
+                              unsigned blockZ, const VCKernelArg *args,
+                              int argCount);
+
   VCError synchronize();
+
+  // ---- Command graphs (record/replay) ----
+  VCError createGraph(VCGraphHandle *out);
+  VCError destroyGraph(VCGraphHandle graph);
+  VCError beginRecord(VCGraph &g);
+  VCError endRecord(VCGraph &g);
+  VCError launchGraph(VCGraph &g, VCStream &s);
+  VCError resetGraph(VCGraph &g);
 
 private:
   std::unique_ptr<VulkanDevice> device_;
   std::unique_ptr<VCStream> defaultStream_;
   std::vector<std::unique_ptr<VCStream>> streams_; // owns created streams
+  std::vector<std::unique_ptr<VCGraph>> graphs_;   // owns created graphs
   bool init_ = false;
 
   bool pickPhysicalDevice();
