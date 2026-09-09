@@ -1,0 +1,85 @@
+// test/geometric.vc — geometric/vector builtins (length, normalize, distance,
+// reflect, refract, faceforward, mod).
+//
+// Regression for the MLIR backend's geometric-builtin coverage. The spirv
+// dialect (LLVM 18) has NO GLLength/GLNormalize/GLDistance/GLReflect/
+// GLRefract/GLFaceForward op (SPIRVGLOps.td only covers the GLSLstd450
+// arithmetic set), so these are EXPANDED with elementary ops, the same
+// strategy as dot/cross:
+//   length(v)        = sqrt(dot(v,v))
+//   normalize(v)     = v / sqrt(dot(v,v))
+//   distance(a,b)    = length(a-b)
+//   reflect(I,N)     = I - 2*dot(N,I)*N
+//   faceforward(N,I,Nref) = dot(Nref,I) < 0 ? N : -N
+//   refract(I,N,eta) = k = 1-eta^2*(1-dot(N,I)^2); eta*I - (eta*dot(N,I)+sqrt(k))*N, or 0 if k<0
+//   mod(x,y)         = x - y*floor(x/y)   (GLSL mod, non-negative)
+// GLSL has all of these natively (pass through lowerBuiltinCall), so the same
+// source runs on both backends.
+//
+// Gotcha locked in: faceforward/refract produce a VECTOR result from a scalar
+// i1 condition. arith.select / spirv.Select with a scalar cond + vector result
+// does NOT legalize under GPUToSPIRV (spirv.Select is marked illegal for this
+// shape pre-1.4), so both use scf.if (yield) instead of select.
+//
+//   vcc test/geometric.vc -o build/geometric_sf && ./build/geometric_sf
+//   vc  test/geometric.vc -emit=full -o build/geometric_m && ./build/geometric_m
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void kgeo(float *out) {
+  int i = threadIdx.x;
+  float4 v = make_float4(3.0f, 4.0f, 0.0f, 0.0f);
+  float4 z = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  float4 n = make_float4(0.6f, 0.8f, 0.0f, 0.0f);
+  // One thread per result, indices 0..6.
+  if (i == 0) out[0] = length(v);                              // 5.0
+  if (i == 1) out[1] = distance(v, z);                         // 5.0
+  if (i == 2) { float4 nn = normalize(v); out[2] = nn.x; }     // 0.6
+  if (i == 3) out[3] = mod(7.5f, 3.0f);                        // 1.5
+  // reflect(n, (0,1,0)) = n - 2*dot((0,1,0),n)*(0,1,0) = (0.6,0.8,0,0)-2*0.8*(0,1,0)
+  //                    = (0.6, 0.8-1.6, 0, 0) = (0.6, -0.8, 0, 0) -> .y = -0.8
+  if (i == 4) { float4 r = reflect(n, make_float4(0,1,0,0)); out[4] = r.y; }
+  // faceforward(N=(0,1,0), I=(0,-1,0), Nref=(0,-1,0)): dot(Nref,I)=1 >= 0 -> -N -> .y=-1
+  if (i == 5) {
+    float4 ff = faceforward(make_float4(0,1,0,0), make_float4(0,-1,0,0),
+                            make_float4(0,-1,0,0));
+    out[5] = ff.y;
+  }
+  // refract(I=(1,0,0,0), N=(-1,0,0,0), eta=1): dot(N,I)=-1, k=1-1*(1-1)=1,
+  // eta*dot+sqrt(k)=-1+1=0 -> eta*I-0*N = (1,0,0,0) -> .x = 1
+  if (i == 6) {
+    float4 rf = refract(make_float4(1,0,0,0), make_float4(-1,0,0,0), 1.0f);
+    out[6] = rf.x;
+  }
+}
+
+int main() {
+  vcInit();
+
+  const int N = 7;
+  void *dOut = 0;
+  vcMalloc(&dOut, N * 4);
+  float zero[7] = {0,0,0,0,0,0,0};
+  vcMemcpy(dOut, zero, N * 4, VCMemcpyKind::HostToDevice);
+  kgeo<<<1, 32>>>(dOut);
+  vcDeviceSynchronize();
+  float h[7];
+  vcMemcpy(h, dOut, N * 4, VCMemcpyKind::DeviceToHost);
+
+  float want[7] = {5.0f, 5.0f, 0.6f, 1.5f, -0.8f, -1.0f, 1.0f};
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    if (fabsf(h[i] - want[i]) > 1e-4f) {
+      printf("  mismatch i=%d got=%f want=%f\n", i, h[i], want[i]);
+      ok = 0;
+    }
+  }
+
+  printf("geometric: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

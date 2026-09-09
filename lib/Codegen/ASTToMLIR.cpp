@@ -2874,6 +2874,179 @@ private:
       return builder.create<spirv::CompositeConstructOp>(l, vty,
           ValueRange{cx, cy, cz});
     }
+    // Geometric builtins on float vectors. Like dot/cross above, the spirv
+    // dialect (LLVM 18) has NO GLLength/GLNormalize/GLDistance/GLReflect/
+    // GLRefract/GLFaceForward op, so these are expanded with elementary ops.
+    // All are defined in terms of dot(v,v) and scalar arithmetic:
+    //   length(v)       = sqrt(dot(v,v))
+    //   normalize(v)    = v * rsqrt(dot(v,v))   (= v / length(v))
+    //   distance(a,b)   = length(a-b)
+    //   reflect(I,N)    = I - 2*dot(N,I)*N
+    //   faceforward(N,I,Nref) = dot(Nref,I) < 0 ? N : -N
+    //   refract(I,N,eta)= k = 1-eta^2*(1-dot(N,I)^2); eta*I - (eta*dot(N,I)+sqrt(k))*N, or 0 if k<0
+    // `mod(x,y) = x - y*floor(x/y)` is the float-modulo (GLSL `mod`, always
+    // non-negative result unlike fmod); operands may be scalar or vector.
+    auto emitDot = [this, l](Value a, Value b) -> Value {
+      auto vty = a.getType().dyn_cast<mlir::VectorType>();
+      if (!vty || vty != b.getType()) return Value();
+      mlir::Type elem = vty.getElementType();
+      unsigned n = vty.getNumElements();
+      if (n == 0) return Value();
+      Value sum;
+      for (unsigned i = 0; i < n; ++i) {
+        Value ai = builder.create<spirv::CompositeExtractOp>(
+            l, elem, a, builder.getI32ArrayAttr({(int32_t)i}));
+        Value bi = builder.create<spirv::CompositeExtractOp>(
+            l, elem, b, builder.getI32ArrayAttr({(int32_t)i}));
+        Value prod = builder.create<arith::MulFOp>(l, ai, bi);
+        sum = sum ? (Value)builder.create<arith::AddFOp>(l, sum, prod) : prod;
+      }
+      return sum;
+    };
+    // length(v) -> sqrt(dot(v,v)). GLSL Length accepts any float vector.
+    if (name == "length" && args.size() == 1) {
+      Value v = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      if (!v) return Value();
+      auto vty = v.getType().dyn_cast<mlir::VectorType>();
+      if (!vty) return Value();  // scalar: length(x) = abs(x)
+      Value d = emitDot(v, v);
+      if (!d) return Value();
+      return builder.create<spirv::GLSqrtOp>(l, d);
+    }
+    // normalize(v) -> v * rsqrt(dot(v,v)) = v / sqrt(dot(v,v)).
+    if (name == "normalize" && args.size() == 1) {
+      Value v = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      if (!v) return Value();
+      auto vty = v.getType().dyn_cast<mlir::VectorType>();
+      if (!vty) return Value();  // scalar: normalize(x) = x<0?-1:1 (sign)
+      mlir::Type elem = vty.getElementType();
+      Value d = emitDot(v, v);
+      if (!d) return Value();
+      Value len = builder.create<spirv::GLSqrtOp>(l, d);
+      // Splat the scalar length across the vector for elementwise division.
+      SmallVector<Value, 4> lenSplat(vty.getNumElements(), len);
+      Value splat = builder.create<spirv::CompositeConstructOp>(l, vty, lenSplat);
+      return builder.create<arith::DivFOp>(l, v, splat);
+    }
+    // distance(a,b) -> length(a-b).
+    if (name == "distance" && args.size() == 2) {
+      Value a = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      Value b = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
+      if (!a || !b) return Value();
+      auto vty = a.getType().dyn_cast<mlir::VectorType>();
+      if (!vty || vty != b.getType()) return Value();
+      Value diff = builder.create<arith::SubFOp>(l, a, b);
+      Value d = emitDot(diff, diff);
+      if (!d) return Value();
+      return builder.create<spirv::GLSqrtOp>(l, d);
+    }
+    // reflect(I, N) -> I - 2*dot(N,I)*N.
+    if (name == "reflect" && args.size() == 2) {
+      Value I = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      Value N = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
+      if (!I || !N) return Value();
+      auto vty = I.getType().dyn_cast<mlir::VectorType>();
+      if (!vty || vty != N.getType()) return Value();
+      mlir::Type elem = vty.getElementType();
+      Value dNI = emitDot(N, I);
+      if (!dNI) return Value();
+      Value two = builder.create<arith::ConstantOp>(l, elem,
+          builder.getFloatAttr(elem, 2.0));
+      Value scale = builder.create<arith::MulFOp>(l, two, dNI);
+      SmallVector<Value, 4> scaleSplat(vty.getNumElements(), scale);
+      Value splat = builder.create<spirv::CompositeConstructOp>(l, vty, scaleSplat);
+      Value NScaled = builder.create<arith::MulFOp>(l, N, splat);
+      return builder.create<arith::SubFOp>(l, I, NScaled);
+    }
+    // faceforward(N, I, Nref) -> dot(Nref, I) < 0 ? N : -N.
+    if (name == "faceforward" && args.size() == 3) {
+      Value N = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      Value I = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
+      Value Nref = loadValue(visitExpr(args[2].get()), loc(args[2].get()));
+      if (!N || !I || !Nref) return Value();
+      auto vty = N.getType().dyn_cast<mlir::VectorType>();
+      if (!vty || vty != I.getType() || vty != Nref.getType()) return Value();
+      mlir::Type elem = vty.getElementType();
+      Value d = emitDot(Nref, I);
+      if (!d) return Value();
+      Value zero = builder.create<arith::ConstantOp>(l, elem,
+          builder.getFloatAttr(elem, 0.0));
+      Value cond = builder.create<arith::CmpFOp>(l, arith::CmpFPredicate::OLT,
+                                                 d, zero);
+      Value negN = builder.create<arith::NegFOp>(l, N);
+      // Use scf.if (yield) instead of select: arith.select / spirv.Select with
+      // a scalar-i1 cond and vector result don't legalize under GPUToSPIRV
+      // (spirv.Select is marked illegal for this shape pre-1.4). scf.if yields
+      // the vector on each branch and lowers cleanly.
+      auto ifOp = builder.create<scf::IfOp>(l, TypeRange{vty}, cond,
+                                           /*withElse=*/true);
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      builder.create<scf::YieldOp>(l, ValueRange{N});
+      builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+      builder.create<scf::YieldOp>(l, ValueRange{negN});
+      builder.setInsertionPointAfter(ifOp);
+      return ifOp.getResult(0);
+    }
+    // refract(I, N, eta) -> k = 1 - eta^2*(1 - dot(N,I)^2);
+    //   if k < 0: 0, else eta*I - (eta*dot(N,I) + sqrt(k))*N
+    if (name == "refract" && args.size() == 3) {
+      Value I = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      Value N = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
+      Value eta = loadValue(visitExpr(args[2].get()), loc(args[2].get()));
+      if (!I || !N || !eta) return Value();
+      auto vty = I.getType().dyn_cast<mlir::VectorType>();
+      if (!vty || vty != N.getType()) return Value();
+      mlir::Type elem = vty.getElementType();
+      Value dNI = emitDot(N, I);
+      if (!dNI) return Value();
+      Value one = builder.create<arith::ConstantOp>(l, elem,
+          builder.getFloatAttr(elem, 1.0));
+      Value dNI2 = builder.create<arith::MulFOp>(l, dNI, dNI);
+      Value oneMinus = builder.create<arith::SubFOp>(l, one, dNI2);
+      Value eta2 = builder.create<arith::MulFOp>(l, eta, eta);
+      Value t = builder.create<arith::MulFOp>(l, eta2, oneMinus);
+      Value k = builder.create<arith::SubFOp>(l, one, t);
+      Value sqrtK = builder.create<spirv::GLSqrtOp>(l, k);
+      Value etaDot = builder.create<arith::MulFOp>(l, eta, dNI);
+      Value coeff = builder.create<arith::AddFOp>(l, etaDot, sqrtK);
+      Value zero = builder.create<arith::ConstantOp>(l, elem,
+          builder.getFloatAttr(elem, 0.0));
+      Value cond = builder.create<arith::CmpFOp>(l, arith::CmpFPredicate::OLT,
+                                                 k, zero);
+      // eta*I
+      SmallVector<Value, 4> etaVals(vty.getNumElements(), eta);
+      Value etaSplat = builder.create<spirv::CompositeConstructOp>(l, vty, etaVals);
+      Value etaI = builder.create<arith::MulFOp>(l, etaSplat, I);
+      // coeff*N
+      SmallVector<Value, 4> coeffVals(vty.getNumElements(), coeff);
+      Value coeffSplat = builder.create<spirv::CompositeConstructOp>(l, vty, coeffVals);
+      Value coeffN = builder.create<arith::MulFOp>(l, coeffSplat, N);
+      Value refr = builder.create<arith::SubFOp>(l, etaI, coeffN);
+      SmallVector<Value, 4> zeroVals(vty.getNumElements(), zero);
+      Value zeroVec = builder.create<spirv::CompositeConstructOp>(l, vty, zeroVals);
+      // scf.if instead of select (vector result + scalar cond doesn't legalize
+      // via arith.select/spirv.Select; see faceforward above).
+      auto ifOp = builder.create<scf::IfOp>(l, TypeRange{vty}, cond,
+                                           /*withElse=*/true);
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      builder.create<scf::YieldOp>(l, ValueRange{zeroVec});
+      builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+      builder.create<scf::YieldOp>(l, ValueRange{refr});
+      builder.setInsertionPointAfter(ifOp);
+      return ifOp.getResult(0);
+    }
+    // mod(x, y) -> x - y*floor(x/y). GLSL mod (always non-negative); any float
+    // width; operands scalar or vector (elementwise). Same shape as fmod below
+    // but matched here before the `strip` so the bare `mod` spelling is caught.
+    if (name == "mod" && args.size() == 2) {
+      Value a = loadValue(visitExpr(args[0].get()), loc(args[0].get()));
+      Value b = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
+      if (!a || !b) return Value();
+      Value div = builder.create<arith::DivFOp>(l, a, b);
+      Value fl = builder.create<spirv::GLFloorOp>(l, div);
+      Value prod = builder.create<arith::MulFOp>(l, b, fl);
+      return builder.create<arith::SubFOp>(l, a, prod);
+    }
     // Normalize: strip a leading `__` and a trailing `f` to get the base
     // (e.g. __sinf -> sin, sqrtf -> sqrt, fabsf -> fabs). Only recognized math
     // bases are accepted so unrelated names fall through. NOTE: `isinf`/`isnan`

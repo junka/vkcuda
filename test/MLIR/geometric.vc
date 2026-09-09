@@ -1,0 +1,51 @@
+// test/MLIR/geometric.vc — geometric/vector builtin IR lowering.
+//
+// The spirv dialect (LLVM 18) has NO GLLength/GLNormalize/GLDistance/GLReflect/
+// GLRefract/GLFaceForward op, so these expand to elementary ops via emitDot
+// (CompositeExtract + MulF + AddF) + GLSqrt + arithmetic. This test pins the
+// key lowered shapes: the dot-product expansion (CompositeExtract chain) and
+// the GLSqrt that length/normalize/distance/refract all produce. mod lowers to
+// GLFloor + SubF (same as fmod). faceforward/refract use scf.if (NOT select)
+// to produce a vector result from a scalar i1 cond — that scf.if is checked
+// here so a regression to arith.select (which doesn't legalize) is caught.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+// RUN: mlirc -emit=spirv %s -o %t.spv && test -s %t.spv
+
+__global__ void k(float *out) {
+  float4 v = make_float4(3.0f, 4.0f, 0.0f, 0.0f);
+  float4 z = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  float4 n = make_float4(0.6f, 0.8f, 0.0f, 0.0f);
+
+  // length(v) = sqrt(dot(v,v)) -> CompositeExtract chain + GLSqrt.
+  // CHECK-DAG: spirv.CompositeExtract
+  // CHECK-DAG: spirv.GL.Sqrt
+  out[0] = length(v);
+
+  // normalize(v) = v / sqrt(dot(v,v)) -> DivF.
+  // CHECK-DAG: arith.divf
+  float4 nn = normalize(v);
+  out[1] = nn.x;
+
+  // distance(v, z) = length(v-z) -> SubF + GLSqrt.
+  // CHECK-DAG: spirv.GL.Sqrt
+  out[2] = distance(v, z);
+
+  // mod(7.5, 3) = 7.5 - 3*floor(7.5/3) -> DivF + GLFloor + MulF + SubF.
+  // CHECK-DAG: spirv.GL.Floor
+  out[3] = mod(7.5f, 3.0f);
+
+  // reflect(n, z) = n - 2*dot(z,n)*z -> MulF + SubF.
+  // CHECK-DAG: arith.subf
+  float4 r = reflect(n, z);
+  out[4] = r.x;
+
+  // faceforward + refract produce a vector result from a scalar i1 cond via
+  // scf.if (not arith.select — the latter doesn't legalize with vector result).
+  // CHECK-DAG: scf.if
+  // CHECK-DAG: scf.yield
+  float4 ff = faceforward(v, z, v);
+  float4 rf = refract(v, z, 1.0f);
+  out[5] = ff.x;
+  out[6] = rf.x;
+}
