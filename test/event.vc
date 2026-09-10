@@ -1,0 +1,88 @@
+// test/event.vc — stream events (vcEvent*) for cross-stream dependencies.
+//
+// Events let one stream wait on work recorded in another without a full device
+// sync (CUDA cudaEventRecord / cudaStreamWaitEvent). Backed by a Vulkan
+// timeline semaphore: each record bumps a monotonic counter; a wait blocks
+// the waiting stream's next submission until that counter is reached.
+//
+//   vcc test/event.vc -o build/event_sf && ./build/event_sf
+//   vc  test/event.vc -emit=full -o build/event_m && ./build/event_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void vadd(float *a, float *b, float *c, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) c[i] = a[i] + b[i];
+}
+
+// Doubles its input: d[i] = c[i] * 2. Reads the buffer that stream A wrote.
+__global__ void vdouble(float *c, float *d, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) d[i] = c[i] * 2.0f;
+}
+
+int main() {
+  vcInit();
+
+  const int N = 64;
+  const int bytes = N * 4;
+  const int block = 32;
+
+  VCStreamHandle streamA = 0, streamB = 0;
+  vcStreamCreate(&streamA);
+  vcStreamCreate(&streamB);
+  VCEventHandle ev = 0;
+  vcEventCreate(&ev);
+
+  void *dA = 0, *dB = 0, *dC = 0, *dD = 0;
+  vcMalloc(&dA, bytes); vcMalloc(&dB, bytes);
+  vcMalloc(&dC, bytes); vcMalloc(&dD, bytes);
+
+  float hA[64], hB[64], hD[64];
+  for (int i = 0; i < N; i++) { hA[i] = 1.0f * i; hB[i] = 2.0f; }
+
+  // H2D on stream A (sync path: fine, it's just setup).
+  vcMemcpyS(dA, hA, bytes, VCMemcpyKind::HostToDevice, streamA);
+  vcMemcpyS(dB, hB, bytes, VCMemcpyKind::HostToDevice, streamA);
+
+  // Stream A: compute c = a + b, then record an event marking completion.
+  vadd<<<N, block, 0, streamA>>>(dA, dB, dC, N);
+  vcEventRecord(ev, streamA);
+
+  // Stream B: wait for A's event, then consume dC. Without the wait, B might
+  // read dC before A wrote it. The event encodes the cross-stream dependency.
+  vcStreamWaitEvent(streamB, ev);
+  vdouble<<<N, block, 0, streamB>>>(dC, dD, N);
+
+  // Host-side: vcEventQuery should eventually report done, and
+  // vcEventSynchronize should block until A's recorded work is complete.
+  // (We don't strictly need to sync the event from the host here — we'll sync
+  // streamB before reading dD — but exercise the query/sync paths.)
+  int done = 0, polled = 0;
+  while (!done) {
+    vcEventQuery(ev, &done);
+    polled++;
+  }
+  vcEventSynchronize(ev); // also a valid wait path; should return immediately now
+
+  vcStreamSynchronize(streamB);
+  vcMemcpyS(hD, dD, bytes, VCMemcpyKind::DeviceToHost, streamB);
+
+  // Expected: c[i] = i + 2 ; d[i] = 2*(i+2) = 2i+4.
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    if (hD[i] != 2.0f * i + 4.0f) { ok = 0; break; }
+  }
+  // Query must have observed completion (polled at least once).
+  if (polled < 1) ok = 0;
+
+  printf("event: %s (polled=%d)\n", ok ? "PASS" : "FAIL", polled);
+
+  vcEventDestroy(ev);
+  vcFree(dA); vcFree(dB); vcFree(dC); vcFree(dD);
+  vcStreamDestroy(streamA);
+  vcStreamDestroy(streamB);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

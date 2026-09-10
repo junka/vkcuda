@@ -27,6 +27,7 @@ struct VulkanDevice {
   VkPipelineCache pipelineCache = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties memProps{};
   bool headless = true; // no surface/swapchain
+  bool timelineSemaphore = false; // VK_KHR_timeline_semaphore / Vulkan 1.2 core
 };
 
 /// A device buffer + its backing memory. May be device-local (mapped==nullptr)
@@ -81,6 +82,16 @@ struct VCStream {
   // are appended to this graph's secondary command buffer instead of being
   // submitted. Set by vcGraphBeginRecord on the default stream.
   struct VCGraph *captureTarget = nullptr;
+
+  // Pending timeline-semaphore operations to attach to the NEXT endFrame
+  // submission on this stream. vcStreamWaitEvent pushes a wait here;
+  // vcEventRecord pushes a signal. endFrame drains both into the VkSubmitInfo
+  // (via VkTimelineSemaphoreSubmitInfo) and clears them. This lets events
+  // express cross-stream dependencies without forcing an extra submit.
+  struct PendingWait { VkSemaphore sem; uint64_t value; };
+  struct PendingSignal { VkSemaphore sem; uint64_t value; };
+  std::vector<PendingWait> pendingWaits;
+  std::vector<PendingSignal> pendingSignals;
 };
 
 /// A loaded kernel: shader module + descriptor/pipeline layouts + a cache of
@@ -127,6 +138,19 @@ struct VCGraph {
   // then calls vcGraphReadback.
   struct D2HReadback { void *hostDst; VCBuffer *staging; size_t bytes; };
   std::vector<D2HReadback> d2hReadbacks;
+};
+
+/// A stream event: a reusable synchronization marker backed by a Vulkan
+/// timeline semaphore. Each vcEventRecord bumps `value` and arranges for the
+/// recording stream's next submission to signal the semaphore at that value;
+/// vcStreamWaitEvent arranges for the waiting stream's next submission to
+/// wait on that value. `value` is the counter to be signaled by the next
+/// record (0 = never recorded); `lastRecorded` is the value most recently
+/// recorded, used for waits/queries.
+struct VCEvent {
+  VkSemaphore semaphore = VK_NULL_HANDLE;
+  uint64_t value = 1;          // next counter to signal on record
+  uint64_t lastRecorded = 0;   // counter of the most recent record (0 = none)
 };
 
 class Runtime {
@@ -217,11 +241,20 @@ public:
   VCError launchGraph(VCGraph &g, VCStream &s);
   VCError resetGraph(VCGraph &g);
 
+  // ---- Stream events (timeline semaphore) ----
+  VCError createEvent(VCEventHandle *out);
+  VCError destroyEvent(VCEventHandle event);
+  VCError recordEvent(VCEvent &e, VCStream &s);
+  VCError streamWaitEvent(VCStream &s, VCEvent &e);
+  VCError eventQuery(const VCEvent &e, int *done) const;
+  VCError eventSynchronize(const VCEvent &e) const;
+
 private:
   std::unique_ptr<VulkanDevice> device_;
   std::unique_ptr<VCStream> defaultStream_;
   std::vector<std::unique_ptr<VCStream>> streams_; // owns created streams
   std::vector<std::unique_ptr<VCGraph>> graphs_;   // owns created graphs
+  std::vector<std::unique_ptr<VCEvent>> events_;   // owns created events
   bool init_ = false;
 
   bool pickPhysicalDevice();

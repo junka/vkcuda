@@ -44,6 +44,15 @@ using VCStreamHandle = VCStream *;
 struct VCGraph;
 using VCGraphHandle = VCGraph *;
 
+/// Opaque handle to a stream event: a synchronization primitive recording a
+/// point in a stream's execution. Events let one stream wait on work recorded
+/// in another, expressing cross-stream dependencies without a full device
+/// sync (CUDA cudaEvent / cudaStreamWaitEvent). Backed by a Vulkan timeline
+/// semaphore so a single event can be recorded repeatedly (each record bumps
+/// a monotonic counter). NULL is never a valid event handle.
+struct VCEvent;
+using VCEventHandle = VCEvent *;
+
 /// Error codes mirroring cudaError_t style.
 enum class VCError {
   Success = 0,
@@ -123,6 +132,39 @@ VCError vcStreamDestroy(VCStreamHandle stream);
 
 /// Block until all work queued on `stream` is complete. NULL = default stream.
 VCError vcStreamSynchronize(VCStreamHandle stream);
+
+//----------------------------------------------------------------------------
+// Stream events (cross-stream synchronization)
+//----------------------------------------------------------------------------
+
+/// Create a stream event. An event is a reusable marker backed by a timeline
+/// semaphore: each vcEventRecord bumps its counter, and vcStreamWaitEvent
+/// makes a stream block until the most recent record completes.
+VCError vcEventCreate(VCEventHandle *out);
+
+/// Destroy an event and its timeline semaphore.
+VCError vcEventDestroy(VCEventHandle event);
+
+/// Record `event` on `stream`: the event's counter is bumped and signaled at
+/// the tail of the stream's NEXT submission (the next launch/copy on that
+/// stream). Subsequent vcStreamWaitEvent calls on other streams will wait for
+/// this point. Recording an event that already has a pending record on the
+/// same stream chains after it (each record is a distinct counter value).
+VCError vcEventRecord(VCEventHandle event, VCStreamHandle stream);
+
+/// Make `stream` wait for `event`'s most recent recorded value before
+/// executing its NEXT submission. This is the cross-stream dependency: work
+/// on `stream` after this call does not start until the recorded work on the
+/// event's stream has completed. Multiple waits accumulate. NULL stream =
+/// default stream.
+VCError vcStreamWaitEvent(VCStreamHandle stream, VCEventHandle event);
+
+/// Query whether `event`'s most recent record has completed (GPU side).
+/// `done` is set to 1 if complete, 0 otherwise. Non-blocking.
+VCError vcEventQuery(VCEventHandle event, int *done);
+
+/// Block the host until `event`'s most recent record has completed.
+VCError vcEventSynchronize(VCEventHandle event);
 
 //----------------------------------------------------------------------------
 // Command graphs (CUDA-Graph-style record/replay)

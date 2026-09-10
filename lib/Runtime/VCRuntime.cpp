@@ -118,12 +118,33 @@ bool Runtime::createLogicalDevice() {
   qi.queueCount = 1;
   qi.pQueuePriorities = &prio;
 
-  VkPhysicalDeviceFeatures feats{};
+  // Enable timeline semaphores (Vulkan 1.2 core feature). Used by stream
+  // events (vcEvent*) to express cross-stream dependencies without a full
+  // device sync. Probe the physical device first so we don't request an
+  // unsupported feature (every conformant 1.2+ driver has it).
+  VkPhysicalDeviceVulkan12Features feats12{};
+  feats12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+  VkPhysicalDeviceVulkan12Features supported12{};
+  supported12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+  VkPhysicalDeviceFeatures2 feats2{};
+  feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  feats2.pNext = &supported12;
+  vkGetPhysicalDeviceFeatures2(device_->physical, &feats2);
+  if (supported12.timelineSemaphore) {
+    feats12.timelineSemaphore = VK_TRUE;
+    device_->timelineSemaphore = true;
+  }
+
   VkDeviceCreateInfo dci{};
   dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qi;
-  dci.pEnabledFeatures = &feats;
+  if (device_->timelineSemaphore) {
+    dci.pNext = &feats12; // replaces pEnabledFeatures chain
+  } else {
+    VkPhysicalDeviceFeatures feats{};
+    dci.pEnabledFeatures = &feats;
+  }
 
   if (vkCreateDevice(device_->physical, &dci, nullptr, &device_->device) !=
       VK_SUCCESS)
@@ -236,6 +257,11 @@ VCError Runtime::shutdown() {
       vkDestroyCommandPool(device_->device, g->commandPool, nullptr);
   }
   graphs_.clear();
+  for (auto &e : events_) {
+    if (e && e->semaphore)
+      vkDestroySemaphore(device_->device, e->semaphore, nullptr);
+  }
+  events_.clear();
   for (auto &s : streams_) if (s) teardownStream(*device_, *s);
   streams_.clear();
   if (defaultStream_) { teardownStream(*device_, *defaultStream_); defaultStream_.reset(); }
@@ -337,10 +363,56 @@ VkCommandBuffer Runtime::beginFrame(VCStream &s) {
 void Runtime::endFrame(VCStream &s) {
   StreamFrame &f = s.frames[s.frameIdx];
   vkEndCommandBuffer(f.cb);
+
   VkSubmitInfo si{};
   si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   si.commandBufferCount = 1;
   si.pCommandBuffers = &f.cb;
+
+  // Attach pending timeline-semaphore waits/signals (from vcEventRecord /
+  // vcStreamWaitEvent) to this submission. Timeline semaphores carry a
+  // 64-bit counter value per signal/wait, threaded via the pNext chain.
+  VkTimelineSemaphoreSubmitInfo ti{};
+  std::vector<VkSemaphore> waitSems;
+  std::vector<uint64_t> waitVals;
+  std::vector<VkPipelineStageFlags> waitStages;
+  std::vector<VkSemaphore> signalSems;
+  std::vector<uint64_t> signalVals;
+  if (device_->timelineSemaphore && !s.pendingWaits.empty()) {
+    waitSems.reserve(s.pendingWaits.size());
+    waitVals.reserve(s.pendingWaits.size());
+    waitStages.assign(s.pendingWaits.size(),
+                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    for (auto &w : s.pendingWaits) {
+      waitSems.push_back(w.sem);
+      waitVals.push_back(w.value);
+    }
+    si.waitSemaphoreCount = static_cast<uint32_t>(waitSems.size());
+    si.pWaitSemaphores = waitSems.data();
+    si.pWaitDstStageMask = waitStages.data();
+  }
+  if (device_->timelineSemaphore && !s.pendingSignals.empty()) {
+    signalSems.reserve(s.pendingSignals.size());
+    signalVals.reserve(s.pendingSignals.size());
+    for (auto &sig : s.pendingSignals) {
+      signalSems.push_back(sig.sem);
+      signalVals.push_back(sig.value);
+    }
+    si.signalSemaphoreCount = static_cast<uint32_t>(signalSems.size());
+    si.pSignalSemaphores = signalSems.data();
+  }
+  if (!waitVals.empty() || !signalVals.empty()) {
+    ti.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    ti.waitSemaphoreValueCount = static_cast<uint32_t>(waitVals.size());
+    ti.pWaitSemaphoreValues = waitVals.empty() ? nullptr : waitVals.data();
+    ti.signalSemaphoreValueCount = static_cast<uint32_t>(signalVals.size());
+    ti.pSignalSemaphoreValues = signalVals.empty() ? nullptr : signalVals.data();
+    si.pNext = &ti;
+  }
+
+  s.pendingWaits.clear();
+  s.pendingSignals.clear();
+
   vkQueueSubmit(s.queue, 1, &si, f.fence);
   s.frameIdx = (s.frameIdx + 1) % s.frames.size();
 }
@@ -793,6 +865,96 @@ VCError Runtime::resetGraph(VCGraph &g) {
 }
 
 //----------------------------------------------------------------------------
+// Stream events (timeline semaphore)
+//----------------------------------------------------------------------------
+
+VCError Runtime::createEvent(VCEventHandle *out) {
+  if (!init_ || !out) return VCError::InitializationError;
+  if (!device_->timelineSemaphore) return VCError::Unknown; // need timeline sem
+  auto e = std::make_unique<VCEvent>();
+  VkSemaphoreTypeCreateInfo ti{};
+  ti.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+  ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  ti.initialValue = 0;
+  VkSemaphoreCreateInfo ci{};
+  ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  ci.pNext = &ti;
+  if (vkCreateSemaphore(device_->device, &ci, nullptr, &e->semaphore) !=
+      VK_SUCCESS)
+    return VCError::Unknown;
+  e->value = 1;          // next signal value
+  e->lastRecorded = 0;   // nothing recorded yet
+  *out = reinterpret_cast<VCEventHandle>(e.get());
+  events_.push_back(std::move(e));
+  return VCError::Success;
+}
+
+VCError Runtime::destroyEvent(VCEventHandle event) {
+  if (!init_ || !event) return VCError::Success;
+  auto *e = reinterpret_cast<VCEvent *>(event);
+  vkDeviceWaitIdle(device_->device);
+  if (e->semaphore)
+    vkDestroySemaphore(device_->device, e->semaphore, nullptr);
+  for (auto it = events_.begin(); it != events_.end(); ++it) {
+    if (it->get() == e) { events_.erase(it); break; }
+  }
+  return VCError::Success;
+}
+
+// Record: the event marks the current tail of `stream` — all work submitted
+// to the stream so far must complete before the event signals. We bump the
+// event's counter, push a pending signal, and immediately flush an empty
+// submission so the signal is actually emitted (VC's model is one submit per
+// operation; without a flush, the signal would wait for the next operation
+// that may never come). The empty submit still carries the frame's fence, so
+// the stream's recycle semantics are unchanged.
+VCError Runtime::recordEvent(VCEvent &e, VCStream &s) {
+  if (!device_->timelineSemaphore) return VCError::Unknown;
+  uint64_t v = e.value++;
+  e.lastRecorded = v;
+  s.pendingSignals.push_back({e.semaphore, v});
+  // Flush: begin/end a frame with no recorded commands. endFrame attaches the
+  // pending signal to the submit and clears it.
+  beginFrame(s);
+  endFrame(s);
+  return VCError::Success;
+}
+
+// Wait: arrange for the stream's NEXT submission to wait on the event's most
+// recently recorded value before executing. Does NOT flush — the wait rides
+// the caller's next launch/copy on this stream. Cross-stream dependency.
+VCError Runtime::streamWaitEvent(VCStream &s, VCEvent &e) {
+  if (!device_->timelineSemaphore) return VCError::Unknown;
+  if (e.lastRecorded == 0) return VCError::Success; // never recorded: no-op
+  s.pendingWaits.push_back({e.semaphore, e.lastRecorded});
+  return VCError::Success;
+}
+
+VCError Runtime::eventQuery(const VCEvent &e, int *done) const {
+  if (!done) return VCError::InvalidValue;
+  if (e.lastRecorded == 0) { *done = 1; return VCError::Success; }
+  uint64_t counter = 0;
+  if (vkGetSemaphoreCounterValue(device_->device, e.semaphore, &counter) !=
+      VK_SUCCESS)
+    return VCError::Unknown;
+  *done = counter >= e.lastRecorded ? 1 : 0;
+  return VCError::Success;
+}
+
+VCError Runtime::eventSynchronize(const VCEvent &e) const {
+  if (e.lastRecorded == 0) return VCError::Success;
+  VkSemaphoreWaitInfo wi{};
+  wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+  wi.flags = VK_SEMAPHORE_WAIT_ANY_BIT;
+  wi.semaphoreCount = 1;
+  wi.pSemaphores = &e.semaphore;
+  wi.pValues = &e.lastRecorded;
+  if (vkWaitSemaphores(device_->device, &wi, UINT64_MAX) != VK_SUCCESS)
+    return VCError::Unknown;
+  return VCError::Success;
+}
+
+//----------------------------------------------------------------------------
 // Kernels / pipelines
 //----------------------------------------------------------------------------
 
@@ -1190,6 +1352,42 @@ VCError vcGraphLaunch(VCGraphHandle graph, VCStreamHandle stream) {
 VCError vcGraphReset(VCGraphHandle graph) {
   if (!graph) return VCError::InvalidValue;
   return Runtime::get().resetGraph(*reinterpret_cast<VCGraph *>(graph));
+}
+
+//----------------------------------------------------------------------------
+// Stream events (C API)
+//----------------------------------------------------------------------------
+
+VCError vcEventCreate(VCEventHandle *out) {
+  return Runtime::get().createEvent(out);
+}
+
+VCError vcEventDestroy(VCEventHandle event) {
+  return Runtime::get().destroyEvent(event);
+}
+
+VCError vcEventRecord(VCEventHandle event, VCStreamHandle stream) {
+  if (!event) return VCError::InvalidValue;
+  auto &rt = Runtime::get();
+  return rt.recordEvent(*reinterpret_cast<VCEvent *>(event),
+                        rt.resolveStream(stream));
+}
+
+VCError vcStreamWaitEvent(VCStreamHandle stream, VCEventHandle event) {
+  if (!event) return VCError::InvalidValue;
+  auto &rt = Runtime::get();
+  return rt.streamWaitEvent(rt.resolveStream(stream),
+                            *reinterpret_cast<VCEvent *>(event));
+}
+
+VCError vcEventQuery(VCEventHandle event, int *done) {
+  if (!event) return VCError::InvalidValue;
+  return Runtime::get().eventQuery(*reinterpret_cast<VCEvent *>(event), done);
+}
+
+VCError vcEventSynchronize(VCEventHandle event) {
+  if (!event) return VCError::InvalidValue;
+  return Runtime::get().eventSynchronize(*reinterpret_cast<VCEvent *>(event));
 }
 
 VCError vcLoadKernel(const uint32_t *spirvWords, size_t wordCount,
