@@ -189,6 +189,16 @@ static void teardownStream(VulkanDevice &dev, VCStream &s) {
   // members sit between them), so &frames[0].cb is not a valid handle array.
   std::vector<VkCommandBuffer> cbs;
   for (auto &f : s.frames) {
+    // Free any staging buffers still attached to this frame (callers are
+    // expected to have idled the queue/device before teardown, so the GPU is
+    // done with them). d2hReadbacks are host-side bookkeeping, dropped here.
+    for (auto &sb : f.stagingBuffers) {
+      if (sb->mapped) vkUnmapMemory(dev.device, sb->memory);
+      if (sb->buffer) vkDestroyBuffer(dev.device, sb->buffer, nullptr);
+      if (sb->memory) vkFreeMemory(dev.device, sb->memory, nullptr);
+    }
+    f.stagingBuffers.clear();
+    f.d2hReadbacks.clear();
     if (f.descriptorPool)
       vkDestroyDescriptorPool(dev.device, f.descriptorPool, nullptr);
     if (f.fence) vkDestroyFence(dev.device, f.fence, nullptr);
@@ -267,14 +277,34 @@ VCError Runtime::destroyStream(VCStreamHandle stream) {
   return VCError::Success;
 }
 
+// Drain deferred D2H readbacks from any frame whose fence is signaled (the
+// device->staging copy has completed). Used by streamSynchronize (so the
+// caller can read hostDst immediately after sync) and beginFrame (which
+// drains the specific frame it is about to recycle).
+static void drainReadyReadbacks(VulkanDevice &dev, VCStream &s) {
+  for (auto &f : s.frames) {
+    if (!f.d2hReadbacks.empty() && f.fence != VK_NULL_HANDLE) {
+      if (vkGetFenceStatus(dev.device, f.fence) == VK_SUCCESS) {
+        for (auto &rb : f.d2hReadbacks)
+          std::memcpy(rb.hostDst, rb.staging->mapped, rb.bytes);
+        f.d2hReadbacks.clear();
+      }
+    }
+  }
+}
+
 VCError Runtime::streamSynchronize(VCStream &s) {
-  // Wait on the in-flight frame's fence (the one most recently submitted).
-  if (!s.frames.empty()) {
-    auto &f = s.frames[(s.frameIdx + s.frames.size() - 1) % s.frames.size()];
-    if (vkWaitForFences(device_->device, 1, &f.fence, VK_TRUE,
+  // Wait for every in-flight frame's fence so all queued work is done.
+  for (size_t i = 0; i < s.frames.size(); ++i) {
+    // The frame at frameIdx may be unsignaled (about to be reused); waiting
+    // on an already-signaled fence is cheap, so just wait on all of them.
+    if (vkWaitForFences(device_->device, 1, &s.frames[i].fence, VK_TRUE,
                         UINT64_MAX) != VK_SUCCESS)
       return VCError::Unknown;
   }
+  // Now every fence is signaled: deliver all deferred D2H readbacks so the
+  // caller can read the host destinations immediately after sync returns.
+  drainReadyReadbacks(*device_, s);
   return VCError::Success;
 }
 
@@ -283,6 +313,16 @@ VkCommandBuffer Runtime::beginFrame(VCStream &s) {
   StreamFrame &f = s.frames[s.frameIdx];
   // Wait for the GPU to finish with this frame's previous submission.
   vkWaitForFences(device_->device, 1, &f.fence, VK_TRUE, UINT64_MAX);
+  // The fence just signaled, so every device->staging copy recorded in this
+  // frame has executed: deliver deferred D2H readbacks to their host targets.
+  // (The caller is responsible for having synchronized before reading.)
+  for (auto &rb : f.d2hReadbacks)
+    std::memcpy(rb.hostDst, rb.staging->mapped, rb.bytes);
+  f.d2hReadbacks.clear();
+  // Drop the frame's staging buffers now that the GPU is done with them.
+  for (auto &sb : f.stagingBuffers) freeBuffer(*sb);
+  f.stagingBuffers.clear();
+
   vkResetFences(device_->device, 1, &f.fence);
   vkResetCommandBuffer(f.cb, 0);
   vkResetDescriptorPool(device_->device, f.descriptorPool, 0);
@@ -526,9 +566,81 @@ VCError Runtime::copyDeviceToHost(void *hostDst, const VCBuffer &src,
   return VCError::Success;
 }
 
+// Async H2D: snapshot host data into a frame-owned staging buffer, submit the
+// device copy, return immediately. The staging lives on the frame and is
+// reclaimed after the fence signals, so this never blocks the host.
+VCError Runtime::copyHostToDeviceAsync(VCBuffer &dst, const void *hostSrc,
+                                       size_t bytes, VCStream &s) {
+  // Graph capture: same as the sync path's graph branch — persistent staging
+  // owned by the graph.
+  if (s.captureTarget) {
+    VCGraph &g = *s.captureTarget;
+    auto staging = std::make_unique<VCBuffer>();
+    if (mallocHostBuffer(bytes, *staging) != VCError::Success)
+      return VCError::OutOfMemory;
+    std::memcpy(staging->mapped, hostSrc, bytes);
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(g.secondaryCB, staging->buffer, dst.buffer, 1, &region);
+    g.stagingBuffers.push_back(std::move(staging));
+    return VCError::Success;
+  }
+  auto staging = std::make_unique<VCBuffer>();
+  if (mallocHostBuffer(bytes, *staging) != VCError::Success)
+    return VCError::OutOfMemory;
+  // Snapshot the host source NOW so the caller can overwrite it immediately.
+  std::memcpy(staging->mapped, hostSrc, bytes);
+  // Record which frame we submit into so we can attach staging to it. endFrame
+  // advances frameIdx, so capture the index before calling it.
+  size_t submitIdx = s.frameIdx;
+  VkCommandBuffer cb = beginFrame(s);
+  VkBufferCopy region{0, 0, bytes};
+  vkCmdCopyBuffer(cb, staging->buffer, dst.buffer, 1, &region);
+  endFrame(s);
+  s.frames[submitIdx].stagingBuffers.push_back(std::move(staging));
+  return VCError::Success;
+}
+
+// Async D2H: submit the device->staging copy, defer the staging->host memcpy
+// to when the frame is recycled (after the fence signals). The caller MUST
+// vcStreamSynchronize before reading hostDst.
+VCError Runtime::copyDeviceToHostAsync(void *hostDst, const VCBuffer &src,
+                                       size_t bytes, VCStream &s) {
+  // Graph capture: record device->staging copy + a deferred readback entry.
+  if (s.captureTarget) {
+    VCGraph &g = *s.captureTarget;
+    auto staging = std::make_unique<VCBuffer>();
+    if (mallocHostBuffer(bytes, *staging) != VCError::Success)
+      return VCError::OutOfMemory;
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(g.secondaryCB, src.buffer, staging->buffer, 1, &region);
+    VCBuffer *raw = staging.get();
+    g.d2hReadbacks.push_back({hostDst, raw, bytes});
+    g.stagingBuffers.push_back(std::move(staging));
+    return VCError::Success;
+  }
+  auto staging = std::make_unique<VCBuffer>();
+  if (mallocHostBuffer(bytes, *staging) != VCError::Success)
+    return VCError::OutOfMemory;
+  size_t submitIdx = s.frameIdx;
+  VkCommandBuffer cb = beginFrame(s);
+  VkBufferCopy region{0, 0, bytes};
+  vkCmdCopyBuffer(cb, src.buffer, staging->buffer, 1, &region);
+  endFrame(s);
+  // Defer the host memcpy: the device copy hasn't run yet. beginFrame will
+  // drain this entry when the fence signals.
+  VCBuffer *raw = staging.get();
+  s.frames[submitIdx].d2hReadbacks.push_back({hostDst, raw, bytes});
+  s.frames[submitIdx].stagingBuffers.push_back(std::move(staging));
+  return VCError::Success;
+}
+
 VCError Runtime::synchronize() {
   if (!init_) return VCError::InitializationError;
   vkDeviceWaitIdle(device_->device);
+  // Deliver deferred D2H readbacks on every stream (the caller may read host
+  // destinations immediately after a device sync).
+  if (defaultStream_) drainReadyReadbacks(*device_, *defaultStream_);
+  for (auto &s : streams_) if (s) drainReadyReadbacks(*device_, *s);
   return VCError::Success;
 }
 
@@ -1004,6 +1116,31 @@ VCError vcMemcpyS(void *dst, const void *src, size_t count,
 VCError vcMemcpy(void *dst, const void *src, size_t count,
                  VCMemcpyKind kind) {
   return vcMemcpyS(dst, src, count, kind, nullptr);
+}
+
+VCError vcMemcpyAsyncS(void *dst, const void *src, size_t count,
+                       VCMemcpyKind kind, VCStreamHandle stream) {
+  auto &rt = Runtime::get();
+  auto &s = rt.resolveStream(stream);
+  if (kind == VCMemcpyKind::HostToDevice) {
+    auto *b = reinterpret_cast<VCBuffer *>(dst);
+    if (!b) return VCError::InvalidValue;
+    return rt.copyHostToDeviceAsync(*b, src, count, s);
+  } else if (kind == VCMemcpyKind::DeviceToHost) {
+    auto *b = reinterpret_cast<VCBuffer *>(const_cast<void *>(src));
+    if (!b) return VCError::InvalidValue;
+    return rt.copyDeviceToHostAsync(dst, *b, count, s);
+  } else { // DeviceToDevice — already async
+    auto *db = reinterpret_cast<VCBuffer *>(dst);
+    auto *sb = reinterpret_cast<VCBuffer *>(const_cast<void *>(src));
+    if (!db || !sb) return VCError::InvalidValue;
+    return rt.copyDeviceToDevice(*db, *sb, count, s);
+  }
+}
+
+VCError vcMemcpyAsync(void *dst, const void *src, size_t count,
+                      VCMemcpyKind kind) {
+  return vcMemcpyAsyncS(dst, src, count, kind, nullptr);
 }
 
 VCError vcDeviceSynchronize() { return Runtime::get().synchronize(); }

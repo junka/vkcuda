@@ -1,0 +1,78 @@
+// test/async_memcpy.vc — asynchronous memcpy (vcMemcpyAsync) demo.
+//
+// Exercises the non-blocking H2D/D2H path. vcMemcpyAsync returns immediately
+// without waiting for the GPU: H2D snapshots the host source into a
+// frame-owned staging buffer (so the caller may overwrite the source at
+// once), and D2H defers the staging->host memcpy until the stream is
+// synchronized. Staging rides the stream's frame lifetime and is reclaimed
+// after the fence signals.
+//
+//   vcc test/async_memcpy.vc -o build/async_memcpy_sf && ./build/async_memcpy_sf
+//   vc  test/async_memcpy.vc -emit=full -o build/async_memcpy_m && ./build/async_memcpy_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void vadd(float *a, float *b, float *c, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) c[i] = a[i] + b[i];
+}
+
+int main() {
+  vcInit();
+
+  const int N = 64;
+  const int bytes = N * 4;
+  const int block = 32;
+
+  VCStreamHandle streamA = 0, streamB = 0;
+  vcStreamCreate(&streamA);
+  vcStreamCreate(&streamB);
+
+  void *dAa = 0, *dBa = 0, *dCa = 0;
+  void *dAb = 0, *dBb = 0, *dCb = 0;
+  vcMalloc(&dAa, bytes); vcMalloc(&dBa, bytes); vcMalloc(&dCa, bytes);
+  vcMalloc(&dAb, bytes); vcMalloc(&dBb, bytes); vcMalloc(&dCb, bytes);
+
+  float hA[64], hB[64], hC[64];
+  for (int i = 0; i < N; i++) { hA[i] = 1.0f * i; hB[i] = 2.0f; hC[i] = 0.0f; }
+
+  // Stream A: async H2D both inputs, then launch.
+  vcMemcpyAsyncS(dAa, hA, bytes, VCMemcpyKind::HostToDevice, streamA);
+  vcMemcpyAsyncS(dBa, hB, bytes, VCMemcpyKind::HostToDevice, streamA);
+  vadd<<<N, block, 0, streamA>>>(dAa, dBa, dCa, N);
+
+  // Overwrite the host source immediately — the async H2D already snapshotted
+  // it into staging, so this must NOT corrupt the device copy.
+  for (int i = 0; i < N; i++) hA[i] = 999.0f;
+
+  // Stream B: independent workload reusing the same host arrays.
+  vcMemcpyAsyncS(dAb, hB, bytes, VCMemcpyKind::HostToDevice, streamB);
+  vcMemcpyAsyncS(dBb, hB, bytes, VCMemcpyKind::HostToDevice, streamB);
+  vadd<<<N, block, 0, streamB>>>(dAb, dBb, dCb, N);
+
+  // Async D2H on both streams, then sync each before reading.
+  vcMemcpyAsyncS(hC, dCa, bytes, VCMemcpyKind::DeviceToHost, streamA);
+  float hCb[64];
+  vcMemcpyAsyncS(hCb, dCb, bytes, VCMemcpyKind::DeviceToHost, streamB);
+
+  vcStreamSynchronize(streamA);
+  vcStreamSynchronize(streamB);
+
+  int ok = 1;
+  // Stream A result: hA was {0..63} at H2D time, hB={2} -> a+b = i+2.
+  for (int i = 0; i < N; i++)
+    if (hC[i] != 1.0f * i + 2.0f) { ok = 0; break; }
+  // Stream B result: b+b = 4.
+  for (int i = 0; i < N; i++)
+    if (hCb[i] != 4.0f) { ok = 0; break; }
+
+  printf("async_memcpy: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dAa); vcFree(dBa); vcFree(dCa);
+  vcFree(dAb); vcFree(dBb); vcFree(dCb);
+  vcStreamDestroy(streamA);
+  vcStreamDestroy(streamB);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

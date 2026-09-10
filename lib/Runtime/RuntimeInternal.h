@@ -49,6 +49,22 @@ struct StreamFrame {
   // Descriptor sets allocated on this frame's pool; all freed together when
   // the frame is reset via vkResetDescriptorPool.
   VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+
+  // Staging buffers owned by this frame for async H2D/D2H copies. They must
+  // outlive the GPU work recorded into this frame, so they live here and are
+  // reclaimed (after the fence signals) when the frame is recycled in
+  // beginFrame. This is what makes vcMemcpyAsync non-blocking: the staging
+  // is not freed in the copy call, it rides the frame's lifetime.
+  std::vector<std::unique_ptr<VCBuffer>> stagingBuffers;
+
+  // Deferred D2H readbacks recorded on this frame. Each entry is a
+  // device->staging copy already submitted in this frame's command buffer;
+  // the final staging->host memcpy can only run once that copy has executed
+  // (i.e. once the fence signals). beginFrame drains this list before
+  // recycling the frame, delivering the data to the caller's host pointer.
+  // The caller must have synchronized (vcStreamSynchronize) before reading.
+  struct D2HReadback { void *hostDst; VCBuffer *staging; size_t bytes; };
+  std::vector<D2HReadback> d2hReadbacks;
 };
 
 /// An execution stream: an ordered command queue. Backed by the device's
@@ -154,6 +170,15 @@ public:
                            VCStream &s);                   // sync (staging freed)
   VCError copyDeviceToHost(void *hostDst, const VCBuffer &src, size_t bytes,
                            VCStream &s);                   // sync (readable on return)
+
+  // Async variants: staging is owned by the stream's current frame and
+  // reclaimed when that frame is recycled (after its fence signals). H2D
+  // snapshots the host source into staging before returning; D2H defers the
+  // staging->host memcpy to frame recycle time (caller must sync first).
+  VCError copyHostToDeviceAsync(VCBuffer &dst, const void *hostSrc,
+                                size_t bytes, VCStream &s);  // async
+  VCError copyDeviceToHostAsync(void *hostDst, const VCBuffer &src,
+                                size_t bytes, VCStream &s);  // async (sync to read)
 
   VCError loadKernel(const uint32_t *words, size_t wordCount,
                      const char *entryPoint, VCKernel &out);

@@ -84,14 +84,33 @@ VCError vcMallocHost(void **hostPtr, size_t bytes);
 /// Free a device or host allocation.
 VCError vcFree(void *devPtr);
 
-/// Copy memory. `count` is bytes. H2D and D2D are asynchronous on the
-/// default stream; D2H blocks until the copy completes so the host can read
-/// the destination immediately.
+/// Copy memory. `count` is bytes. D2D is asynchronous on the default stream;
+/// H2D and D2H block until the copy completes so the host can read/write the
+/// host side immediately (staging is transient). For non-blocking copies use
+/// vcMemcpyAsync.
 VCError vcMemcpy(void *dst, const void *src, size_t count, VCMemcpyKind kind);
 
 /// Like vcMemcpy but on an explicit `stream` (NULL = default stream).
 VCError vcMemcpyS(void *dst, const void *src, size_t count, VCMemcpyKind kind,
                   VCStreamHandle stream);
+
+/// Asynchronous copy on an explicit `stream` (NULL = default stream). Returns
+/// immediately without waiting for the GPU:
+///   - H2D: the host source is snapshot into a staging buffer (owned by the
+///     stream's frame) before returning, so the caller may overwrite `src`
+///     immediately. The device copy executes in stream order.
+///   - D2H: the device->staging copy is submitted to the stream, but the
+///     final host memcpy (staging -> dst) is deferred until the copy finishes.
+///     The caller MUST vcStreamSynchronize before reading `dst`.
+///   - D2D: same as the synchronous path (already async).
+/// Staging buffers live on the stream's current frame and are reclaimed when
+/// that frame is recycled (after its fence signals), so they never block.
+VCError vcMemcpyAsyncS(void *dst, const void *src, size_t count,
+                       VCMemcpyKind kind, VCStreamHandle stream);
+
+/// Asynchronous copy on the default stream. Convenience wrapper.
+VCError vcMemcpyAsync(void *dst, const void *src, size_t count,
+                      VCMemcpyKind kind);
 
 /// Block until all queued device work is complete.
 VCError vcDeviceSynchronize();
