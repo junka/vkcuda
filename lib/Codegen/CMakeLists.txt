@@ -7,6 +7,11 @@ add_library(VCCodegen STATIC
 
 target_include_directories(VCCodegen PUBLIC
   ${VC_INCLUDE_DIR}
+)
+# MLIR/LLVM headers are upstream; mark SYSTEM so warnings inside them (e.g.
+# the C++20 "these are ambiguous" note in mlir/IR/TypeRange.h under GCC 13)
+# do not clutter our build.
+target_include_directories(VCCodegen SYSTEM PUBLIC
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
 )

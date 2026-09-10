@@ -8,6 +8,9 @@ add_executable(vcc vcc.cpp)
 
 target_include_directories(vcc PRIVATE
   ${VC_INCLUDE_DIR}
+)
+# LLVM headers are upstream; SYSTEM suppresses their build warnings.
+target_include_directories(vcc SYSTEM PRIVATE
   ${LLVM_INCLUDE_DIRS}
 )
 

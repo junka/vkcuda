@@ -4,6 +4,9 @@
 add_executable(vc-dump-ast vc-dump-ast.cpp)
 target_include_directories(vc-dump-ast PRIVATE
   ${VC_INCLUDE_DIR}
+)
+# LLVM headers are upstream; SYSTEM suppresses their build warnings.
+target_include_directories(vc-dump-ast SYSTEM PRIVATE
   ${LLVM_INCLUDE_DIRS}
 )
 target_compile_features(vc-dump-ast PRIVATE cxx_std_20)

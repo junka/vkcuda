@@ -3,6 +3,10 @@ add_executable(vc vc.cpp)
 
 target_include_directories(vc PRIVATE
   ${VC_INCLUDE_DIR}
+)
+# MLIR/LLVM headers are upstream; SYSTEM suppresses their build warnings
+# (e.g. the C++20 TypeRange.h ambiguity note under GCC 13).
+target_include_directories(vc SYSTEM PRIVATE
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
 )

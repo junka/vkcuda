@@ -14,6 +14,9 @@ add_library(VCFrontend STATIC
 
 target_include_directories(VCFrontend PUBLIC
   ${VC_INCLUDE_DIR}
+)
+# LLVM headers are upstream; SYSTEM suppresses their build warnings.
+target_include_directories(VCFrontend SYSTEM PUBLIC
   ${LLVM_INCLUDE_DIRS}
 )
 

@@ -1,7 +1,7 @@
 # VC dialect: built with mlir-tblgen. Requires libmlir-18-dev.
 # tablegen() reads its input .td from LLVM_TARGET_DEFINITIONS; VC.td includes
 # mlir/IR/OpBase.td, so MLIR include dirs must be on the tablegen -I path.
-include_directories(${MLIR_INCLUDE_DIRS})
+include_directories(SYSTEM ${MLIR_INCLUDE_DIRS})
 set(LLVM_TARGET_DEFINITIONS VC.td)
 mlir_tablegen(VCOps.h.inc -gen-op-decls)
 mlir_tablegen(VCOps.cpp.inc -gen-op-defs)
@@ -30,5 +30,9 @@ target_include_directories(VCDialect PUBLIC
   ${VC_INCLUDE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_BINARY_DIR}
+)
+# MLIR headers are upstream; SYSTEM suppresses their build warnings (e.g. the
+# C++20 TypeRange.h ambiguity note under GCC 13).
+target_include_directories(VCDialect SYSTEM PUBLIC
   ${MLIR_INCLUDE_DIRS}
 )

@@ -3,6 +3,9 @@ add_executable(vc-glsl vc.cpp)
 
 target_include_directories(vc-glsl PRIVATE
   ${VC_INCLUDE_DIR}
+)
+# LLVM headers are upstream; SYSTEM suppresses their build warnings.
+target_include_directories(vc-glsl SYSTEM PRIVATE
   ${LLVM_INCLUDE_DIRS}
 )
 
