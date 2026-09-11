@@ -93,6 +93,25 @@ VCError vcMallocHost(void **hostPtr, size_t bytes);
 /// Free a device or host allocation.
 VCError vcFree(void *devPtr);
 
+/// Asynchronous allocation on `stream` (NULL = default stream). The returned
+/// handle is immediately usable for subsequent operations on the same stream
+/// (which execute in stream order). The allocation itself is host-side and
+/// immediate; the `stream` argument orders subsequent use, matching
+/// cudaMallocAsync's contract.
+VCError vcMallocAsync(void **devPtr, size_t bytes, VCStreamHandle stream);
+
+/// Asynchronous host-visible (pinned) allocation on `stream`. See
+/// vcMallocAsync.
+VCError vcMallocHostAsync(void **hostPtr, size_t bytes, VCStreamHandle stream);
+
+/// Asynchronous free on `stream` (NULL = default stream). Defers the actual
+/// release until all work already submitted to `stream` has completed, so it
+/// is safe to call while GPU work referencing `devPtr` is still in flight on
+/// that stream (mirrors cudaFreeAsync — no use-after-free). The buffer is
+/// reclaimed at the next vcStreamSynchronize / vcDeviceSynchronize / vcShutdown
+/// once its stream's work is done.
+VCError vcFreeAsync(void *devPtr, VCStreamHandle stream);
+
 /// Copy memory. `count` is bytes. D2D is asynchronous on the default stream;
 /// H2D and D2H block until the copy completes so the host can read/write the
 /// host side immediately (staging is transient). For non-blocking copies use
@@ -120,6 +139,25 @@ VCError vcMemcpyAsyncS(void *dst, const void *src, size_t count,
 /// Asynchronous copy on the default stream. Convenience wrapper.
 VCError vcMemcpyAsync(void *dst, const void *src, size_t count,
                       VCMemcpyKind kind);
+
+/// Fill the first `count` bytes of a device allocation with `value` (taken as
+/// a byte, broadcast to every byte) — equivalent to cudaMemset. `count` MUST
+/// be a multiple of 4 (Vulkan vkCmdFillBuffer constraint). Synchronous: blocks
+/// until the fill completes. Safe on both device-local and host-visible
+/// allocations.
+VCError vcMemset(void *devPtr, int value, size_t count);
+
+/// Like vcMemset but on an explicit `stream` (NULL = default stream).
+VCError vcMemsetS(void *devPtr, int value, size_t count, VCStreamHandle stream);
+
+/// Asynchronous fill on `stream` (NULL = default stream). Returns immediately;
+/// the fill executes in stream order. The caller MUST vcStreamSynchronize
+/// before reading the buffer. Equivalent to cudaMemsetAsync.
+VCError vcMemsetAsyncS(void *devPtr, int value, size_t count,
+                       VCStreamHandle stream);
+
+/// Asynchronous fill on the default stream. Convenience wrapper.
+VCError vcMemsetAsync(void *devPtr, int value, size_t count);
 
 /// Block until all queued device work is complete.
 VCError vcDeviceSynchronize();

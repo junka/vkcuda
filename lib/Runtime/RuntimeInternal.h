@@ -187,6 +187,18 @@ public:
   VCError mallocBuffer(size_t bytes, VCBuffer &out);          // device-local
   VCError mallocHostBuffer(size_t bytes, VCBuffer &out);      // host-visible
   VCError freeBuffer(VCBuffer &buf);
+  // Fill `bytes` of `buf` (offset 0) with byte `value` broadcast to uint32.
+  // bytes must be a multiple of 4 (vkCmdFillBuffer constraint). Sync blocks;
+  // Async records and returns (caller syncs before reading). Staging-free:
+  // the buffer has TRANSFER_DST usage, so vkCmdFillBuffer writes it directly.
+  VCError memsetBuffer(VCBuffer &buf, int value, size_t bytes,
+                       VCStream &s);                          // sync
+  VCError memsetBufferAsync(VCBuffer &buf, int value, size_t bytes,
+                            VCStream &s);                     // async
+  // Deferred free: the buffer is reclaimed once all work already submitted to
+  // `s` has completed (its frame fences signal). Safe to call while GPU work
+  // referencing the buffer is still in flight on `s` (cudaFreeAsync semantics).
+  VCError freeBufferAsync(VCBuffer *buf, VCStream &s);
   // Copy primitives, all recorded on stream `s`:
   VCError copyDeviceToDevice(VCBuffer &dst, const VCBuffer &src, size_t bytes,
                              VCStream &s);                 // async
@@ -256,6 +268,13 @@ private:
   std::vector<std::unique_ptr<VCGraph>> graphs_;   // owns created graphs
   std::vector<std::unique_ptr<VCEvent>> events_;   // owns created events
   bool init_ = false;
+
+  // Buffers whose release was deferred by vcFreeAsync. Each is freed once all
+  // work on its stream has completed (frame fences signal). Drained from
+  // streamSynchronize / synchronize / shutdown.
+  struct PendingFree { VCBuffer *buf; VCStream *stream; };
+  std::vector<PendingFree> pendingFrees_;
+  void drainPendingFrees();
 
   bool pickPhysicalDevice();
   bool createLogicalDevice();

@@ -1,0 +1,101 @@
+// test/memset.vc — vcMemset / vcMemsetAsync + vcMallocAsync / vcFreeAsync.
+//
+// Memset fills a device buffer with a byte value (broadcast to every byte),
+// matching cudaMemset. Implemented with vkCmdFillBuffer (uint32 fill, so the
+// count must be a multiple of 4). vcMallocAsync/vcFreeAsync mirror CUDA's
+// stream-ordered resource management: freeAsync defers the actual release
+// until the stream's pending work finishes, so it is safe to free a buffer
+// a kernel is still reading.
+//
+//   vcc test/memset.vc -o build/memset_sf && ./build/memset_sf
+//   vc  test/memset.vc -emit=full -o build/memset_m && ./build/memset_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// Every thread checks its element is 0; atomically bumps `bad` otherwise.
+__global__ void checkZero(float *a, int *bad, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && a[i] != 0.0f) atomicAdd(bad, 1);
+}
+
+// Writes a constant to every element — used after a memset to verify the
+// memset's write is visible to a later kernel on the same stream.
+__global__ void scale(float *a, float s, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) a[i] = s;
+}
+
+int main() {
+  vcInit();
+
+  // N is a literal here (not `const int N`) because the host backend emits a
+  // fixed-size stack array from a literal; a const-N VLA would degrade to
+  // `int host[0]` and stack-smash on write.
+  const int bytes = 256 * 4; // 256 floats, naturally 4-byte aligned
+  VCStreamHandle s = 0;
+  vcStreamCreate(&s);
+
+  // vcMallocAsync: allocation is host-side immediate; the stream arg just
+  // documents stream-ordered use. The handle is usable right away.
+  float *d = 0;
+  int *dbad = 0;
+  vcMallocAsync((void **)&d, bytes, s);
+  vcMalloc((void **)&dbad, 4);
+
+  // 1. Synchronous zero-fill, then a kernel verifies every element is 0.
+  int z = 0;
+  vcMemcpy(dbad, &z, 4, VCMemcpyKind::HostToDevice);
+  vcMemset(d, 0, bytes); // sync: blocks until the fill completes
+  checkZero<<<256, 32>>>(d, dbad, 256);
+  vcDeviceSynchronize();
+  int bad = 0;
+  vcMemcpy(&bad, dbad, 4, VCMemcpyKind::DeviceToHost);
+  if (bad != 0) {
+    printf("memset: FAIL (sync zero-fill saw %d nonzeros)\n", bad);
+    return 1;
+  }
+
+  // 2. 0xFF byte broadcast: every uint32 should read 0xFFFFFFFF. This is the
+  //    core cudaMemset semantic — a *byte* value replicated to all bytes.
+  vcMemset(d, 0xFF, bytes);
+  int host[256];
+  vcMemcpy(host, d, bytes, VCMemcpyKind::DeviceToHost);
+  for (int i = 0; i < 256; i++) {
+    if (host[i] != (int)0xFFFFFFFF) {
+      printf("memset: FAIL (0xFF broadcast, host[%d]=0x%08X)\n", i, host[i]);
+      return 1;
+    }
+  }
+
+  // 3. Async memset on `s` then a kernel on the same stream: the fill must
+  //    complete before the kernel reads (stream ordering), and the host did
+  //    not block. Scale writes 7.0 over the zeroed buffer.
+  vcMemsetAsyncS(d, 0, bytes, s);
+  scale<<<256, 32, 0, s>>>(d, 7.0f, 256);
+  vcStreamSynchronize(s);
+  float hf[256];
+  vcMemcpy(hf, d, bytes, VCMemcpyKind::DeviceToHost);
+  for (int i = 0; i < 256; i++) {
+    if (hf[i] != 7.0f) {
+      printf("memset: FAIL (async + scale, hf[%d]=%g)\n", i, hf[i]);
+      return 1;
+    }
+  }
+
+  // 4. vcFreeAsync: submit a kernel still reading `d`, then immediately free
+  //    it (no sync). The release is deferred until the stream's work finishes,
+  //    so there is no use-after-free. We then keep using the stream to prove
+  //    the free did not stall it.
+  vcMemsetAsyncS(d, 0, bytes, s);
+  checkZero<<<256, 32, 0, s>>>(d, dbad, 256); // references d
+  vcFreeAsync(d, s);                           // deferred: safe, GPU still reading d
+  scale<<<1, 1, 0, s>>>(dbad, 1.0f, 1);        // stream keeps going, no d
+  vcStreamSynchronize(s);                      // drains the pending free here
+
+  vcFree(dbad);
+  vcStreamDestroy(s);
+  vcShutdown();
+  printf("memset: PASS\n");
+  return 0;
+}

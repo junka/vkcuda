@@ -246,6 +246,9 @@ bool Runtime::createPipelineCache() {
 VCError Runtime::shutdown() {
   if (!init_) return VCError::Success;
   vkDeviceWaitIdle(device_->device);
+  // Reclaim any buffers whose release was deferred by vcFreeAsync — the device
+  // is idle, so they are all safe to free now (avoids leaking them).
+  drainPendingFrees();
   for (auto &g : graphs_) {
     if (!g) continue;
     resetGraphState(*device_, *g);
@@ -331,6 +334,9 @@ VCError Runtime::streamSynchronize(VCStream &s) {
   // Now every fence is signaled: deliver all deferred D2H readbacks so the
   // caller can read the host destinations immediately after sync returns.
   drainReadyReadbacks(*device_, s);
+  // Reclaim buffers whose release was deferred by vcFreeAsync on this stream —
+  // its work is now done, so they are safe to free.
+  drainPendingFrees();
   return VCError::Success;
 }
 
@@ -540,6 +546,103 @@ VCError Runtime::freeBuffer(VCBuffer &buf) {
   return VCError::Success;
 }
 
+// Fill `bytes` of `buf` (offset 0) with byte `value` broadcast to uint32.
+// vkCmdFillBuffer writes a 4-byte uint32 repeatedly, so `bytes` must be a
+// multiple of 4. The buffer already carries TRANSFER_DST usage (see
+// createBuffer), so this writes the device buffer directly — no staging.
+VCError Runtime::memsetBuffer(VCBuffer &buf, int value, size_t bytes,
+                              VCStream &s) {
+  if (bytes == 0) return VCError::Success;
+  if (bytes % 4 != 0) return VCError::InvalidValue; // vkCmdFillBuffer constraint
+  uint32_t fill = (uint32_t)(uint8_t)value * 0x01010101u;
+  if (s.captureTarget) {
+    vkCmdFillBuffer(s.captureTarget->secondaryCB, buf.buffer, 0, bytes, fill);
+    // Make the transfer write visible to subsequent ops in the graph (same
+    // barrier as the D2D copy's capture branch).
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(s.captureTarget->secondaryCB,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+    return VCError::Success;
+  }
+  VkCommandBuffer cb = beginFrame(s);
+  vkCmdFillBuffer(cb, buf.buffer, 0, bytes, fill);
+  endFrame(s);
+  streamSynchronize(s); // sync: fill completes before we return
+  return VCError::Success;
+}
+
+VCError Runtime::memsetBufferAsync(VCBuffer &buf, int value, size_t bytes,
+                                   VCStream &s) {
+  if (bytes == 0) return VCError::Success;
+  if (bytes % 4 != 0) return VCError::InvalidValue;
+  uint32_t fill = (uint32_t)(uint8_t)value * 0x01010101u;
+  if (s.captureTarget) {
+    vkCmdFillBuffer(s.captureTarget->secondaryCB, buf.buffer, 0, bytes, fill);
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(s.captureTarget->secondaryCB,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+    return VCError::Success;
+  }
+  VkCommandBuffer cb = beginFrame(s);
+  vkCmdFillBuffer(cb, buf.buffer, 0, bytes, fill);
+  endFrame(s);
+  // async: do NOT sync — caller must vcStreamSynchronize before reading.
+  return VCError::Success;
+}
+
+// Deferred free (cudaFreeAsync semantics): the buffer is not released here.
+// It is queued and reclaimed once all work already submitted to `s` has
+// finished (its frame fences signal). This makes "submit a launch referencing
+// buf, then immediately freeAsync(buf), then keep going" safe — no
+// use-after-free, and the host did not stall waiting for the GPU.
+VCError Runtime::freeBufferAsync(VCBuffer *buf, VCStream &s) {
+  if (!buf) return VCError::Success;
+  pendingFrees_.push_back({buf, &s});
+  return VCError::Success;
+}
+
+// Reclaim every deferred buffer whose stream's in-flight work is done. A
+// stream is "done" when all its frame fences are signaled (queried
+// non-blockingly with vkGetFenceStatus). Buffers whose stream is still busy
+// stay queued for a later drain. Called from streamSynchronize / synchronize /
+// shutdown.
+void Runtime::drainPendingFrees() {
+  for (auto it = pendingFrees_.begin(); it != pendingFrees_.end();) {
+    VCStream *s = it->stream;
+    bool ready = true;
+    if (s) {
+      for (auto &f : s->frames) {
+        if (f.fence != VK_NULL_HANDLE &&
+            vkGetFenceStatus(device_->device, f.fence) != VK_SUCCESS) {
+          ready = false;
+          break;
+        }
+      }
+    }
+    if (ready) {
+      freeBuffer(*it->buf);
+      delete it->buf;
+      it = pendingFrees_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 // Primitive: record vkCmdCopyBuffer(src.buf -> dst.buf) on stream s.
 VCError Runtime::copyDeviceToDevice(VCBuffer &dst, const VCBuffer &src,
                                     size_t bytes, VCStream &s) {
@@ -713,6 +816,8 @@ VCError Runtime::synchronize() {
   // destinations immediately after a device sync).
   if (defaultStream_) drainReadyReadbacks(*device_, *defaultStream_);
   for (auto &s : streams_) if (s) drainReadyReadbacks(*device_, *s);
+  // The device is idle: every deferred free is now safe to reclaim.
+  drainPendingFrees();
   return VCError::Success;
 }
 
@@ -1255,6 +1360,32 @@ VCError vcFree(void *devPtr) {
   return e;
 }
 
+// Allocation is a host-side operation (vkCreateBuffer + vkAllocateMemory); it
+// is not recorded on a stream. The `stream` argument is accepted for API
+// symmetry with CUDA's cudaMallocAsync and to document that the returned
+// handle is usable by subsequent stream-ordered operations — it does not make
+// the allocation itself asynchronous. (Vulkan has no true async allocation;
+// this matches the contract without pretending otherwise.)
+VCError vcMallocAsync(void **devPtr, size_t bytes, VCStreamHandle stream) {
+  (void)stream; // stream-orders subsequent use; allocation is host-immediate
+  return vcMalloc(devPtr, bytes);
+}
+
+VCError vcMallocHostAsync(void **hostPtr, size_t bytes, VCStreamHandle stream) {
+  (void)stream;
+  return vcMallocHost(hostPtr, bytes);
+}
+
+// Deferred free: queue the buffer for release once its stream's pending work
+// completes. Safe to call while GPU work referencing the buffer is in flight
+// on `stream` (cudaFreeAsync semantics).
+VCError vcFreeAsync(void *devPtr, VCStreamHandle stream) {
+  if (!devPtr) return VCError::Success;
+  auto *b = reinterpret_cast<VCBuffer *>(devPtr);
+  auto &rt = Runtime::get();
+  return rt.freeBufferAsync(b, rt.resolveStream(stream));
+}
+
 VCError vcMemcpyS(void *dst, const void *src, size_t count,
                   VCMemcpyKind kind, VCStreamHandle stream) {
   auto &rt = Runtime::get();
@@ -1303,6 +1434,29 @@ VCError vcMemcpyAsyncS(void *dst, const void *src, size_t count,
 VCError vcMemcpyAsync(void *dst, const void *src, size_t count,
                       VCMemcpyKind kind) {
   return vcMemcpyAsyncS(dst, src, count, kind, nullptr);
+}
+
+VCError vcMemset(void *devPtr, int value, size_t count) {
+  return vcMemsetS(devPtr, value, count, nullptr);
+}
+
+VCError vcMemsetS(void *devPtr, int value, size_t count, VCStreamHandle stream) {
+  if (!devPtr) return VCError::InvalidValue;
+  auto *b = reinterpret_cast<VCBuffer *>(devPtr);
+  auto &rt = Runtime::get();
+  return rt.memsetBuffer(*b, value, count, rt.resolveStream(stream));
+}
+
+VCError vcMemsetAsyncS(void *devPtr, int value, size_t count,
+                       VCStreamHandle stream) {
+  if (!devPtr) return VCError::InvalidValue;
+  auto *b = reinterpret_cast<VCBuffer *>(devPtr);
+  auto &rt = Runtime::get();
+  return rt.memsetBufferAsync(*b, value, count, rt.resolveStream(stream));
+}
+
+VCError vcMemsetAsync(void *devPtr, int value, size_t count) {
+  return vcMemsetAsyncS(devPtr, value, count, nullptr);
 }
 
 VCError vcDeviceSynchronize() { return Runtime::get().synchronize(); }
