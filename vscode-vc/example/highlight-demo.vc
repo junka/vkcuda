@@ -1,0 +1,121 @@
+// example/highlight-demo.vc — exercises every token category the VSCode
+// VC grammar knows about. Open this file in the Extension Development Host
+// (F5 from vscode-vc/) to sanity-check highlighting.
+//
+//   vcc example/highlight-demo.vc -o build/demo && ./build/demo
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+#define TILE 16
+#define PI 3.14159f
+
+// CUDA execution-space attributes + __shared__ dynamic memory.
+__global__ void demoKernel(float *out, int N) {
+  // thread-index builtins
+  int tid = threadIdx.x;
+  int i = blockIdx.x * blockDim.x + tid;
+  int lane = tid % warpSize;
+
+  // __shared__ storage
+  __shared__ float sbuf[TILE];
+  if (tid < TILE) sbuf[tid] = 0.0f;
+  __syncthreads();
+
+  // vector types + make_ constructor + swizzle (read + write)
+  float4 a = make_float4(1.0, 2.0, 3.0, 4.0);
+  float4 b = float4(10.0, 20.0, 30.0, 40.0);
+  float2 lo = a.xy;
+  float2 hi = a.zw;
+  float4 sw;
+  sw.xz = float2(lo.x, hi.x);
+
+  // math + geometric builtins (and f-suffix + fast intrinsics)
+  float d = dot(a, b);
+  float3 x = float3(1.0, 0.0, 0.0);
+  float3 y = float3(0.0, 1.0, 0.0);
+  float3 z = cross(x, y);
+  float s = sinf(PI) + __sinf(PI);
+  float c = clamp(d, 0.0f, 100.0f);
+  float e = expf(1.0f);
+
+  // atomics
+  if (i < N) {
+    atomicAdd(&out[i], 1);
+    atomicExch(&out[i], (int)d);
+  }
+  __threadfence();
+
+  // warp / subgroup intrinsics (hex mask literal)
+  int v = 1;
+  int sum0 = __shfl_sync(0xffffffff, v, 0);
+  bool allPos = __allSync(0xffffffff, sum0 > 0);
+  unsigned mask = __ballot_sync(0xffffffff, i < N);
+  __syncwarp();
+
+  // control-flow + numeric literal forms
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    if (lane < offset) v += offset;
+  }
+  switch (lane) {
+    case 0:  out[i] = sum0; break;
+    case 1:  out[i] = (float)mask; break;
+    default: out[i] = s + c + e; break;
+  }
+}
+
+// constants + anonymous enum + typedef + struct + namespace
+enum OpCode { ADD, SUB, MUL = 10, DIV, MOD };
+enum { TILE2 = 32 };
+
+typedef long long int64;
+
+struct Result {
+  float f;
+  int i;
+  long l;
+};
+
+namespace math {
+  __device__ float square(float x) { return x * x; }
+}
+
+int main() {
+  vcInit();
+
+  const int N = 256;
+  const size_t bytes = N * sizeof(float);
+  const int hexMask = 0xffffffff;
+  const double eps = 1.0e-9;
+
+  void *dOut = 0;
+  vcMalloc(&dOut, bytes);
+  int zero = 0;
+  vcMemcpy(dOut, &zero, sizeof(int), VCMemcpyKind::HostToDevice);
+
+  // CUDA triple-chevron launch
+  demoKernel<<<(N + 255) / 256, 256>>>(dOut, N);
+  vcDeviceSynchronize();
+
+  Result h;
+  vcMemcpy(&h, dOut, sizeof(Result), VCMemcpyKind::DeviceToHost);
+
+  // std:: + qualified-name call
+  float sq = math::square(h.f);
+  if (std::fabs(sq) < eps) {
+    printf("demo: zero\n");
+  }
+
+  printf("demo: %s (f=%.3f i=%d l=%ld mask=0x%x)\n",
+         h.f > 0.0f ? "PASS" : "FAIL", h.f, h.i, h.l, hexMask);
+
+  vcFree(dOut);
+  vcShutdown();
+  return 0;
+}
+
+/* block comment to test comment.block.vc
+   - multi-line
+   - with a "string" and 0x123 in it
+*/

@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run VC Extension (Extension Development Host)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        // Open the parent gg/ folder so test/*.vc and example/*.vc are reachable.
+        "${workspaceFolder}/.."
+      ],
+      "outFiles": []
+    }
+  ]
+}

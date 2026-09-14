@@ -1,0 +1,377 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "VC",
+  "scopeName": "source.vc",
+  "fileTypes": ["vc"],
+  "patterns": [
+    { "include": "#preprocessor" },
+    { "include": "#comments" },
+    { "include": "#launch" },
+    { "include": "#strings" },
+    { "include": "#literals" },
+    { "include": "#attributes" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#builtins" },
+    { "include": "#vc-runtime" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.documentation.vc",
+          "begin": "/\\*\\*(?!/)",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.vc" } },
+          "end": "\\*/",
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.vc" } },
+          "patterns": [
+            { "include": "#docblock-content" }
+          ]
+        },
+        {
+          "name": "comment.block.vc",
+          "begin": "/\\*",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.vc" } },
+          "end": "\\*/",
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.vc" } }
+        },
+        {
+          "name": "comment.line.double-slash.vc",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "docblock-content": {
+      "patterns": [
+        { "match": "(?<=^|\\s)@param\\b", "name": "keyword.other.documentation.vc" },
+        { "match": "(?<=^|\\s)@(return|returns|brief|see|note|warning|todo|fixme)\\b", "name": "keyword.other.documentation.vc" }
+      ]
+    },
+    "preprocessor": {
+      "patterns": [
+        {
+          "name": "meta.preprocessor.include.vc",
+          "begin": "^\\s*((#)\\s*include)\\b",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.directive.include.vc" },
+            "2": { "name": "punctuation.definition.directive.vc" }
+          },
+          "end": "(?=$|(?<!\\\\)\\n)",
+          "patterns": [
+            {
+              "name": "string.quoted.other.less-than.vc",
+              "begin": "<",
+              "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.vc" } },
+              "end": ">",
+              "endCaptures": { "0": { "name": "punctuation.definition.string.end.vc" } }
+            },
+            {
+              "name": "string.quoted.double.include.vc",
+              "begin": "\"",
+              "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.vc" } },
+              "end": "\"",
+              "endCaptures": { "0": { "name": "punctuation.definition.string.end.vc" } }
+            }
+          ]
+        },
+        {
+          "name": "meta.preprocessor.define.vc",
+          "begin": "^\\s*((#)\\s*define)\\b",
+          "beginCaptures": {
+            "1": { "name": "keyword.control.directive.define.vc" },
+            "2": { "name": "punctuation.definition.directive.vc" }
+          },
+          "end": "(?=$|(?<!\\\\)\\n)",
+          "patterns": [
+            {
+              "name": "entity.name.function.preprocessor.vc",
+              "match": "[A-Za-z_][A-Za-z0-9_]*(?=\\s)"
+            },
+            { "include": "#comments" },
+            { "include": "#strings" },
+            { "include": "#literals" }
+          ]
+        },
+        {
+          "name": "meta.preprocessor.conditional.vc",
+          "match": "^\\s*((#)\\s*(ifdef|ifndef|if|elif|else|endif|undef|pragma|line|error))\\b",
+          "captures": {
+            "1": { "name": "keyword.control.directive.conditional.vc" },
+            "2": { "name": "punctuation.definition.directive.vc" }
+          }
+        },
+        {
+          "name": "meta.preprocessor.vc",
+          "match": "^\\s*(#)\\s*[A-Za-z_]+",
+          "captures": {
+            "1": { "name": "punctuation.definition.directive.vc" }
+          }
+        }
+      ]
+    },
+    "launch": {
+      "comment": "CUDA triple-chevron kernel launch: kernel<<<grid, block[, stream]>>>(args). The VC lexer treats <<< as three lt tokens and >>> as one launch_close; here we highlight the whole construct as a meta.",
+      "patterns": [
+        {
+          "name": "meta.function-call.launch.vc",
+          "begin": "(<<<)",
+          "beginCaptures": { "1": { "name": "keyword.operator.launch.vc" } },
+          "end": "(>>>)",
+          "endCaptures": { "1": { "name": "keyword.operator.launch.vc" } },
+          "patterns": [
+            { "include": "#comments" },
+            { "include": "#literals" },
+            { "include": "#types" },
+            { "include": "#builtins" },
+            { "include": "#vc-runtime" },
+            { "include": "#identifiers" },
+            {
+              "match": "[,]",
+              "name": "punctuation.separator.parameter.vc"
+            }
+          ]
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.vc",
+          "begin": "\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.vc" } },
+          "end": "\"",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.vc" } },
+          "patterns": [
+            { "include": "#string-escapes" }
+          ]
+        },
+        {
+          "name": "string.quoted.single.vc",
+          "match": "(')((?:\\\\.|[^'\\\\])*)(')",
+          "captures": {
+            "1": { "name": "punctuation.definition.string.begin.vc" },
+            "2": { "patterns": [{ "include": "#string-escapes" }] },
+            "3": { "name": "punctuation.definition.string.end.vc" }
+          }
+        }
+      ]
+    },
+    "string-escapes": {
+      "patterns": [
+        {
+          "name": "constant.character.escape.vc",
+          "match": "\\\\([\\\\\"'nrtbfav0?]|[0-7]{1,3}|x[0-9A-Fa-f]+|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})"
+        },
+        {
+          "name": "invalid.illegal.escape.vc",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "literals": {
+      "patterns": [
+        {
+          "comment": "Hex / binary integer literals with u/U/l/L/ul/ull suffixes",
+          "name": "constant.numeric.integer.hexadecimal.vc",
+          "match": "\\b(?i:0x[0-9A-F]+|0b[01]+)(?i:ull|ll|ul|u|l|U|L)*\\b"
+        },
+        {
+          "comment": "Floating point: exponent, decimal point, or f suffix",
+          "name": "constant.numeric.float.vc",
+          "match": "(?x)\n\\b\n(?:\n  (?:[0-9]+\\.[0-9]*|\\.[0-9]+|[0-9]+)(?i:e[+-]?[0-9]+)\n  |\n  (?:[0-9]+\\.[0-9]*|\\.[0-9]+)[0-9]*\n  |\n  [0-9]+(?i:f)\n)\n(?i:f|l|L)?\\b"
+        },
+        {
+          "comment": "Decimal integer literals with u/U/l/L suffixes",
+          "name": "constant.numeric.integer.decimal.vc",
+          "match": "\\b[0-9]+(?i:ull|ll|ul|u|l|U|L)*\\b"
+        },
+        {
+          "name": "constant.language.boolean.true.vc",
+          "match": "\\btrue\\b"
+        },
+        {
+          "name": "constant.language.boolean.false.vc",
+          "match": "\\bfalse\\b"
+        },
+        {
+          "name": "constant.language.null.vc",
+          "match": "\\bnullptr\\b"
+        }
+      ]
+    },
+    "attributes": {
+      "comment": "CUDA execution-space and storage attribute keywords (double-underscore, double-trailing-underscore)",
+      "patterns": [
+        {
+          "name": "storage.modifier.cuda.vc",
+          "match": "\\b__(global|device|host|shared|constant|restrict)__\\b"
+        },
+        {
+          "name": "keyword.other.cuda.attribute.vc",
+          "match": "\\b__(builtin|noinline|forceinline|align|managed)__\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.vc",
+          "match": "\\b(if|else|for|while|do|return|break|continue|switch|case|default|goto)\\b"
+        },
+        {
+          "name": "keyword.operator.word.vc",
+          "match": "\\b(sizeof|new|delete|and|or|not)\\b"
+        },
+        {
+          "name": "keyword.other.vc",
+          "match": "\\b(const|static|extern|volatile|register|inline|virtual|explicit|mutable|constexpr|typedef|struct|union|enum|class|namespace|using|public|private|protected|this|template|typename|operator|friend|virtual|override|final)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "comment": "CUDA/HLSL-style vector types: <base><2|3|4>",
+          "name": "support.type.vector.vc",
+          "match": "\\b(?i:(float|int|uint|double|bool|long|ulong|half|short|ushort|char|uchar)(2|3|4))\\b"
+        },
+        {
+          "comment": "Scalar built-in types",
+          "name": "storage.type.builtin.vc",
+          "match": "\\b(void|bool|int|unsigned|uint|long|float|double|half|__half|short|ushort|char|uchar|size_t|ptrdiff_t|int8_t|int16_t|int32_t|int64_t|uint8_t|uint16_t|uint32_t|uint64_t|auto)\\b"
+        },
+        {
+          "comment": "dim3 launch-dimension constructor (intentionally lexes as identifier; highlight as a type)",
+          "name": "support.type.cuda.vc",
+          "match": "\\bdim3\\b"
+        }
+      ]
+    },
+    "builtins": {
+      "patterns": [
+        {
+          "comment": "CUDA thread-index built-in variables",
+          "name": "support.variable.cuda.vc",
+          "match": "\\b(threadIdx|blockIdx|blockDim|gridDim|warpSize)\\b"
+        },
+        {
+          "comment": "CUDA synchronization / memory fence builtins",
+          "name": "support.function.builtin.sync.vc",
+          "match": "\\b(__syncthreads|__threadfence|__threadfence_block|__threadfence_system|__syncthreads_count|__syncthreads_and|__syncthreads_or|__syncwarp)\\b"
+        },
+        {
+          "comment": "CUDA warp / subgroup intrinsics",
+          "name": "support.function.builtin.warp.vc",
+          "match": "\\b(__ballot_sync|__anySync|__allSync|__activemask|__shfl_sync|__shfl_up_sync|__shfl_down_sync|__shfl_xor_sync|__syncwarp)\\b"
+        },
+        {
+          "comment": "CUDA atomic operations",
+          "name": "support.function.builtin.atomic.vc",
+          "match": "\\b(atomicAdd|atomicSub|atomicExch|atomicMin|atomicMax|atomicInc|atomicDec|atomicCAS|atomicAnd|atomicOr|atomicXor)\\b"
+        },
+        {
+          "comment": "GLSL-style math builtins (no f-suffix variants listed separately)",
+          "name": "support.function.builtin.math.vc",
+          "match": "\\b(sin|cos|tan|asin|acos|atan|atan2|exp|log|log10|pow|sqrt|exp2|log2|cbrt|abs|fabs|fmin|fmax|fminf|fmaxf|min|max|floor|ceil|trunc|round|rint|sign|fract|mod|fmod|fma|mix|clamp|step|smoothstep|inversesqrt|isnan|isinf|finite|degrees|radians|lerp|saturate|dot|cross|length|normalize|reflect|refract|distance|faceforward|all|any|lessThan|greaterThan|lessThanEqual|greaterThanEqual|equal|notEqual|transpose|determinant|outerProduct|matrixCompMult)\\b"
+        },
+        {
+          "comment": "f-suffixed single-precision math variants",
+          "name": "support.function.builtin.mathf.vc",
+          "match": "\\b(sinf|cosf|tanf|asinf|acosf|atanf|atan2f|expf|logf|log10f|powf|sqrtf|exp2f|log2f|fabsf|floorf|ceilf|truncf|roundf|fmodf|fmaf|clampf)\\b"
+        },
+        {
+          "comment": "CUDA fast-math intrinsics",
+          "name": "support.function.builtin.fastmath.vc",
+          "match": "\\b(__sinf|__cosf|__tanf|__expf|__logf|__powf|__fabsf|__fdividef|__fmul_rn|__fmaf_rn)\\b"
+        },
+        {
+          "comment": "VC async-copy / pipeline device builtins",
+          "name": "support.function.builtin.vcdevice.vc",
+          "match": "\\b(vcMemcpyAsync|vcPipelineProducerCommit|vcPipelineConsumerWait|vcPipelineConsumerCommit)\\b"
+        },
+        {
+          "comment": "make_<vec> constructor family",
+          "name": "support.function.builtin.make.vc",
+          "match": "\\b(?i:make_(float|int|uint|double|bool|long|ulong|half|short|ushort|char|uchar)(2|3|4)?)\\b"
+        }
+      ]
+    },
+    "vc-runtime": {
+      "comment": "Host-side VC runtime API (vcMalloc, vcMemcpy, vcLaunchKernel, ...) — all begin with vc; plus VC enum types and qualified enum constants",
+      "patterns": [
+        {
+          "comment": "Qualified enum constant: VCMemcpyKind::DeviceToHost — matched before the bare-type rule below",
+          "match": "\\b(VCError|VCMemcpyKind|VCDeviceProperty)\\s*(::)\\s*([A-Z][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "support.type.enum.vc" },
+            "2": { "name": "punctuation.separator.namespace.vc" },
+            "3": { "name": "constant.other.enummember.vc" }
+          }
+        },
+        {
+          "name": "support.function.vc-runtime.vc",
+          "match": "\\bvc[A-Z][A-Za-z0-9_]*\\b"
+        },
+        {
+          "comment": "Bare VC enum type (e.g. in a switch on vcInit()'s return): VCError, VCMemcpyKind",
+          "name": "support.type.enum.vc",
+          "match": "\\b(VCError|VCMemcpyKind|VCDeviceProperty)\\b"
+        }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "comment": "Function-call form: identifier( — highlight the callee as a function name",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.vc" }
+          }
+        },
+        {
+          "comment": "Type-namespaced call: NS::func(  /  Class::method(",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(::)\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.type.vc" },
+            "2": { "name": "punctuation.separator.namespace.vc" },
+            "3": { "name": "entity.name.function.vc" }
+          }
+        },
+        {
+          "comment": "Qualified name in any context: NS::name",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(::)",
+          "captures": {
+            "1": { "name": "entity.name.type.vc" },
+            "2": { "name": "punctuation.separator.namespace.vc" }
+          }
+        },
+        {
+          "comment": "Member access: .name or ->name",
+          "match": "(\\.|->)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "punctuation.accessor.vc" },
+            "2": { "name": "variable.other.property.vc" }
+          }
+        },
+        {
+          "comment": "Swizzle write target detection handled by member rule above; plain identifier fallback",
+          "name": "variable.other.vc",
+          "match": "[A-Za-z_][A-Za-z0-9_]*"
+        },
+        {
+          "name": "keyword.operator.vc",
+          "match": "(->|::|<<|>>|<=|>=|==|!=|&&|\\|\\||\\+\\+|--|\\+=|-=|\\*=|/=|%=|<<=|>>=|&=|\\|=|\\^=|[+\\-*/%=<>!&|^~?:])"
+        },
+        {
+          "name": "punctuation.terminator.vc",
+          "match": ";"
+        },
+        {
+          "name": "punctuation.separator.vc",
+          "match": ","
+        }
+      ]
+    }
+  }
+}

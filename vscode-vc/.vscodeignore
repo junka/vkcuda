@@ -1,0 +1,6 @@
+.vscode/**
+.vscodeignore
+example/**
+**/*.map
+.gitignore
+.gitattributes

@@ -1,0 +1,49 @@
+{
+  "name": "vc",
+  "displayName": "VC Language Support",
+  "description": "Syntax highlighting for the VC language — a CUDA-like language targeting Vulkan via MLIR/SPIR-V.",
+  "version": "0.1.0",
+  "publisher": "vc-lang",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/junka/gg.git",
+    "directory": "vscode-vc"
+  },
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "vc",
+    "cuda",
+    "vulkan",
+    "spir-v",
+    "mlir",
+    "gpu"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "vc",
+        "aliases": [
+          "VC",
+          "vc"
+        ],
+        "extensions": [
+          ".vc"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "vc",
+        "scopeName": "source.vc",
+        "path": "./syntaxes/vc.tmLanguage.json"
+      }
+    ]
+  }
+}
