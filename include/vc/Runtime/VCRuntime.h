@@ -83,6 +83,53 @@ VCError vcShutdown();
 /// Query the number of available Vulkan devices.
 VCError vcGetDeviceCount(int *count);
 
+/// Device properties mirroring the commonly-used fields of cudaDeviceProp.
+/// VC is single-device, so `device` must be 0. Fields that have no Vulkan
+/// equivalent (multiProcessorCount, clockRate) are filled with 0 — see field
+/// comments. `warpSize` is the Vulkan subgroup size (32 on NVIDIA, 64 on AMD).
+struct VCDeviceProperties {
+  char name[256];        // VkPhysicalDeviceProperties.deviceName
+  size_t totalGlobalMem; // size of the first device-local memory heap
+  size_t sharedMemPerBlock;        // limits.maxComputeSharedMemorySize
+  size_t sharedMemPerMultiprocessor; // same (Vulkan has no SM concept)
+  int warpSize;          // subgroup size (NV 32 / AMD 64)
+  int maxThreadsPerBlock;          // limits.maxComputeWorkGroupInvocations
+  int maxThreadsDim[3];            // limits.maxComputeWorkGroupSize[3]
+  int maxGridSize[3];              // limits.maxComputeWorkGroupCount[3]
+  int clockRate;         // GPU core clock in kHz; 0 (Vulkan core has no query)
+  int multiProcessorCount; // SM count; 0 (Vulkan does not expose CU/SM count)
+  int major;             // Vulkan API major (from physical device apiVersion)
+  int minor;             // Vulkan API minor
+};
+
+/// Fill `out` with the properties of `device` (must be 0). Equivalent to a
+/// subset of cudaGetDeviceProperties.
+VCError vcGetDeviceProperties(VCDeviceProperties *out, int device);
+
+/// The kind of memory a pointer points into, for vcPointerGetAttributes.
+enum class VCMemoryType {
+  Unregistered, // not a VC allocation (e.g. a stack/heap host pointer)
+  Device,       // from vcMalloc / vcMallocAsync (device-local)
+  Host,         // from vcMallocHost / vcMallocHostAsync (host-visible, pinned)
+};
+
+/// Attributes of a pointer, mirroring cudaPointerAttributes. For a VC
+/// allocation, `memoryType` is Device or Host; `devicePointer`/`hostPointer`
+/// are the handles VC returned at allocation time, and `size` is the
+/// allocation size (a bonus field CUDA lacks). For an unrecognized pointer,
+/// memoryType is Unregistered and the other fields are null/0.
+struct VCPointerAttributes {
+  VCMemoryType memoryType = VCMemoryType::Unregistered;
+  void *devicePointer = nullptr;
+  void *hostPointer = nullptr;
+  size_t size = 0;
+};
+
+/// Query the attributes of `ptr`. If it is a VC allocation (from vcMalloc /
+/// vcMallocHost / the Async variants), fills `out` accordingly; otherwise
+/// `out->memoryType` is Unregistered. Equivalent to cudaPointerGetAttributes.
+VCError vcPointerGetAttributes(VCPointerAttributes *out, const void *ptr);
+
 /// Allocate `bytes` of device-local memory. Not host-accessible; use
 /// vcMemcpy to move data in/out.
 VCError vcMalloc(void **devPtr, size_t bytes);
@@ -248,6 +295,18 @@ VCError vcEventQuery(VCEventHandle event, int *done);
 
 /// Block the host until `event`'s most recent record has completed.
 VCError vcEventSynchronize(VCEventHandle event);
+
+/// Compute the GPU-side elapsed time between two recorded events, in
+/// milliseconds, written to `ms`. Both events must have been recorded (and
+/// reached on the GPU) on streams whose work has completed — call
+/// vcEventSynchronize (or vcStreamSynchronize) on the recording streams first.
+/// `end` must have been recorded at or after `start` in GPU execution order;
+/// otherwise the result is undefined (CUDA returns an error here; VC returns
+/// InvalidValue if either event was never recorded). VC events always carry a
+/// GPU timestamp (there is no disable-timing flag). Equivalent to
+/// cudaEventElapsedTime.
+VCError vcEventElapsedTime(float *ms, VCEventHandle start, VCEventHandle end);
+
 
 //----------------------------------------------------------------------------
 // Command graphs (CUDA-Graph-style record/replay)

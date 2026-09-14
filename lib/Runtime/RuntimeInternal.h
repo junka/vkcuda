@@ -29,6 +29,9 @@ struct VulkanDevice {
   VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
   VkPipelineCache pipelineCache = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties memProps{};
+  VkPhysicalDeviceProperties physProps{}; // device name, limits, timestampPeriod
+  int subgroupSize = 1;          // queried via VkPhysicalDeviceSubgroupProperties
+  bool timestampAvailable = false; // limits.timestampComputeAndGraphics
   bool headless = true; // no surface/swapchain
   bool timelineSemaphore = false; // VK_KHR_timeline_semaphore / Vulkan 1.2 core
 };
@@ -154,6 +157,10 @@ struct VCEvent {
   VkSemaphore semaphore = VK_NULL_HANDLE;
   uint64_t value = 1;          // next counter to signal on record
   uint64_t lastRecorded = 0;   // counter of the most recent record (0 = none)
+  // GPU timestamp query for vcEventElapsedTime. One-slot query pool written by
+  // vkCmdWriteTimestamp at record time; the counter is read back (with WAIT) by
+  // eventElapsedTime. VC events always carry timing (no disable-timing flag).
+  VkQueryPool queryPool = VK_NULL_HANDLE;
 };
 
 class Runtime {
@@ -289,6 +296,20 @@ public:
   VCError streamWaitEvent(VCStream &s, VCEvent &e);
   VCError eventQuery(const VCEvent &e, int *done) const;
   VCError eventSynchronize(const VCEvent &e) const;
+  // GPU-side elapsed time between two recorded events (ms). Reads back each
+  // event's timestamp query (blocking) and converts ticks→ms via timestampPeriod.
+  VCError eventElapsedTime(float *ms, const VCEvent &start,
+                           const VCEvent &end) const;
+
+  // ---- Device / pointer queries ----
+  VCError getDeviceProperties(VCDeviceProperties *out, int device) const;
+  VCError pointerGetAttributes(VCPointerAttributes *out,
+                               const void *ptr) const;
+  // Register/unregister a buffer for vcPointerGetAttributes. Called by the
+  // vcMalloc/MallocHost/Async C wrappers so the registry tracks every live
+  // allocation and its kind (Device vs Host).
+  void registerBuffer(VCBuffer *b, bool hostVisible);
+  void unregisterBuffer(VCBuffer *b);
 
 private:
   std::unique_ptr<VulkanDevice> device_;
@@ -297,6 +318,13 @@ private:
   std::vector<std::unique_ptr<VCGraph>> graphs_;   // owns created graphs
   std::vector<std::unique_ptr<VCEvent>> events_;   // owns created events
   bool init_ = false;
+
+  // Registry of live allocations for vcPointerGetAttributes. Maps the buffer
+  // handle (the void* VC hands out) to its kind. Mutex-guarded because allocs
+  // and frees can happen from the host-func background thread (callbacks may
+  // re-enter the runtime).
+  std::unordered_map<VCBuffer*, bool> allocRegistry_; // value: hostVisible?
+  mutable std::mutex allocRegistryMu_;
 
   // Buffers whose release was deferred by vcFreeAsync. Each is freed once all
   // work on its stream has completed (frame fences signal). Drained from

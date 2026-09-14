@@ -124,6 +124,20 @@ bool Runtime::pickPhysicalDevice() {
         device_->physical = d;
         device_->computeQueueFamily = i;
         vkGetPhysicalDeviceMemoryProperties(d, &device_->memProps);
+        // Device properties: name, limits (shared mem, workgroup caps,
+        // timestampPeriod), apiVersion. Chain VkPhysicalDeviceSubgroupProperties
+        // to learn the subgroup size (VC's warpSize: 32 NV / 64 AMD).
+        VkPhysicalDeviceSubgroupProperties sub{};
+        sub.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+        VkPhysicalDeviceProperties2 p2{};
+        p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        p2.pNext = &sub;
+        vkGetPhysicalDeviceProperties2(d, &p2);
+        device_->physProps = p2.properties;
+        device_->subgroupSize = (int)sub.subgroupSize;
+        if (device_->subgroupSize == 0) device_->subgroupSize = 1;
+        device_->timestampAvailable =
+            p2.properties.limits.timestampComputeAndGraphics == VK_TRUE;
         return true;
       }
     }
@@ -1128,6 +1142,16 @@ VCError Runtime::createEvent(VCEventHandle *out) {
   if (vkCreateSemaphore(device_->device, &ci, nullptr, &e->semaphore) !=
       VK_SUCCESS)
     return VCError::Unknown;
+  // One-slot timestamp query pool for vcEventElapsedTime. Created even if the
+  // device reports no timestamp support; in that case eventElapsedTime returns
+  // an error rather than failing here (so events still work for sync).
+  if (device_->timestampAvailable) {
+    VkQueryPoolCreateInfo qci{};
+    qci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qci.queryCount = 1;
+    vkCreateQueryPool(device_->device, &qci, nullptr, &e->queryPool);
+  }
   e->value = 1;          // next signal value
   e->lastRecorded = 0;   // nothing recorded yet
   *out = reinterpret_cast<VCEventHandle>(e.get());
@@ -1141,6 +1165,8 @@ VCError Runtime::destroyEvent(VCEventHandle event) {
   vkDeviceWaitIdle(device_->device);
   if (e->semaphore)
     vkDestroySemaphore(device_->device, e->semaphore, nullptr);
+  if (e->queryPool)
+    vkDestroyQueryPool(device_->device, e->queryPool, nullptr);
   for (auto it = events_.begin(); it != events_.end(); ++it) {
     if (it->get() == e) { events_.erase(it); break; }
   }
@@ -1153,7 +1179,9 @@ VCError Runtime::destroyEvent(VCEventHandle event) {
 // submission so the signal is actually emitted (VC's model is one submit per
 // operation; without a flush, the signal would wait for the next operation
 // that may never come). The empty submit still carries the frame's fence, so
-// the stream's recycle semantics are unchanged.
+// the stream's recycle semantics are unchanged. We also reset + write a GPU
+// timestamp query in the same command buffer so vcEventElapsedTime can later
+// read back the GPU-side time at this point.
 VCError Runtime::recordEvent(VCEvent &e, VCStream &s) {
   if (!device_->timelineSemaphore) return VCError::Unknown;
   uint64_t v = e.value++;
@@ -1161,7 +1189,14 @@ VCError Runtime::recordEvent(VCEvent &e, VCStream &s) {
   s.pendingSignals.push_back({e.semaphore, v});
   // Flush: begin/end a frame with no recorded commands. endFrame attaches the
   // pending signal to the submit and clears it.
-  beginFrame(s);
+  VkCommandBuffer cb = beginFrame(s);
+  if (e.queryPool) {
+    // Reset then write at the end of the recorded stream work — ALL_COMMANDS
+    // captures everything submitted so far on this stream.
+    vkCmdResetQueryPool(cb, e.queryPool, 0, 1);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        e.queryPool, 0);
+  }
   endFrame(s);
   return VCError::Success;
 }
@@ -1198,6 +1233,105 @@ VCError Runtime::eventSynchronize(const VCEvent &e) const {
   if (vkWaitSemaphores(device_->device, &wi, UINT64_MAX) != VK_SUCCESS)
     return VCError::Unknown;
   return VCError::Success;
+}
+
+// GPU-side elapsed time between two recorded events. Both must have been
+// recorded (lastRecorded != 0) and reached on the GPU; we read each event's
+// timestamp query with WAIT_BIT so this blocks until the GPU has written both.
+// Ticks are converted to ms via limits.timestampPeriod (ns/tick). Returns
+// InvalidValue if either event was never recorded or lacks a query pool, and
+// NotReady if the device has no timestamp support.
+VCError Runtime::eventElapsedTime(float *ms, const VCEvent &start,
+                                  const VCEvent &end) const {
+  if (!ms) return VCError::InvalidValue;
+  if (!device_->timestampAvailable) return VCError::NotReady;
+  if (start.lastRecorded == 0 || end.lastRecorded == 0)
+    return VCError::InvalidValue; // never recorded
+  if (!start.queryPool || !end.queryPool) return VCError::NotReady;
+  uint64_t t0 = 0, t1 = 0;
+  VkResult r0 = vkGetQueryPoolResults(device_->device, start.queryPool, 0, 1,
+                                      sizeof(t0), &t0, sizeof(t0),
+                                      VK_QUERY_RESULT_64_BIT |
+                                          VK_QUERY_RESULT_WAIT_BIT);
+  VkResult r1 = vkGetQueryPoolResults(device_->device, end.queryPool, 0, 1,
+                                      sizeof(t1), &t1, sizeof(t1),
+                                      VK_QUERY_RESULT_64_BIT |
+                                          VK_QUERY_RESULT_WAIT_BIT);
+  if (r0 != VK_SUCCESS || r1 != VK_SUCCESS) return VCError::Unknown;
+  // timestampPeriod is nanoseconds per tick.
+  double ns = (double)(int64_t)(t1 - t0) * device_->physProps.limits.timestampPeriod;
+  *ms = (float)(ns / 1e6);
+  return VCError::Success;
+}
+
+// Fill VCDeviceProperties from the cached VkPhysicalDeviceProperties + limits.
+// VC is single-device: device must be 0. Fields with no Vulkan equivalent
+// (multiProcessorCount, clockRate) are left at 0.
+VCError Runtime::getDeviceProperties(VCDeviceProperties *out, int device) const {
+  if (!out) return VCError::InvalidValue;
+  if (device != 0) return VCError::InvalidDevice;
+  const auto &p = device_->physProps;
+  const auto &l = p.limits;
+  std::memset(out, 0, sizeof(*out));
+  std::strncpy(out->name, p.deviceName, sizeof(out->name) - 1);
+  out->warpSize = device_->subgroupSize;
+  out->maxThreadsPerBlock = (int)l.maxComputeWorkGroupInvocations;
+  for (int i = 0; i < 3; ++i) {
+    out->maxThreadsDim[i] = (int)l.maxComputeWorkGroupSize[i];
+    out->maxGridSize[i] = (int)l.maxComputeWorkGroupCount[i];
+  }
+  out->sharedMemPerBlock = l.maxComputeSharedMemorySize;
+  out->sharedMemPerMultiprocessor = l.maxComputeSharedMemorySize;
+  // totalGlobalMem: size of the first device-local heap.
+  for (uint32_t i = 0; i < device_->memProps.memoryHeapCount; ++i) {
+    if (device_->memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+      out->totalGlobalMem = device_->memProps.memoryHeaps[i].size;
+      break;
+    }
+  }
+  out->clockRate = 0;            // no Vulkan core query
+  out->multiProcessorCount = 0; // Vulkan does not expose SM/CU count
+  out->major = (int)VK_API_VERSION_MAJOR(p.apiVersion);
+  out->minor = (int)VK_API_VERSION_MINOR(p.apiVersion);
+  return VCError::Success;
+}
+
+// Look up `ptr` in the allocation registry. VC hands out the VCBuffer* itself
+// as the device/host pointer, so a valid pointer is a key in the registry.
+VCError Runtime::pointerGetAttributes(VCPointerAttributes *out,
+                                      const void *ptr) const {
+  if (!out) return VCError::InvalidValue;
+  out->memoryType = VCMemoryType::Unregistered;
+  out->devicePointer = nullptr;
+  out->hostPointer = nullptr;
+  out->size = 0;
+  auto *b = reinterpret_cast<VCBuffer *>(const_cast<void *>(ptr));
+  bool hostVisible = false;
+  {
+    std::lock_guard<std::mutex> lk(allocRegistryMu_);
+    auto it = allocRegistry_.find(b);
+    if (it == allocRegistry_.end()) return VCError::Success; // unregistered
+    hostVisible = it->second;
+  }
+  out->devicePointer = b;        // the handle VC returned
+  out->size = b->size;
+  if (hostVisible) {
+    out->memoryType = VCMemoryType::Host;
+    out->hostPointer = b->mapped; // persistently-mapped host address
+  } else {
+    out->memoryType = VCMemoryType::Device;
+  }
+  return VCError::Success;
+}
+
+void Runtime::registerBuffer(VCBuffer *b, bool hostVisible) {
+  std::lock_guard<std::mutex> lk(allocRegistryMu_);
+  allocRegistry_[b] = hostVisible;
+}
+
+void Runtime::unregisterBuffer(VCBuffer *b) {
+  std::lock_guard<std::mutex> lk(allocRegistryMu_);
+  allocRegistry_.erase(b);
 }
 
 // Stream-ordered host callback (cudaLaunchHostFunc). Vulkan has no native
@@ -1582,12 +1716,25 @@ VCError vcGetDeviceCount(int *count) {
   return VCError::Success;
 }
 
+VCError vcGetDeviceProperties(VCDeviceProperties *out, int device) {
+  if (!Runtime::get().initialized())
+    return VCError::InitializationError;
+  return Runtime::get().getDeviceProperties(out, device);
+}
+
+VCError vcPointerGetAttributes(VCPointerAttributes *out, const void *ptr) {
+  if (!Runtime::get().initialized())
+    return VCError::InitializationError;
+  return Runtime::get().pointerGetAttributes(out, ptr);
+}
+
 VCError vcMalloc(void **devPtr, size_t bytes) {
   if (!devPtr) return VCError::InvalidValue;
   auto *b = new VCBuffer{};
   VCError e = Runtime::get().mallocBuffer(bytes, *b);
   if (e != VCError::Success) { delete b; return e; }
   *devPtr = b;
+  Runtime::get().registerBuffer(b, /*hostVisible=*/false);
   return VCError::Success;
 }
 
@@ -1597,12 +1744,14 @@ VCError vcMallocHost(void **hostPtr, size_t bytes) {
   VCError e = Runtime::get().mallocHostBuffer(bytes, *b);
   if (e != VCError::Success) { delete b; return e; }
   *hostPtr = b;
+  Runtime::get().registerBuffer(b, /*hostVisible=*/true);
   return VCError::Success;
 }
 
 VCError vcFree(void *devPtr) {
   if (!devPtr) return VCError::Success;
   auto *b = reinterpret_cast<VCBuffer *>(devPtr);
+  Runtime::get().unregisterBuffer(b);
   VCError e = Runtime::get().freeBuffer(*b);
   delete b;
   return e;
@@ -1631,6 +1780,10 @@ VCError vcFreeAsync(void *devPtr, VCStreamHandle stream) {
   if (!devPtr) return VCError::Success;
   auto *b = reinterpret_cast<VCBuffer *>(devPtr);
   auto &rt = Runtime::get();
+  // Drop from the registry now: a subsequent vcPointerGetAttributes on this
+  // pointer reports Unregistered (matching cudaFreeAsync semantics). The
+  // underlying buffer is reclaimed later, once the stream's work completes.
+  rt.unregisterBuffer(b);
   return rt.freeBufferAsync(b, rt.resolveStream(stream));
 }
 
@@ -1849,6 +2002,13 @@ VCError vcEventQuery(VCEventHandle event, int *done) {
 VCError vcEventSynchronize(VCEventHandle event) {
   if (!event) return VCError::InvalidValue;
   return Runtime::get().eventSynchronize(*reinterpret_cast<VCEvent *>(event));
+}
+
+VCError vcEventElapsedTime(float *ms, VCEventHandle start, VCEventHandle end) {
+  if (!start || !end) return VCError::InvalidValue;
+  return Runtime::get().eventElapsedTime(
+      ms, *reinterpret_cast<VCEvent *>(start),
+      *reinterpret_cast<VCEvent *>(end));
 }
 
 VCError vcLoadKernel(const uint32_t *spirvWords, size_t wordCount,
