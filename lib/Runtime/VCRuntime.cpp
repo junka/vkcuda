@@ -26,6 +26,7 @@ const char *vcErrorString(VCError err) {
   case VCError::InvalidDevice: return "invalid device";
   case VCError::InitializationError: return "initialization error";
   case VCError::MapFailed: return "map failed";
+  case VCError::NotReady: return "not ready";
   default: return "unknown error";
   }
 }
@@ -45,6 +46,22 @@ debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
               const VkDebugUtilsMessengerCallbackDataEXT *data, void *) {
   (void)data;
   return VK_FALSE;
+}
+
+Runtime::~Runtime() {
+  // Safety net: if the program exits without vcShutdown, the singleton's
+  // destructor still runs. Join the host-func thread to avoid std::terminate
+  // from destroying a joinable std::thread. If init() was never called or
+  // shutdown() already ran, there is nothing to do.
+  if (!init_) return;
+  hostFuncStop_ = true;
+  if (hostFuncThread_.joinable()) hostFuncThread_.join();
+  // Best-effort device teardown (shutdown() does the full job normally).
+  if (device_) {
+    vkDeviceWaitIdle(device_->device);
+    vkDestroyDevice(device_->device, nullptr);
+    vkDestroyInstance(device_->instance, nullptr);
+  }
 }
 
 VCError Runtime::init() {
@@ -83,6 +100,10 @@ VCError Runtime::init() {
   if (!createPipelineCache()) return VCError::InitializationError;
 
   init_ = true;
+  // Background thread dispatches vcLaunchHostFunc callbacks once their
+  // stream-ordered semaphore signals. Started after init_ so it sees a valid
+  // device; joined at the top of shutdown().
+  hostFuncThread_ = std::thread(&Runtime::hostFuncLoop, this);
   return VCError::Success;
 }
 
@@ -246,6 +267,12 @@ bool Runtime::createPipelineCache() {
 VCError Runtime::shutdown() {
   if (!init_) return VCError::Success;
   vkDeviceWaitIdle(device_->device);
+  // Stop the host-callback thread first: it dispatches any remaining
+  // vcLaunchHostFunc callbacks (the device is idle, so their semaphores have
+  // all signaled) then exits. Must join before tearing down the device the
+  // thread polls.
+  hostFuncStop_ = true;
+  if (hostFuncThread_.joinable()) hostFuncThread_.join();
   // Reclaim any buffers whose release was deferred by vcFreeAsync — the device
   // is idle, so they are all safe to free now (avoids leaking them).
   drainPendingFrees();
@@ -334,10 +361,42 @@ VCError Runtime::streamSynchronize(VCStream &s) {
   // Now every fence is signaled: deliver all deferred D2H readbacks so the
   // caller can read the host destinations immediately after sync returns.
   drainReadyReadbacks(*device_, s);
+  // Dispatch any stream-ordered host callbacks (vcLaunchHostFunc) whose
+  // semaphore signaled with the stream's submissions — they are due now.
+  // Also covers callbacks whose semaphore has not yet signaled: the stream's
+  // fences are done, so the empty-submit signal must have fired too; loop a
+  // few polls to let the timeline counter propagate.
+  for (int i = 0; i < 64; ++i) {
+    size_t before = 0;
+    { std::lock_guard<std::mutex> lk(hostFuncMu_); before = pendingHostFuncs_.size(); }
+    if (before == 0) break;
+    drainHostFuncs();
+    size_t after = 0;
+    { std::lock_guard<std::mutex> lk(hostFuncMu_); after = pendingHostFuncs_.size(); }
+    if (after == 0) break;
+    // Still pending (semaphore counter not yet visible): wait briefly for the
+    // GPU/driver to publish it, then retry.
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
   // Reclaim buffers whose release was deferred by vcFreeAsync on this stream —
   // its work is now done, so they are safe to free.
   drainPendingFrees();
   return VCError::Success;
+}
+
+// Non-blocking completion query: a stream is "done" when every frame's fence
+// has signaled (i.e. no submission is in flight). Mirrors cudaStreamQuery.
+VCError Runtime::streamQuery(const VCStream &s, int *done) const {
+  if (!done) return VCError::InvalidValue;
+  *done = 1;
+  for (auto &f : s.frames) {
+    if (f.fence != VK_NULL_HANDLE &&
+        vkGetFenceStatus(device_->device, f.fence) != VK_SUCCESS) {
+      *done = 0; // at least one frame still executing
+      break;
+    }
+  }
+  return VCError::Success; // query succeeded; *done reflects the state
 }
 
 // Wait for the frame we're about to reuse, reset it, begin recording.
@@ -641,6 +700,88 @@ void Runtime::drainPendingFrees() {
       ++it;
     }
   }
+}
+
+// 2D pitched D2D copy: height rows of `width` bytes, src stride spitch, dst
+// stride dpitch. vkCmdCopyBuffer accepts multiple regions in one call, so this
+// is a single submit with one region per row — no copy kernel needed.
+VCError Runtime::copy2DAsync(VCBuffer &dst, size_t dpitch, const VCBuffer &src,
+                             size_t spitch, size_t width, size_t height,
+                             VCStream &s) {
+  if (width == 0 || height == 0) return VCError::Success;
+  std::vector<VkBufferCopy> regions(height);
+  for (size_t r = 0; r < height; ++r)
+    regions[r] = {r * spitch, r * dpitch, width};
+  if (s.captureTarget) {
+    vkCmdCopyBuffer(s.captureTarget->secondaryCB, src.buffer, dst.buffer,
+                    static_cast<uint32_t>(height), regions.data());
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(s.captureTarget->secondaryCB,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+    return VCError::Success;
+  }
+  VkCommandBuffer cb = beginFrame(s);
+  vkCmdCopyBuffer(cb, src.buffer, dst.buffer,
+                  static_cast<uint32_t>(height), regions.data());
+  endFrame(s);
+  return VCError::Success;
+}
+
+VCError Runtime::copy2D(VCBuffer &dst, size_t dpitch, const VCBuffer &src,
+                        size_t spitch, size_t width, size_t height,
+                        VCStream &s) {
+  VCError e = copy2DAsync(dst, dpitch, src, spitch, width, height, s);
+  if (e != VCError::Success) return e;
+  streamSynchronize(s);
+  return VCError::Success;
+}
+
+// 2D pitched fill: height rows of `width` bytes at stride `pitch`. width must
+// be a multiple of 4 (vkCmdFillBuffer). One vkCmdFillBuffer per row, all in the
+// same command buffer — Vulkan executes recorded commands in order, so no
+// intervening barrier is needed.
+VCError Runtime::memset2DBufferAsync(VCBuffer &buf, size_t pitch, int value,
+                                     size_t width, size_t height,
+                                     VCStream &s) {
+  if (width == 0 || height == 0) return VCError::Success;
+  if (width % 4 != 0) return VCError::InvalidValue;
+  uint32_t fill = (uint32_t)(uint8_t)value * 0x01010101u;
+  if (s.captureTarget) {
+    for (size_t r = 0; r < height; ++r)
+      vkCmdFillBuffer(s.captureTarget->secondaryCB, buf.buffer, r * pitch,
+                      width, fill);
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(s.captureTarget->secondaryCB,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+    return VCError::Success;
+  }
+  VkCommandBuffer cb = beginFrame(s);
+  for (size_t r = 0; r < height; ++r)
+    vkCmdFillBuffer(cb, buf.buffer, r * pitch, width, fill);
+  endFrame(s);
+  return VCError::Success;
+}
+
+VCError Runtime::memset2DBuffer(VCBuffer &buf, size_t pitch, int value,
+                                size_t width, size_t height, VCStream &s) {
+  VCError e = memset2DBufferAsync(buf, pitch, value, width, height, s);
+  if (e != VCError::Success) return e;
+  streamSynchronize(s);
+  return VCError::Success;
 }
 
 // Primitive: record vkCmdCopyBuffer(src.buf -> dst.buf) on stream s.
@@ -1059,6 +1200,113 @@ VCError Runtime::eventSynchronize(const VCEvent &e) const {
   return VCError::Success;
 }
 
+// Stream-ordered host callback (cudaLaunchHostFunc). Vulkan has no native
+// stream-ordered host callback, so we approximate it with a one-shot timeline
+// semaphore signaled at the stream's current tail (the same empty-submit
+// trick recordEvent uses) plus a background thread that polls the semaphore
+// counter and invokes the callback once it signals. This preserves the
+// essential contract: the callback runs after all work already submitted to
+// the stream, without the host having to poll.
+VCError Runtime::launchHostFunc(VCStream &s, VCHostFn fn, void *userData) {
+  if (!fn) return VCError::InvalidValue;
+  if (!device_->timelineSemaphore) return VCError::Unknown;
+
+  // One-shot timeline semaphore, signaled at value 1.
+  VkSemaphoreTypeCreateInfo sti{};
+  sti.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+  sti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  sti.initialValue = 0;
+  VkSemaphoreCreateInfo sci{};
+  sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  sci.pNext = &sti;
+  VkSemaphore sem = VK_NULL_HANDLE;
+  if (vkCreateSemaphore(device_->device, &sci, nullptr, &sem) != VK_SUCCESS)
+    return VCError::OutOfMemory;
+
+  // Signal sem@1 at the stream's current tail: push a pending signal, then
+  // flush an empty submit (beginFrame+endFrame with no recorded commands).
+  // endFrame attaches the pending signal via the timeline submit info path.
+  s.pendingSignals.push_back({sem, 1});
+  beginFrame(s);
+  endFrame(s);
+
+  {
+    std::lock_guard<std::mutex> lk(hostFuncMu_);
+    pendingHostFuncs_.push_back({sem, 1, fn, userData});
+  }
+  return VCError::Success;
+}
+
+// Background thread: poll every pending callback's semaphore counter; once it
+// reaches `value` the preceding stream work is done, so dispatch the callback
+// (outside the lock, so callbacks may re-enter the runtime) and destroy the
+// semaphore. On shutdown (hostFuncStop_ set) drain whatever remains first.
+void Runtime::hostFuncLoop() {
+  while (true) {
+    // Collect any callbacks whose semaphore has signaled, dispatch them
+    // outside the lock (a callback may re-enter the runtime).
+    std::vector<PendingHostFunc> ready;
+    {
+      std::lock_guard<std::mutex> lk(hostFuncMu_);
+      for (auto it = pendingHostFuncs_.begin();
+           it != pendingHostFuncs_.end();) {
+        uint64_t cur = 0;
+        if (vkGetSemaphoreCounterValue(device_->device, it->sem, &cur) == VK_SUCCESS
+            && cur >= it->value) {
+          ready.push_back(*it);
+          vkDestroySemaphore(device_->device, it->sem, nullptr);
+          it = pendingHostFuncs_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    for (auto &h : ready) h.fn(h.userData);
+
+    if (hostFuncStop_.load()) {
+      // Shutdown path: the device is idle (shutdown called vkDeviceWaitIdle),
+      // so every remaining semaphore has signaled. Dispatch + destroy them.
+      std::lock_guard<std::mutex> lk(hostFuncMu_);
+      for (auto &h : pendingHostFuncs_) {
+        h.fn(h.userData);
+        vkDestroySemaphore(device_->device, h.sem, nullptr);
+      }
+      pendingHostFuncs_.clear();
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+// Dispatch any pending host callbacks whose semaphore has already signaled
+// (i.e. the stream work preceding them is done). Called by streamSynchronize
+// after waiting the stream's fences: the stream's submissions — including the
+// empty submits that signal host-func semaphores — have all completed, so the
+// callbacks are due. Dispatching here (rather than waiting for the background
+// thread's next poll) makes vcStreamSynchronize also wait for stream-ordered
+// host callbacks, which is what callers expect. Safe vs. the background thread:
+// we move the entries out of the shared list under the same lock, so the thread
+// cannot double-dispatch them.
+void Runtime::drainHostFuncs() {
+  std::vector<PendingHostFunc> ready;
+  {
+    std::lock_guard<std::mutex> lk(hostFuncMu_);
+    for (auto it = pendingHostFuncs_.begin();
+         it != pendingHostFuncs_.end();) {
+      uint64_t cur = 0;
+      if (vkGetSemaphoreCounterValue(device_->device, it->sem, &cur) == VK_SUCCESS
+          && cur >= it->value) {
+        ready.push_back(*it);
+        vkDestroySemaphore(device_->device, it->sem, nullptr);
+        it = pendingHostFuncs_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (auto &h : ready) h.fn(h.userData);
+}
+
 //----------------------------------------------------------------------------
 // Kernels / pipelines
 //----------------------------------------------------------------------------
@@ -1436,6 +1684,36 @@ VCError vcMemcpyAsync(void *dst, const void *src, size_t count,
   return vcMemcpyAsyncS(dst, src, count, kind, nullptr);
 }
 
+// 2D pitched copies. Only DeviceToDevice is supported: both pointers must be
+// vcMalloc handles. The 2D region is height rows of width bytes; row r of the
+// source is at r*spitch, row r of the dst at r*dpitch.
+VCError vcMemcpy2DAsync(void *dst, size_t dpitch, const void *src, size_t spitch,
+                        size_t width, size_t height, VCMemcpyKind kind,
+                        VCStreamHandle stream) {
+  if (kind != VCMemcpyKind::DeviceToDevice) return VCError::InvalidValue;
+  auto *db = reinterpret_cast<VCBuffer *>(dst);
+  auto *sb = reinterpret_cast<VCBuffer *>(const_cast<void *>(src));
+  if (!db || !sb) return VCError::InvalidValue;
+  auto &rt = Runtime::get();
+  return rt.copy2DAsync(*db, dpitch, *sb, spitch, width, height,
+                        rt.resolveStream(stream));
+}
+
+VCError vcMemcpy2DS(void *dst, size_t dpitch, const void *src, size_t spitch,
+                    size_t width, size_t height, VCMemcpyKind kind,
+                    VCStreamHandle stream) {
+  VCError e = vcMemcpy2DAsync(dst, dpitch, src, spitch, width, height, kind,
+                              stream);
+  if (e != VCError::Success) return e;
+  auto &rt = Runtime::get();
+  return rt.streamSynchronize(rt.resolveStream(stream));
+}
+
+VCError vcMemcpy2D(void *dst, size_t dpitch, const void *src, size_t spitch,
+                   size_t width, size_t height, VCMemcpyKind kind) {
+  return vcMemcpy2DS(dst, dpitch, src, spitch, width, height, kind, nullptr);
+}
+
 VCError vcMemset(void *devPtr, int value, size_t count) {
   return vcMemsetS(devPtr, value, count, nullptr);
 }
@@ -1459,6 +1737,25 @@ VCError vcMemsetAsync(void *devPtr, int value, size_t count) {
   return vcMemsetAsyncS(devPtr, value, count, nullptr);
 }
 
+// 2D pitched fill: height rows of width bytes at stride pitch. width must be a
+// multiple of 4 (vkCmdFillBuffer).
+VCError vcMemset2DAsync(void *dst, size_t pitch, int value, size_t width,
+                        size_t height, VCStreamHandle stream) {
+  if (!dst) return VCError::InvalidValue;
+  auto *b = reinterpret_cast<VCBuffer *>(dst);
+  auto &rt = Runtime::get();
+  return rt.memset2DBufferAsync(*b, pitch, value, width, height,
+                                rt.resolveStream(stream));
+}
+
+VCError vcMemset2D(void *dst, size_t pitch, int value, size_t width,
+                   size_t height) {
+  VCError e = vcMemset2DAsync(dst, pitch, value, width, height, nullptr);
+  if (e != VCError::Success) return e;
+  auto &rt = Runtime::get();
+  return rt.streamSynchronize(rt.resolveStream(nullptr));
+}
+
 VCError vcDeviceSynchronize() { return Runtime::get().synchronize(); }
 
 VCError vcStreamCreate(VCStreamHandle *out) {
@@ -1472,6 +1769,16 @@ VCError vcStreamDestroy(VCStreamHandle stream) {
 VCError vcStreamSynchronize(VCStreamHandle stream) {
   auto &rt = Runtime::get();
   return rt.streamSynchronize(rt.resolveStream(stream));
+}
+
+VCError vcStreamQuery(VCStreamHandle stream, int *done) {
+  auto &rt = Runtime::get();
+  return rt.streamQuery(rt.resolveStream(stream), done);
+}
+
+VCError vcLaunchHostFunc(VCStreamHandle stream, VCHostFn fn, void *userData) {
+  auto &rt = Runtime::get();
+  return rt.launchHostFunc(rt.resolveStream(stream), fn, userData);
 }
 
 //----------------------------------------------------------------------------

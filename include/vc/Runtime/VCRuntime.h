@@ -62,6 +62,7 @@ enum class VCError {
   InvalidDevice,
   InitializationError,
   MapFailed,
+  NotReady, // a non-blocking query found work still in flight
   Unknown,
 };
 
@@ -159,6 +160,35 @@ VCError vcMemsetAsyncS(void *devPtr, int value, size_t count,
 /// Asynchronous fill on the default stream. Convenience wrapper.
 VCError vcMemsetAsync(void *devPtr, int value, size_t count);
 
+/// 2D pitched copy of a `width`x`height` byte region: row `r` of the source
+/// (at offset `r*spitch`) is copied to row `r` of the destination (at offset
+/// `r*dpitch`). Only DeviceToDevice is supported (both pointers from vcMalloc).
+/// Synchronous on the default stream. Equivalent to cudaMemcpy2D (D2D).
+VCError vcMemcpy2D(void *dst, size_t dpitch, const void *src, size_t spitch,
+                   size_t width, size_t height, VCMemcpyKind kind);
+
+/// Like vcMemcpy2D but on an explicit `stream` (NULL = default stream).
+VCError vcMemcpy2DS(void *dst, size_t dpitch, const void *src, size_t spitch,
+                    size_t width, size_t height, VCMemcpyKind kind,
+                    VCStreamHandle stream);
+
+/// Asynchronous 2D pitched copy on `stream` (NULL = default stream). Only
+/// DeviceToDevice. Caller must vcStreamSynchronize before reading.
+VCError vcMemcpy2DAsync(void *dst, size_t dpitch, const void *src, size_t spitch,
+                        size_t width, size_t height, VCMemcpyKind kind,
+                        VCStreamHandle stream);
+
+/// 2D pitched fill: `width`x`height` bytes of `dst` (row `r` at `r*pitch`)
+/// set to `value` (byte, broadcast). `width` must be a multiple of 4.
+/// Synchronous on the default stream. Equivalent to cudaMemset2D.
+VCError vcMemset2D(void *dst, size_t pitch, int value, size_t width,
+                   size_t height);
+
+/// Asynchronous 2D pitched fill on `stream` (NULL = default stream). `width`
+/// must be a multiple of 4. Caller must vcStreamSynchronize before reading.
+VCError vcMemset2DAsync(void *dst, size_t pitch, int value, size_t width,
+                        size_t height, VCStreamHandle stream);
+
 /// Block until all queued device work is complete.
 VCError vcDeviceSynchronize();
 
@@ -170,6 +200,21 @@ VCError vcStreamDestroy(VCStreamHandle stream);
 
 /// Block until all work queued on `stream` is complete. NULL = default stream.
 VCError vcStreamSynchronize(VCStreamHandle stream);
+
+/// Non-blocking query: `done` is set to 1 if all work queued on `stream` has
+/// completed, 0 otherwise. NULL = default stream. Equivalent to
+/// cudaStreamQuery (returns Success with *done rather than a NotReady error).
+VCError vcStreamQuery(VCStreamHandle stream, int *done);
+
+/// Host callback type for vcLaunchHostFunc.
+using VCHostFn = void (*)(void *userData);
+
+/// Queue a host function `fn` to run on `stream` (NULL = default stream) after
+/// all work already submitted to the stream completes. This is stream-ordered:
+/// the callback runs once the GPU reaches this point, without the host polling.
+/// Mirrors cudaLaunchHostFunc. The callback runs on an internal runtime thread;
+/// it must not block or call vcShutdown. It MAY submit further work to streams.
+VCError vcLaunchHostFunc(VCStreamHandle stream, VCHostFn fn, void *userData);
 
 //----------------------------------------------------------------------------
 // Stream events (cross-stream synchronization)

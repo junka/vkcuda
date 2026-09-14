@@ -7,9 +7,12 @@
 
 #include <vulkan/vulkan.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -157,6 +160,11 @@ class Runtime {
 public:
   static Runtime &get();
 
+  // Safety net: if the program exits without calling vcShutdown, the Meyers
+  // singleton is destroyed and the background host-func thread would be joinable
+  // -> std::terminate. The destructor signals stop + joins so that path is safe.
+  ~Runtime();
+
   VCError init();
   VCError shutdown();
   bool initialized() const { return bool(device_); }
@@ -169,6 +177,12 @@ public:
   VCError createStream(VCStreamHandle *out);
   VCError destroyStream(VCStreamHandle stream);
   VCError streamSynchronize(VCStream &s);
+  // Non-blocking: *done = 1 if all the stream's frame fences are signaled.
+  VCError streamQuery(const VCStream &s, int *done) const;
+  // Stream-ordered host callback: signal a one-shot timeline semaphore at the
+  // stream's current tail (empty submit), record {sem, value, fn, userData}
+  // for the background thread to dispatch once the semaphore signals.
+  VCError launchHostFunc(VCStream &s, VCHostFn fn, void *userData);
 
   // Frame lifecycle on a stream.
   // beginFrame: wait for the next frame's previous submission, reset its
@@ -199,6 +213,21 @@ public:
   // `s` has completed (its frame fences signal). Safe to call while GPU work
   // referencing the buffer is still in flight on `s` (cudaFreeAsync semantics).
   VCError freeBufferAsync(VCBuffer *buf, VCStream &s);
+  // 2D pitched D2D copy: height rows of `width` bytes, src stride spitch, dst
+  // stride dpitch. One submit with height VkBufferCopy regions (no kernel).
+  VCError copy2D(VCBuffer &dst, size_t dpitch, const VCBuffer &src,
+                 size_t spitch, size_t width, size_t height,
+                 VCStream &s);                          // sync
+  VCError copy2DAsync(VCBuffer &dst, size_t dpitch, const VCBuffer &src,
+                      size_t spitch, size_t width, size_t height,
+                      VCStream &s);                     // async
+  // 2D pitched fill: height rows of `width` bytes at stride `pitch`. width
+  // must be a multiple of 4. height vkCmdFillBuffer calls, one per row.
+  VCError memset2DBuffer(VCBuffer &buf, size_t pitch, int value, size_t width,
+                         size_t height, VCStream &s);   // sync
+  VCError memset2DBufferAsync(VCBuffer &buf, size_t pitch, int value,
+                              size_t width, size_t height,
+                              VCStream &s);              // async
   // Copy primitives, all recorded on stream `s`:
   VCError copyDeviceToDevice(VCBuffer &dst, const VCBuffer &src, size_t bytes,
                              VCStream &s);                 // async
@@ -275,6 +304,28 @@ private:
   struct PendingFree { VCBuffer *buf; VCStream *stream; };
   std::vector<PendingFree> pendingFrees_;
   void drainPendingFrees();
+
+  // Stream-ordered host callbacks (vcLaunchHostFunc). Each entry's semaphore
+  // is signaled at the stream's tail when the preceding work completes; the
+  // background thread polls the counter and invokes the callback (unlocked)
+  // once it reaches `value`, then destroys the semaphore.
+  struct PendingHostFunc {
+    VkSemaphore sem;
+    uint64_t value;
+    VCHostFn fn;
+    void *userData;
+  };
+  std::vector<PendingHostFunc> pendingHostFuncs_;
+  std::mutex hostFuncMu_;
+  std::atomic<bool> hostFuncStop_{false};
+  std::thread hostFuncThread_;
+  void hostFuncLoop(); // background thread entry: poll + dispatch callbacks
+  // Dispatch any pending host callbacks whose timeline semaphore has signaled.
+  // Called by streamSynchronize (after the stream's fences are done) so that
+  // stream-ordered callbacks have run by the time sync returns. Moves entries
+  // out of the shared list under hostFuncMu_ so the background thread cannot
+  // double-dispatch them.
+  void drainHostFuncs();
 
   bool pickPhysicalDevice();
   bool createLogicalDevice();

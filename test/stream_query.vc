@@ -1,0 +1,129 @@
+// test/stream_query.vc — vcStreamQuery, vcLaunchHostFunc, 2D memcpy/memset.
+//
+// Three CUDA Runtime API gaps filled:
+//   vcStreamQuery     — non-blocking "is the stream done?" (cudaStreamQuery)
+//   vcLaunchHostFunc  — stream-ordered host callback (cudaLaunchHostFunc)
+//   vcMemcpy2D/Async  — pitched 2D device-to-device copy (cudaMemcpy2D)
+//   vcMemset2D/Async  — pitched 2D fill (cudaMemset2D)
+//
+//   vcc test/stream_query.vc -o build/sq_sf && ./build/sq_sf
+//   vc  test/stream_query.vc -emit=full -o build/sq_m && ./build/sq_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void fillConst(float *a, float v, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) a[i] = v;
+}
+
+// Host callback: sets the int pointed to by userData. Runs on the runtime's
+// background thread once the stream's preceding GPU work completes.
+// (Not `static` — the VC frontend parser does not accept storage qualifiers
+// on plain host functions; a bare definition is emitted to host C++ as-is.)
+void setFlag(void *p) {
+  *(int *)p = 1;
+}
+
+int main() {
+  vcInit();
+
+  VCStreamHandle s = 0;
+  vcStreamCreate(&s);
+
+  // ---- 1. vcStreamQuery: async launch, query done==0, sync, query done==1.
+  float *d = 0;
+  vcMalloc((void **)&d, 256 * 4);
+  fillConst<<<256, 32, 0, s>>>(d, 3.0f, 256);
+
+  int done = 0;
+  vcStreamQuery(s, &done);
+  // The launch was async; right after submitting, the stream may or may not be
+  // done. We can't assert done==0 deterministically (a tiny launch could
+  // finish instantly), so just record it. The real check is after sync.
+  int queriedBefore = done;
+
+  vcStreamSynchronize(s);
+  vcStreamQuery(s, &done);
+  if (done != 1) {
+    printf("stream_query: FAIL (done=%d after sync, queriedBefore=%d)\n",
+           done, queriedBefore);
+    return 1;
+  }
+
+  // ---- 2. vcMemcpy2D: copy a 4-wide x 4-tall sub-block of a 4x8 src matrix
+  //         into a 4x4 dst (dst pitch 4, src pitch 8). Verifies per-row stride.
+  // src layout (8 floats/row), we copy cols [0..3] of rows [0..3]:
+  //   row0: 0 1 2 3 | 9 9 9 9     -> dst row0: 0 1 2 3
+  //   row1: 4 5 6 7 | 9 9 9 9     -> dst row1: 4 5 6 7
+  //   row2: 8 9 10 11 | 9 9 9 9   -> dst row2: 8 9 10 11
+  //   row3: 12 13 14 15 | 9 9 9 9 -> dst row3: 12 13 14 15
+  float *srcD = 0, *dstD = 0;
+  vcMalloc((void **)&srcD, 4 * 8 * 4); // 4 rows x 8 cols x 4 bytes
+  vcMalloc((void **)&dstD, 4 * 4 * 4); // 4 rows x 4 cols x 4 bytes
+
+  // Fill src: row r col c = r*8 + c; the right half (cols 4..7) = 99.
+  float hSrc[32];
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 8; c++)
+      hSrc[r * 8 + c] = (c < 4) ? (float)(r * 8 + c) : 99.0f;
+  vcMemcpyS(srcD, hSrc, 4 * 8 * 4, VCMemcpyKind::HostToDevice, s);
+
+  // 2D copy: width=4 floats=16 bytes, height=4, spitch=8*4=32, dpitch=4*4=16.
+  vcMemcpy2DS(dstD, 16, srcD, 32, 16, 4, VCMemcpyKind::DeviceToDevice, s);
+  vcStreamSynchronize(s);
+
+  float hDst[16];
+  vcMemcpyS(hDst, dstD, 4 * 4 * 4, VCMemcpyKind::DeviceToHost, s);
+  vcStreamSynchronize(s);
+  int ok = 1;
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++)
+      if (hDst[r * 4 + c] != (float)(r * 8 + c)) { ok = 0; }
+  if (!ok) {
+    printf("stream_query: FAIL (2D copy)\n");
+    return 1;
+  }
+
+  // ---- 3. vcMemset2D: zero out a 2-wide x 3-tall sub-block of a 4x4 matrix
+  //         (pitch 16 bytes). Then the untouched cells must keep their value.
+  float *mD = 0;
+  vcMalloc((void **)&mD, 4 * 4 * 4);
+  fillConst<<<16, 32, 0, s>>>(mD, 7.0f, 16);
+  vcStreamSynchronize(s);
+  // Zero cols [0..1] of rows [0..2]: width=8 bytes, height=3, pitch=16.
+  vcMemset2DAsync(mD, 16, 0, 8, 3, s);
+  vcStreamSynchronize(s);
+  float hM[16];
+  vcMemcpyS(hM, mD, 4 * 4 * 4, VCMemcpyKind::DeviceToHost, s);
+  vcStreamSynchronize(s);
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++) {
+      float want = (r < 3 && c < 2) ? 0.0f : 7.0f;
+      if (hM[r * 4 + c] != want) { ok = 0; }
+    }
+  if (!ok) {
+    printf("stream_query: FAIL (2D memset)\n");
+    return 1;
+  }
+
+  // ---- 4. vcLaunchHostFunc: queue a host callback after a launch; it must
+  //         run once the stream reaches it. We sync after to guarantee it ran.
+  int flag = 0;
+  fillConst<<<16, 32, 0, s>>>(mD, 5.0f, 16);
+  vcLaunchHostFunc(s, setFlag, &flag);
+  vcStreamSynchronize(s);
+  if (flag != 1) {
+    printf("stream_query: FAIL (host func not invoked)\n");
+    return 1;
+  }
+
+  vcFree(d);
+  vcFree(srcD);
+  vcFree(dstD);
+  vcFree(mD);
+  vcStreamDestroy(s);
+  vcShutdown();
+  printf("stream_query: PASS\n");
+  return 0;
+}
