@@ -1,0 +1,131 @@
+// test/indirect.vc — vkCmdDispatchIndirect (device-driven grid).
+//
+// Exercises vcLaunchKernelIndirect(S): the workgroup counts {x,y,z} are read
+// from a device buffer (a VkDispatchIndirectCommand) instead of being
+// host-supplied. A first kernel computes the grid it wants (mimicking a
+// reduce that decides how many workgroups the next pass needs) and writes it
+// to the args buffer; the second launch reads that grid from the buffer with
+// no host round-trip.
+//
+// The direct launches use the <<<grid,block>>> sugar (which auto-loads the
+// kernel handle __vc_k_<name>); the indirect launch passes that same handle
+// to vcLaunchKernelIndirect explicitly.
+//
+//   vcc test/indirect.vc -o build/ind_sf && ./build/ind_sf
+//   vc  test/indirect.vc -emit=full -o build/ind_m && ./build/ind_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// Writes the workgroup counts {x, y, z} a consumer kernel should launch,
+// given an element count `n` and a block size `block`. Thread 0 writes:
+//   out[0] = ceil(n / block)   (workgroups in X)
+//   out[1] = 1
+//   out[2] = 1
+// This stands in for a reduce/scan that computes "how many workgroups the
+// next pass needs" from device-side data.
+__global__ void computeGrid(int *out, int n, int block) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    int wg = (n + block - 1) / block;
+    out[0] = wg;
+    out[1] = 1;
+    out[2] = 1;
+  }
+}
+
+// Consumer: each thread writes a recognizable value a[i] = base + i. Launched
+// indirectly with grid dims from the args buffer.
+__global__ void fillIdx(int *a, int base, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) a[i] = base + i;
+}
+
+int main() {
+  vcInit();
+
+  const int N = 100000;       // not a multiple of BLOCK on purpose
+  const int BLOCK = 256;
+  const size_t bytes = N * sizeof(int);
+
+  int *data = 0;
+  int *argsBuf = 0;           // holds {x,y,z} (12 bytes)
+  if (vcMalloc((void **)&data, bytes) != VCError::Success ||
+      vcMalloc((void **)&argsBuf, 12) != VCError::Success) {
+    printf("indirect: FAIL (malloc)\n");
+    vcShutdown();
+    return 1;
+  }
+
+  // 1. Device computes the grid it wants (no host reads it back). The <<<>>
+  //    sugar loads the kernel handle and packs (argsBuf, N, BLOCK) as args.
+  computeGrid<<<1, 1>>>(argsBuf, N, BLOCK);
+  vcDeviceSynchronize();
+
+  // 2. Prime the fillIdx kernel handle via the <<<>>> sugar. The sugar's
+  //    lazy load fires at a launch site and resolves the SPIR-V entry-point
+  //    name portably (GLSL backend names it "main"; the MLIR backend names it
+  //    after the kernel symbol). vcLaunchKernelIndirect takes the handle
+  //    directly, so we do a direct launch first — its result is also the
+  //    cross-check below — then reuse the loaded handle for the indirect call.
+  int base = 700000;
+  vcMemset(data, 0, bytes);
+  fillIdx<<<N, BLOCK>>>(data, base, N);   // direct launch; loads __vc_k_fillIdx
+  vcDeviceSynchronize();
+
+  // 3. Verify the DIRECT launch covered all N elements. (vcMallocHost returns
+  //    a VCBuffer* handle whose payload lives at a separate mapped address;
+  //    vcPointerGetAttributes exposes it as hostPointer. vcMemcpy D2H writes
+  //    the mapped payload, not the handle struct.)
+  int *hostHandle = 0;
+  vcMallocHost((void **)&hostHandle, bytes);
+  vcMemcpy(hostHandle, data, bytes, VCMemcpyKind::DeviceToHost);
+  VCPointerAttributes attr;
+  vcPointerGetAttributes(&attr, hostHandle);
+  int *host = (int *)attr.hostPointer;
+  int ok = 1;
+  int firstBad = -1, firstBadVal = 0;
+  for (int i = 0; i < N; ++i)
+    if (host[i] != base + i) { ok = 0; firstBad = i; firstBadVal = host[i]; break; }
+  if (!ok) fprintf(stderr, "DIRECT bad: host[%d]=%d expected %d\n", firstBad, firstBadVal, base + firstBad);
+  vcFree(hostHandle);
+
+  // 4. Indirect launch: grid {x,y,z} read from argsBuf[0..11] (the values
+  //    computeGrid wrote in step 1). Block is still host-supplied (specializes
+  //    the pipeline). The kernel args (data, base, N) are passed as a
+  //    VCKernelArg array, exactly as the <<<>>> sugar would build them.
+  //    __vc_k_fillIdx was loaded by step 2's direct launch.
+  vcMemset(data, 0, bytes);
+  VCKernelArg fiArgs[3] = {{VCKernelArg::Pointer, data, 0}, {VCKernelArg::Scalar, &base, sizeof(base)}, {VCKernelArg::Scalar, (void *)&N, sizeof(N)}};
+  VCError ie = vcLaunchKernelIndirect(__vc_k_fillIdx, argsBuf, 0, BLOCK, 1, 1, fiArgs, 3);
+  if (ie != VCError::Success) {
+    printf("indirect: FAIL (vcLaunchKernelIndirect err=%d)\n", (int)ie);
+    vcShutdown();
+    return 1;
+  }
+  vcDeviceSynchronize();
+
+  // 5. Verify the INDIRECT launch covered all N elements with the SAME grid
+  //    the device computed (no host round-trip).
+  int *host2Handle = 0;
+  vcMallocHost((void **)&host2Handle, bytes);
+  vcMemcpy(host2Handle, data, bytes, VCMemcpyKind::DeviceToHost);
+  VCPointerAttributes attr2;
+  vcPointerGetAttributes(&attr2, host2Handle);
+  int *host2 = (int *)attr2.hostPointer;
+  int ok2 = 1, firstBad2 = -1, firstBadVal2 = 0;
+  for (int i = 0; i < N; ++i)
+    if (host2[i] != base + i) { ok2 = 0; firstBad2 = i; firstBadVal2 = host2[i]; break; }
+  if (!ok2) fprintf(stderr, "INDIRECT bad: host2[%d]=%d expected %d\n", firstBad2, firstBadVal2, base + firstBad2);
+  if (!ok2) ok = 0;
+  vcFree(host2Handle);
+
+  vcFree(data);
+  vcFree(argsBuf);
+  vcShutdown();
+  if (!ok) {
+    printf("indirect: FAIL (data mismatch)\n");
+    return 1;
+  }
+  printf("indirect: PASS\n");
+  return 0;
+}

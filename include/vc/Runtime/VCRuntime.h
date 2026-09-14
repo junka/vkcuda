@@ -416,6 +416,26 @@ VCError vcLaunchKernel2DS(VCKernelHandle kernel, unsigned gridDimX,
                           unsigned blockDimY, const VCKernelArg *args,
                           int argCount, VCStreamHandle stream);
 
+/// Indirect dispatch on `stream` (NULL = default stream): the workgroup counts
+/// {x, y, z} are read from `indirectArgs` at byte `offset` (a
+/// VkDispatchIndirectCommand — 3 contiguous uint32) via vkCmdDispatchIndirect,
+/// instead of being host-supplied. `indirectArgs` is a normal vcMalloc device
+/// buffer; it is typically written by a prior kernel (e.g. a reduce that
+/// computes the remaining work) so the next launch's grid is device-driven
+/// with no host round-trip. `blockX/Y/Z` specialize the pipeline (as
+/// vcLaunchKernel). `indirectArgs` must be on the same device as `stream`.
+VCError vcLaunchKernelIndirectS(VCKernelHandle kernel, void *indirectArgs,
+                                size_t offset, unsigned blockX,
+                                unsigned blockY, unsigned blockZ,
+                                const VCKernelArg *args, int argCount,
+                                VCStreamHandle stream);
+
+/// Indirect dispatch on the default stream. Convenience wrapper.
+VCError vcLaunchKernelIndirect(VCKernelHandle kernel, void *indirectArgs,
+                               size_t offset, unsigned blockX,
+                               unsigned blockY, unsigned blockZ,
+                               const VCKernelArg *args, int argCount);
+
 /// Human-readable string for an error code.
 const char *vcErrorString(VCError err);
 

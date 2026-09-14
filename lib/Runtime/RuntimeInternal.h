@@ -312,6 +312,33 @@ public:
                               unsigned blockY, unsigned blockZ,
                               const VCKernelArg *args, int argCount);
 
+  // Shared bind sequence for direct + indirect dispatch: get/create the
+  // pipeline (specialized to blockX/Y/Z), allocate + write the descriptor
+  // set for pointer args, pack scalars into push constants, and record
+  // vkCmdBindPipeline + vkCmdBindDescriptorSets + vkCmdPushConstants into
+  // `cb`. Returns the bound pipeline (VK_NULL_HANDLE on failure). Does NOT
+  // dispatch — the caller records vkCmdDispatch(Indirect).
+  VkPipeline bindKernelForDispatch(VkCommandBuffer cb, VkDescriptorPool dpool,
+                                   VCKernel &k, int deviceIdx, unsigned blockX,
+                                   unsigned blockY, unsigned blockZ,
+                                   const VCKernelArg *args, int argCount);
+
+  // Indirect dispatch: same bind sequence as recordDispatchInto, but the
+  // workgroup counts {x,y,z} are read from `indirectArgs` at `offset`
+  // (a VkDispatchIndirectCommand) via vkCmdDispatchIndirect. The grid is
+  // device-driven — no host round-trip. `indirectArgs` must be on the same
+  // device as the stream/graph (`deviceIdx`).
+  VCError recordDispatchIndirectInto(VkCommandBuffer cb, VkDescriptorPool dpool,
+                                     VCKernel &k, int deviceIdx,
+                                     const VCBuffer &indirectArgs,
+                                     size_t offset, unsigned blockX,
+                                     unsigned blockY, unsigned blockZ,
+                                     const VCKernelArg *args, int argCount);
+  VCError dispatchIndirect(VCKernel &k, const VCBuffer &indirectArgs,
+                           size_t offset, unsigned blockX, unsigned blockY,
+                           unsigned blockZ, const VCKernelArg *args,
+                           int argCount, VCStream &s);
+
   VCError synchronize();
 
   // ---- Command graphs (record/replay) ----
@@ -343,6 +370,14 @@ public:
   // allocation and its kind (Device vs Host).
   void registerBuffer(VCBuffer *b, bool hostVisible);
   void unregisterBuffer(VCBuffer *b);
+
+  // Resolve a D2H destination to the address bytes should be written to. If
+  // `hostDst` is a registered host-visible VCBuffer (from vcMallocHost), the
+  // caller passed the *handle* (VCBuffer*), not the mapped payload address —
+  // writing `bytes` there would clobber the struct. Return its persistently
+  // mapped host pointer instead. Otherwise `hostDst` is a plain host pointer
+  // (stack/heap array) and is returned unchanged.
+  void *resolveHostWriteTarget(void *hostDst) const;
 
   // ---- Cross-device copy (host-bridge) ----
   // Copies `bytes` from src buffer (on srcDevice) to dst buffer (on dstDevice).

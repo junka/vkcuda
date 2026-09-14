@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 
@@ -375,7 +376,8 @@ static void drainReadyReadbacks(VulkanDevice &dev, VCStream &s) {
     if (!f.d2hReadbacks.empty() && f.fence != VK_NULL_HANDLE) {
       if (vkGetFenceStatus(dev.device, f.fence) == VK_SUCCESS) {
         for (auto &rb : f.d2hReadbacks)
-          std::memcpy(rb.hostDst, rb.staging->mapped, rb.bytes);
+          std::memcpy(Runtime::get().resolveHostWriteTarget(rb.hostDst),
+                      rb.staging->mapped, rb.bytes);
         f.d2hReadbacks.clear();
       }
     }
@@ -444,7 +446,7 @@ VkCommandBuffer Runtime::beginFrame(VCStream &s) {
   // frame has executed: deliver deferred D2H readbacks to their host targets.
   // (The caller is responsible for having synchronized before reading.)
   for (auto &rb : f.d2hReadbacks)
-    std::memcpy(rb.hostDst, rb.staging->mapped, rb.bytes);
+    std::memcpy(resolveHostWriteTarget(rb.hostDst), rb.staging->mapped, rb.bytes);
   f.d2hReadbacks.clear();
   // Drop the frame's staging buffers now that the GPU is done with them.
   for (auto &sb : f.stagingBuffers) freeBuffer(*sb);
@@ -557,7 +559,8 @@ static VkBuffer createBuffer(VkDevice dev, size_t bytes) {
   bci.size = bytes;
   bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-              VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+              VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+              VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
   bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   VkBuffer buf = VK_NULL_HANDLE;
   vkCreateBuffer(dev, &bci, nullptr, &buf);
@@ -931,7 +934,7 @@ VCError Runtime::copyDeviceToHost(void *hostDst, const VCBuffer &src,
   vkCmdCopyBuffer(cb, src.buffer, scratch.buffer, 1, &region);
   endFrame(s);
   streamSynchronize(s);
-  std::memcpy(hostDst, scratch.mapped, bytes);
+  std::memcpy(resolveHostWriteTarget(hostDst), scratch.mapped, bytes);
   freeBuffer(scratch);
   return VCError::Success;
 }
@@ -1453,6 +1456,18 @@ VCError Runtime::pointerGetAttributes(VCPointerAttributes *out,
   return VCError::Success;
 }
 
+void *Runtime::resolveHostWriteTarget(void *hostDst) const {
+  if (!hostDst) return hostDst;
+  auto *b = reinterpret_cast<VCBuffer *>(hostDst);
+  {
+    std::lock_guard<std::mutex> lk(allocRegistryMu_);
+    auto it = allocRegistry_.find(b);
+    if (it != allocRegistry_.end() && it->second && b->mapped)
+      return b->mapped; // host-visible VCBuffer: write the mapped payload
+  }
+  return hostDst; // plain stack/heap pointer: write directly
+}
+
 void Runtime::registerBuffer(VCBuffer *b, bool hostVisible) {
   std::lock_guard<std::mutex> lk(allocRegistryMu_);
   allocRegistry_[b] = hostVisible;
@@ -1744,19 +1759,25 @@ VkPipeline Runtime::getPipeline(VCKernel &k, int deviceIdx, unsigned blockX,
 // Launch
 //----------------------------------------------------------------------------
 
-VCError Runtime::recordDispatchInto(VkCommandBuffer cb, VkDescriptorPool dpool,
-                                     VCKernel &k, int deviceIdx, unsigned wgX,
-                                     unsigned wgY, unsigned wgZ,
-                                     unsigned blockX, unsigned blockY,
-                                     unsigned blockZ,
-                                     const VCKernelArg *args, int argCount) {
-  if (k.spirvWords.empty()) return VCError::InvalidKernel;
+// Shared bind sequence: get/create the pipeline specialized to the block size,
+// allocate + write the descriptor set for pointer args, pack scalars into push
+// constants, and record vkCmdBindPipeline + vkCmdBindDescriptorSets +
+// vkCmdPushConstants into `cb`. Returns the bound pipeline (VK_NULL_HANDLE on
+// failure). Does NOT dispatch — the caller records vkCmdDispatch(Indirect).
+VkPipeline Runtime::bindKernelForDispatch(VkCommandBuffer cb,
+                                          VkDescriptorPool dpool,
+                                          VCKernel &k, int deviceIdx,
+                                          unsigned blockX, unsigned blockY,
+                                          unsigned blockZ,
+                                          const VCKernelArg *args,
+                                          int argCount) {
+  if (k.spirvWords.empty()) return VK_NULL_HANDLE;
   VCKernelDeviceState *st = getOrCreateKernelDeviceState(k, deviceIdx);
-  if (!st) return VCError::InvalidKernel;
+  if (!st) return VK_NULL_HANDLE;
   VkDevice dev = devices_[deviceIdx]->device;
   VkPipeline pipeline = getPipeline(k, deviceIdx, blockX, blockY, blockZ,
                                     args, argCount);
-  if (!pipeline) return VCError::InvalidKernel;
+  if (!pipeline) return VK_NULL_HANDLE;
 
   VkDescriptorSet set = VK_NULL_HANDLE;
   // Only allocate a set if there are pointer args (SSBO bindings).
@@ -1771,7 +1792,7 @@ VCError Runtime::recordDispatchInto(VkCommandBuffer cb, VkDescriptorPool dpool,
     ai.pSetLayouts = &st->descriptorSetLayout;
     vkAllocateDescriptorSets(dev, &ai, &set);
   }
-  if (hasPointer && !set) return VCError::Unknown;
+  if (hasPointer && !set) return VK_NULL_HANDLE;
 
   // Write descriptor bindings for pointer args (consecutive binding index).
   std::vector<VkDescriptorBufferInfo> bufInfos;
@@ -1819,14 +1840,17 @@ VCError Runtime::recordDispatchInto(VkCommandBuffer cb, VkDescriptorPool dpool,
   if (!pcData.empty())
     vkCmdPushConstants(cb, st->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        static_cast<uint32_t>(pcData.size()), pcData.data());
-  vkCmdDispatch(cb, wgX, wgY, wgZ);
-  // Make the dispatch's SSBO writes visible to subsequent commands in the
-  // same command buffer (copies, later dispatches). Within a single Vulkan
-  // command buffer, a later vkCmdCopyBuffer/vkCmdDispatch does NOT
-  // automatically see an earlier dispatch's memory writes without a barrier.
-  // For graph capture (secondary cb) this is essential: the recorded ops must
-  // form a correct pipeline. For the normal per-frame path the barrier is
-  // harmless (the submit's fence is the only cross-cb sync the caller needs).
+  return pipeline;
+}
+
+// Make a dispatch's SSBO writes visible to subsequent commands in the same
+// command buffer (copies, later dispatches, indirect reads). Within a single
+// Vulkan command buffer, a later vkCmdCopyBuffer/vkCmdDispatch does NOT
+// automatically see an earlier dispatch's memory writes without a barrier.
+// For graph capture (secondary cb) this is essential: the recorded ops must
+// form a correct pipeline. For the normal per-frame path the barrier is
+// harmless (the submit's fence is the only cross-cb sync the caller needs).
+static void emitPostDispatchBarrier(VkCommandBuffer cb) {
   VkMemoryBarrier mb{};
   mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
   mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1836,6 +1860,57 @@ VCError Runtime::recordDispatchInto(VkCommandBuffer cb, VkDescriptorPool dpool,
                        VK_PIPELINE_STAGE_TRANSFER_BIT |
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+
+VCError Runtime::recordDispatchInto(VkCommandBuffer cb, VkDescriptorPool dpool,
+                                     VCKernel &k, int deviceIdx, unsigned wgX,
+                                     unsigned wgY, unsigned wgZ,
+                                     unsigned blockX, unsigned blockY,
+                                     unsigned blockZ,
+                                     const VCKernelArg *args, int argCount) {
+  VkPipeline pipeline = bindKernelForDispatch(cb, dpool, k, deviceIdx, blockX,
+                                              blockY, blockZ, args, argCount);
+  if (!pipeline) return VCError::InvalidKernel;
+  vkCmdDispatch(cb, wgX, wgY, wgZ);
+  emitPostDispatchBarrier(cb);
+  return VCError::Success;
+}
+
+// Indirect dispatch: grid {x,y,z} read from `indirectArgs` at `offset`
+// (a VkDispatchIndirectCommand) via vkCmdDispatchIndirect. The bind sequence
+// is identical to the direct path; only the source of the grid dims differs.
+// A barrier makes the prior shader/transfer writes to `indirectArgs` visible
+// to the indirect-command read (COMPUTE_SHADER|TRANSFER -> DRAW_INDIRECT).
+VCError Runtime::recordDispatchIndirectInto(VkCommandBuffer cb,
+                                            VkDescriptorPool dpool,
+                                            VCKernel &k, int deviceIdx,
+                                            const VCBuffer &indirectArgs,
+                                            size_t offset, unsigned blockX,
+                                            unsigned blockY, unsigned blockZ,
+                                            const VCKernelArg *args,
+                                            int argCount) {
+  if (!indirectArgs.buffer) return VCError::InvalidValue;
+  // offset must be within the buffer and leave room for 12 bytes.
+  if (offset > indirectArgs.size ||
+      indirectArgs.size - offset < 3 * sizeof(uint32_t))
+    return VCError::InvalidValue;
+  // Ensure prior writes to the args buffer are visible to the indirect read.
+  VkMemoryBarrier preMb{};
+  preMb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  preMb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT |
+                        VK_ACCESS_TRANSFER_WRITE_BIT;
+  preMb.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+  vkCmdPipelineBarrier(cb,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                       0, 1, &preMb, 0, nullptr, 0, nullptr);
+
+  VkPipeline pipeline = bindKernelForDispatch(cb, dpool, k, deviceIdx, blockX,
+                                              blockY, blockZ, args, argCount);
+  if (!pipeline) return VCError::InvalidKernel;
+  vkCmdDispatchIndirect(cb, indirectArgs.buffer, offset);
+  emitPostDispatchBarrier(cb);
   return VCError::Success;
 }
 
@@ -1855,6 +1930,35 @@ VCError Runtime::dispatch(VCKernel &k, unsigned wgX, unsigned wgY,
   VCError e = recordDispatchInto(cb, s.frames[s.frameIdx].descriptorPool, k,
                                   s.deviceIdx, wgX, wgY, wgZ, blockX, blockY,
                                   blockZ, args, argCount);
+  if (e != VCError::Success) return e;
+  endFrame(s);
+  return VCError::Success;
+}
+
+// Indirect dispatch on a stream: grid dims come from `indirectArgs` (written
+// by prior device work) instead of host values. Graph capture records into
+// the graph's secondary cb; otherwise it is wrapped in beginFrame/endFrame
+// like a normal dispatch. `indirectArgs` must be on the same device as the
+// stream (vkCmdDispatchIndirect reads a VkBuffer that must belong to the
+// VkDevice that owns the command buffer).
+VCError Runtime::dispatchIndirect(VCKernel &k, const VCBuffer &indirectArgs,
+                                  size_t offset, unsigned blockX,
+                                  unsigned blockY, unsigned blockZ,
+                                  const VCKernelArg *args, int argCount,
+                                  VCStream &s) {
+  if (indirectArgs.deviceIdx != s.deviceIdx)
+    return VCError::InvalidDevice;
+  if (s.captureTarget) {
+    VCGraph &g = *s.captureTarget;
+    return recordDispatchIndirectInto(g.secondaryCB, g.descriptorPool, k,
+                                      g.deviceIdx, indirectArgs, offset,
+                                      blockX, blockY, blockZ, args, argCount);
+  }
+  VkCommandBuffer cb = beginFrame(s);
+  VCError e = recordDispatchIndirectInto(cb, s.frames[s.frameIdx].descriptorPool,
+                                         k, s.deviceIdx, indirectArgs, offset,
+                                         blockX, blockY, blockZ, args,
+                                         argCount);
   if (e != VCError::Success) return e;
   endFrame(s);
   return VCError::Success;
@@ -2282,6 +2386,28 @@ VCError vcLaunchKernel2D(VCKernelHandle kernel, unsigned gridDimX,
                          int argCount) {
   return vcLaunchKernel2DS(kernel, gridDimX, gridDimY, blockDimX, blockDimY,
                            args, argCount, nullptr);
+}
+
+VCError vcLaunchKernelIndirectS(VCKernelHandle kernel, void *indirectArgs,
+                                size_t offset, unsigned blockX,
+                                unsigned blockY, unsigned blockZ,
+                                const VCKernelArg *args, int argCount,
+                                VCStreamHandle stream) {
+  if (!kernel) return VCError::InvalidKernel;
+  if (!indirectArgs) return VCError::InvalidValue;
+  auto &rt = Runtime::get();
+  auto *k = reinterpret_cast<VCKernel *>(kernel);
+  auto *argsBuf = reinterpret_cast<VCBuffer *>(indirectArgs);
+  return rt.dispatchIndirect(*k, *argsBuf, offset, blockX, blockY, blockZ,
+                             args, argCount, rt.resolveStream(stream));
+}
+
+VCError vcLaunchKernelIndirect(VCKernelHandle kernel, void *indirectArgs,
+                               size_t offset, unsigned blockX,
+                               unsigned blockY, unsigned blockZ,
+                               const VCKernelArg *args, int argCount) {
+  return vcLaunchKernelIndirectS(kernel, indirectArgs, offset, blockX, blockY,
+                                 blockZ, args, argCount, nullptr);
 }
 
 } // namespace vc
