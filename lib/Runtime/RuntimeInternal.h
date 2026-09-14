@@ -18,6 +18,8 @@
 
 namespace vc {
 
+struct VCStream; // forward: VulkanDevice owns a per-device default stream
+
 /// All long-lived Vulkan handles for one logical device + compute queue.
 struct VulkanDevice {
   VkInstance instance = VK_NULL_HANDLE;
@@ -34,6 +36,10 @@ struct VulkanDevice {
   bool timestampAvailable = false; // limits.timestampComputeAndGraphics
   bool headless = true; // no surface/swapchain
   bool timelineSemaphore = false; // VK_KHR_timeline_semaphore / Vulkan 1.2 core
+  // Per-device default stream. CUDA gives each device its own default stream;
+  // vcSetDevice(i) makes resolveStream(NULL) return devices_[i]->defaultStream.
+  // unique_ptr because VCStream is forward-declared at this point.
+  std::unique_ptr<VCStream> defaultStream;
 };
 
 /// A device buffer + its backing memory. May be device-local (mapped==nullptr)
@@ -44,6 +50,7 @@ struct VCBuffer {
   size_t size = 0;
   void *mapped = nullptr; // non-null when persistently mapped (host-visible)
   bool hostVisible = false;
+  int deviceIdx = 0; // which device owns this allocation (for free/peer copy)
 };
 
 /// A frame in a stream's command-buffer ring. One command buffer + the fence
@@ -81,6 +88,7 @@ struct StreamFrame {
 struct VCStream {
   VkQueue queue = VK_NULL_HANDLE;
   uint32_t queueFamily = 0;
+  int deviceIdx = 0; // which device this stream's queue belongs to
   VkCommandPool commandPool = VK_NULL_HANDLE;
   std::vector<StreamFrame> frames;
   size_t frameIdx = 0; // next frame to record into
@@ -102,21 +110,31 @@ struct VCStream {
 
 /// A loaded kernel: shader module + descriptor/pipeline layouts + a cache of
 /// already-built pipelines keyed by (block dims, scalar-arg layout).
-struct VCKernel {
+/// Per-device Vulkan objects for a kernel. A VCKernel can be launched on any
+/// device: each device it touches lazily gets its own shader module, layout,
+/// and pipeline cache (all VkHandles are device-local and cannot be shared
+/// across VkDevices). The SPIR-V words themselves are device-independent and
+/// held once on the VCKernel.
+struct VCKernelDeviceState {
   VkShaderModule shaderModule = VK_NULL_HANDLE;
   VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
   VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
-  std::string entryPoint;
-  int argCount = 0;
-  // Push-constant range (offset/size) for scalar args, in bytes. size==0
-  // means no push constants. Layout is built lazily on first launch once the
-  // scalar/pointer arg arrangement is known.
-  uint32_t pcOffset = 0;
-  uint32_t pcSize = 0;
   bool layoutBuilt = false;
   // Cache: key = packed (blockX, blockY, blockZ) -> pipeline. Pipelines are
   // specialized on workgroup size, so one per distinct block shape.
   std::unordered_map<uint64_t, VkPipeline> pipelines;
+};
+
+struct VCKernel {
+  std::vector<uint32_t> spirvWords; // device-independent SPIR-V
+  std::string entryPoint;
+  int argCount = 0;
+  // Push-constant range (offset/size) for scalar args, in bytes. size==0
+  // means no push constants. Layout is built once per device and cached there.
+  uint32_t pcOffset = 0;
+  uint32_t pcSize = 0;
+  // Per-device state, lazily created on first launch on that device.
+  std::unordered_map<int, std::unique_ptr<VCKernelDeviceState>> perDevice;
 };
 
 /// A recorded command graph (CUDA-Graph-style record/replay). While
@@ -133,6 +151,7 @@ struct VCGraph {
   VkDescriptorPool descriptorPool = VK_NULL_HANDLE; // graph-lifetime sets
   bool recording = false;
   bool recorded = false;
+  int deviceIdx = 0; // which device this graph was recorded on
   // Persistent staging for H2D (and D2H) copies recorded into the graph.
   // These must outlive the graph's replays, so they live here, not as
   // transient scratch.
@@ -157,6 +176,7 @@ struct VCEvent {
   VkSemaphore semaphore = VK_NULL_HANDLE;
   uint64_t value = 1;          // next counter to signal on record
   uint64_t lastRecorded = 0;   // counter of the most recent record (0 = none)
+  int deviceIdx = 0;           // which device this event's semaphore lives on
   // GPU timestamp query for vcEventElapsedTime. One-slot query pool written by
   // vkCmdWriteTimestamp at record time; the counter is read back (with WAIT) by
   // eventElapsedTime. VC events always carry timing (no disable-timing flag).
@@ -174,11 +194,20 @@ public:
 
   VCError init();
   VCError shutdown();
-  bool initialized() const { return bool(device_); }
+  bool initialized() const { return !devices_.empty(); }
 
-  VulkanDevice &device() { return *device_; }
+  // The current device (set by vcSetDevice). Most host operations target it;
+  // operations that take a stream/buffer use that object's own deviceIdx
+  // instead so they stay correct after a device switch.
+  VulkanDevice &device() { return *devices_[currentDeviceIdx_]; }
+  const VulkanDevice &device() const { return *devices_[currentDeviceIdx_]; }
+  size_t deviceCount() const { return devices_.size(); }
+  int currentDevice() const { return currentDeviceIdx_; }
+  VCError setDevice(int idx);
+  VulkanDevice &deviceAt(int idx) { return *devices_[idx]; }
 
-  // Resolve a public stream handle to the internal stream; NULL -> default.
+  // Resolve a public stream handle to the internal stream; NULL -> the
+  // current device's default stream.
   VCStream &resolveStream(VCStreamHandle h);
 
   VCError createStream(VCStreamHandle *out);
@@ -207,6 +236,8 @@ public:
 
   VCError mallocBuffer(size_t bytes, VCBuffer &out);          // device-local
   VCError mallocHostBuffer(size_t bytes, VCBuffer &out);      // host-visible
+  VCError mallocHostBufferOn(int deviceIdx, size_t bytes,
+                             VCBuffer &out); // host-visible on a specific device
   VCError freeBuffer(VCBuffer &buf);
   // Fill `bytes` of `buf` (offset 0) with byte `value` broadcast to uint32.
   // bytes must be a multiple of 4 (vkCmdFillBuffer constraint). Sync blocks;
@@ -257,13 +288,15 @@ public:
   VCError loadKernelFromFile(const char *path, const char *entryPoint,
                              VCKernel &out);
   void releaseKernel(VCKernel &k);
+  // Lazily create the per-device shader module for `k` on `deviceIdx`.
+  VCKernelDeviceState *getOrCreateKernelDeviceState(VCKernel &k, int deviceIdx);
 
   // Build (or fetch cached) the compute pipeline specialized to the block
-  // size. Lazily builds the descriptor/pipeline layout on first call using
-  // the scalar/pointer arrangement of `args`.
-  VkPipeline getPipeline(VCKernel &k, unsigned blockX, unsigned blockY,
-                         unsigned blockZ, const VCKernelArg *args,
-                         int argCount);
+  // size, on `deviceIdx`. Lazily builds the descriptor/pipeline layout on
+  // first call using the scalar/pointer arrangement of `args`.
+  VkPipeline getPipeline(VCKernel &k, int deviceIdx, unsigned blockX,
+                         unsigned blockY, unsigned blockZ,
+                         const VCKernelArg *args, int argCount);
 
   // Core launch: record bind+dispatch into the stream's current frame.
   VCError dispatch(VCKernel &k, unsigned wgX, unsigned wgY, unsigned wgZ,
@@ -274,10 +307,10 @@ public:
   // descriptor pool (used by graph capture, which records into a secondary
   // command buffer instead of submitting).
   VCError recordDispatchInto(VkCommandBuffer cb, VkDescriptorPool dpool,
-                              VCKernel &k, unsigned wgX, unsigned wgY,
-                              unsigned wgZ, unsigned blockX, unsigned blockY,
-                              unsigned blockZ, const VCKernelArg *args,
-                              int argCount);
+                              VCKernel &k, int deviceIdx, unsigned wgX,
+                              unsigned wgY, unsigned wgZ, unsigned blockX,
+                              unsigned blockY, unsigned blockZ,
+                              const VCKernelArg *args, int argCount);
 
   VCError synchronize();
 
@@ -311,9 +344,18 @@ public:
   void registerBuffer(VCBuffer *b, bool hostVisible);
   void unregisterBuffer(VCBuffer *b);
 
+  // ---- Cross-device copy (host-bridge) ----
+  // Copies `bytes` from src buffer (on srcDevice) to dst buffer (on dstDevice).
+  // Same-device falls through to the normal D2D path. Cross-device routes
+  // through host staging (src D2H -> memcpy -> dst H2D); true P2P is a TODO.
+  VCError copyPeer(VCBuffer &dst, int dstDevice, const VCBuffer &src,
+                   int srcDevice, size_t bytes);
+
 private:
-  std::unique_ptr<VulkanDevice> device_;
-  std::unique_ptr<VCStream> defaultStream_;
+  // All enumerated Vulkan devices; currentDeviceIdx_ selects the active one
+  // (CUDA cudaSetDevice model). Each VulkanDevice owns its own default stream.
+  std::vector<std::unique_ptr<VulkanDevice>> devices_;
+  int currentDeviceIdx_ = 0;
   std::vector<std::unique_ptr<VCStream>> streams_; // owns created streams
   std::vector<std::unique_ptr<VCGraph>> graphs_;   // owns created graphs
   std::vector<std::unique_ptr<VCEvent>> events_;   // owns created events
@@ -342,6 +384,7 @@ private:
     uint64_t value;
     VCHostFn fn;
     void *userData;
+    int deviceIdx = 0; // device the semaphore was created on (must query/destroy there)
   };
   std::vector<PendingHostFunc> pendingHostFuncs_;
   std::mutex hostFuncMu_;
@@ -355,14 +398,18 @@ private:
   // double-dispatch them.
   void drainHostFuncs();
 
-  bool pickPhysicalDevice();
-  bool createLogicalDevice();
-  bool createDefaultStream();
-  bool createPipelineCache();
-  bool buildLayout(VCKernel &k, const VCKernelArg *args, int argCount);
+  // Enumerate all physical devices with a compute queue and build a
+  // VulkanDevice (logical device + default stream + pipeline cache) for each.
+  bool enumerateDevices(VkInstance instance);
+  // Create the logical device + compute queue for one VulkanDevice.
+  bool setupLogicalDevice(VulkanDevice &vd);
+  bool buildLayout(VCKernel &k, int deviceIdx, const VCKernelArg *args,
+                    int argCount);
   // Find a memory type index satisfying `flags` among `reqBits`.
   uint32_t findMemoryType(uint32_t reqBits,
                           VkMemoryPropertyFlags flags) const;
+  static uint32_t findMemoryTypeOn(const VulkanDevice &vd, uint32_t reqBits,
+                                   VkMemoryPropertyFlags flags);
 };
 
 } // namespace vc

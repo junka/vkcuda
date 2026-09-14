@@ -1,0 +1,150 @@
+// test/multigpu.vc — multi-device selection + cross-device peer copy.
+//
+// Exercises the multi-GPU device model added to the VC runtime:
+//   vcGetDeviceCount   — real enumeration (no longer hardcoded 1)
+//   vcGetDevice        — current device index (cudaGetDevice)
+//   vcSetDevice        — select current device (cudaSetDevice)
+//   vcMemcpyPeer       — cross-device copy (cudaMemcpyPeer), host-bridge MVP
+//
+// The host machine may have only one Vulkan device (e.g. a single Intel iGPU).
+// In that case the test exercises the single-device path: setDevice(0),
+// alloc/launch on device 0, and a degenerate peer copy 0->0 (which must still
+// be correct — same-device falls through to an ordinary D2D copy). With two or
+// more devices it additionally allocates on each, peer-copies 0->1, and
+// verifies the bytes landed on device 1.
+//
+//   vcc test/multigpu.vc -o build/mg_sf && ./build/mg_sf
+//   vc  test/multigpu.vc -emit=full -o build/mg_m && ./build/mg_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// Fill a device buffer with a recognizable per-thread pattern, so a peer copy
+// can be verified by reading the pattern back on the destination device.
+__global__ void fillPattern(int *a, int base, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) a[i] = base + i;
+}
+
+int main() {
+  vcInit();
+
+  int devCount = 0;
+  if (vcGetDeviceCount(&devCount) != VCError::Success || devCount < 1) {
+    printf("multigpu: FAIL (no devices)\n");
+    vcShutdown();
+    return 1;
+  }
+  printf("device count: %d\n", devCount);
+
+  // ---- current-device get/set round trip ----
+  int cur = -1;
+  if (vcGetDevice(&cur) != VCError::Success || cur != 0) {
+    printf("multigpu: FAIL (default current device != 0, got %d)\n", cur);
+    vcShutdown();
+    return 1;
+  }
+  // Out-of-range set must be rejected.
+  if (vcSetDevice(devCount) == VCError::Success) {
+    printf("multigpu: FAIL (vcSetDevice(out-of-range) accepted)\n");
+    vcShutdown();
+    return 1;
+  }
+  // Valid set must succeed and update current.
+  if (vcSetDevice(0) != VCError::Success) {
+    printf("multigpu: FAIL (vcSetDevice(0))\n");
+    vcShutdown();
+    return 1;
+  }
+  if (vcGetDevice(&cur) != VCError::Success || cur != 0) {
+    printf("multigpu: FAIL (current not 0 after setDevice(0))\n");
+    vcShutdown();
+    return 1;
+  }
+
+  const int N = 1024;
+  const size_t bytes = N * sizeof(int);
+
+  // ---- device 0: allocate + launch a fill ----
+  vcSetDevice(0);
+  int *buf0 = 0;
+  if (vcMalloc((void **)&buf0, bytes) != VCError::Success) {
+    printf("multigpu: FAIL (malloc device 0)\n");
+    vcShutdown();
+    return 1;
+  }
+  fillPattern<<<(N + 255) / 256, 256>>>(buf0, 1000, N);
+  vcDeviceSynchronize();
+
+  // ---- peer copy 0 -> 0 (degenerate same-device) ----
+  int *buf0b = 0;
+  vcMalloc((void **)&buf0b, bytes);
+  if (vcMemcpyPeer(buf0b, 0, buf0, 0, bytes) != VCError::Success) {
+    printf("multigpu: FAIL (peer copy 0->0)\n");
+    vcShutdown();
+    return 1;
+  }
+  // Read back and verify a few elements.
+  int hostCheck[8];
+  vcMemcpy(hostCheck, buf0b, 8 * sizeof(int), VCMemcpyKind::DeviceToHost);
+  int ok = 1;
+  for (int i = 0; i < 8; ++i)
+    if (hostCheck[i] != 1000 + i) { ok = 0; break; }
+  if (!ok) {
+    printf("multigpu: FAIL (peer 0->0 data mismatch)\n");
+    vcShutdown();
+    return 1;
+  }
+
+  if (devCount >= 2) {
+    // ---- device 1: allocate, peer-copy 0->1, verify ----
+    vcSetDevice(1);
+    int *buf1 = 0;
+    if (vcMalloc((void **)&buf1, bytes) != VCError::Success) {
+      printf("multigpu: FAIL (malloc device 1)\n");
+      vcShutdown();
+      return 1;
+    }
+    // Cross-device peer copy: source on device 0, dest on device 1.
+    if (vcMemcpyPeer(buf1, 1, buf0, 0, bytes) != VCError::Success) {
+      printf("multigpu: FAIL (peer copy 0->1)\n");
+      vcShutdown();
+      return 1;
+    }
+    // Read back on device 1 (current device is 1, so D2H uses device 1).
+    int hostRead[8];
+    vcMemcpy(hostRead, buf1, 8 * sizeof(int), VCMemcpyKind::DeviceToHost);
+    for (int i = 0; i < 8; ++i)
+      if (hostRead[i] != 1000 + i) { ok = 0; break; }
+    if (!ok) {
+      printf("multigpu: FAIL (peer 0->1 data mismatch)\n");
+      vcShutdown();
+      return 1;
+    }
+    // Also launch a kernel on device 1 to confirm the device is usable.
+    fillPattern<<<(N + 255) / 256, 256>>>(buf1, 2000, N);
+    vcDeviceSynchronize();
+    vcMemcpy(hostRead, buf1, 8 * sizeof(int), VCMemcpyKind::DeviceToHost);
+    for (int i = 0; i < 8; ++i)
+      if (hostRead[i] != 2000 + i) { ok = 0; break; }
+    if (!ok) {
+      printf("multigpu: FAIL (device 1 launch data mismatch)\n");
+      vcShutdown();
+      return 1;
+    }
+
+    // Free device-1 buffer while current device is 0 (exercises free-by-deviceIdx).
+    vcSetDevice(0);
+    vcFree(buf1);
+    printf("multigpu: 0->1 peer copy + device-1 launch verified\n");
+  } else {
+    printf("multigpu: single-device — peer copy degenerate same-device verified\n");
+  }
+
+  vcSetDevice(0);
+  vcFree(buf0);
+  vcFree(buf0b);
+  vcShutdown();
+  printf("multigpu: PASS\n");
+  return 0;
+}

@@ -80,11 +80,22 @@ VCError vcInit();
 /// Tear down the runtime and release all device resources.
 VCError vcShutdown();
 
-/// Query the number of available Vulkan devices.
+/// Query the number of available Vulkan devices (every physical device with a
+/// compute queue that VC enumerated at init).
 VCError vcGetDeviceCount(int *count);
 
+/// Return the index of the current device (cudaGetDevice). The current device
+/// is selected by vcSetDevice and defaults to 0; it governs where subsequent
+/// vcMalloc / vcLoadKernel / vcStreamCreate / the default stream land.
+VCError vcGetDevice(int *device);
+
+/// Select the current device (cudaSetDevice). `device` must be in
+/// [0, vcGetDeviceCount()). Existing allocations/streams/kernels stay on the
+/// device they were created on — switching does not migrate them.
+VCError vcSetDevice(int device);
+
 /// Device properties mirroring the commonly-used fields of cudaDeviceProp.
-/// VC is single-device, so `device` must be 0. Fields that have no Vulkan
+/// `device` may be any valid device index. Fields that have no Vulkan
 /// equivalent (multiProcessorCount, clockRate) are filled with 0 — see field
 /// comments. `warpSize` is the Vulkan subgroup size (32 on NVIDIA, 64 on AMD).
 struct VCDeviceProperties {
@@ -102,8 +113,8 @@ struct VCDeviceProperties {
   int minor;             // Vulkan API minor
 };
 
-/// Fill `out` with the properties of `device` (must be 0). Equivalent to a
-/// subset of cudaGetDeviceProperties.
+/// Fill `out` with the properties of `device` (any valid index). Equivalent to
+/// a subset of cudaGetDeviceProperties.
 VCError vcGetDeviceProperties(VCDeviceProperties *out, int device);
 
 /// The kind of memory a pointer points into, for vcPointerGetAttributes.
@@ -187,6 +198,23 @@ VCError vcMemcpyAsyncS(void *dst, const void *src, size_t count,
 /// Asynchronous copy on the default stream. Convenience wrapper.
 VCError vcMemcpyAsync(void *dst, const void *src, size_t count,
                       VCMemcpyKind kind);
+
+/// Cross-device copy (cudaMemcpyPeer). Both `dst` and `src` must be vcMalloc
+/// handles; `dstDevice`/`srcDevice` must match the buffers' own device
+/// indices. Implemented via a host bridge (source D2H -> host memcpy -> dest
+/// H2D); true P2P via VK_KHR_device_group peer memory is not yet supported.
+/// Synchronous: idles both devices and returns once the copy has landed.
+VCError vcMemcpyPeer(void *dst, int dstDevice, const void *src, int srcDevice,
+                     size_t bytes);
+
+/// Stream-ordered cross-device copy (cudaMemcpyPeerAsync). `stream` must
+/// belong to the destination device. NOTE: VC's MVP runs the host-bridge copy
+/// synchronously internally (it coordinates two devices' queues); a truly
+/// asynchronous, stream-ordered peer copy is a TODO. The `stream` argument is
+/// validated for device ownership and accepted for API symmetry.
+VCError vcMemcpyPeerAsync(void *dst, int dstDevice, const void *src,
+                          int srcDevice, size_t bytes,
+                          VCStreamHandle stream);
 
 /// Fill the first `count` bytes of a device allocation with `value` (taken as
 /// a byte, broadcast to every byte) — equivalent to cudaMemset. `count` MUST

@@ -48,6 +48,11 @@ debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
   return VK_FALSE;
 }
 
+// Forward declarations: enumerateDevices (called from init) builds default
+// streams before the static definitions below.
+static bool initStream(VulkanDevice &dev, VCStream &s, size_t frameRing = 2);
+static void teardownStream(VulkanDevice &dev, VCStream &s);
+
 Runtime::~Runtime() {
   // Safety net: if the program exits without vcShutdown, the singleton's
   // destructor still runs. Join the host-func thread to avoid std::terminate
@@ -57,17 +62,21 @@ Runtime::~Runtime() {
   hostFuncStop_ = true;
   if (hostFuncThread_.joinable()) hostFuncThread_.join();
   // Best-effort device teardown (shutdown() does the full job normally).
-  if (device_) {
-    vkDeviceWaitIdle(device_->device);
-    vkDestroyDevice(device_->device, nullptr);
-    vkDestroyInstance(device_->instance, nullptr);
+  for (auto &d : devices_) {
+    if (!d) continue;
+    vkDeviceWaitIdle(d->device);
+    vkDestroyDevice(d->device, nullptr);
   }
+  if (!devices_.empty())
+    vkDestroyInstance(devices_[0]->instance, nullptr);
+  devices_.clear();
 }
 
 VCError Runtime::init() {
   if (init_) return VCError::Success;
-  device_ = std::make_unique<VulkanDevice>();
 
+  // One shared instance across all devices.
+  auto instDev = std::make_unique<VulkanDevice>();
   VkApplicationInfo app{};
   app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
   app.pApplicationName = "vc-runtime";
@@ -85,19 +94,21 @@ VCError Runtime::init() {
   ici.enabledExtensionCount = 2;
   ici.ppEnabledExtensionNames = exts;
 
-  VkResult r = vkCreateInstance(&ici, nullptr, &device_->instance);
+  VkResult r = vkCreateInstance(&ici, nullptr, &instDev->instance);
   if (r != VK_SUCCESS) {
     // Retry without debug utils extension (portability ext still required).
     ici.enabledExtensionCount = 1;
     ici.ppEnabledExtensionNames = &exts[1];
-    r = vkCreateInstance(&ici, nullptr, &device_->instance);
+    r = vkCreateInstance(&ici, nullptr, &instDev->instance);
     if (r != VK_SUCCESS) return VCError::InitializationError;
   }
+  VkInstance instance = instDev->instance;
 
-  if (!pickPhysicalDevice()) return VCError::InvalidDevice;
-  if (!createLogicalDevice()) return VCError::InitializationError;
-  if (!createDefaultStream()) return VCError::InitializationError;
-  if (!createPipelineCache()) return VCError::InitializationError;
+  if (!enumerateDevices(instance)) {
+    vkDestroyInstance(instance, nullptr);
+    return VCError::InvalidDevice;
+  }
+  instDev.reset(); // devices_ entries each carry `instance` (shared)
 
   init_ = true;
   // Background thread dispatches vcLaunchHostFunc callbacks once their
@@ -107,56 +118,69 @@ VCError Runtime::init() {
   return VCError::Success;
 }
 
-bool Runtime::pickPhysicalDevice() {
+// Enumerate every physical device with a compute queue and build a full
+// VulkanDevice (logical device + default stream + pipeline cache) for each.
+// Returns false if none were found. Each entry shares the single instance.
+bool Runtime::enumerateDevices(VkInstance instance) {
   uint32_t n = 0;
-  vkEnumeratePhysicalDevices(device_->instance, &n, nullptr);
+  vkEnumeratePhysicalDevices(instance, &n, nullptr);
   if (n == 0) return false;
-  std::vector<VkPhysicalDevice> devs(n);
-  vkEnumeratePhysicalDevices(device_->instance, &n, devs.data());
-  // Prefer a device with a compute queue.
-  for (auto d : devs) {
+  std::vector<VkPhysicalDevice> phys(n);
+  vkEnumeratePhysicalDevices(instance, &n, phys.data());
+  for (auto d : phys) {
     uint32_t qf = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(d, &qf, nullptr);
     std::vector<VkQueueFamilyProperties> props(qf);
     vkGetPhysicalDeviceQueueFamilyProperties(d, &qf, props.data());
-    for (uint32_t i = 0; i < qf; ++i) {
-      if (props[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-        device_->physical = d;
-        device_->computeQueueFamily = i;
-        vkGetPhysicalDeviceMemoryProperties(d, &device_->memProps);
-        // Device properties: name, limits (shared mem, workgroup caps,
-        // timestampPeriod), apiVersion. Chain VkPhysicalDeviceSubgroupProperties
-        // to learn the subgroup size (VC's warpSize: 32 NV / 64 AMD).
-        VkPhysicalDeviceSubgroupProperties sub{};
-        sub.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
-        VkPhysicalDeviceProperties2 p2{};
-        p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-        p2.pNext = &sub;
-        vkGetPhysicalDeviceProperties2(d, &p2);
-        device_->physProps = p2.properties;
-        device_->subgroupSize = (int)sub.subgroupSize;
-        if (device_->subgroupSize == 0) device_->subgroupSize = 1;
-        device_->timestampAvailable =
-            p2.properties.limits.timestampComputeAndGraphics == VK_TRUE;
-        return true;
-      }
-    }
+    uint32_t chosenQf = UINT32_MAX;
+    for (uint32_t i = 0; i < qf; ++i)
+      if (props[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { chosenQf = i; break; }
+    if (chosenQf == UINT32_MAX) continue; // no compute queue: skip
+
+    auto vd = std::make_unique<VulkanDevice>();
+    vd->instance = instance;
+    vd->physical = d;
+    vd->computeQueueFamily = chosenQf;
+    vkGetPhysicalDeviceMemoryProperties(d, &vd->memProps);
+    VkPhysicalDeviceSubgroupProperties sub{};
+    sub.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+    VkPhysicalDeviceProperties2 p2{};
+    p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    p2.pNext = &sub;
+    vkGetPhysicalDeviceProperties2(d, &p2);
+    vd->physProps = p2.properties;
+    vd->subgroupSize = (int)sub.subgroupSize;
+    if (vd->subgroupSize == 0) vd->subgroupSize = 1;
+    vd->timestampAvailable =
+        p2.properties.limits.timestampComputeAndGraphics == VK_TRUE;
+
+    if (!setupLogicalDevice(*vd)) continue;
+    // Per-device default stream.
+    vd->defaultStream = std::make_unique<VCStream>();
+    if (!initStream(*vd, *vd->defaultStream)) continue;
+    vd->defaultStream->deviceIdx = (int)devices_.size();
+    VkPipelineCacheCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    vkCreatePipelineCache(vd->device, &pci, nullptr, &vd->pipelineCache);
+
+    devices_.push_back(std::move(vd));
   }
-  return false;
+  return !devices_.empty();
 }
 
-bool Runtime::createLogicalDevice() {
+// Build the logical device + compute queue for one VulkanDevice (formerly
+// createLogicalDevice, now per-device).
+bool Runtime::setupLogicalDevice(VulkanDevice &vd) {
   float prio = 1.0f;
   VkDeviceQueueCreateInfo qi{};
   qi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-  qi.queueFamilyIndex = device_->computeQueueFamily;
+  qi.queueFamilyIndex = vd.computeQueueFamily;
   qi.queueCount = 1;
   qi.pQueuePriorities = &prio;
 
   // Enable timeline semaphores (Vulkan 1.2 core feature). Used by stream
   // events (vcEvent*) to express cross-stream dependencies without a full
-  // device sync. Probe the physical device first so we don't request an
-  // unsupported feature (every conformant 1.2+ driver has it).
+  // device sync.
   VkPhysicalDeviceVulkan12Features feats12{};
   feats12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
   VkPhysicalDeviceVulkan12Features supported12{};
@@ -164,36 +188,82 @@ bool Runtime::createLogicalDevice() {
   VkPhysicalDeviceFeatures2 feats2{};
   feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
   feats2.pNext = &supported12;
-  vkGetPhysicalDeviceFeatures2(device_->physical, &feats2);
+  vkGetPhysicalDeviceFeatures2(vd.physical, &feats2);
   if (supported12.timelineSemaphore) {
     feats12.timelineSemaphore = VK_TRUE;
-    device_->timelineSemaphore = true;
+    vd.timelineSemaphore = true;
   }
 
   VkDeviceCreateInfo dci{};
   dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qi;
-  if (device_->timelineSemaphore) {
+  if (vd.timelineSemaphore) {
     dci.pNext = &feats12; // replaces pEnabledFeatures chain
   } else {
     VkPhysicalDeviceFeatures feats{};
     dci.pEnabledFeatures = &feats;
   }
 
-  if (vkCreateDevice(device_->physical, &dci, nullptr, &device_->device) !=
-      VK_SUCCESS)
+  if (vkCreateDevice(vd.physical, &dci, nullptr, &vd.device) != VK_SUCCESS)
     return false;
-  vkGetDeviceQueue(device_->device, device_->computeQueueFamily, 0,
-                   &device_->computeQueue);
+  vkGetDeviceQueue(vd.device, vd.computeQueueFamily, 0, &vd.computeQueue);
   return true;
 }
 
-// Build a stream over the compute queue with a FRAME_RING-sized frame ring.
-// Each frame has its own command buffer, fence, and descriptor pool so it can
-// be reset independently when recycled.
+VCError Runtime::shutdown() {
+  if (!init_) return VCError::Success;
+  // Idle every device before tearing anything down.
+  for (auto &d : devices_) if (d) vkDeviceWaitIdle(d->device);
+  // Stop the host-callback thread first: it dispatches any remaining
+  // vcLaunchHostFunc callbacks (the devices are idle, so their semaphores have
+  // all signaled) then exits. Must join before tearing down the devices the
+  // thread polls.
+  hostFuncStop_ = true;
+  if (hostFuncThread_.joinable()) hostFuncThread_.join();
+  // Reclaim any buffers whose release was deferred by vcFreeAsync — the devices
+  // are idle, so they are all safe to free now (avoids leaking them).
+  drainPendingFrees();
+  // Graphs/events/streams each belong to a specific device (their deviceIdx);
+  // tear them down with that device's handle.
+  for (auto &g : graphs_) {
+    if (!g) continue;
+    VulkanDevice &gd = *devices_[g->deviceIdx];
+    resetGraphState(gd, *g);
+    if (g->secondaryCB && g->commandPool)
+      vkFreeCommandBuffers(gd.device, g->commandPool, 1, &g->secondaryCB);
+    if (g->descriptorPool)
+      vkDestroyDescriptorPool(gd.device, g->descriptorPool, nullptr);
+    if (g->commandPool)
+      vkDestroyCommandPool(gd.device, g->commandPool, nullptr);
+  }
+  graphs_.clear();
+  for (auto &e : events_) {
+    if (!e) continue;
+    VulkanDevice &ed = *devices_[e->deviceIdx];
+    if (e->semaphore) vkDestroySemaphore(ed.device, e->semaphore, nullptr);
+    if (e->queryPool) vkDestroyQueryPool(ed.device, e->queryPool, nullptr);
+  }
+  events_.clear();
+  for (auto &s : streams_) if (s) teardownStream(*devices_[s->deviceIdx], *s);
+  streams_.clear();
+  // Destroy each device: default stream, pipeline cache, logical device.
+  VkInstance instance = devices_.empty() ? VK_NULL_HANDLE : devices_[0]->instance;
+  for (auto &d : devices_) {
+    if (!d) continue;
+    if (d->defaultStream) teardownStream(*d, *d->defaultStream);
+    if (d->pipelineCache) vkDestroyPipelineCache(d->device, d->pipelineCache, nullptr);
+    vkDestroyDevice(d->device, nullptr);
+  }
+  devices_.clear();
+  if (instance) vkDestroyInstance(instance, nullptr);
+  currentDeviceIdx_ = 0;
+  init_ = false;
+  return VCError::Success;
+}
+
 static bool initStream(VulkanDevice &dev, VCStream &s,
-                       size_t frameRing = 2) {
+                       size_t frameRing) {
   s.queue = dev.computeQueue;
   s.queueFamily = dev.computeQueueFamily;
   s.frames.resize(frameRing);
@@ -266,70 +336,19 @@ static void teardownStream(VulkanDevice &dev, VCStream &s) {
   if (s.commandPool) vkDestroyCommandPool(dev.device, s.commandPool, nullptr);
 }
 
-bool Runtime::createDefaultStream() {
-  defaultStream_ = std::make_unique<VCStream>();
-  return initStream(*device_, *defaultStream_);
-}
-
-bool Runtime::createPipelineCache() {
-  VkPipelineCacheCreateInfo ci{};
-  ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
-  return vkCreatePipelineCache(device_->device, &ci, nullptr,
-                               &device_->pipelineCache) == VK_SUCCESS;
-}
-
-VCError Runtime::shutdown() {
-  if (!init_) return VCError::Success;
-  vkDeviceWaitIdle(device_->device);
-  // Stop the host-callback thread first: it dispatches any remaining
-  // vcLaunchHostFunc callbacks (the device is idle, so their semaphores have
-  // all signaled) then exits. Must join before tearing down the device the
-  // thread polls.
-  hostFuncStop_ = true;
-  if (hostFuncThread_.joinable()) hostFuncThread_.join();
-  // Reclaim any buffers whose release was deferred by vcFreeAsync — the device
-  // is idle, so they are all safe to free now (avoids leaking them).
-  drainPendingFrees();
-  for (auto &g : graphs_) {
-    if (!g) continue;
-    resetGraphState(*device_, *g);
-    if (g->secondaryCB && g->commandPool)
-      vkFreeCommandBuffers(device_->device, g->commandPool, 1, &g->secondaryCB);
-    if (g->descriptorPool)
-      vkDestroyDescriptorPool(device_->device, g->descriptorPool, nullptr);
-    if (g->commandPool)
-      vkDestroyCommandPool(device_->device, g->commandPool, nullptr);
-  }
-  graphs_.clear();
-  for (auto &e : events_) {
-    if (e && e->semaphore)
-      vkDestroySemaphore(device_->device, e->semaphore, nullptr);
-  }
-  events_.clear();
-  for (auto &s : streams_) if (s) teardownStream(*device_, *s);
-  streams_.clear();
-  if (defaultStream_) { teardownStream(*device_, *defaultStream_); defaultStream_.reset(); }
-  if (device_->pipelineCache)
-    vkDestroyPipelineCache(device_->device, device_->pipelineCache, nullptr);
-  vkDestroyDevice(device_->device, nullptr);
-  vkDestroyInstance(device_->instance, nullptr);
-  device_.reset();
-  init_ = false;
-  return VCError::Success;
-}
-
 //----------------------------------------------------------------------------
 // Streams
 //----------------------------------------------------------------------------
 
 VCStream &Runtime::resolveStream(VCStreamHandle h) {
-  return h ? *reinterpret_cast<VCStream *>(h) : *defaultStream_;
+  return h ? *reinterpret_cast<VCStream *>(h) : *device().defaultStream;
 }
 
 VCError Runtime::createStream(VCStreamHandle *out) {
   if (!init_ || !out) return VCError::InitializationError;
   auto s = std::make_unique<VCStream>();
-  if (!initStream(*device_, *s)) return VCError::InitializationError;
+  if (!initStream(device(), *s)) return VCError::InitializationError;
+  s->deviceIdx = currentDeviceIdx_;
   *out = reinterpret_cast<VCStreamHandle>(s.get());
   streams_.push_back(std::move(s));
   return VCError::Success;
@@ -339,7 +358,7 @@ VCError Runtime::destroyStream(VCStreamHandle stream) {
   if (!init_ || !stream) return VCError::Success;
   auto *s = reinterpret_cast<VCStream *>(stream);
   vkQueueWaitIdle(s->queue);
-  teardownStream(*device_, *s);
+  teardownStream(*devices_[s->deviceIdx], *s);
   // Remove from ownership vector.
   for (auto it = streams_.begin(); it != streams_.end(); ++it) {
     if (it->get() == s) { streams_.erase(it); break; }
@@ -364,17 +383,18 @@ static void drainReadyReadbacks(VulkanDevice &dev, VCStream &s) {
 }
 
 VCError Runtime::streamSynchronize(VCStream &s) {
+  VkDevice dev = devices_[s.deviceIdx]->device;
   // Wait for every in-flight frame's fence so all queued work is done.
   for (size_t i = 0; i < s.frames.size(); ++i) {
     // The frame at frameIdx may be unsignaled (about to be reused); waiting
     // on an already-signaled fence is cheap, so just wait on all of them.
-    if (vkWaitForFences(device_->device, 1, &s.frames[i].fence, VK_TRUE,
+    if (vkWaitForFences(dev, 1, &s.frames[i].fence, VK_TRUE,
                         UINT64_MAX) != VK_SUCCESS)
       return VCError::Unknown;
   }
   // Now every fence is signaled: deliver all deferred D2H readbacks so the
   // caller can read the host destinations immediately after sync returns.
-  drainReadyReadbacks(*device_, s);
+  drainReadyReadbacks(*devices_[s.deviceIdx], s);
   // Dispatch any stream-ordered host callbacks (vcLaunchHostFunc) whose
   // semaphore signaled with the stream's submissions — they are due now.
   // Also covers callbacks whose semaphore has not yet signaled: the stream's
@@ -402,10 +422,11 @@ VCError Runtime::streamSynchronize(VCStream &s) {
 // has signaled (i.e. no submission is in flight). Mirrors cudaStreamQuery.
 VCError Runtime::streamQuery(const VCStream &s, int *done) const {
   if (!done) return VCError::InvalidValue;
+  VkDevice dev = devices_[s.deviceIdx]->device;
   *done = 1;
   for (auto &f : s.frames) {
     if (f.fence != VK_NULL_HANDLE &&
-        vkGetFenceStatus(device_->device, f.fence) != VK_SUCCESS) {
+        vkGetFenceStatus(dev, f.fence) != VK_SUCCESS) {
       *done = 0; // at least one frame still executing
       break;
     }
@@ -415,9 +436,10 @@ VCError Runtime::streamQuery(const VCStream &s, int *done) const {
 
 // Wait for the frame we're about to reuse, reset it, begin recording.
 VkCommandBuffer Runtime::beginFrame(VCStream &s) {
+  VkDevice dev = devices_[s.deviceIdx]->device;
   StreamFrame &f = s.frames[s.frameIdx];
   // Wait for the GPU to finish with this frame's previous submission.
-  vkWaitForFences(device_->device, 1, &f.fence, VK_TRUE, UINT64_MAX);
+  vkWaitForFences(dev, 1, &f.fence, VK_TRUE, UINT64_MAX);
   // The fence just signaled, so every device->staging copy recorded in this
   // frame has executed: deliver deferred D2H readbacks to their host targets.
   // (The caller is responsible for having synchronized before reading.)
@@ -428,9 +450,9 @@ VkCommandBuffer Runtime::beginFrame(VCStream &s) {
   for (auto &sb : f.stagingBuffers) freeBuffer(*sb);
   f.stagingBuffers.clear();
 
-  vkResetFences(device_->device, 1, &f.fence);
+  vkResetFences(dev, 1, &f.fence);
   vkResetCommandBuffer(f.cb, 0);
-  vkResetDescriptorPool(device_->device, f.descriptorPool, 0);
+  vkResetDescriptorPool(dev, f.descriptorPool, 0);
 
   VkCommandBufferBeginInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -440,6 +462,7 @@ VkCommandBuffer Runtime::beginFrame(VCStream &s) {
 }
 
 void Runtime::endFrame(VCStream &s) {
+  VulkanDevice &vd = *devices_[s.deviceIdx];
   StreamFrame &f = s.frames[s.frameIdx];
   vkEndCommandBuffer(f.cb);
 
@@ -457,7 +480,7 @@ void Runtime::endFrame(VCStream &s) {
   std::vector<VkPipelineStageFlags> waitStages;
   std::vector<VkSemaphore> signalSems;
   std::vector<uint64_t> signalVals;
-  if (device_->timelineSemaphore && !s.pendingWaits.empty()) {
+  if (vd.timelineSemaphore && !s.pendingWaits.empty()) {
     waitSems.reserve(s.pendingWaits.size());
     waitVals.reserve(s.pendingWaits.size());
     waitStages.assign(s.pendingWaits.size(),
@@ -470,7 +493,7 @@ void Runtime::endFrame(VCStream &s) {
     si.pWaitSemaphores = waitSems.data();
     si.pWaitDstStageMask = waitStages.data();
   }
-  if (device_->timelineSemaphore && !s.pendingSignals.empty()) {
+  if (vd.timelineSemaphore && !s.pendingSignals.empty()) {
     signalSems.reserve(s.pendingSignals.size());
     signalVals.reserve(s.pendingSignals.size());
     for (auto &sig : s.pendingSignals) {
@@ -505,7 +528,7 @@ VkDescriptorSet Runtime::allocFrameDescriptorSet(VCStream &s,
   ai.descriptorSetCount = 1;
   ai.pSetLayouts = &layout;
   VkDescriptorSet set = VK_NULL_HANDLE;
-  vkAllocateDescriptorSets(device_->device, &ai, &set);
+  vkAllocateDescriptorSets(devices_[s.deviceIdx]->device, &ai, &set);
   return set;
 }
 
@@ -515,9 +538,14 @@ VkDescriptorSet Runtime::allocFrameDescriptorSet(VCStream &s,
 
 uint32_t Runtime::findMemoryType(uint32_t reqBits,
                                  VkMemoryPropertyFlags flags) const {
-  for (uint32_t i = 0; i < device_->memProps.memoryTypeCount; ++i) {
+  return findMemoryTypeOn(device(), reqBits, flags);
+}
+
+uint32_t Runtime::findMemoryTypeOn(const VulkanDevice &vd, uint32_t reqBits,
+                                   VkMemoryPropertyFlags flags) {
+  for (uint32_t i = 0; i < vd.memProps.memoryTypeCount; ++i) {
     if ((reqBits & (1u << i)) &&
-        (device_->memProps.memoryTypes[i].propertyFlags & flags) == flags)
+        (vd.memProps.memoryTypes[i].propertyFlags & flags) == flags)
       return i;
   }
   return UINT32_MAX;
@@ -540,12 +568,13 @@ static VkBuffer createBuffer(VkDevice dev, size_t bytes) {
 // type satisfies the buffer (e.g. on integrated GPUs device-local == host).
 VCError Runtime::mallocBuffer(size_t bytes, VCBuffer &out) {
   if (!init_) return VCError::InitializationError;
+  out.deviceIdx = currentDeviceIdx_;
   out.size = bytes;
-  out.buffer = createBuffer(device_->device, bytes);
+  out.buffer = createBuffer(device().device, bytes);
   if (!out.buffer) return VCError::OutOfMemory;
 
   VkMemoryRequirements reqs;
-  vkGetBufferMemoryRequirements(device_->device, out.buffer, &reqs);
+  vkGetBufferMemoryRequirements(device().device, out.buffer, &reqs);
   uint32_t typeIdx = findMemoryType(
       reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   bool hostFallback = false;
@@ -555,7 +584,7 @@ VCError Runtime::mallocBuffer(size_t bytes, VCBuffer &out) {
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     hostFallback = true;
     if (typeIdx == UINT32_MAX) {
-      vkDestroyBuffer(device_->device, out.buffer, nullptr);
+      vkDestroyBuffer(device().device, out.buffer, nullptr);
       return VCError::OutOfMemory;
     }
   }
@@ -564,57 +593,67 @@ VCError Runtime::mallocBuffer(size_t bytes, VCBuffer &out) {
   mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
   mai.allocationSize = reqs.size;
   mai.memoryTypeIndex = typeIdx;
-  if (vkAllocateMemory(device_->device, &mai, nullptr, &out.memory) !=
+  if (vkAllocateMemory(device().device, &mai, nullptr, &out.memory) !=
       VK_SUCCESS) {
-    vkDestroyBuffer(device_->device, out.buffer, nullptr);
+    vkDestroyBuffer(device().device, out.buffer, nullptr);
     return VCError::OutOfMemory;
   }
-  vkBindBufferMemory(device_->device, out.buffer, out.memory, 0);
+  vkBindBufferMemory(device().device, out.buffer, out.memory, 0);
   out.hostVisible = hostFallback;
   if (hostFallback)
-    vkMapMemory(device_->device, out.memory, 0, bytes, 0, &out.mapped);
+    vkMapMemory(device().device, out.memory, 0, bytes, 0, &out.mapped);
   return VCError::Success;
 }
 
-// host-visible + coherent, persistently mapped (pinned staging).
-VCError Runtime::mallocHostBuffer(size_t bytes, VCBuffer &out) {
+// host-visible + coherent, persistently mapped (pinned staging), on a
+// specific device. Used by the copy paths so staging lives on the SAME device
+// as the stream/buffer the copy targets — staging allocated on the "current"
+// device would be a VkBuffer on the wrong VkDevice for a cross-device stream.
+VCError Runtime::mallocHostBufferOn(int deviceIdx, size_t bytes,
+                                    VCBuffer &out) {
   if (!init_) return VCError::InitializationError;
+  VulkanDevice &vd = *devices_[deviceIdx];
+  out.deviceIdx = deviceIdx;
   out.size = bytes;
-  out.buffer = createBuffer(device_->device, bytes);
+  out.buffer = createBuffer(vd.device, bytes);
   if (!out.buffer) return VCError::OutOfMemory;
 
   VkMemoryRequirements reqs;
-  vkGetBufferMemoryRequirements(device_->device, out.buffer, &reqs);
-  uint32_t typeIdx = findMemoryType(
-      reqs.memoryTypeBits,
+  vkGetBufferMemoryRequirements(vd.device, out.buffer, &reqs);
+  uint32_t typeIdx = findMemoryTypeOn(vd, reqs.memoryTypeBits,
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
   if (typeIdx == UINT32_MAX) {
-    vkDestroyBuffer(device_->device, out.buffer, nullptr);
+    vkDestroyBuffer(vd.device, out.buffer, nullptr);
     return VCError::OutOfMemory;
   }
   VkMemoryAllocateInfo mai{};
   mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
   mai.allocationSize = reqs.size;
   mai.memoryTypeIndex = typeIdx;
-  if (vkAllocateMemory(device_->device, &mai, nullptr, &out.memory) !=
-      VK_SUCCESS) {
-    vkDestroyBuffer(device_->device, out.buffer, nullptr);
+  if (vkAllocateMemory(vd.device, &mai, nullptr, &out.memory) != VK_SUCCESS) {
+    vkDestroyBuffer(vd.device, out.buffer, nullptr);
     return VCError::OutOfMemory;
   }
-  vkBindBufferMemory(device_->device, out.buffer, out.memory, 0);
-  vkMapMemory(device_->device, out.memory, 0, bytes, 0, &out.mapped);
+  vkBindBufferMemory(vd.device, out.buffer, out.memory, 0);
+  vkMapMemory(vd.device, out.memory, 0, bytes, 0, &out.mapped);
   out.hostVisible = true;
   return VCError::Success;
 }
 
+// host-visible staging on the current device.
+VCError Runtime::mallocHostBuffer(size_t bytes, VCBuffer &out) {
+  return mallocHostBufferOn(currentDeviceIdx_, bytes, out);
+}
+
 VCError Runtime::freeBuffer(VCBuffer &buf) {
   if (!init_) return VCError::InitializationError;
+  VkDevice dev = devices_[buf.deviceIdx]->device;
   if (buf.mapped) {
-    vkUnmapMemory(device_->device, buf.memory);
+    vkUnmapMemory(dev, buf.memory);
     buf.mapped = nullptr;
   }
-  if (buf.buffer) vkDestroyBuffer(device_->device, buf.buffer, nullptr);
-  if (buf.memory) vkFreeMemory(device_->device, buf.memory, nullptr);
+  if (buf.buffer) vkDestroyBuffer(dev, buf.buffer, nullptr);
+  if (buf.memory) vkFreeMemory(dev, buf.memory, nullptr);
   buf = VCBuffer{};
   return VCError::Success;
 }
@@ -698,9 +737,10 @@ void Runtime::drainPendingFrees() {
     VCStream *s = it->stream;
     bool ready = true;
     if (s) {
+      VkDevice sdev = devices_[s->deviceIdx]->device;
       for (auto &f : s->frames) {
         if (f.fence != VK_NULL_HANDLE &&
-            vkGetFenceStatus(device_->device, f.fence) != VK_SUCCESS) {
+            vkGetFenceStatus(sdev, f.fence) != VK_SUCCESS) {
           ready = false;
           break;
         }
@@ -836,7 +876,7 @@ VCError Runtime::copyHostToDevice(VCBuffer &dst, const void *hostSrc,
   if (s.captureTarget) {
     VCGraph &g = *s.captureTarget;
     auto staging = std::make_unique<VCBuffer>();
-    if (mallocHostBuffer(bytes, *staging) != VCError::Success)
+    if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
       return VCError::OutOfMemory;
     std::memcpy(staging->mapped, hostSrc, bytes);
     VkBufferCopy region{0, 0, bytes};
@@ -845,7 +885,7 @@ VCError Runtime::copyHostToDevice(VCBuffer &dst, const void *hostSrc,
     return VCError::Success;
   }
   VCBuffer scratch{};
-  if (mallocHostBuffer(bytes, scratch) != VCError::Success)
+  if (mallocHostBufferOn(s.deviceIdx, bytes, scratch) != VCError::Success)
     return VCError::OutOfMemory;
   std::memcpy(scratch.mapped, hostSrc, bytes);
   VkCommandBuffer cb = beginFrame(s);
@@ -872,7 +912,7 @@ VCError Runtime::copyDeviceToHost(void *hostDst, const VCBuffer &src,
   if (s.captureTarget) {
     VCGraph &g = *s.captureTarget;
     auto staging = std::make_unique<VCBuffer>();
-    if (mallocHostBuffer(bytes, *staging) != VCError::Success)
+    if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
       return VCError::OutOfMemory;
     VkBufferCopy region{0, 0, bytes};
     vkCmdCopyBuffer(g.secondaryCB, src.buffer, staging->buffer, 1, &region);
@@ -884,7 +924,7 @@ VCError Runtime::copyDeviceToHost(void *hostDst, const VCBuffer &src,
     return VCError::Success;
   }
   VCBuffer scratch{};
-  if (mallocHostBuffer(bytes, scratch) != VCError::Success)
+  if (mallocHostBufferOn(s.deviceIdx, bytes, scratch) != VCError::Success)
     return VCError::OutOfMemory;
   VkCommandBuffer cb = beginFrame(s);
   VkBufferCopy region{0, 0, bytes};
@@ -906,7 +946,7 @@ VCError Runtime::copyHostToDeviceAsync(VCBuffer &dst, const void *hostSrc,
   if (s.captureTarget) {
     VCGraph &g = *s.captureTarget;
     auto staging = std::make_unique<VCBuffer>();
-    if (mallocHostBuffer(bytes, *staging) != VCError::Success)
+    if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
       return VCError::OutOfMemory;
     std::memcpy(staging->mapped, hostSrc, bytes);
     VkBufferCopy region{0, 0, bytes};
@@ -915,7 +955,7 @@ VCError Runtime::copyHostToDeviceAsync(VCBuffer &dst, const void *hostSrc,
     return VCError::Success;
   }
   auto staging = std::make_unique<VCBuffer>();
-  if (mallocHostBuffer(bytes, *staging) != VCError::Success)
+  if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
     return VCError::OutOfMemory;
   // Snapshot the host source NOW so the caller can overwrite it immediately.
   std::memcpy(staging->mapped, hostSrc, bytes);
@@ -939,7 +979,7 @@ VCError Runtime::copyDeviceToHostAsync(void *hostDst, const VCBuffer &src,
   if (s.captureTarget) {
     VCGraph &g = *s.captureTarget;
     auto staging = std::make_unique<VCBuffer>();
-    if (mallocHostBuffer(bytes, *staging) != VCError::Success)
+    if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
       return VCError::OutOfMemory;
     VkBufferCopy region{0, 0, bytes};
     vkCmdCopyBuffer(g.secondaryCB, src.buffer, staging->buffer, 1, &region);
@@ -949,7 +989,7 @@ VCError Runtime::copyDeviceToHostAsync(void *hostDst, const VCBuffer &src,
     return VCError::Success;
   }
   auto staging = std::make_unique<VCBuffer>();
-  if (mallocHostBuffer(bytes, *staging) != VCError::Success)
+  if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
     return VCError::OutOfMemory;
   size_t submitIdx = s.frameIdx;
   VkCommandBuffer cb = beginFrame(s);
@@ -966,11 +1006,12 @@ VCError Runtime::copyDeviceToHostAsync(void *hostDst, const VCBuffer &src,
 
 VCError Runtime::synchronize() {
   if (!init_) return VCError::InitializationError;
-  vkDeviceWaitIdle(device_->device);
-  // Deliver deferred D2H readbacks on every stream (the caller may read host
-  // destinations immediately after a device sync).
-  if (defaultStream_) drainReadyReadbacks(*device_, *defaultStream_);
-  for (auto &s : streams_) if (s) drainReadyReadbacks(*device_, *s);
+  for (auto &d : devices_) if (d) vkDeviceWaitIdle(d->device);
+  // Deliver deferred D2H readbacks on every stream across every device (the
+  // caller may read host destinations immediately after a device sync).
+  for (auto &d : devices_)
+    if (d && d->defaultStream) drainReadyReadbacks(*d, *d->defaultStream);
+  for (auto &s : streams_) if (s) drainReadyReadbacks(*devices_[s->deviceIdx], *s);
   // The device is idle: every deferred free is now safe to reclaim.
   drainPendingFrees();
   return VCError::Success;
@@ -1002,18 +1043,20 @@ static VkDescriptorPool createGraphDescriptorPool(VkDevice dev) {
 VCError Runtime::createGraph(VCGraphHandle *out) {
   if (!init_ || !out) return VCError::InitializationError;
   auto g = std::make_unique<VCGraph>();
+  g->deviceIdx = currentDeviceIdx_;
+  VulkanDevice &vd = *devices_[currentDeviceIdx_];
 
   VkCommandPoolCreateInfo pci{};
   pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
   pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-  pci.queueFamilyIndex = device_->computeQueueFamily;
-  if (vkCreateCommandPool(device_->device, &pci, nullptr, &g->commandPool) !=
+  pci.queueFamilyIndex = vd.computeQueueFamily;
+  if (vkCreateCommandPool(vd.device, &pci, nullptr, &g->commandPool) !=
       VK_SUCCESS)
     return VCError::Unknown;
 
-  g->descriptorPool = createGraphDescriptorPool(device_->device);
+  g->descriptorPool = createGraphDescriptorPool(vd.device);
   if (!g->descriptorPool) {
-    vkDestroyCommandPool(device_->device, g->commandPool, nullptr);
+    vkDestroyCommandPool(vd.device, g->commandPool, nullptr);
     return VCError::Unknown;
   }
 
@@ -1022,10 +1065,10 @@ VCError Runtime::createGraph(VCGraphHandle *out) {
   ai.commandPool = g->commandPool;
   ai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
   ai.commandBufferCount = 1;
-  if (vkAllocateCommandBuffers(device_->device, &ai, &g->secondaryCB) !=
+  if (vkAllocateCommandBuffers(vd.device, &ai, &g->secondaryCB) !=
       VK_SUCCESS) {
-    vkDestroyDescriptorPool(device_->device, g->descriptorPool, nullptr);
-    vkDestroyCommandPool(device_->device, g->commandPool, nullptr);
+    vkDestroyDescriptorPool(vd.device, g->descriptorPool, nullptr);
+    vkDestroyCommandPool(vd.device, g->commandPool, nullptr);
     return VCError::Unknown;
   }
 
@@ -1050,17 +1093,18 @@ static void resetGraphState(VulkanDevice &dev, VCGraph &g) {
 VCError Runtime::destroyGraph(VCGraphHandle graph) {
   if (!init_ || !graph) return VCError::Success;
   auto *g = reinterpret_cast<VCGraph *>(graph);
-  // Clear capture on the default stream if this graph is mid-record.
-  if (defaultStream_ && defaultStream_->captureTarget == g)
-    defaultStream_->captureTarget = nullptr;
-  vkDeviceWaitIdle(device_->device);
-  resetGraphState(*device_, *g);
+  VulkanDevice &gd = *devices_[g->deviceIdx];
+  // Clear capture on the graph's device default stream if mid-record.
+  if (gd.defaultStream && gd.defaultStream->captureTarget == g)
+    gd.defaultStream->captureTarget = nullptr;
+  vkDeviceWaitIdle(gd.device);
+  resetGraphState(gd, *g);
   if (g->secondaryCB && g->commandPool)
-    vkFreeCommandBuffers(device_->device, g->commandPool, 1, &g->secondaryCB);
+    vkFreeCommandBuffers(gd.device, g->commandPool, 1, &g->secondaryCB);
   if (g->descriptorPool)
-    vkDestroyDescriptorPool(device_->device, g->descriptorPool, nullptr);
+    vkDestroyDescriptorPool(gd.device, g->descriptorPool, nullptr);
   if (g->commandPool)
-    vkDestroyCommandPool(device_->device, g->commandPool, nullptr);
+    vkDestroyCommandPool(gd.device, g->commandPool, nullptr);
   for (auto it = graphs_.begin(); it != graphs_.end(); ++it) {
     if (it->get() == g) { graphs_.erase(it); break; }
   }
@@ -1073,7 +1117,7 @@ VCError Runtime::beginRecord(VCGraph &g) {
   // previously recorded (avoid touching a freshly-allocated cb in its
   // initial state, which some drivers handle poorly on reset).
   if (g.recorded)
-    resetGraphState(*device_, g);
+    resetGraphState(*devices_[g.deviceIdx], g);
   VkCommandBufferBeginInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   // SIMULTANEOUS_USE lets the same graph be replayed on multiple streams
@@ -1088,21 +1132,21 @@ VCError Runtime::beginRecord(VCGraph &g) {
   if (vkBeginCommandBuffer(g.secondaryCB, &bi) != VK_SUCCESS)
     return VCError::Unknown;
   g.recording = true;
-  defaultStream_->captureTarget = &g;
+  devices_[g.deviceIdx]->defaultStream->captureTarget = &g;
   return VCError::Success;
 }
 
 VCError Runtime::endRecord(VCGraph &g) {
   if (!g.recording) return VCError::Unknown; // not recording
   if (vkEndCommandBuffer(g.secondaryCB) != VK_SUCCESS) {
-    defaultStream_->captureTarget = nullptr;
+    devices_[g.deviceIdx]->defaultStream->captureTarget = nullptr;
     g.recording = false;
     return VCError::Unknown;
   }
   g.recording = false;
   g.recorded = true;
-  if (defaultStream_->captureTarget == &g)
-    defaultStream_->captureTarget = nullptr;
+  if (devices_[g.deviceIdx]->defaultStream->captureTarget == &g)
+    devices_[g.deviceIdx]->defaultStream->captureTarget = nullptr;
   return VCError::Success;
 }
 
@@ -1117,10 +1161,10 @@ VCError Runtime::launchGraph(VCGraph &g, VCStream &s) {
 }
 
 VCError Runtime::resetGraph(VCGraph &g) {
-  if (defaultStream_ && defaultStream_->captureTarget == &g)
-    defaultStream_->captureTarget = nullptr;
-  vkDeviceWaitIdle(device_->device);
-  resetGraphState(*device_, g);
+  if (devices_[g.deviceIdx]->defaultStream && devices_[g.deviceIdx]->defaultStream->captureTarget == &g)
+    devices_[g.deviceIdx]->defaultStream->captureTarget = nullptr;
+  vkDeviceWaitIdle(devices_[g.deviceIdx]->device);
+  resetGraphState(*devices_[g.deviceIdx], g);
   return VCError::Success;
 }
 
@@ -1130,7 +1174,7 @@ VCError Runtime::resetGraph(VCGraph &g) {
 
 VCError Runtime::createEvent(VCEventHandle *out) {
   if (!init_ || !out) return VCError::InitializationError;
-  if (!device_->timelineSemaphore) return VCError::Unknown; // need timeline sem
+  if (!device().timelineSemaphore) return VCError::Unknown; // need timeline sem
   auto e = std::make_unique<VCEvent>();
   VkSemaphoreTypeCreateInfo ti{};
   ti.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
@@ -1139,19 +1183,20 @@ VCError Runtime::createEvent(VCEventHandle *out) {
   VkSemaphoreCreateInfo ci{};
   ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
   ci.pNext = &ti;
-  if (vkCreateSemaphore(device_->device, &ci, nullptr, &e->semaphore) !=
+  if (vkCreateSemaphore(device().device, &ci, nullptr, &e->semaphore) !=
       VK_SUCCESS)
     return VCError::Unknown;
   // One-slot timestamp query pool for vcEventElapsedTime. Created even if the
   // device reports no timestamp support; in that case eventElapsedTime returns
   // an error rather than failing here (so events still work for sync).
-  if (device_->timestampAvailable) {
+  if (device().timestampAvailable) {
     VkQueryPoolCreateInfo qci{};
     qci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
     qci.queryCount = 1;
-    vkCreateQueryPool(device_->device, &qci, nullptr, &e->queryPool);
+    vkCreateQueryPool(device().device, &qci, nullptr, &e->queryPool);
   }
+  e->deviceIdx = currentDeviceIdx_;
   e->value = 1;          // next signal value
   e->lastRecorded = 0;   // nothing recorded yet
   *out = reinterpret_cast<VCEventHandle>(e.get());
@@ -1162,11 +1207,12 @@ VCError Runtime::createEvent(VCEventHandle *out) {
 VCError Runtime::destroyEvent(VCEventHandle event) {
   if (!init_ || !event) return VCError::Success;
   auto *e = reinterpret_cast<VCEvent *>(event);
-  vkDeviceWaitIdle(device_->device);
+  VkDevice dev = devices_[e->deviceIdx]->device;
+  vkDeviceWaitIdle(dev);
   if (e->semaphore)
-    vkDestroySemaphore(device_->device, e->semaphore, nullptr);
+    vkDestroySemaphore(dev, e->semaphore, nullptr);
   if (e->queryPool)
-    vkDestroyQueryPool(device_->device, e->queryPool, nullptr);
+    vkDestroyQueryPool(dev, e->queryPool, nullptr);
   for (auto it = events_.begin(); it != events_.end(); ++it) {
     if (it->get() == e) { events_.erase(it); break; }
   }
@@ -1183,7 +1229,7 @@ VCError Runtime::destroyEvent(VCEventHandle event) {
 // timestamp query in the same command buffer so vcEventElapsedTime can later
 // read back the GPU-side time at this point.
 VCError Runtime::recordEvent(VCEvent &e, VCStream &s) {
-  if (!device_->timelineSemaphore) return VCError::Unknown;
+  if (!devices_[e.deviceIdx]->timelineSemaphore) return VCError::Unknown;
   uint64_t v = e.value++;
   e.lastRecorded = v;
   s.pendingSignals.push_back({e.semaphore, v});
@@ -1205,7 +1251,7 @@ VCError Runtime::recordEvent(VCEvent &e, VCStream &s) {
 // recently recorded value before executing. Does NOT flush — the wait rides
 // the caller's next launch/copy on this stream. Cross-stream dependency.
 VCError Runtime::streamWaitEvent(VCStream &s, VCEvent &e) {
-  if (!device_->timelineSemaphore) return VCError::Unknown;
+  if (!devices_[s.deviceIdx]->timelineSemaphore) return VCError::Unknown;
   if (e.lastRecorded == 0) return VCError::Success; // never recorded: no-op
   s.pendingWaits.push_back({e.semaphore, e.lastRecorded});
   return VCError::Success;
@@ -1215,8 +1261,8 @@ VCError Runtime::eventQuery(const VCEvent &e, int *done) const {
   if (!done) return VCError::InvalidValue;
   if (e.lastRecorded == 0) { *done = 1; return VCError::Success; }
   uint64_t counter = 0;
-  if (vkGetSemaphoreCounterValue(device_->device, e.semaphore, &counter) !=
-      VK_SUCCESS)
+  if (vkGetSemaphoreCounterValue(devices_[e.deviceIdx]->device, e.semaphore,
+                                 &counter) != VK_SUCCESS)
     return VCError::Unknown;
   *done = counter >= e.lastRecorded ? 1 : 0;
   return VCError::Success;
@@ -1230,7 +1276,8 @@ VCError Runtime::eventSynchronize(const VCEvent &e) const {
   wi.semaphoreCount = 1;
   wi.pSemaphores = &e.semaphore;
   wi.pValues = &e.lastRecorded;
-  if (vkWaitSemaphores(device_->device, &wi, UINT64_MAX) != VK_SUCCESS)
+  if (vkWaitSemaphores(devices_[e.deviceIdx]->device, &wi, UINT64_MAX) !=
+      VK_SUCCESS)
     return VCError::Unknown;
   return VCError::Success;
 }
@@ -1244,37 +1291,41 @@ VCError Runtime::eventSynchronize(const VCEvent &e) const {
 VCError Runtime::eventElapsedTime(float *ms, const VCEvent &start,
                                   const VCEvent &end) const {
   if (!ms) return VCError::InvalidValue;
-  if (!device_->timestampAvailable) return VCError::NotReady;
+  // Both events are expected on the same device; use start's.
+  const VulkanDevice &vd = *devices_[start.deviceIdx];
+  if (!vd.timestampAvailable) return VCError::NotReady;
   if (start.lastRecorded == 0 || end.lastRecorded == 0)
     return VCError::InvalidValue; // never recorded
   if (!start.queryPool || !end.queryPool) return VCError::NotReady;
   uint64_t t0 = 0, t1 = 0;
-  VkResult r0 = vkGetQueryPoolResults(device_->device, start.queryPool, 0, 1,
+  VkResult r0 = vkGetQueryPoolResults(vd.device, start.queryPool, 0, 1,
                                       sizeof(t0), &t0, sizeof(t0),
                                       VK_QUERY_RESULT_64_BIT |
                                           VK_QUERY_RESULT_WAIT_BIT);
-  VkResult r1 = vkGetQueryPoolResults(device_->device, end.queryPool, 0, 1,
+  VkResult r1 = vkGetQueryPoolResults(vd.device, end.queryPool, 0, 1,
                                       sizeof(t1), &t1, sizeof(t1),
                                       VK_QUERY_RESULT_64_BIT |
                                           VK_QUERY_RESULT_WAIT_BIT);
   if (r0 != VK_SUCCESS || r1 != VK_SUCCESS) return VCError::Unknown;
   // timestampPeriod is nanoseconds per tick.
-  double ns = (double)(int64_t)(t1 - t0) * device_->physProps.limits.timestampPeriod;
+  double ns = (double)(int64_t)(t1 - t0) * vd.physProps.limits.timestampPeriod;
   *ms = (float)(ns / 1e6);
   return VCError::Success;
 }
 
 // Fill VCDeviceProperties from the cached VkPhysicalDeviceProperties + limits.
-// VC is single-device: device must be 0. Fields with no Vulkan equivalent
-// (multiProcessorCount, clockRate) are left at 0.
-VCError Runtime::getDeviceProperties(VCDeviceProperties *out, int device) const {
+// Multi-device: any valid device index is accepted. Fields with no Vulkan
+// equivalent (multiProcessorCount, clockRate) are left at 0.
+VCError Runtime::getDeviceProperties(VCDeviceProperties *out, int deviceIndex) const {
   if (!out) return VCError::InvalidValue;
-  if (device != 0) return VCError::InvalidDevice;
-  const auto &p = device_->physProps;
+  if (deviceIndex < 0 || (size_t)deviceIndex >= devices_.size())
+    return VCError::InvalidDevice;
+  const VulkanDevice &vd = *devices_[deviceIndex];
+  const auto &p = vd.physProps;
   const auto &l = p.limits;
   std::memset(out, 0, sizeof(*out));
   std::strncpy(out->name, p.deviceName, sizeof(out->name) - 1);
-  out->warpSize = device_->subgroupSize;
+  out->warpSize = vd.subgroupSize;
   out->maxThreadsPerBlock = (int)l.maxComputeWorkGroupInvocations;
   for (int i = 0; i < 3; ++i) {
     out->maxThreadsDim[i] = (int)l.maxComputeWorkGroupSize[i];
@@ -1283,9 +1334,9 @@ VCError Runtime::getDeviceProperties(VCDeviceProperties *out, int device) const 
   out->sharedMemPerBlock = l.maxComputeSharedMemorySize;
   out->sharedMemPerMultiprocessor = l.maxComputeSharedMemorySize;
   // totalGlobalMem: size of the first device-local heap.
-  for (uint32_t i = 0; i < device_->memProps.memoryHeapCount; ++i) {
-    if (device_->memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-      out->totalGlobalMem = device_->memProps.memoryHeaps[i].size;
+  for (uint32_t i = 0; i < vd.memProps.memoryHeapCount; ++i) {
+    if (vd.memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+      out->totalGlobalMem = vd.memProps.memoryHeaps[i].size;
       break;
     }
   }
@@ -1293,6 +1344,84 @@ VCError Runtime::getDeviceProperties(VCDeviceProperties *out, int device) const 
   out->multiProcessorCount = 0; // Vulkan does not expose SM/CU count
   out->major = (int)VK_API_VERSION_MAJOR(p.apiVersion);
   out->minor = (int)VK_API_VERSION_MINOR(p.apiVersion);
+  return VCError::Success;
+}
+
+// Switch the current device (cudaSetDevice). Subsequent allocations, kernel
+// loads, stream creation, and the default stream all target this device. Does
+// NOT migrate existing buffers/streams/kernels — each object stays on the
+// device it was created on (recorded in its deviceIdx) and is operated on via
+// that device regardless of the current selection.
+VCError Runtime::setDevice(int idx) {
+  if (!init_) return VCError::InitializationError;
+  if (idx < 0 || (size_t)idx >= devices_.size())
+    return VCError::InvalidDevice;
+  currentDeviceIdx_ = idx;
+  return VCError::Success;
+}
+
+// Cross-device copy (cudaMemcpyPeer) via a host bridge: read the source
+// buffer back to host memory, then upload it to the destination buffer. True
+// P2P (VK_KHR_device_group peer memory features) is a TODO; the host bridge is
+// always correct, just slower. Same-device (dstDevice == srcDevice) degenerates
+// to an ordinary D2D copy. `dstDevice`/`srcDevice` must match the buffers'
+// own deviceIdx (passed as a sanity check; the buffers' own deviceIdx is the
+// authority). Sync: idles both devices' queues so the host readback is valid.
+VCError Runtime::copyPeer(VCBuffer &dst, int dstDevice, const VCBuffer &src,
+                          int srcDevice, size_t bytes) {
+  if (!init_) return VCError::InitializationError;
+  if (dstDevice != dst.deviceIdx || srcDevice != src.deviceIdx)
+    return VCError::InvalidValue;
+  if (bytes == 0) return VCError::Success;
+  if (bytes > dst.size || bytes > src.size)
+    return VCError::InvalidValue;
+  // Same device: ordinary D2D copy on a throwaway synchronization — use the
+  // source device's default stream.
+  if (srcDevice == dstDevice) {
+    VulkanDevice &vd = *devices_[srcDevice];
+    VCStream &ds = *vd.defaultStream;
+    VkCommandBuffer cb = beginFrame(ds);
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(cb, src.buffer, dst.buffer, 1, &region);
+    endFrame(ds);
+    streamSynchronize(ds);
+    return VCError::Success;
+  }
+  // Cross-device host bridge: D2H on the source device, then H2D on the dest.
+  VulkanDevice &svd = *devices_[srcDevice];
+  VulkanDevice &dvd = *devices_[dstDevice];
+  // Idle the source so any pending writes to `src` are visible.
+  vkQueueWaitIdle(svd.computeQueue);
+  // D2H: staging on the SOURCE device.
+  VCBuffer sStaging{};
+  if (mallocHostBufferOn(srcDevice, bytes, sStaging) != VCError::Success)
+    return VCError::OutOfMemory;
+  {
+    VCStream &ss = *svd.defaultStream;
+    VkCommandBuffer cb = beginFrame(ss);
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(cb, src.buffer, sStaging.buffer, 1, &region);
+    endFrame(ss);
+    streamSynchronize(ss);
+  }
+  // sStaging.mapped now holds the source bytes on the host.
+  // H2D: staging on the DEST device, then D2D into the dst buffer.
+  VCBuffer dStaging{};
+  if (mallocHostBufferOn(dstDevice, bytes, dStaging) != VCError::Success) {
+    freeBuffer(sStaging);
+    return VCError::OutOfMemory;
+  }
+  std::memcpy(dStaging.mapped, sStaging.mapped, bytes);
+  {
+    VCStream &ds = *dvd.defaultStream;
+    VkCommandBuffer cb = beginFrame(ds);
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(cb, dStaging.buffer, dst.buffer, 1, &region);
+    endFrame(ds);
+    streamSynchronize(ds);
+  }
+  freeBuffer(sStaging);
+  freeBuffer(dStaging);
   return VCError::Success;
 }
 
@@ -1343,7 +1472,8 @@ void Runtime::unregisterBuffer(VCBuffer *b) {
 // the stream, without the host having to poll.
 VCError Runtime::launchHostFunc(VCStream &s, VCHostFn fn, void *userData) {
   if (!fn) return VCError::InvalidValue;
-  if (!device_->timelineSemaphore) return VCError::Unknown;
+  VulkanDevice &vd = *devices_[s.deviceIdx];
+  if (!vd.timelineSemaphore) return VCError::Unknown;
 
   // One-shot timeline semaphore, signaled at value 1.
   VkSemaphoreTypeCreateInfo sti{};
@@ -1354,7 +1484,7 @@ VCError Runtime::launchHostFunc(VCStream &s, VCHostFn fn, void *userData) {
   sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
   sci.pNext = &sti;
   VkSemaphore sem = VK_NULL_HANDLE;
-  if (vkCreateSemaphore(device_->device, &sci, nullptr, &sem) != VK_SUCCESS)
+  if (vkCreateSemaphore(vd.device, &sci, nullptr, &sem) != VK_SUCCESS)
     return VCError::OutOfMemory;
 
   // Signal sem@1 at the stream's current tail: push a pending signal, then
@@ -1366,7 +1496,7 @@ VCError Runtime::launchHostFunc(VCStream &s, VCHostFn fn, void *userData) {
 
   {
     std::lock_guard<std::mutex> lk(hostFuncMu_);
-    pendingHostFuncs_.push_back({sem, 1, fn, userData});
+    pendingHostFuncs_.push_back({sem, 1, fn, userData, s.deviceIdx});
   }
   return VCError::Success;
 }
@@ -1385,10 +1515,11 @@ void Runtime::hostFuncLoop() {
       for (auto it = pendingHostFuncs_.begin();
            it != pendingHostFuncs_.end();) {
         uint64_t cur = 0;
-        if (vkGetSemaphoreCounterValue(device_->device, it->sem, &cur) == VK_SUCCESS
+        if (vkGetSemaphoreCounterValue(devices_[it->deviceIdx]->device,
+                                       it->sem, &cur) == VK_SUCCESS
             && cur >= it->value) {
           ready.push_back(*it);
-          vkDestroySemaphore(device_->device, it->sem, nullptr);
+          vkDestroySemaphore(devices_[it->deviceIdx]->device, it->sem, nullptr);
           it = pendingHostFuncs_.erase(it);
         } else {
           ++it;
@@ -1403,7 +1534,7 @@ void Runtime::hostFuncLoop() {
       std::lock_guard<std::mutex> lk(hostFuncMu_);
       for (auto &h : pendingHostFuncs_) {
         h.fn(h.userData);
-        vkDestroySemaphore(device_->device, h.sem, nullptr);
+        vkDestroySemaphore(devices_[h.deviceIdx]->device, h.sem, nullptr);
       }
       pendingHostFuncs_.clear();
       return;
@@ -1428,10 +1559,11 @@ void Runtime::drainHostFuncs() {
     for (auto it = pendingHostFuncs_.begin();
          it != pendingHostFuncs_.end();) {
       uint64_t cur = 0;
-      if (vkGetSemaphoreCounterValue(device_->device, it->sem, &cur) == VK_SUCCESS
+      if (vkGetSemaphoreCounterValue(devices_[it->deviceIdx]->device,
+                                     it->sem, &cur) == VK_SUCCESS
           && cur >= it->value) {
         ready.push_back(*it);
-        vkDestroySemaphore(device_->device, it->sem, nullptr);
+        vkDestroySemaphore(devices_[it->deviceIdx]->device, it->sem, nullptr);
         it = pendingHostFuncs_.erase(it);
       } else {
         ++it;
@@ -1449,16 +1581,31 @@ VCError Runtime::loadKernel(const uint32_t *words, size_t wordCount,
                             const char *entryPoint, VCKernel &out) {
   if (!init_) return VCError::InitializationError;
   if (!words || wordCount == 0) return VCError::InvalidValue;
-
-  VkShaderModuleCreateInfo ci{};
-  ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-  ci.codeSize = wordCount * sizeof(uint32_t);
-  ci.pCode = words;
-  if (vkCreateShaderModule(device_->device, &ci, nullptr,
-                           &out.shaderModule) != VK_SUCCESS)
-    return VCError::InvalidKernel;
+  // Store the device-independent SPIR-V; per-device shader modules / layouts /
+  // pipelines are created lazily on first launch on each device.
+  out.spirvWords.assign(words, words + wordCount);
   out.entryPoint = entryPoint ? entryPoint : "main";
   return VCError::Success;
+}
+
+// Lazily create the per-device Vulkan state for `k` on `deviceIdx`: a shader
+// module built from the kernel's SPIR-V. Layout/pipelines are built later on
+// first dispatch. Returns nullptr on shader-module creation failure.
+VCKernelDeviceState *Runtime::getOrCreateKernelDeviceState(VCKernel &k,
+                                                           int deviceIdx) {
+  auto it = k.perDevice.find(deviceIdx);
+  if (it != k.perDevice.end()) return it->second.get();
+  auto st = std::make_unique<VCKernelDeviceState>();
+  VkShaderModuleCreateInfo ci{};
+  ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+  ci.codeSize = k.spirvWords.size() * sizeof(uint32_t);
+  ci.pCode = k.spirvWords.data();
+  if (vkCreateShaderModule(devices_[deviceIdx]->device, &ci, nullptr,
+                           &st->shaderModule) != VK_SUCCESS)
+    return nullptr;
+  auto *raw = st.get();
+  k.perDevice[deviceIdx] = std::move(st);
+  return raw;
 }
 
 VCError Runtime::loadKernelFromFile(const char *path, const char *entryPoint,
@@ -1473,25 +1620,32 @@ VCError Runtime::loadKernelFromFile(const char *path, const char *entryPoint,
 }
 
 void Runtime::releaseKernel(VCKernel &k) {
-  if (!init_) return;
-  for (auto &kv : k.pipelines)
-    if (kv.second) vkDestroyPipeline(device_->device, kv.second, nullptr);
-  k.pipelines.clear();
-  if (k.pipelineLayout)
-    vkDestroyPipelineLayout(device_->device, k.pipelineLayout, nullptr);
-  if (k.descriptorSetLayout)
-    vkDestroyDescriptorSetLayout(device_->device, k.descriptorSetLayout,
-                                 nullptr);
-  if (k.shaderModule)
-    vkDestroyShaderModule(device_->device, k.shaderModule, nullptr);
+  if (!init_) { k = VCKernel{}; return; }
+  for (auto &kv : k.perDevice) {
+    VkDevice dev = devices_[kv.first]->device;
+    for (auto &p : kv.second->pipelines)
+      if (p.second) vkDestroyPipeline(dev, p.second, nullptr);
+    if (kv.second->pipelineLayout)
+      vkDestroyPipelineLayout(dev, kv.second->pipelineLayout, nullptr);
+    if (kv.second->descriptorSetLayout)
+      vkDestroyDescriptorSetLayout(dev, kv.second->descriptorSetLayout,
+                                   nullptr);
+    if (kv.second->shaderModule)
+      vkDestroyShaderModule(dev, kv.second->shaderModule, nullptr);
+  }
   k = VCKernel{};
 }
 
-// Build the descriptor-set + pipeline layouts. Pointer args get consecutive
-// SSBO bindings; scalar args are packed into a single push-constant range
-// (so they don't need per-launch staging buffers). `args`/`argCount` define
-// the arrangement; the layout is built once and cached on the kernel.
-bool Runtime::buildLayout(VCKernel &k, const VCKernelArg *args, int argCount) {
+// Build the descriptor-set + pipeline layouts for `k` on `deviceIdx`. Pointer
+// args get consecutive SSBO bindings; scalar args are packed into a single
+// push-constant range (so they don't need per-launch staging buffers).
+// `args`/`argCount` define the arrangement; the layout is built once per
+// device and cached on the per-device state.
+bool Runtime::buildLayout(VCKernel &k, int deviceIdx,
+                          const VCKernelArg *args, int argCount) {
+  VCKernelDeviceState *st = getOrCreateKernelDeviceState(k, deviceIdx);
+  if (!st) return false;
+  VkDevice dev = devices_[deviceIdx]->device;
   k.argCount = argCount;
   // Collect pointer bindings + measure push-constant size for scalars.
   std::vector<VkDescriptorSetLayoutBinding> bindings;
@@ -1515,14 +1669,14 @@ bool Runtime::buildLayout(VCKernel &k, const VCKernelArg *args, int argCount) {
   dci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
   dci.bindingCount = static_cast<uint32_t>(bindings.size());
   dci.pBindings = bindings.data();
-  if (vkCreateDescriptorSetLayout(device_->device, &dci, nullptr,
-                                  &k.descriptorSetLayout) != VK_SUCCESS)
+  if (vkCreateDescriptorSetLayout(dev, &dci, nullptr,
+                                  &st->descriptorSetLayout) != VK_SUCCESS)
     return false;
 
   VkPipelineLayoutCreateInfo plci{};
   plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   plci.setLayoutCount = 1;
-  plci.pSetLayouts = &k.descriptorSetLayout;
+  plci.pSetLayouts = &st->descriptorSetLayout;
   VkPushConstantRange pcr{};
   if (pcSize > 0) {
     pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1531,26 +1685,28 @@ bool Runtime::buildLayout(VCKernel &k, const VCKernelArg *args, int argCount) {
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges = &pcr;
   }
-  if (vkCreatePipelineLayout(device_->device, &plci, nullptr,
-                             &k.pipelineLayout) != VK_SUCCESS)
+  if (vkCreatePipelineLayout(dev, &plci, nullptr,
+                             &st->pipelineLayout) != VK_SUCCESS)
     return false;
   k.pcSize = pcSize;
-  k.layoutBuilt = true;
+  st->layoutBuilt = true;
   return true;
 }
 
-// Fetch or create a pipeline specialized to the block size. Layout must be
-// built first (via buildLayout) — done in dispatch on first use.
-VkPipeline Runtime::getPipeline(VCKernel &k, unsigned blockX,
+// Fetch or create a pipeline specialized to the block size, on `deviceIdx`.
+// Layout must be built first (via buildLayout) — done in dispatch on first use.
+VkPipeline Runtime::getPipeline(VCKernel &k, int deviceIdx, unsigned blockX,
                                 unsigned blockY, unsigned blockZ,
                                 const VCKernelArg *args, int argCount) {
-  if (!k.layoutBuilt && !buildLayout(k, args, argCount))
+  VCKernelDeviceState *st = getOrCreateKernelDeviceState(k, deviceIdx);
+  if (!st) return VK_NULL_HANDLE;
+  if (!st->layoutBuilt && !buildLayout(k, deviceIdx, args, argCount))
     return VK_NULL_HANDLE;
 
   // Key: pack block dims into 64 bits (16 bits each + reserved).
   uint64_t key = (uint64_t(blockX) << 32) | (uint64_t(blockY) << 16) | blockZ;
-  auto it = k.pipelines.find(key);
-  if (it != k.pipelines.end()) return it->second;
+  auto it = st->pipelines.find(key);
+  if (it != st->pipelines.end()) return it->second;
 
   // Specialization constants: 0->x, 1->y, 2->z (matches GLSL backend).
   VkSpecializationMapEntry entries[3];
@@ -1571,15 +1727,16 @@ VkPipeline Runtime::getPipeline(VCKernel &k, unsigned blockX,
   pci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
   pci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   pci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-  pci.stage.module = k.shaderModule;
+  pci.stage.module = st->shaderModule;
   pci.stage.pName = k.entryPoint.c_str();
   pci.stage.pSpecializationInfo = &spec;
-  pci.layout = k.pipelineLayout;
+  pci.layout = st->pipelineLayout;
   VkPipeline pipeline = VK_NULL_HANDLE;
-  if (vkCreateComputePipelines(device_->device, device_->pipelineCache, 1,
+  if (vkCreateComputePipelines(devices_[deviceIdx]->device,
+                               devices_[deviceIdx]->pipelineCache, 1,
                                &pci, nullptr, &pipeline) != VK_SUCCESS)
     return VK_NULL_HANDLE;
-  k.pipelines[key] = pipeline;
+  st->pipelines[key] = pipeline;
   return pipeline;
 }
 
@@ -1588,12 +1745,17 @@ VkPipeline Runtime::getPipeline(VCKernel &k, unsigned blockX,
 //----------------------------------------------------------------------------
 
 VCError Runtime::recordDispatchInto(VkCommandBuffer cb, VkDescriptorPool dpool,
-                                     VCKernel &k, unsigned wgX, unsigned wgY,
-                                     unsigned wgZ, unsigned blockX,
-                                     unsigned blockY, unsigned blockZ,
+                                     VCKernel &k, int deviceIdx, unsigned wgX,
+                                     unsigned wgY, unsigned wgZ,
+                                     unsigned blockX, unsigned blockY,
+                                     unsigned blockZ,
                                      const VCKernelArg *args, int argCount) {
-  if (!k.shaderModule) return VCError::InvalidKernel;
-  VkPipeline pipeline = getPipeline(k, blockX, blockY, blockZ, args, argCount);
+  if (k.spirvWords.empty()) return VCError::InvalidKernel;
+  VCKernelDeviceState *st = getOrCreateKernelDeviceState(k, deviceIdx);
+  if (!st) return VCError::InvalidKernel;
+  VkDevice dev = devices_[deviceIdx]->device;
+  VkPipeline pipeline = getPipeline(k, deviceIdx, blockX, blockY, blockZ,
+                                    args, argCount);
   if (!pipeline) return VCError::InvalidKernel;
 
   VkDescriptorSet set = VK_NULL_HANDLE;
@@ -1606,8 +1768,8 @@ VCError Runtime::recordDispatchInto(VkCommandBuffer cb, VkDescriptorPool dpool,
     ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     ai.descriptorPool = dpool;
     ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &k.descriptorSetLayout;
-    vkAllocateDescriptorSets(device_->device, &ai, &set);
+    ai.pSetLayouts = &st->descriptorSetLayout;
+    vkAllocateDescriptorSets(dev, &ai, &set);
   }
   if (hasPointer && !set) return VCError::Unknown;
 
@@ -1635,8 +1797,7 @@ VCError Runtime::recordDispatchInto(VkCommandBuffer cb, VkDescriptorPool dpool,
     writes.push_back(w);
   }
   if (!writes.empty())
-    vkUpdateDescriptorSets(device_->device, writes.size(), writes.data(), 0,
-                           nullptr);
+    vkUpdateDescriptorSets(dev, writes.size(), writes.data(), 0, nullptr);
 
   // Pack scalar args into a push-constant buffer.
   std::vector<uint8_t> pcData;
@@ -1654,9 +1815,9 @@ VCError Runtime::recordDispatchInto(VkCommandBuffer cb, VkDescriptorPool dpool,
   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
   if (set)
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            k.pipelineLayout, 0, 1, &set, 0, nullptr);
+                            st->pipelineLayout, 0, 1, &set, 0, nullptr);
   if (!pcData.empty())
-    vkCmdPushConstants(cb, k.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+    vkCmdPushConstants(cb, st->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        static_cast<uint32_t>(pcData.size()), pcData.data());
   vkCmdDispatch(cb, wgX, wgY, wgZ);
   // Make the dispatch's SSBO writes visible to subsequent commands in the
@@ -1686,13 +1847,14 @@ VCError Runtime::dispatch(VCKernel &k, unsigned wgX, unsigned wgY,
   // own descriptor pool, without submitting.
   if (s.captureTarget) {
     VCGraph &g = *s.captureTarget;
-    return recordDispatchInto(g.secondaryCB, g.descriptorPool, k, wgX, wgY,
-                              wgZ, blockX, blockY, blockZ, args, argCount);
+    return recordDispatchInto(g.secondaryCB, g.descriptorPool, k, g.deviceIdx,
+                              wgX, wgY, wgZ, blockX, blockY, blockZ, args,
+                              argCount);
   }
   VkCommandBuffer cb = beginFrame(s);
   VCError e = recordDispatchInto(cb, s.frames[s.frameIdx].descriptorPool, k,
-                                  wgX, wgY, wgZ, blockX, blockY, blockZ, args,
-                                  argCount);
+                                  s.deviceIdx, wgX, wgY, wgZ, blockX, blockY,
+                                  blockZ, args, argCount);
   if (e != VCError::Success) return e;
   endFrame(s);
   return VCError::Success;
@@ -1706,14 +1868,29 @@ VCError vcInit() { return Runtime::get().init(); }
 VCError vcShutdown() { return Runtime::get().shutdown(); }
 
 VCError vcGetDeviceCount(int *count) {
+  if (!count) return VCError::InvalidValue;
   if (!Runtime::get().initialized()) {
     if (Runtime::get().init() != VCError::Success) {
       *count = 0;
       return VCError::Success;
     }
   }
-  *count = 1; // scaffold: single-device
+  *count = (int)Runtime::get().deviceCount();
   return VCError::Success;
+}
+
+VCError vcGetDevice(int *device) {
+  if (!device) return VCError::InvalidValue;
+  if (!Runtime::get().initialized())
+    return VCError::InitializationError;
+  *device = Runtime::get().currentDevice();
+  return VCError::Success;
+}
+
+VCError vcSetDevice(int device) {
+  if (!Runtime::get().initialized())
+    return VCError::InitializationError;
+  return Runtime::get().setDevice(device);
 }
 
 VCError vcGetDeviceProperties(VCDeviceProperties *out, int device) {
@@ -1835,6 +2012,36 @@ VCError vcMemcpyAsyncS(void *dst, const void *src, size_t count,
 VCError vcMemcpyAsync(void *dst, const void *src, size_t count,
                       VCMemcpyKind kind) {
   return vcMemcpyAsyncS(dst, src, count, kind, nullptr);
+}
+
+// Cross-device copy (cudaMemcpyPeer). Both pointers must be vcMalloc handles
+// (device-local buffers); `dstDevice`/`srcDevice` must match the buffers' own
+// device indices. Implemented as a host bridge: source D2H -> host memcpy ->
+// dest H2D. True P2P via VK_KHR_device_group peer memory is a TODO. This is
+// the synchronous form — it idles both devices and returns once the copy lands.
+VCError vcMemcpyPeer(void *dst, int dstDevice, const void *src, int srcDevice,
+                     size_t bytes) {
+  auto *db = reinterpret_cast<VCBuffer *>(dst);
+  auto *sb = reinterpret_cast<VCBuffer *>(const_cast<void *>(src));
+  if (!db || !sb) return VCError::InvalidValue;
+  return Runtime::get().copyPeer(*db, dstDevice, *sb, srcDevice, bytes);
+}
+
+// Async form: CUDA's cudaMemcpyPeerAsync runs on a stream belonging to the
+// destination device. VC's MVP runs the same host-bridge synchronously
+// internally (it must coordinate two devices' queues); the `stream` argument
+// is accepted for API symmetry and validated to belong to the destination
+// device. A truly asynchronous, stream-ordered peer copy is a TODO.
+VCError vcMemcpyPeerAsync(void *dst, int dstDevice, const void *src,
+                          int srcDevice, size_t bytes,
+                          VCStreamHandle stream) {
+  auto *db = reinterpret_cast<VCBuffer *>(dst);
+  auto *sb = reinterpret_cast<VCBuffer *>(const_cast<void *>(src));
+  if (!db || !sb) return VCError::InvalidValue;
+  auto &rt = Runtime::get();
+  VCStream &s = rt.resolveStream(stream);
+  if (s.deviceIdx != dstDevice) return VCError::InvalidValue;
+  return rt.copyPeer(*db, dstDevice, *sb, srcDevice, bytes);
 }
 
 // 2D pitched copies. Only DeviceToDevice is supported: both pointers must be
