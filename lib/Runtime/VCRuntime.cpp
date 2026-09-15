@@ -117,6 +117,10 @@ Runtime::~Runtime() {
   if (!init_) return;
   hostFuncStop_ = true;
   if (hostFuncThread_.joinable()) hostFuncThread_.join();
+  // Release kernel Vulkan handles before devices are destroyed (same reason as
+  // shutdown(): the host's VCKernel locals have no destructor to do this).
+  for (VCKernel *k : kernelRegistry_) if (k) releaseKernel(*k);
+  kernelRegistry_.clear();
   // Best-effort device teardown (shutdown() does the full job normally).
   for (auto &d : devices_) {
     if (!d) continue;
@@ -460,6 +464,12 @@ VCError Runtime::shutdown() {
   events_.clear();
   for (auto &s : streams_) if (s) teardownStream(*devices_[s->deviceIdx], *s);
   streams_.clear();
+  // Release every kernel's per-device Vulkan handles (shader module, pipelines,
+  // layouts) BEFORE destroying the devices they belong to. The host caller's
+  // VCKernel is a raw local with no destructor, so without this the handles
+  // leak (visible as OBJ_ERRORs when the validation layer is on).
+  for (VCKernel *k : kernelRegistry_) if (k) releaseKernel(*k);
+  kernelRegistry_.clear();
   // Destroy each device: default stream, pipeline cache, logical device.
   VkInstance instance = devices_.empty() ? VK_NULL_HANDLE : devices_[0]->instance;
   for (auto &d : devices_) {
@@ -2368,7 +2378,22 @@ VCKernelDeviceState *Runtime::getOrCreateKernelDeviceState(VCKernel &k,
     return nullptr;
   auto *raw = st.get();
   k.perDevice[deviceIdx] = std::move(st);
+  // This kernel now owns Vulkan handles on a device. Register it so shutdown()
+  // can releaseKernel() it before vkDestroyDevice — the caller's VCKernel
+  // (a raw local in host main) has no destructor that would do this.
+  trackKernel(&k);
   return raw;
+}
+
+// Remember `k` so its Vulkan handles can be torn down at shutdown. Deduped: a
+// kernel launched on N devices calls getOrCreateKernelDeviceState N times but
+// registers once. Raw pointer — we don't own the VCKernel struct (the host
+// caller does), only the per-device VkHandles inside it.
+void Runtime::trackKernel(VCKernel *k) {
+  if (!k) return;
+  for (VCKernel *existing : kernelRegistry_)
+    if (existing == k) return;
+  kernelRegistry_.push_back(k);
 }
 
 VCError Runtime::loadKernelFromFile(const char *path, const char *entryPoint,

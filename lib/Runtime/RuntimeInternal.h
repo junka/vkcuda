@@ -441,6 +441,16 @@ private:
   std::vector<std::unique_ptr<VCEvent>> events_;   // owns created events
   bool init_ = false;
 
+  // Every VCKernel the runtime has built per-device state for (shader module +
+  // pipelines + layouts). VCKernelHandle is a raw pointer the caller owns (the
+  // `__vc_k_<name>` local in host main), so the runtime does NOT own the
+  // VCKernel struct — but it DOES own the Vulkan handles inside it. We track
+  // the pointers here so shutdown() can releaseKernel() them all before
+  // destroying the devices, instead of leaking VkShaderModule/Pipeline/Layout.
+  // Deduped: a kernel launched on multiple devices registers once.
+  std::vector<VCKernel*> kernelRegistry_;
+  void trackKernel(VCKernel *k);
+
   // Debug messenger for the validation layer (kernel printf). Created in init()
   // when g_kernelPrintfEnabled is set; destroyed at the top of shutdown() before
   // the instance is torn down. The single shared instance lives on devices_[0].
