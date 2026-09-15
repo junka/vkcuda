@@ -122,13 +122,15 @@ enum class VCMemoryType {
   Unregistered, // not a VC allocation (e.g. a stack/heap host pointer)
   Device,       // from vcMalloc / vcMallocAsync (device-local)
   Host,         // from vcMallocHost / vcMallocHostAsync (host-visible, pinned)
+  Managed,      // from vcMallocManaged (unified: device storage, persistently
+                // mapped + host-coherent; host and device share the payload)
 };
 
 /// Attributes of a pointer, mirroring cudaPointerAttributes. For a VC
-/// allocation, `memoryType` is Device or Host; `devicePointer`/`hostPointer`
-/// are the handles VC returned at allocation time, and `size` is the
-/// allocation size (a bonus field CUDA lacks). For an unrecognized pointer,
-/// memoryType is Unregistered and the other fields are null/0.
+/// allocation, `memoryType` is Device, Host, or Managed; `devicePointer`/
+/// `hostPointer` are the handles VC returned at allocation time, and `size`
+/// is the allocation size (a bonus field CUDA lacks). For an unrecognized
+/// pointer, memoryType is Unregistered and the other fields are null/0.
 struct VCPointerAttributes {
   VCMemoryType memoryType = VCMemoryType::Unregistered;
   void *devicePointer = nullptr;
@@ -148,6 +150,26 @@ VCError vcMalloc(void **devPtr, size_t bytes);
 /// Allocate `bytes` of host-visible (pinned) memory, persistently mapped.
 /// Useful for staging buffers the host reads/writes directly.
 VCError vcMallocHost(void **hostPtr, size_t bytes);
+
+/// Allocate `bytes` of unified memory: device storage that is also
+/// persistently mapped and host-coherent, so host and device share the same
+/// payload with no vcMemcpy. The host reads/writes the payload via the mapped
+/// address returned by vcPointerGetAttributes (hostPointer); the device
+/// accesses the same storage through the buffer handle (devicePointer).
+///
+/// Prefers a DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT memory type (true
+/// unified memory — UMA, or a discrete GPU with a BAR window); falls back to
+/// plain host-visible if none exists, so the shared-pointer contract still
+/// holds. Vulkan has no page-fault migration, so this is zero-copy shared
+/// memory, not HMM-style on-demand migration: on discrete GPUs host reads
+/// traverse PCIe (slow), on UMA it is device-local. Equivalent to a subset of
+/// cudaMallocManaged (no cudaMemPrefetchAsync / cudaMemAdvise).
+VCError vcMallocManaged(void **devPtr, size_t bytes);
+
+/// Stream-ordered vcMallocManaged. The allocation is host-immediate; `stream`
+/// orders subsequent use (matches cudaMallocAsync's contract). Vulkan has no
+/// true async allocation.
+VCError vcMallocManagedS(void **devPtr, size_t bytes, VCStreamHandle stream);
 
 /// Free a device or host allocation.
 VCError vcFree(void *devPtr);

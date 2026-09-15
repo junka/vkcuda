@@ -43,13 +43,17 @@ struct VulkanDevice {
 };
 
 /// A device buffer + its backing memory. May be device-local (mapped==nullptr)
-/// or host-visible (mapped!=nullptr, persistently mapped).
+/// or host-visible (mapped!=nullptr, persistently mapped). `managed` marks a
+/// unified-memory allocation (vcMallocManaged): device storage persistently
+/// mapped + host-coherent, so host and device share the same payload with no
+/// vcMemcpy.
 struct VCBuffer {
   VkBuffer buffer = VK_NULL_HANDLE;
   VkDeviceMemory memory = VK_NULL_HANDLE;
   size_t size = 0;
   void *mapped = nullptr; // non-null when persistently mapped (host-visible)
   bool hostVisible = false;
+  bool managed = false; // unified memory (vcMallocManaged)
   int deviceIdx = 0; // which device owns this allocation (for free/peer copy)
 };
 
@@ -238,6 +242,7 @@ public:
   VCError mallocHostBuffer(size_t bytes, VCBuffer &out);      // host-visible
   VCError mallocHostBufferOn(int deviceIdx, size_t bytes,
                              VCBuffer &out); // host-visible on a specific device
+  VCError mallocManagedBuffer(size_t bytes, VCBuffer &out); // unified (shared ptr)
   VCError freeBuffer(VCBuffer &buf);
   // Fill `bytes` of `buf` (offset 0) with byte `value` broadcast to uint32.
   // bytes must be a multiple of 4 (vkCmdFillBuffer constraint). Sync blocks;
@@ -366,18 +371,21 @@ public:
   VCError pointerGetAttributes(VCPointerAttributes *out,
                                const void *ptr) const;
   // Register/unregister a buffer for vcPointerGetAttributes. Called by the
-  // vcMalloc/MallocHost/Async C wrappers so the registry tracks every live
-  // allocation and its kind (Device vs Host).
-  void registerBuffer(VCBuffer *b, bool hostVisible);
+  // vcMalloc/MallocHost/MallocManaged/Async C wrappers so the registry tracks
+  // every live allocation and its kind (Device / Host / Managed).
+  void registerBuffer(VCBuffer *b, VCMemoryType kind);
   void unregisterBuffer(VCBuffer *b);
 
-  // Resolve a D2H destination to the address bytes should be written to. If
-  // `hostDst` is a registered host-visible VCBuffer (from vcMallocHost), the
-  // caller passed the *handle* (VCBuffer*), not the mapped payload address —
-  // writing `bytes` there would clobber the struct. Return its persistently
-  // mapped host pointer instead. Otherwise `hostDst` is a plain host pointer
-  // (stack/heap array) and is returned unchanged.
-  void *resolveHostWriteTarget(void *hostDst) const;
+  // Resolve a host pointer used as a vcMemcpy H2D source or D2H destination.
+  // If `hostPtr` is a registered host-visible/managed VCBuffer (from
+  // vcMallocHost / vcMallocManaged), the caller passed the *handle*
+  // (VCBuffer*), not the mapped payload address — reading/writing `bytes`
+  // there would read/clobber the struct. Return its persistently mapped host
+  // pointer instead. Otherwise `hostPtr` is a plain host pointer (stack/heap
+  // array) and is returned unchanged. Used by both copyHostToDevice (read
+  // source) and copyDeviceToHost (write target) so the same handle/payload
+  // distinction applies symmetrically.
+  void *resolveHostAccess(void *hostPtr) const;
 
   // ---- Cross-device copy (host-bridge) ----
   // Copies `bytes` from src buffer (on srcDevice) to dst buffer (on dstDevice).
@@ -400,7 +408,7 @@ private:
   // handle (the void* VC hands out) to its kind. Mutex-guarded because allocs
   // and frees can happen from the host-func background thread (callbacks may
   // re-enter the runtime).
-  std::unordered_map<VCBuffer*, bool> allocRegistry_; // value: hostVisible?
+  std::unordered_map<VCBuffer*, VCMemoryType> allocRegistry_; // value: kind
   mutable std::mutex allocRegistryMu_;
 
   // Buffers whose release was deferred by vcFreeAsync. Each is freed once all

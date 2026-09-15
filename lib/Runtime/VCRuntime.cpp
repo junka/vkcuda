@@ -376,7 +376,7 @@ static void drainReadyReadbacks(VulkanDevice &dev, VCStream &s) {
     if (!f.d2hReadbacks.empty() && f.fence != VK_NULL_HANDLE) {
       if (vkGetFenceStatus(dev.device, f.fence) == VK_SUCCESS) {
         for (auto &rb : f.d2hReadbacks)
-          std::memcpy(Runtime::get().resolveHostWriteTarget(rb.hostDst),
+          std::memcpy(Runtime::get().resolveHostAccess(rb.hostDst),
                       rb.staging->mapped, rb.bytes);
         f.d2hReadbacks.clear();
       }
@@ -446,7 +446,7 @@ VkCommandBuffer Runtime::beginFrame(VCStream &s) {
   // frame has executed: deliver deferred D2H readbacks to their host targets.
   // (The caller is responsible for having synchronized before reading.)
   for (auto &rb : f.d2hReadbacks)
-    std::memcpy(resolveHostWriteTarget(rb.hostDst), rb.staging->mapped, rb.bytes);
+    std::memcpy(resolveHostAccess(rb.hostDst), rb.staging->mapped, rb.bytes);
   f.d2hReadbacks.clear();
   // Drop the frame's staging buffers now that the GPU is done with them.
   for (auto &sb : f.stagingBuffers) freeBuffer(*sb);
@@ -646,6 +646,54 @@ VCError Runtime::mallocHostBufferOn(int deviceIdx, size_t bytes,
 // host-visible staging on the current device.
 VCError Runtime::mallocHostBuffer(size_t bytes, VCBuffer &out) {
   return mallocHostBufferOn(currentDeviceIdx_, bytes, out);
+}
+
+// Unified memory: device storage that is also persistently mapped + host-
+// coherent, so host and device share the same payload with no vcMemcpy.
+// Prefer DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT (true unified — UMA, or
+// discrete GPU with a sufficiently large BAR window). Fall back to plain
+// HOST_VISIBLE | HOST_COHERENT (host-visible, possibly non-device-local) so
+// the unified-pointer contract holds even without a device-local host type.
+// Vulkan has no page-fault migration, so this is zero-copy shared memory, not
+// HMM-style on-demand migration.
+VCError Runtime::mallocManagedBuffer(size_t bytes, VCBuffer &out) {
+  if (!init_) return VCError::InitializationError;
+  VulkanDevice &vd = *devices_[currentDeviceIdx_];
+  out.deviceIdx = currentDeviceIdx_;
+  out.size = bytes;
+  out.buffer = createBuffer(vd.device, bytes);
+  if (!out.buffer) return VCError::OutOfMemory;
+
+  VkMemoryRequirements reqs;
+  vkGetBufferMemoryRequirements(vd.device, out.buffer, &reqs);
+  uint32_t typeIdx = findMemoryTypeOn(vd, reqs.memoryTypeBits,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (typeIdx == UINT32_MAX) {
+    // No device-local host-visible type: fall back to host-visible (still
+    // satisfies the shared-pointer contract, just not device-local).
+    typeIdx = findMemoryTypeOn(vd, reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (typeIdx == UINT32_MAX) {
+      vkDestroyBuffer(vd.device, out.buffer, nullptr);
+      return VCError::OutOfMemory;
+    }
+  }
+  VkMemoryAllocateInfo mai{};
+  mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  mai.allocationSize = reqs.size;
+  mai.memoryTypeIndex = typeIdx;
+  if (vkAllocateMemory(vd.device, &mai, nullptr, &out.memory) != VK_SUCCESS) {
+    vkDestroyBuffer(vd.device, out.buffer, nullptr);
+    return VCError::OutOfMemory;
+  }
+  vkBindBufferMemory(vd.device, out.buffer, out.memory, 0);
+  vkMapMemory(vd.device, out.memory, 0, bytes, 0, &out.mapped);
+  out.hostVisible = true;
+  out.managed = true;
+  return VCError::Success;
 }
 
 VCError Runtime::freeBuffer(VCBuffer &buf) {
@@ -881,7 +929,8 @@ VCError Runtime::copyHostToDevice(VCBuffer &dst, const void *hostSrc,
     auto staging = std::make_unique<VCBuffer>();
     if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
       return VCError::OutOfMemory;
-    std::memcpy(staging->mapped, hostSrc, bytes);
+    std::memcpy(staging->mapped,
+                resolveHostAccess(const_cast<void *>(hostSrc)), bytes);
     VkBufferCopy region{0, 0, bytes};
     vkCmdCopyBuffer(g.secondaryCB, staging->buffer, dst.buffer, 1, &region);
     g.stagingBuffers.push_back(std::move(staging));
@@ -890,7 +939,8 @@ VCError Runtime::copyHostToDevice(VCBuffer &dst, const void *hostSrc,
   VCBuffer scratch{};
   if (mallocHostBufferOn(s.deviceIdx, bytes, scratch) != VCError::Success)
     return VCError::OutOfMemory;
-  std::memcpy(scratch.mapped, hostSrc, bytes);
+  std::memcpy(scratch.mapped,
+              resolveHostAccess(const_cast<void *>(hostSrc)), bytes);
   VkCommandBuffer cb = beginFrame(s);
   VkBufferCopy region{0, 0, bytes};
   vkCmdCopyBuffer(cb, scratch.buffer, dst.buffer, 1, &region);
@@ -934,7 +984,7 @@ VCError Runtime::copyDeviceToHost(void *hostDst, const VCBuffer &src,
   vkCmdCopyBuffer(cb, src.buffer, scratch.buffer, 1, &region);
   endFrame(s);
   streamSynchronize(s);
-  std::memcpy(resolveHostWriteTarget(hostDst), scratch.mapped, bytes);
+  std::memcpy(resolveHostAccess(hostDst), scratch.mapped, bytes);
   freeBuffer(scratch);
   return VCError::Success;
 }
@@ -951,7 +1001,8 @@ VCError Runtime::copyHostToDeviceAsync(VCBuffer &dst, const void *hostSrc,
     auto staging = std::make_unique<VCBuffer>();
     if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
       return VCError::OutOfMemory;
-    std::memcpy(staging->mapped, hostSrc, bytes);
+    std::memcpy(staging->mapped,
+                resolveHostAccess(const_cast<void *>(hostSrc)), bytes);
     VkBufferCopy region{0, 0, bytes};
     vkCmdCopyBuffer(g.secondaryCB, staging->buffer, dst.buffer, 1, &region);
     g.stagingBuffers.push_back(std::move(staging));
@@ -961,7 +1012,8 @@ VCError Runtime::copyHostToDeviceAsync(VCBuffer &dst, const void *hostSrc,
   if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
     return VCError::OutOfMemory;
   // Snapshot the host source NOW so the caller can overwrite it immediately.
-  std::memcpy(staging->mapped, hostSrc, bytes);
+  std::memcpy(staging->mapped,
+              resolveHostAccess(const_cast<void *>(hostSrc)), bytes);
   // Record which frame we submit into so we can attach staging to it. endFrame
   // advances frameIdx, so capture the index before calling it.
   size_t submitIdx = s.frameIdx;
@@ -1438,39 +1490,39 @@ VCError Runtime::pointerGetAttributes(VCPointerAttributes *out,
   out->hostPointer = nullptr;
   out->size = 0;
   auto *b = reinterpret_cast<VCBuffer *>(const_cast<void *>(ptr));
-  bool hostVisible = false;
+  VCMemoryType kind = VCMemoryType::Unregistered;
   {
     std::lock_guard<std::mutex> lk(allocRegistryMu_);
     auto it = allocRegistry_.find(b);
     if (it == allocRegistry_.end()) return VCError::Success; // unregistered
-    hostVisible = it->second;
+    kind = it->second;
   }
   out->devicePointer = b;        // the handle VC returned
   out->size = b->size;
-  if (hostVisible) {
-    out->memoryType = VCMemoryType::Host;
+  out->memoryType = kind;
+  if (kind == VCMemoryType::Host || kind == VCMemoryType::Managed)
     out->hostPointer = b->mapped; // persistently-mapped host address
-  } else {
-    out->memoryType = VCMemoryType::Device;
-  }
   return VCError::Success;
 }
 
-void *Runtime::resolveHostWriteTarget(void *hostDst) const {
-  if (!hostDst) return hostDst;
-  auto *b = reinterpret_cast<VCBuffer *>(hostDst);
+void *Runtime::resolveHostAccess(void *hostPtr) const {
+  if (!hostPtr) return hostPtr;
+  auto *b = reinterpret_cast<VCBuffer *>(hostPtr);
   {
     std::lock_guard<std::mutex> lk(allocRegistryMu_);
     auto it = allocRegistry_.find(b);
-    if (it != allocRegistry_.end() && it->second && b->mapped)
-      return b->mapped; // host-visible VCBuffer: write the mapped payload
+    if (it != allocRegistry_.end() &&
+        (it->second == VCMemoryType::Host ||
+         it->second == VCMemoryType::Managed) &&
+        b->mapped)
+      return b->mapped; // host-visible/managed VCBuffer: use the mapped payload
   }
-  return hostDst; // plain stack/heap pointer: write directly
+  return hostPtr; // plain stack/heap pointer: use directly
 }
 
-void Runtime::registerBuffer(VCBuffer *b, bool hostVisible) {
+void Runtime::registerBuffer(VCBuffer *b, VCMemoryType kind) {
   std::lock_guard<std::mutex> lk(allocRegistryMu_);
-  allocRegistry_[b] = hostVisible;
+  allocRegistry_[b] = kind;
 }
 
 void Runtime::unregisterBuffer(VCBuffer *b) {
@@ -2015,7 +2067,7 @@ VCError vcMalloc(void **devPtr, size_t bytes) {
   VCError e = Runtime::get().mallocBuffer(bytes, *b);
   if (e != VCError::Success) { delete b; return e; }
   *devPtr = b;
-  Runtime::get().registerBuffer(b, /*hostVisible=*/false);
+  Runtime::get().registerBuffer(b, VCMemoryType::Device);
   return VCError::Success;
 }
 
@@ -2025,8 +2077,30 @@ VCError vcMallocHost(void **hostPtr, size_t bytes) {
   VCError e = Runtime::get().mallocHostBuffer(bytes, *b);
   if (e != VCError::Success) { delete b; return e; }
   *hostPtr = b;
-  Runtime::get().registerBuffer(b, /*hostVisible=*/true);
+  Runtime::get().registerBuffer(b, VCMemoryType::Host);
   return VCError::Success;
+}
+
+// Unified memory: same handle contract as vcMalloc (the VCBuffer* is the
+// pointer VC tracks), but the backing storage is persistently mapped +
+// host-coherent. Host reads/writes the payload directly via the mapped
+// address exposed by vcPointerGetAttributes (hostPointer); the device accesses
+// the same storage through the buffer handle (devicePointer). No vcMemcpy
+// needed between host and device. Stream arg is for API symmetry with
+// cudaMallocAsync (allocation is host-immediate; Vulkan has no async alloc).
+VCError vcMallocManaged(void **devPtr, size_t bytes) {
+  if (!devPtr) return VCError::InvalidValue;
+  auto *b = new VCBuffer{};
+  VCError e = Runtime::get().mallocManagedBuffer(bytes, *b);
+  if (e != VCError::Success) { delete b; return e; }
+  *devPtr = b;
+  Runtime::get().registerBuffer(b, VCMemoryType::Managed);
+  return VCError::Success;
+}
+
+VCError vcMallocManagedS(void **devPtr, size_t bytes, VCStreamHandle stream) {
+  (void)stream; // stream-orders subsequent use; allocation is host-immediate
+  return vcMallocManaged(devPtr, bytes);
 }
 
 VCError vcFree(void *devPtr) {

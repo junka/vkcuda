@@ -1,0 +1,100 @@
+// test/managed.vc — unified memory (vcMallocManaged, zero-copy host/device).
+//
+// Exercises vcMallocManaged: a single allocation whose payload is shared by
+// host and device with no vcMemcpy. The host writes initial values directly
+// through the mapped address (exposed by vcPointerGetAttributes), a kernel
+// modifies the same storage in place, and the host reads the result back
+// directly — all without a single H2D/D2H copy. A vcMalloc + vcMemcpy control
+// path verifies the unified path produces identical results.
+//
+//   vcc test/managed.vc -o build/mgd_sf && ./build/mgd_sf
+//   vc  test/managed.vc -emit=full -o build/mgd_m && ./build/mgd_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// In-place: a[i] = a[i] * factor. Reads what the host wrote (no H2D copy),
+// writes back into the same storage the host will read (no D2H copy).
+__global__ void scaleInPlace(int *a, int factor, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) a[i] = a[i] * factor;
+}
+
+int main() {
+  vcInit();
+
+  const int N = 4096;
+  const int BLOCK = 256;
+  const size_t bytes = N * sizeof(int);
+
+  // ---- Unified path: host and device share one pointer, zero vcMemcpy. ----
+  void *m = 0;
+  if (vcMallocManaged(&m, bytes) != VCError::Success) {
+    printf("managed: FAIL (vcMallocManaged)\n");
+    vcShutdown();
+    return 1;
+  }
+  VCPointerAttributes attr;
+  vcPointerGetAttributes(&attr, m);
+  if (attr.memoryType != VCMemoryType::Managed && attr.memoryType != VCMemoryType::Host) {
+    printf("managed: FAIL (memoryType=%d, expected Managed or Host fallback)\n", (int)attr.memoryType);
+    vcFree(m);
+    vcShutdown();
+    return 1;
+  }
+  if (!attr.hostPointer) {
+    printf("managed: FAIL (no mapped hostPointer)\n");
+    vcFree(m);
+    vcShutdown();
+    return 1;
+  }
+  // Host writes initial values directly into the shared payload (zero-copy).
+  int *h = (int *)attr.hostPointer;
+  for (int i = 0; i < N; ++i) h[i] = i;
+  vcDeviceSynchronize(); // host writes visible to the device (coherent)
+
+  // Device modifies the same storage in place. `m` is the buffer handle the
+  // <<<>>> sugar binds as a Pointer kernel arg.
+  scaleInPlace<<<N, BLOCK>>>(m, 3, N);
+  vcDeviceSynchronize(); // device writes visible to the host (coherent)
+
+  // Host reads back directly (zero-copy) and verifies.
+  int ok = 1, firstBad = -1, firstBadVal = 0;
+  for (int i = 0; i < N; ++i)
+    if (h[i] != i * 3) { ok = 0; firstBad = i; firstBadVal = h[i]; break; }
+  if (!ok) fprintf(stderr, "UNIFIED bad: h[%d]=%d expected %d\n", firstBad, firstBadVal, firstBad * 3);
+  vcFree(m);
+
+  // ---- Control path: vcMalloc + explicit vcMemcpy, same computation. ----
+  int *d = 0;
+  if (vcMalloc((void **)&d, bytes) != VCError::Success) {
+    printf("managed: FAIL (vcMalloc control)\n");
+    vcShutdown();
+    return 1;
+  }
+  int *hCtrlHandle = 0;
+  vcMallocHost((void **)&hCtrlHandle, bytes);
+  VCPointerAttributes attrCtrl;
+  vcPointerGetAttributes(&attrCtrl, hCtrlHandle);
+  int *hCtrl = (int *)attrCtrl.hostPointer;
+  for (int i = 0; i < N; ++i) hCtrl[i] = i;
+  vcMemcpy(d, hCtrlHandle, bytes, VCMemcpyKind::HostToDevice);
+  scaleInPlace<<<N, BLOCK>>>(d, 3, N);
+  vcDeviceSynchronize();
+  vcMemcpy(hCtrlHandle, d, bytes, VCMemcpyKind::DeviceToHost);
+  int ok2 = 1, firstBad2 = -1, firstBadVal2 = 0;
+  for (int i = 0; i < N; ++i)
+    if (hCtrl[i] != i * 3) { ok2 = 0; firstBad2 = i; firstBadVal2 = hCtrl[i]; break; }
+  if (!ok2) fprintf(stderr, "CONTROL bad: hCtrl[%d]=%d expected %d\n", firstBad2, firstBadVal2, firstBad2 * 3);
+  if (!ok2) ok = 0;
+  vcFree(hCtrlHandle);
+  vcFree(d);
+
+  vcShutdown();
+  if (!ok) {
+    printf("managed: FAIL (data mismatch)\n");
+    return 1;
+  }
+  printf("managed: PASS\n");
+  return 0;
+}
