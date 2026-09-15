@@ -200,8 +200,9 @@ Done: lexer, parser (CUDA subset + `if`/`for`/`while`/`do`/`switch`,
 (unused-var / argument type / extra diagnostics), Vulkan runtime
 (instance/device/queue/buffer/stream/pipeline/dispatch), CUDA-style host API
 (async streams, events, graphs, managed memory, multi-device selection,
-host-bridged peer copies, device-local memory, reusable staging buffers,
-push-constant scalar args, pipeline caching), CMake with optional MLIR, and the
+device-group P2P peer copies with host-bridge fallback, device-local memory,
+reusable staging buffers, push-constant scalar args, pipeline caching), CMake
+with optional MLIR, and the
 **MLIR backend**: `vc` dialect, AST→MLIR translation, `vc→gpu` lowering,
 shared memory/barriers, atomics, warp/vote intrinsics, serialized SPIR-V
 (`vc -emit=spirv`), and host executable generation (`vc -emit=full`).
@@ -209,6 +210,5 @@ shared memory/barriers, atomics, warp/vote intrinsics, serialized SPIR-V
 Deferred (placeholders or partial support present): WMMA/tensor-core lowering
 (`vc.wmma.*` → `spirv.KHR.CooperativeMatrix`), full C/CUDA type system,
 full overload resolution, optimizer passes, true asynchronous peer copies,
-true device-group P2P transfers, independent transfer queue + cross-queue
-semaphores, general-purpose device memory sub-allocation, and broader
-cross-driver performance coverage.
+independent transfer queue + cross-queue semaphores, general-purpose device
+memory sub-allocation, and broader cross-driver performance coverage.

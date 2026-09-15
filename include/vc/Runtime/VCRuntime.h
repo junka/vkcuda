@@ -137,6 +137,19 @@ VCError vcOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize,
                                          size_t dynamicSharedMemPerBlock,
                                          int blockSizeLimit);
 
+/// Enable kernel-internal printf support (debugPrintfEXT). When enabled, the
+/// Vulkan validation layer is activated at instance creation (next vcInit) so
+/// that `NonSemantic.DebugPrintf` SPIR-V instructions emitted by kernel
+/// `printf(...)` calls are captured and forwarded to a debug messenger, which
+/// prints them to stderr. MUST be called BEFORE vcInit (it configures the
+/// instance/device creation path); calling after vcInit returns InvalidValue.
+/// Equivalently, set the environment variable VC_KERNEL_PRINTF=1 before launch.
+/// Default is off: the validation layer imposes a runtime/perf cost and is only
+/// useful while debugging kernels. Requires a Vulkan validation layer
+/// (VK_LAYER_KHRONOS_validation) installed and a device supporting
+/// VK_KHR_shader_non_semantic_info.
+VCError vcEnableKernelPrintf(int enable);
+
 /// The kind of memory a pointer points into, for vcPointerGetAttributes.
 enum class VCMemoryType {
   Unregistered, // not a VC allocation (e.g. a stack/heap host pointer)
@@ -243,17 +256,19 @@ VCError vcMemcpyAsync(void *dst, const void *src, size_t count,
 
 /// Cross-device copy (cudaMemcpyPeer). Both `dst` and `src` must be vcMalloc
 /// handles; `dstDevice`/`srcDevice` must match the buffers' own device
-/// indices. Implemented via a host bridge (source D2H -> host memcpy -> dest
-/// H2D); true P2P via VK_KHR_device_group peer memory is not yet supported.
-/// Synchronous: idles both devices and returns once the copy has landed.
+/// indices. Uses a Vulkan device-group peer copy when both allocations belong
+/// to the same VK_KHR_device_group/Vulkan 1.1 logical device group and the
+/// source heap exposes peer COPY_SRC access from the destination device;
+/// otherwise falls back to a host bridge (source D2H -> host memcpy -> dest
+/// H2D). Synchronous: returns once the copy has landed.
 VCError vcMemcpyPeer(void *dst, int dstDevice, const void *src, int srcDevice,
                      size_t bytes);
 
 /// Stream-ordered cross-device copy (cudaMemcpyPeerAsync). `stream` must
-/// belong to the destination device. NOTE: VC's MVP runs the host-bridge copy
-/// synchronously internally (it coordinates two devices' queues); a truly
-/// asynchronous, stream-ordered peer copy is a TODO. The `stream` argument is
-/// validated for device ownership and accepted for API symmetry.
+/// belong to the destination device. NOTE: VC currently runs the selected peer
+/// path synchronously internally (it may coordinate two devices' queues); a
+/// truly asynchronous, stream-ordered peer copy is a TODO. The `stream`
+/// argument is validated for device ownership and accepted for API symmetry.
 VCError vcMemcpyPeerAsync(void *dst, int dstDevice, const void *src,
                           int srcDevice, size_t bytes,
                           VCStreamHandle stream);

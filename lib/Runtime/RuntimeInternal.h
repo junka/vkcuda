@@ -20,6 +20,16 @@ namespace vc {
 
 struct VCStream; // forward: VulkanDevice owns a per-device default stream
 
+// Process-global toggle for kernel-internal printf (debugPrintfEXT). Set by
+// vcEnableKernelPrintf OR the VC_KERNEL_PRINTF=1 env var BEFORE vcInit; read
+// once during init() to decide whether to enable the validation layer, the
+// VK_KHR_shader_non_semantic_info device extension, and a debug messenger that
+// captures NonSemantic.DebugPrintf output. Lives at namespace scope (not on the
+// Runtime singleton) because vcEnableKernelPrintf may be called before the
+// singleton is constructed.
+extern bool g_kernelPrintfEnabled;
+
+
 /// All long-lived Vulkan handles for one logical device + compute queue.
 struct VulkanDevice {
   VkInstance instance = VK_NULL_HANDLE;
@@ -30,6 +40,12 @@ struct VulkanDevice {
   VkCommandPool commandPool = VK_NULL_HANDLE; // backs the default stream
   VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
   VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+  bool ownsDevice = true; // false for secondary entries sharing a device group
+  bool deviceGroup = false;
+  uint32_t groupId = UINT32_MAX;
+  uint32_t groupLocalIndex = 0;
+  uint32_t groupSize = 1;
+  uint32_t groupDeviceMask = 1;
   VkPhysicalDeviceMemoryProperties memProps{};
   VkPhysicalDeviceProperties physProps{}; // device name, limits, timestampPeriod
   int subgroupSize = 1;          // queried via VkPhysicalDeviceSubgroupProperties
@@ -55,6 +71,7 @@ struct VCBuffer {
   bool hostVisible = false;
   bool managed = false; // unified memory (vcMallocManaged)
   int deviceIdx = 0; // which device owns this allocation (for free/peer copy)
+  uint32_t memoryHeapIndex = UINT32_MAX;
 };
 
 /// A frame in a stream's command-buffer ring. One command buffer + the fence
@@ -405,10 +422,12 @@ public:
   // distinction applies symmetrically.
   void *resolveHostAccess(void *hostPtr) const;
 
-  // ---- Cross-device copy (host-bridge) ----
+  // ---- Cross-device copy (device-group P2P when available, host fallback) ----
   // Copies `bytes` from src buffer (on srcDevice) to dst buffer (on dstDevice).
   // Same-device falls through to the normal D2D path. Cross-device routes
-  // through host staging (src D2H -> memcpy -> dst H2D); true P2P is a TODO.
+  // through a VK_KHR_device_group/Vulkan 1.1 peer copy when both buffers belong
+  // to the same logical device group and the source heap reports COPY_SRC peer
+  // access from the destination device. Otherwise it falls back to host staging.
   VCError copyPeer(VCBuffer &dst, int dstDevice, const VCBuffer &src,
                    int srcDevice, size_t bytes);
 
@@ -421,6 +440,11 @@ private:
   std::vector<std::unique_ptr<VCGraph>> graphs_;   // owns created graphs
   std::vector<std::unique_ptr<VCEvent>> events_;   // owns created events
   bool init_ = false;
+
+  // Debug messenger for the validation layer (kernel printf). Created in init()
+  // when g_kernelPrintfEnabled is set; destroyed at the top of shutdown() before
+  // the instance is torn down. The single shared instance lives on devices_[0].
+  VkDebugUtilsMessengerEXT debugMessenger_ = VK_NULL_HANDLE;
 
   // Registry of live allocations for vcPointerGetAttributes. Maps the buffer
   // handle (the void* VC hands out) to its kind. Mutex-guarded because allocs
@@ -462,8 +486,11 @@ private:
   // Enumerate all physical devices with a compute queue and build a
   // VulkanDevice (logical device + default stream + pipeline cache) for each.
   bool enumerateDevices(VkInstance instance);
-  // Create the logical device + compute queue for one VulkanDevice.
-  bool setupLogicalDevice(VulkanDevice &vd);
+  // Create the logical device + compute queue for one VulkanDevice. When
+  // `deviceGroupMembers` has more than one physical device, the logical device
+  // is created as a Vulkan device group rooted at `vd.physical`.
+  bool setupLogicalDevice(VulkanDevice &vd,
+                          const std::vector<VkPhysicalDevice> &deviceGroupMembers = {});
   bool buildLayout(VCKernel &k, int deviceIdx, const VCKernelArg *args,
                     int argCount);
   // Find a memory type index satisfying `flags` among `reqBits`.

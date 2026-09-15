@@ -12,6 +12,10 @@
 
 namespace vc {
 
+// Process-global kernel-printf toggle (see RuntimeInternal.h). Read once in
+// init(); defaults off (validation layer has a runtime/perf cost).
+bool g_kernelPrintfEnabled = false;
+
 // Forward decl: defined in the graphs section below; used by shutdown().
 static void resetGraphState(VulkanDevice &dev, VCGraph &g);
 
@@ -42,11 +46,25 @@ Runtime &Runtime::get() {
   return inst;
 }
 
+// debugPrintfEXT output from kernels arrives here as a validation-layer INFO
+// message. We print the formatted text to stderr so it is visible alongside the
+// program's own stdout. WARNING/ERROR messages (real Vulkan misuse) are also
+// surfaced when the layer is active; VERBOSE is dropped to avoid noise.
 static VKAPI_ATTR VkBool32 VKAPI_CALL
-debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
+debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
               VkDebugUtilsMessageTypeFlagsEXT,
               const VkDebugUtilsMessengerCallbackDataEXT *data, void *) {
-  (void)data;
+  if (!data) return VK_FALSE;
+  // Kernel printf comes through as INFO; real misuse is WARNING/ERROR. Always
+  // forward those; drop VERBOSE (loader chatter).
+  if (severity & (VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)) {
+    if (data->pMessage) {
+      std::fprintf(stderr, "%s\n", data->pMessage);
+      std::fflush(stderr);
+    }
+  }
   return VK_FALSE;
 }
 
@@ -54,9 +72,42 @@ debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
 // streams before the static definitions below.
 static bool initStream(VulkanDevice &dev, VCStream &s, size_t frameRing = 2);
 static void teardownStream(VulkanDevice &dev, VCStream &s);
+static bool canUseDeviceGroupPeerCopy(const VulkanDevice &dstDevice,
+                                      const VulkanDevice &srcDevice,
+                                      const VCBuffer &src);
 
 static constexpr size_t kMaxCachedStagingBuffers = 16;
 static constexpr size_t kMaxCachedStagingBytes = 64ull * 1024ull * 1024ull;
+
+static uint32_t selectComputeQueueFamily(VkPhysicalDevice physical) {
+  uint32_t qf = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(physical, &qf, nullptr);
+  std::vector<VkQueueFamilyProperties> props(qf);
+  vkGetPhysicalDeviceQueueFamilyProperties(physical, &qf, props.data());
+  for (uint32_t i = 0; i < qf; ++i)
+    if (props[i].queueFlags & VK_QUEUE_COMPUTE_BIT) return i;
+  return UINT32_MAX;
+}
+
+static void fillPhysicalDeviceInfo(VulkanDevice &vd, VkInstance instance,
+                                   VkPhysicalDevice physical,
+                                   uint32_t queueFamily) {
+  vd.instance = instance;
+  vd.physical = physical;
+  vd.computeQueueFamily = queueFamily;
+  vkGetPhysicalDeviceMemoryProperties(physical, &vd.memProps);
+  VkPhysicalDeviceSubgroupProperties sub{};
+  sub.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+  VkPhysicalDeviceProperties2 p2{};
+  p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  p2.pNext = &sub;
+  vkGetPhysicalDeviceProperties2(physical, &p2);
+  vd.physProps = p2.properties;
+  vd.subgroupSize = (int)sub.subgroupSize;
+  if (vd.subgroupSize == 0) vd.subgroupSize = 1;
+  vd.timestampAvailable =
+      p2.properties.limits.timestampComputeAndGraphics == VK_TRUE;
+}
 
 Runtime::~Runtime() {
   // Safety net: if the program exits without vcShutdown, the singleton's
@@ -70,15 +121,35 @@ Runtime::~Runtime() {
   for (auto &d : devices_) {
     if (!d) continue;
     vkDeviceWaitIdle(d->device);
-    vkDestroyDevice(d->device, nullptr);
+    if (d->ownsDevice)
+      vkDestroyDevice(d->device, nullptr);
   }
-  if (!devices_.empty())
-    vkDestroyInstance(devices_[0]->instance, nullptr);
+  if (!devices_.empty()) {
+    VkInstance inst = devices_[0]->instance;
+    if (debugMessenger_ && inst) {
+      auto vkDestroyDebugUtilsMessengerEXT =
+          (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+              inst, "vkDestroyDebugUtilsMessengerEXT");
+      if (vkDestroyDebugUtilsMessengerEXT)
+        vkDestroyDebugUtilsMessengerEXT(inst, debugMessenger_, nullptr);
+      debugMessenger_ = VK_NULL_HANDLE;
+    }
+    vkDestroyInstance(inst, nullptr);
+  }
   devices_.clear();
 }
 
 VCError Runtime::init() {
   if (init_) return VCError::Success;
+
+  // VC_KERNEL_PRINTF=1 is an alternative entry to vcEnableKernelPrintf (which
+  // must run before init). Read once here; the flag gates validation-layer +
+  // debugPrintfEXT support for the whole instance/device lifetime.
+  if (!g_kernelPrintfEnabled) {
+    const char *env = std::getenv("VC_KERNEL_PRINTF");
+    if (env && (env[0] == '1' || env[0] == 'y' || env[0] == 'Y'))
+      g_kernelPrintfEnabled = true;
+  }
 
   // One shared instance across all devices.
   auto instDev = std::make_unique<VulkanDevice>();
@@ -99,9 +170,35 @@ VCError Runtime::init() {
   ici.enabledExtensionCount = 2;
   ici.ppEnabledExtensionNames = exts;
 
+  // Kernel printf (debugPrintfEXT) is forwarded to a debug messenger by the
+  // Khronos validation layer. When enabled, activate the layer at instance
+  // creation and request GPU-based debug printf via the validation-features
+  // pNext chain. The layer + DEBUG_PRINTF_EXT feature must be present on the
+  // INSTANCE so the layer intercepts NonSemantic.DebugPrintf ExtInst during
+  // shader execution and routes the formatted text to the messenger.
+  const char *layer = "VK_LAYER_KHRONOS_validation";
+  VkValidationFeatureEnableEXT printfEnable =
+      VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT;
+  VkValidationFeaturesEXT valFeats{};
+  valFeats.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+  valFeats.enabledValidationFeatureCount = 1;
+  valFeats.pEnabledValidationFeatures = &printfEnable;
+  bool wantPrintf = g_kernelPrintfEnabled;
+  if (wantPrintf) {
+    ici.enabledLayerCount = 1;
+    ici.ppEnabledLayerNames = &layer;
+    ici.pNext = &valFeats;
+  }
+
   VkResult r = vkCreateInstance(&ici, nullptr, &instDev->instance);
   if (r != VK_SUCCESS) {
     // Retry without debug utils extension (portability ext still required).
+    // Keep the validation layer + printf feature if requested (they don't
+    // depend on debug_utils being in the instance extension list; the messenger
+    // is created via vkGetInstanceProcAddr below and needs the layer, not the
+    // instance extension, to receive printf — but debug_utils IS required for
+    // the messenger itself, so if it was stripped the messenger just won't be
+    // created and printf output is lost; correctness is unaffected).
     ici.enabledExtensionCount = 1;
     ici.ppEnabledExtensionNames = &exts[1];
     r = vkCreateInstance(&ici, nullptr, &instDev->instance);
@@ -109,7 +206,40 @@ VCError Runtime::init() {
   }
   VkInstance instance = instDev->instance;
 
+  // When kernel printf is on, register a debug messenger on the instance so the
+  // validation layer can deliver debugPrintfEXT output (and any misuse) to
+  // debugCallback. INFO severity is required: debugPrintfEXT arrives as INFO.
+  if (wantPrintf) {
+    auto vkCreateDebugUtilsMessengerEXT =
+        (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+            instance, "vkCreateDebugUtilsMessengerEXT");
+    if (vkCreateDebugUtilsMessengerEXT) {
+      VkDebugUtilsMessengerCreateInfoEXT mci{};
+      mci.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+      mci.messageSeverity =
+          VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
+          VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+          VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+      mci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                        VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                        VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+      mci.pfnUserCallback = debugCallback;
+      // Non-fatal if messenger creation fails: kernels still run, just without
+      // printf output capture. Don't disable printf globally on this — the
+      // layer may still print via printf_to_stdout.
+      vkCreateDebugUtilsMessengerEXT(instance, &mci, nullptr, &debugMessenger_);
+    }
+  }
+
   if (!enumerateDevices(instance)) {
+    if (debugMessenger_) {
+      auto vkDestroyDebugUtilsMessengerEXT =
+          (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+              instance, "vkDestroyDebugUtilsMessengerEXT");
+      if (vkDestroyDebugUtilsMessengerEXT)
+        vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger_, nullptr);
+      debugMessenger_ = VK_NULL_HANDLE;
+    }
     vkDestroyInstance(instance, nullptr);
     return VCError::InvalidDevice;
   }
@@ -127,55 +257,109 @@ VCError Runtime::init() {
 // VulkanDevice (logical device + default stream + pipeline cache) for each.
 // Returns false if none were found. Each entry shares the single instance.
 bool Runtime::enumerateDevices(VkInstance instance) {
-  uint32_t n = 0;
-  vkEnumeratePhysicalDevices(instance, &n, nullptr);
-  if (n == 0) return false;
-  std::vector<VkPhysicalDevice> phys(n);
-  vkEnumeratePhysicalDevices(instance, &n, phys.data());
-  for (auto d : phys) {
-    uint32_t qf = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(d, &qf, nullptr);
-    std::vector<VkQueueFamilyProperties> props(qf);
-    vkGetPhysicalDeviceQueueFamilyProperties(d, &qf, props.data());
-    uint32_t chosenQf = UINT32_MAX;
-    for (uint32_t i = 0; i < qf; ++i)
-      if (props[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { chosenQf = i; break; }
-    if (chosenQf == UINT32_MAX) continue; // no compute queue: skip
+  uint32_t groupCount = 0;
+  vkEnumeratePhysicalDeviceGroups(instance, &groupCount, nullptr);
+  std::vector<VkPhysicalDeviceGroupProperties> groups(groupCount);
+  for (auto &g : groups)
+    g.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
+  if (groupCount)
+    vkEnumeratePhysicalDeviceGroups(instance, &groupCount, groups.data());
 
-    auto vd = std::make_unique<VulkanDevice>();
-    vd->instance = instance;
-    vd->physical = d;
-    vd->computeQueueFamily = chosenQf;
-    vkGetPhysicalDeviceMemoryProperties(d, &vd->memProps);
-    VkPhysicalDeviceSubgroupProperties sub{};
-    sub.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
-    VkPhysicalDeviceProperties2 p2{};
-    p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    p2.pNext = &sub;
-    vkGetPhysicalDeviceProperties2(d, &p2);
-    vd->physProps = p2.properties;
-    vd->subgroupSize = (int)sub.subgroupSize;
-    if (vd->subgroupSize == 0) vd->subgroupSize = 1;
-    vd->timestampAvailable =
-        p2.properties.limits.timestampComputeAndGraphics == VK_TRUE;
+  if (groups.empty()) {
+    uint32_t n = 0;
+    vkEnumeratePhysicalDevices(instance, &n, nullptr);
+    if (n == 0) return false;
+    groups.resize(n);
+    std::vector<VkPhysicalDevice> phys(n);
+    vkEnumeratePhysicalDevices(instance, &n, phys.data());
+    for (uint32_t i = 0; i < n; ++i) {
+      groups[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
+      groups[i].physicalDeviceCount = 1;
+      groups[i].physicalDevices[0] = phys[i];
+    }
+  }
 
-    if (!setupLogicalDevice(*vd)) continue;
-    // Per-device default stream.
-    vd->defaultStream = std::make_unique<VCStream>();
-    if (!initStream(*vd, *vd->defaultStream)) continue;
-    vd->defaultStream->deviceIdx = (int)devices_.size();
-    VkPipelineCacheCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
-    vkCreatePipelineCache(vd->device, &pci, nullptr, &vd->pipelineCache);
+  for (uint32_t gi = 0; gi < groups.size(); ++gi) {
+    VkPhysicalDeviceGroupProperties &group = groups[gi];
+    std::vector<VkPhysicalDevice> members;
+    std::vector<uint32_t> queueFamilies;
+    members.reserve(group.physicalDeviceCount);
+    queueFamilies.reserve(group.physicalDeviceCount);
+    for (uint32_t i = 0; i < group.physicalDeviceCount; ++i) {
+      VkPhysicalDevice physical = group.physicalDevices[i];
+      uint32_t qf = selectComputeQueueFamily(physical);
+      if (qf == UINT32_MAX) continue;
+      members.push_back(physical);
+      queueFamilies.push_back(qf);
+    }
+    if (members.empty()) continue;
 
-    devices_.push_back(std::move(vd));
+    bool canUseDeviceGroup = members.size() > 1;
+    for (uint32_t qf : queueFamilies)
+      if (qf != queueFamilies[0]) canUseDeviceGroup = false;
+
+    if (!canUseDeviceGroup) {
+      for (size_t i = 0; i < members.size(); ++i) {
+        auto vd = std::make_unique<VulkanDevice>();
+        fillPhysicalDeviceInfo(*vd, instance, members[i], queueFamilies[i]);
+        if (!setupLogicalDevice(*vd)) continue;
+        vd->defaultStream = std::make_unique<VCStream>();
+        if (!initStream(*vd, *vd->defaultStream)) continue;
+        vd->defaultStream->deviceIdx = (int)devices_.size();
+        VkPipelineCacheCreateInfo pci{};
+        pci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        vkCreatePipelineCache(vd->device, &pci, nullptr, &vd->pipelineCache);
+        devices_.push_back(std::move(vd));
+      }
+      continue;
+    }
+
+    auto owner = std::make_unique<VulkanDevice>();
+    fillPhysicalDeviceInfo(*owner, instance, members[0], queueFamilies[0]);
+    owner->deviceGroup = true;
+    owner->groupId = gi;
+    owner->groupLocalIndex = 0;
+    owner->groupSize = static_cast<uint32_t>(members.size());
+    owner->groupDeviceMask = 1u;
+    if (!setupLogicalDevice(*owner, members)) continue;
+    VkDevice sharedDevice = owner->device;
+    VkQueue sharedQueue = owner->computeQueue;
+    bool timelineSemaphore = owner->timelineSemaphore;
+
+    std::vector<std::unique_ptr<VulkanDevice>> groupDevices;
+    groupDevices.push_back(std::move(owner));
+    for (uint32_t i = 1; i < members.size(); ++i) {
+      auto vd = std::make_unique<VulkanDevice>();
+      fillPhysicalDeviceInfo(*vd, instance, members[i], queueFamilies[i]);
+      vd->device = sharedDevice;
+      vd->computeQueue = sharedQueue;
+      vd->ownsDevice = false;
+      vd->deviceGroup = true;
+      vd->groupId = gi;
+      vd->groupLocalIndex = i;
+      vd->groupSize = static_cast<uint32_t>(members.size());
+      vd->groupDeviceMask = 1u << i;
+      vd->timelineSemaphore = timelineSemaphore;
+      groupDevices.push_back(std::move(vd));
+    }
+
+    for (auto &vd : groupDevices) {
+      vd->defaultStream = std::make_unique<VCStream>();
+      if (!initStream(*vd, *vd->defaultStream)) continue;
+      vd->defaultStream->deviceIdx = (int)devices_.size();
+      VkPipelineCacheCreateInfo pci{};
+      pci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+      vkCreatePipelineCache(vd->device, &pci, nullptr, &vd->pipelineCache);
+      devices_.push_back(std::move(vd));
+    }
   }
   return !devices_.empty();
 }
 
 // Build the logical device + compute queue for one VulkanDevice (formerly
 // createLogicalDevice, now per-device).
-bool Runtime::setupLogicalDevice(VulkanDevice &vd) {
+bool Runtime::setupLogicalDevice(
+    VulkanDevice &vd, const std::vector<VkPhysicalDevice> &deviceGroupMembers) {
   float prio = 1.0f;
   VkDeviceQueueCreateInfo qi{};
   qi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -199,13 +383,37 @@ bool Runtime::setupLogicalDevice(VulkanDevice &vd) {
     vd.timelineSemaphore = true;
   }
 
+  VkDeviceGroupDeviceCreateInfo dgci{};
+  bool useDeviceGroup = deviceGroupMembers.size() > 1;
+  if (useDeviceGroup) {
+    dgci.sType = VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO;
+    dgci.physicalDeviceCount = static_cast<uint32_t>(deviceGroupMembers.size());
+    dgci.pPhysicalDevices = deviceGroupMembers.data();
+  }
+
   VkDeviceCreateInfo dci{};
   dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qi;
+
+  // Device extensions. When kernel printf is on, enable
+  // VK_KHR_shader_non_semantic_info so the validation layer recognizes the
+  // NonSemantic.DebugPrintf extended instruction set the shaders emit. It is
+  // core in Vulkan 1.1+ but enabled explicitly for layer matching on any
+  // device (harmless if unsupported — vkCreateDevice would just fail, and we
+  // only set it when the user opted into printf).
+  const char *devExts[1];
+  if (g_kernelPrintfEnabled) {
+    devExts[0] = VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME;
+    dci.enabledExtensionCount = 1;
+    dci.ppEnabledExtensionNames = devExts;
+  }
+
   if (vd.timelineSemaphore) {
+    feats12.pNext = useDeviceGroup ? &dgci : nullptr;
     dci.pNext = &feats12; // replaces pEnabledFeatures chain
   } else {
+    if (useDeviceGroup) dci.pNext = &dgci;
     VkPhysicalDeviceFeatures feats{};
     dci.pEnabledFeatures = &feats;
   }
@@ -258,9 +466,20 @@ VCError Runtime::shutdown() {
     if (!d) continue;
     if (d->defaultStream) teardownStream(*d, *d->defaultStream);
     if (d->pipelineCache) vkDestroyPipelineCache(d->device, d->pipelineCache, nullptr);
-    vkDestroyDevice(d->device, nullptr);
+    if (d->ownsDevice)
+      vkDestroyDevice(d->device, nullptr);
   }
   devices_.clear();
+  // Destroy the debug messenger BEFORE the instance it belongs to. The messenger
+  // is on the shared instance (devices_[0]->instance, captured in `instance`).
+  if (debugMessenger_ && instance) {
+    auto vkDestroyDebugUtilsMessengerEXT =
+        (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+            instance, "vkDestroyDebugUtilsMessengerEXT");
+    if (vkDestroyDebugUtilsMessengerEXT)
+      vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger_, nullptr);
+    debugMessenger_ = VK_NULL_HANDLE;
+  }
   if (instance) vkDestroyInstance(instance, nullptr);
   currentDeviceIdx_ = 0;
   init_ = false;
@@ -502,6 +721,12 @@ VkCommandBuffer Runtime::beginFrame(VCStream &s) {
   VkCommandBufferBeginInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  VkDeviceGroupCommandBufferBeginInfo dgbi{};
+  if (devices_[s.deviceIdx]->deviceGroup) {
+    dgbi.sType = VK_STRUCTURE_TYPE_DEVICE_GROUP_COMMAND_BUFFER_BEGIN_INFO;
+    dgbi.deviceMask = devices_[s.deviceIdx]->groupDeviceMask;
+    bi.pNext = &dgbi;
+  }
   vkBeginCommandBuffer(f.cb, &bi);
   return f.cb;
 }
@@ -557,6 +782,29 @@ void Runtime::endFrame(VCStream &s) {
     si.pNext = &ti;
   }
 
+  VkDeviceGroupSubmitInfo dgsi{};
+  uint32_t commandDeviceMask = vd.groupDeviceMask;
+  std::vector<uint32_t> waitDeviceIndices;
+  std::vector<uint32_t> signalDeviceIndices;
+  if (vd.deviceGroup) {
+    waitDeviceIndices.assign(waitSems.size(), vd.groupLocalIndex);
+    signalDeviceIndices.assign(signalSems.size(), vd.groupLocalIndex);
+    dgsi.sType = VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO;
+    dgsi.waitSemaphoreCount = static_cast<uint32_t>(waitDeviceIndices.size());
+    dgsi.pWaitSemaphoreDeviceIndices = waitDeviceIndices.empty()
+                                           ? nullptr
+                                           : waitDeviceIndices.data();
+    dgsi.commandBufferCount = 1;
+    dgsi.pCommandBufferDeviceMasks = &commandDeviceMask;
+    dgsi.signalSemaphoreCount =
+        static_cast<uint32_t>(signalDeviceIndices.size());
+    dgsi.pSignalSemaphoreDeviceIndices = signalDeviceIndices.empty()
+                                             ? nullptr
+                                             : signalDeviceIndices.data();
+    dgsi.pNext = si.pNext;
+    si.pNext = &dgsi;
+  }
+
   s.pendingWaits.clear();
   s.pendingSignals.clear();
 
@@ -610,17 +858,55 @@ static VkBuffer createBuffer(VkDevice dev, size_t bytes) {
   return buf;
 }
 
+static VkResult allocateBufferMemoryOn(const VulkanDevice &vd, VkDeviceSize size,
+                                       uint32_t memoryTypeIndex,
+                                       VkDeviceMemory *memory) {
+  VkMemoryAllocateInfo mai{};
+  mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  mai.allocationSize = size;
+  mai.memoryTypeIndex = memoryTypeIndex;
+  VkMemoryAllocateFlagsInfo flags{};
+  if (vd.deviceGroup) {
+    flags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flags.flags = VK_MEMORY_ALLOCATE_DEVICE_MASK_BIT;
+    flags.deviceMask = vd.groupDeviceMask;
+    mai.pNext = &flags;
+  }
+  return vkAllocateMemory(vd.device, &mai, nullptr, memory);
+}
+
+static VkResult bindBufferMemoryOn(const VulkanDevice &vd, VkBuffer buffer,
+                                   VkDeviceMemory memory) {
+  if (!vd.deviceGroup)
+    return vkBindBufferMemory(vd.device, buffer, memory, 0);
+
+  std::vector<uint32_t> deviceIndices(vd.groupSize, vd.groupLocalIndex);
+  VkBindBufferMemoryDeviceGroupInfo dgbi{};
+  dgbi.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_DEVICE_GROUP_INFO;
+  dgbi.deviceIndexCount = static_cast<uint32_t>(deviceIndices.size());
+  dgbi.pDeviceIndices = deviceIndices.data();
+
+  VkBindBufferMemoryInfo bi{};
+  bi.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
+  bi.pNext = &dgbi;
+  bi.buffer = buffer;
+  bi.memory = memory;
+  bi.memoryOffset = 0;
+  return vkBindBufferMemory2(vd.device, 1, &bi);
+}
+
 // device-local: not mapped. Falls back to host-visible if no device-local
 // type satisfies the buffer (e.g. on integrated GPUs device-local == host).
 VCError Runtime::mallocBuffer(size_t bytes, VCBuffer &out) {
   if (!init_) return VCError::InitializationError;
+  VulkanDevice &vd = device();
   out.deviceIdx = currentDeviceIdx_;
   out.size = bytes;
-  out.buffer = createBuffer(device().device, bytes);
+  out.buffer = createBuffer(vd.device, bytes);
   if (!out.buffer) return VCError::OutOfMemory;
 
   VkMemoryRequirements reqs;
-  vkGetBufferMemoryRequirements(device().device, out.buffer, &reqs);
+  vkGetBufferMemoryRequirements(vd.device, out.buffer, &reqs);
   uint32_t typeIdx = findMemoryType(
       reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   bool hostFallback = false;
@@ -630,24 +916,26 @@ VCError Runtime::mallocBuffer(size_t bytes, VCBuffer &out) {
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     hostFallback = true;
     if (typeIdx == UINT32_MAX) {
-      vkDestroyBuffer(device().device, out.buffer, nullptr);
+      vkDestroyBuffer(vd.device, out.buffer, nullptr);
       return VCError::OutOfMemory;
     }
   }
 
-  VkMemoryAllocateInfo mai{};
-  mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  mai.allocationSize = reqs.size;
-  mai.memoryTypeIndex = typeIdx;
-  if (vkAllocateMemory(device().device, &mai, nullptr, &out.memory) !=
+  if (allocateBufferMemoryOn(vd, reqs.size, typeIdx, &out.memory) !=
       VK_SUCCESS) {
-    vkDestroyBuffer(device().device, out.buffer, nullptr);
+    vkDestroyBuffer(vd.device, out.buffer, nullptr);
     return VCError::OutOfMemory;
   }
-  vkBindBufferMemory(device().device, out.buffer, out.memory, 0);
+  if (bindBufferMemoryOn(vd, out.buffer, out.memory) != VK_SUCCESS) {
+    vkFreeMemory(vd.device, out.memory, nullptr);
+    vkDestroyBuffer(vd.device, out.buffer, nullptr);
+    out = VCBuffer{};
+    return VCError::OutOfMemory;
+  }
   out.hostVisible = hostFallback;
+  out.memoryHeapIndex = vd.memProps.memoryTypes[typeIdx].heapIndex;
   if (hostFallback)
-    vkMapMemory(device().device, out.memory, 0, bytes, 0, &out.mapped);
+    vkMapMemory(vd.device, out.memory, 0, bytes, 0, &out.mapped);
   return VCError::Success;
 }
 
@@ -672,17 +960,19 @@ VCError Runtime::mallocHostBufferOn(int deviceIdx, size_t bytes,
     vkDestroyBuffer(vd.device, out.buffer, nullptr);
     return VCError::OutOfMemory;
   }
-  VkMemoryAllocateInfo mai{};
-  mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  mai.allocationSize = reqs.size;
-  mai.memoryTypeIndex = typeIdx;
-  if (vkAllocateMemory(vd.device, &mai, nullptr, &out.memory) != VK_SUCCESS) {
+  if (allocateBufferMemoryOn(vd, reqs.size, typeIdx, &out.memory) != VK_SUCCESS) {
     vkDestroyBuffer(vd.device, out.buffer, nullptr);
     return VCError::OutOfMemory;
   }
-  vkBindBufferMemory(vd.device, out.buffer, out.memory, 0);
+  if (bindBufferMemoryOn(vd, out.buffer, out.memory) != VK_SUCCESS) {
+    vkFreeMemory(vd.device, out.memory, nullptr);
+    vkDestroyBuffer(vd.device, out.buffer, nullptr);
+    out = VCBuffer{};
+    return VCError::OutOfMemory;
+  }
   vkMapMemory(vd.device, out.memory, 0, bytes, 0, &out.mapped);
   out.hostVisible = true;
+  out.memoryHeapIndex = vd.memProps.memoryTypes[typeIdx].heapIndex;
   return VCError::Success;
 }
 
@@ -724,18 +1014,20 @@ VCError Runtime::mallocManagedBuffer(size_t bytes, VCBuffer &out) {
       return VCError::OutOfMemory;
     }
   }
-  VkMemoryAllocateInfo mai{};
-  mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  mai.allocationSize = reqs.size;
-  mai.memoryTypeIndex = typeIdx;
-  if (vkAllocateMemory(vd.device, &mai, nullptr, &out.memory) != VK_SUCCESS) {
+  if (allocateBufferMemoryOn(vd, reqs.size, typeIdx, &out.memory) != VK_SUCCESS) {
     vkDestroyBuffer(vd.device, out.buffer, nullptr);
     return VCError::OutOfMemory;
   }
-  vkBindBufferMemory(vd.device, out.buffer, out.memory, 0);
+  if (bindBufferMemoryOn(vd, out.buffer, out.memory) != VK_SUCCESS) {
+    vkFreeMemory(vd.device, out.memory, nullptr);
+    vkDestroyBuffer(vd.device, out.buffer, nullptr);
+    out = VCBuffer{};
+    return VCError::OutOfMemory;
+  }
   vkMapMemory(vd.device, out.memory, 0, bytes, 0, &out.mapped);
   out.hostVisible = true;
   out.managed = true;
+  out.memoryHeapIndex = vd.memProps.memoryTypes[typeIdx].heapIndex;
   return VCError::Success;
 }
 
@@ -1216,6 +1508,12 @@ VCError Runtime::beginRecord(VCGraph &g) {
   VkCommandBufferInheritanceInfo inh{};
   inh.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
   bi.pInheritanceInfo = &inh;
+  VkDeviceGroupCommandBufferBeginInfo dgbi{};
+  if (devices_[g.deviceIdx]->deviceGroup) {
+    dgbi.sType = VK_STRUCTURE_TYPE_DEVICE_GROUP_COMMAND_BUFFER_BEGIN_INFO;
+    dgbi.deviceMask = devices_[g.deviceIdx]->groupDeviceMask;
+    bi.pNext = &dgbi;
+  }
   if (vkBeginCommandBuffer(g.secondaryCB, &bi) != VK_SUCCESS)
     return VCError::Unknown;
   g.recording = true;
@@ -1483,13 +1781,11 @@ VCError Runtime::setDevice(int idx) {
   return VCError::Success;
 }
 
-// Cross-device copy (cudaMemcpyPeer) via a host bridge: read the source
-// buffer back to host memory, then upload it to the destination buffer. True
-// P2P (VK_KHR_device_group peer memory features) is a TODO; the host bridge is
-// always correct, just slower. Same-device (dstDevice == srcDevice) degenerates
-// to an ordinary D2D copy. `dstDevice`/`srcDevice` must match the buffers'
-// own deviceIdx (passed as a sanity check; the buffers' own deviceIdx is the
-// authority). Sync: idles both devices' queues so the host readback is valid.
+// Cross-device copy (cudaMemcpyPeer): prefer a real Vulkan device-group peer
+// copy when both buffers are backed by the same logical device group and the
+// source heap exposes COPY_SRC peer access to the destination device. Otherwise
+// fall back to the always-correct host bridge. Same-device degenerates to an
+// ordinary D2D copy. Sync: returns once the copy lands.
 VCError Runtime::copyPeer(VCBuffer &dst, int dstDevice, const VCBuffer &src,
                           int srcDevice, size_t bytes) {
   if (!init_) return VCError::InitializationError;
@@ -1510,9 +1806,22 @@ VCError Runtime::copyPeer(VCBuffer &dst, int dstDevice, const VCBuffer &src,
     streamSynchronize(ds);
     return VCError::Success;
   }
-  // Cross-device host bridge: D2H on the source device, then H2D on the dest.
   VulkanDevice &svd = *devices_[srcDevice];
   VulkanDevice &dvd = *devices_[dstDevice];
+  if (canUseDeviceGroupPeerCopy(dvd, svd, src)) {
+    // The command executes on the destination physical device and reads the
+    // source allocation as peer memory inside the same logical device group.
+    vkQueueWaitIdle(svd.computeQueue);
+    VCStream &ds = *dvd.defaultStream;
+    VkCommandBuffer cb = beginFrame(ds);
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(cb, src.buffer, dst.buffer, 1, &region);
+    endFrame(ds);
+    streamSynchronize(ds);
+    return VCError::Success;
+  }
+
+  // Cross-device host bridge: D2H on the source device, then H2D on the dest.
   // Idle the source so any pending writes to `src` are visible.
   vkQueueWaitIdle(svd.computeQueue);
   // D2H: staging on the SOURCE device.
@@ -1596,6 +1905,24 @@ void Runtime::registerBuffer(VCBuffer *b, VCMemoryType kind) {
 void Runtime::unregisterBuffer(VCBuffer *b) {
   std::lock_guard<std::mutex> lk(allocRegistryMu_);
   allocRegistry_.erase(b);
+}
+
+static bool canUseDeviceGroupPeerCopy(const VulkanDevice &dstDevice,
+                                      const VulkanDevice &srcDevice,
+                                      const VCBuffer &src) {
+  if (!dstDevice.deviceGroup || !srcDevice.deviceGroup)
+    return false;
+  if (dstDevice.device != srcDevice.device ||
+      dstDevice.groupId != srcDevice.groupId ||
+      dstDevice.groupLocalIndex == srcDevice.groupLocalIndex)
+    return false;
+  if (src.memoryHeapIndex == UINT32_MAX)
+    return false;
+  VkPeerMemoryFeatureFlags features = 0;
+  vkGetDeviceGroupPeerMemoryFeatures(dstDevice.device, src.memoryHeapIndex,
+                                     dstDevice.groupLocalIndex,
+                                     srcDevice.groupLocalIndex, &features);
+  return (features & VK_PEER_MEMORY_FEATURE_COPY_SRC_BIT) != 0;
 }
 
 // Stream-ordered host callback (cudaLaunchHostFunc). Vulkan has no native
@@ -2413,6 +2740,17 @@ VCError Runtime::dispatchIndirect(VCKernel &k, const VCBuffer &indirectArgs,
 VCError vcInit() { return Runtime::get().init(); }
 VCError vcShutdown() { return Runtime::get().shutdown(); }
 
+// Configure kernel-internal printf support. Must run before vcInit because the
+// flag is read during instance/device creation to enable the validation layer,
+// VK_KHR_shader_non_semantic_info, and the debug messenger that captures
+// debugPrintfEXT output. Setting it after init() has no effect on the already-
+// built instance — return InvalidValue so callers notice the ordering mistake.
+VCError vcEnableKernelPrintf(int enable) {
+  if (Runtime::get().initialized()) return VCError::InvalidValue;
+  g_kernelPrintfEnabled = enable != 0;
+  return VCError::Success;
+}
+
 VCError vcGetDeviceCount(int *count) {
   if (!count) return VCError::InvalidValue;
   if (!Runtime::get().initialized()) {
@@ -2595,11 +2933,10 @@ VCError vcMemcpyAsync(void *dst, const void *src, size_t count,
   return vcMemcpyAsyncS(dst, src, count, kind, nullptr);
 }
 
-// Cross-device copy (cudaMemcpyPeer). Both pointers must be vcMalloc handles
-// (device-local buffers); `dstDevice`/`srcDevice` must match the buffers' own
-// device indices. Implemented as a host bridge: source D2H -> host memcpy ->
-// dest H2D. True P2P via VK_KHR_device_group peer memory is a TODO. This is
-// the synchronous form — it idles both devices and returns once the copy lands.
+// Cross-device copy (cudaMemcpyPeer). Both pointers must be vcMalloc handles;
+// `dstDevice`/`srcDevice` must match the buffers' own device indices. Uses a
+// device-group peer copy when available, otherwise falls back to host staging.
+// This is the synchronous form — it returns once the copy lands.
 VCError vcMemcpyPeer(void *dst, int dstDevice, const void *src, int srcDevice,
                      size_t bytes) {
   auto *db = reinterpret_cast<VCBuffer *>(dst);
@@ -2609,10 +2946,10 @@ VCError vcMemcpyPeer(void *dst, int dstDevice, const void *src, int srcDevice,
 }
 
 // Async form: CUDA's cudaMemcpyPeerAsync runs on a stream belonging to the
-// destination device. VC's MVP runs the same host-bridge synchronously
-// internally (it must coordinate two devices' queues); the `stream` argument
-// is accepted for API symmetry and validated to belong to the destination
-// device. A truly asynchronous, stream-ordered peer copy is a TODO.
+// destination device. VC currently runs the selected peer path synchronously
+// internally; the `stream` argument is accepted for API symmetry and validated
+// to belong to the destination device. A truly asynchronous, stream-ordered
+// peer copy is still future work.
 VCError vcMemcpyPeerAsync(void *dst, int dstDevice, const void *src,
                           int srcDevice, size_t bytes,
                           VCStreamHandle stream) {
