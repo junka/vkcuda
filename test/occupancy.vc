@@ -1,0 +1,115 @@
+// test/occupancy.vc — vcOccupancyMaxPotentialBlockSize (launch-config query).
+//
+// Exercises the limit-based block-size heuristic: ask the runtime for a block
+// size that maximizes per-block occupancy without exceeding device limits,
+// then launch a kernel with that size and verify correctness. Also checks the
+// shared-memory over-budget path returns OutOfMemory.
+//
+// NOTE: this is a Vulkan-limit heuristic, NOT real SM occupancy (Vulkan
+// exposes no SM/CU count or per-kernel register usage). The contract here is
+// only that the returned block size is legal (a power of two, a multiple of
+// the warp/subgroup size, within maxComputeWorkGroupInvocations) and usable.
+//
+//   vcc test/occupancy.vc -o build/occ_sf && ./build/occ_sf
+//   vc  test/occupancy.vc -emit=full -o build/occ_m && ./build/occ_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// Each thread writes a[i] = i. Trivial kernel — the point is to launch it with
+// the occupancy-recommended block size and verify coverage.
+__global__ void fillIndex(int *a, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) a[i] = i;
+}
+
+int main() {
+  vcInit();
+
+  VCDeviceProperties props;
+  int devIdx = 0;
+  vcGetDevice(&devIdx);
+  vcGetDeviceProperties(&props, devIdx);
+
+  // Prime the kernel handle via the <<<>>> sugar (resolves the SPIR-V
+  // entry-point name portably across backends), then query occupancy on it.
+  const int N = 100000;
+  int *d = 0;
+  if (vcMalloc((void **)&d, N * sizeof(int)) != VCError::Success) {
+    printf("occupancy: FAIL (malloc)\n");
+    vcShutdown();
+    return 1;
+  }
+  // A throwaway direct launch loads __vc_k_fillIndex; we reuse the handle.
+  fillIndex<<<N, 64>>>(d, N);
+  vcDeviceSynchronize();
+
+  int minGrid = 0, block = 0;
+  VCError e = vcOccupancyMaxPotentialBlockSize(&minGrid, &block, __vc_k_fillIndex,
+                                               /*dynamicSharedMemPerBlock=*/0,
+                                               /*blockSizeLimit=*/0);
+  if (e != VCError::Success) {
+    printf("occupancy: FAIL (query err=%d)\n", (int)e);
+    vcFree(d);
+    vcShutdown();
+    return 1;
+  }
+
+  // Validate the heuristic's contract: power of two, warp-aligned, in range.
+  int ok = 1;
+  if (block < 1 || block > props.maxThreadsPerBlock) {
+    fprintf(stderr, "block %d out of [1,%d]\n", block, props.maxThreadsPerBlock);
+    ok = 0;
+  }
+  if (block % props.warpSize != 0) {
+    fprintf(stderr, "block %d not a multiple of warpSize %d\n", block, props.warpSize);
+    ok = 0;
+  }
+  if ((block & (block - 1)) != 0) { // power-of-two check (block>=1)
+    fprintf(stderr, "block %d not a power of two\n", block);
+    ok = 0;
+  }
+  if (minGrid != props.maxGridSize[0]) {
+    fprintf(stderr, "minGrid %d != maxGridSize[0] %d\n", minGrid, props.maxGridSize[0]);
+    ok = 0;
+  }
+  if (!ok) { vcFree(d); vcShutdown(); printf("occupancy: FAIL (contract)\n"); return 1; }
+
+  // Launch with the recommended block size and verify coverage.
+  vcMemset(d, 0, N * sizeof(int));
+  fillIndex<<<N, block>>>(d, N);
+  vcDeviceSynchronize();
+  int *hHandle = 0;
+  vcMallocHost((void **)&hHandle, N * sizeof(int));
+  vcMemcpy(hHandle, d, N * sizeof(int), VCMemcpyKind::DeviceToHost);
+  VCPointerAttributes attr;
+  vcPointerGetAttributes(&attr, hHandle);
+  int *h = (int *)attr.hostPointer;
+  for (int i = 0; i < N; ++i)
+    if (h[i] != i) { ok = 0; fprintf(stderr, "data[%d]=%d expected %d\n", i, h[i], i); break; }
+  vcFree(hHandle);
+
+  // Shared-memory over-budget: request more than the per-block cap.
+  VCError over = vcOccupancyMaxPotentialBlockSize(&minGrid, &block, __vc_k_fillIndex,
+                                                  props.sharedMemPerBlock + 1, 0);
+  if (over != VCError::OutOfMemory) {
+    fprintf(stderr, "over-budget shared should be OutOfMemory, got %d\n", (int)over);
+    ok = 0;
+  }
+
+  // A blockSizeLimit below maxInv should cap the result.
+  int minGrid2 = 0, block2 = 0;
+  if (vcOccupancyMaxPotentialBlockSize(&minGrid2, &block2, __vc_k_fillIndex, 0, 128) ==
+          VCError::Success &&
+      block2 > 128) {
+    fprintf(stderr, "block2 %d exceeds limit 128\n", block2);
+    ok = 0;
+  }
+
+  vcFree(d);
+  vcShutdown();
+  if (!ok) { printf("occupancy: FAIL\n"); return 1; }
+  printf("occupancy: PASS (block=%d minGrid=%d warp=%d)\n", block, minGrid,
+         props.warpSize);
+  return 0;
+}

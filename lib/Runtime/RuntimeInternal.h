@@ -368,6 +368,11 @@ public:
 
   // ---- Device / pointer queries ----
   VCError getDeviceProperties(VCDeviceProperties *out, int device) const;
+  // Limit-based block-size heuristic for vcOccupancyMaxPotentialBlockSize.
+  // Not real SM occupancy (Vulkan exposes no SM count / per-kernel resources).
+  VCError occupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize,
+                                         size_t dynamicSharedMemPerBlock,
+                                         int blockSizeLimit) const;
   VCError pointerGetAttributes(VCPointerAttributes *out,
                                const void *ptr) const;
   // Register/unregister a buffer for vcPointerGetAttributes. Called by the

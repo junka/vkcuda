@@ -117,6 +117,26 @@ struct VCDeviceProperties {
 /// a subset of cudaGetDeviceProperties.
 VCError vcGetDeviceProperties(VCDeviceProperties *out, int device);
 
+/// Estimate a launch block size that maximizes per-block occupancy without
+/// exceeding device limits. On success, `*blockSize` is the largest power of
+/// two that fits under `blockSizeLimit` (or maxComputeWorkGroupInvocations if
+/// `blockSizeLimit <= 0`), leaves room for `dynamicSharedMemPerBlock` under
+/// maxComputeSharedMemorySize, and is a multiple of the device warp/subgroup
+/// size; `*minGridSize` is maxComputeWorkGroupCount[0] (the grid-count upper
+/// bound).
+///
+/// THIS IS A LIMIT-BASED HEURISTIC, NOT REAL SM OCCUPANCY: Vulkan does not
+/// expose SM/CU count, per-SM registers, or per-kernel resource usage, so true
+/// active-blocks-per-SM cannot be computed. `kernel` is accepted for CUDA-API
+/// symmetry (cudaOccupancyMaxPotentialBlockSize) and future SPIR-V resource
+/// reflection; it is not currently inspected. Returns InvalidKernel on a null
+/// handle and OutOfMemory if `dynamicSharedMemPerBlock` exceeds the per-block
+/// shared-memory limit or no legal block size satisfies the constraints.
+VCError vcOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize,
+                                         VCKernelHandle kernel,
+                                         size_t dynamicSharedMemPerBlock,
+                                         int blockSizeLimit);
+
 /// The kind of memory a pointer points into, for vcPointerGetAttributes.
 enum class VCMemoryType {
   Unregistered, // not a VC allocation (e.g. a stack/heap host pointer)

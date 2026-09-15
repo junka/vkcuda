@@ -1402,6 +1402,42 @@ VCError Runtime::getDeviceProperties(VCDeviceProperties *out, int deviceIndex) c
   return VCError::Success;
 }
 
+// Limit-based block-size heuristic (not real SM occupancy — Vulkan exposes no
+// SM count, per-SM registers, or per-kernel resource usage). Picks the largest
+// power of two that fits the invocation/shared/warp constraints, mirroring the
+// shape of cudaOccupancyMaxPotentialBlockSize within Vulkan's limited envelope.
+VCError Runtime::occupancyMaxPotentialBlockSize(
+    int *minGridSize, int *blockSize, size_t dynamicSharedMemPerBlock,
+    int blockSizeLimit) const {
+  if (!init_) return VCError::InitializationError;
+  if (currentDeviceIdx_ < 0 || (size_t)currentDeviceIdx_ >= devices_.size())
+    return VCError::InvalidDevice;
+  VCDeviceProperties props;
+  VCError e = getDeviceProperties(&props, currentDeviceIdx_);
+  if (e != VCError::Success) return e;
+
+  const size_t sharedLimit = props.sharedMemPerBlock;
+  if (dynamicSharedMemPerBlock > sharedLimit)
+    return VCError::OutOfMemory; // shared-mem request exceeds per-block cap
+
+  const int maxInv = props.maxThreadsPerBlock; // maxComputeWorkGroupInvocations
+  int cap = (blockSizeLimit > 0 && blockSizeLimit < maxInv) ? blockSizeLimit
+                                                            : maxInv;
+  if (cap < 1) return VCError::OutOfMemory;
+
+  // Largest power of two <= cap, then rounded down to a multiple of the
+  // device warp/subgroup size (so full warps/subgroups are dispatched).
+  int blk = 1;
+  while (blk * 2 <= cap) blk *= 2;
+  const int warp = props.warpSize > 0 ? props.warpSize : 1;
+  blk -= blk % warp;
+  if (blk < 1) blk = 1;
+
+  if (blockSize) *blockSize = blk;
+  if (minGridSize) *minGridSize = props.maxGridSize[0];
+  return VCError::Success;
+}
+
 // Switch the current device (cudaSetDevice). Subsequent allocations, kernel
 // loads, stream creation, and the default stream all target this device. Does
 // NOT migrate existing buffers/streams/kernels — each object stays on the
@@ -2053,6 +2089,19 @@ VCError vcGetDeviceProperties(VCDeviceProperties *out, int device) {
   if (!Runtime::get().initialized())
     return VCError::InitializationError;
   return Runtime::get().getDeviceProperties(out, device);
+}
+
+VCError vcOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize,
+                                         VCKernelHandle kernel,
+                                         size_t dynamicSharedMemPerBlock,
+                                         int blockSizeLimit) {
+  if (!Runtime::get().initialized())
+    return VCError::InitializationError;
+  // Kernel handle is accepted for CUDA-API symmetry and future SPIR-V resource
+  // reflection; the current limit-based heuristic does not inspect it.
+  if (!kernel) return VCError::InvalidKernel;
+  return Runtime::get().occupancyMaxPotentialBlockSize(
+      minGridSize, blockSize, dynamicSharedMemPerBlock, blockSizeLimit);
 }
 
 VCError vcPointerGetAttributes(VCPointerAttributes *out, const void *ptr) {
