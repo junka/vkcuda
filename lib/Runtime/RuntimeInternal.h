@@ -133,10 +133,18 @@ struct VCKernel {
   std::vector<uint32_t> spirvWords; // device-independent SPIR-V
   std::string entryPoint;
   int argCount = 0;
+  // Reflected SSBO bindings in API pointer-argument order. Reflection keeps the
+  // runtime ABI tied to the shader's actual DescriptorSet/Binding decorations
+  // instead of assuming bindings are dense from zero.
+  std::vector<uint32_t> storageBufferBindings;
+  bool hasResourceReflection = false;
   // Push-constant range (offset/size) for scalar args, in bytes. size==0
   // means no push constants. Layout is built once per device and cached there.
   uint32_t pcOffset = 0;
   uint32_t pcSize = 0;
+  // Reflected push-constant member offsets in API scalar-argument order. Empty
+  // means fall back to the legacy tightly-packed scalar ABI.
+  std::vector<uint32_t> pushConstantOffsets;
   // Per-device state, lazily created on first launch on that device.
   std::unordered_map<int, std::unique_ptr<VCKernelDeviceState>> perDevice;
 };

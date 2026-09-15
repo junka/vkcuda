@@ -2,16 +2,14 @@
 //
 // Kernel loading and pipeline construction live in VCRuntime.cpp (Runtime
 // methods loadKernel / buildPipelineForKernel / launch). This file is
-// reserved for future specialization: descriptor-set layout reflection from
-// SPIR-V, specialization constants, push constants, and pipeline caches.
+// reserved for future specialization of the pipeline subsystem.
 //
 //===----------------------------------------------------------------------===//
 
 #include "RuntimeInternal.h"
 
 namespace vc {
-// TODO: reflect descriptor bindings from spirv instead of assuming one SSBO
-//       per launch argument.
-// TODO: pipeline cache (VkPipelineCache) for faster re-loads.
-// TODO: push-constant path for small scalar args instead of SSBO binding.
+// TODO: persist VkPipelineCache blobs across process runs.
+// TODO: move the lightweight SPIR-V reflection helper out of VCRuntime.cpp
+//       when the pipeline subsystem grows beyond the current single file.
 } // namespace vc

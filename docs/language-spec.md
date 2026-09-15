@@ -81,14 +81,16 @@ maps to `vkCmdDispatch` with workgroup count = `ceil(grid/block)`.
 ## Hardware features (deferred)
 - `wmma::*` -> `spirv.KHR.CooperativeMatrix` (Tensor Core). Placeholder ops
   `vc.wmma.load/store/mma` exist in the dialect; lowering TBD.
-- `__shfl_*`, atomics, `__ballot` — TBD.
+- Atomics, warp shuffle/vote, and block-wide vote intrinsics are implemented
+  for the currently tested scalar cases; broader CUDA overload coverage and
+  backend-specific edge cases remain planned work.
 
 ## Limitations
 - Kernel parameter names that are GLSL reserved words (e.g. `out`) collide with
   glslc — use a different name (e.g. `result`).
 - `__device__` helper parameters that share a name with a kernel scalar param
   are emitted with a `pc.` push-constant prefix; avoid shadowing those names.
-- No `enum`/`union`, no multi-dimensional initializer nesting beyond one level,
+- No `union`, no multi-dimensional initializer nesting beyond one level,
   no string type, no full overload resolution.
 
 ## Host API
@@ -96,4 +98,3 @@ See `include/vc/Runtime/VCRuntime.h` (`vcMalloc`, `vcFree`, `vcMemcpy`,
 `vcLaunchKernel`, `vcDeviceSynchronize`, ...). Examples live in `examples/`
 (`vector_add`, `block_reduce`, `matmul`, `async_overlap`, `features_demo`,
 `struct_demo`, `features2_demo`).
-

@@ -1,0 +1,8 @@
+// test/MLIR/deref_pointer.vc — pointer dereference lvalue regression.
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && test -s %t.spv
+
+__global__ void derefPointer(int *out, int *in) {
+  int v = *in;
+  *out = v + 1;
+}

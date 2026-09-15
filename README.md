@@ -3,13 +3,12 @@
 > The project has **two SPIR-V backends**:
 >
 > - **GLSL backend (working, no MLIR needed)**: `.vc` → AST → GLSL compute
->   shader → `glslc` → SPIR-V. End-to-end `vector_add`, `block_reduce`, and
->   `matmul` run and print PASS; an `async_overlap` demo exercises the
->   stream API.
+>   shader → `glslc` → SPIR-V. The full `test/*.vc` self-checking demo suite
+>   runs through this backend.
 > - **MLIR backend (working)**: `.vc` → AST → MLIR (vc dialect) → gpu →
->   spirv → binary. The `vc` driver emits MLIR and serialized SPIR-V
->   (`-emit=mlir` / `-emit=spirv`); see [MLIR backend](#mlir-backend) for the
->   design and [test/MLIR](test/MLIR) for the regression tests.
+>   spirv → binary. The `vc` driver emits MLIR, serialized SPIR-V, and linked
+>   host executables (`-emit=mlir` / `-emit=spirv` / `-emit=full`); the same
+>   self-checking demos run through this backend when MLIR is enabled.
 
 ## Architecture
 
@@ -196,19 +195,20 @@ The Vulkan runtime implements a CUDA-style host API over Vulkan compute:
 
 ## What is scaffolded vs. TODO
 
-Done: lexer, parser (CUDA subset + `if`/`for`/`while`/`__shared__`/
-`__syncthreads`/2D launch), AST, AST dumper, Sema (unused-var / argument
-type / extra diagnostics), Vulkan runtime (instance/device/queue/buffer/
-stream/pipeline/dispatch), CUDA-style host API (async streams,
-device-local + staging memory, push-constant scalar args, pipeline
-caching), CMake with optional MLIR, end-to-end demos, and the **MLIR
-backend**: `vc` dialect, AST→MLIR translation, `vc→gpu` lowering, and
-the gpu→spirv pipeline producing serialized SPIR-V (`vc -emit=spirv`,
-validated by `constant.vc`), plus `mlir-check` IR regression tests.
+Done: lexer, parser (CUDA subset + `if`/`for`/`while`/`do`/`switch`,
+`__shared__`, `__syncthreads`, 2D launch), AST, AST dumper, Sema
+(unused-var / argument type / extra diagnostics), Vulkan runtime
+(instance/device/queue/buffer/stream/pipeline/dispatch), CUDA-style host API
+(async streams, events, graphs, managed memory, multi-device selection,
+host-bridged peer copies, device-local + staging memory, push-constant scalar
+args, pipeline caching), CMake with optional MLIR, end-to-end demos, and the
+**MLIR backend**: `vc` dialect, AST→MLIR translation, `vc→gpu` lowering,
+shared memory/barriers, atomics, warp/vote intrinsics, serialized SPIR-V
+(`vc -emit=spirv`), and host executable generation (`vc -emit=full`).
 
-Deferred (placeholders present): `vc.barrier`/`__shared__` GPU lowering
-and SPIR-V semantics, WMMA/tensor-core lowering (`vc.wmma.*` →
-`spirv.KHR.CooperativeMatrix`), full type system, optimizer passes,
-async D2H memcpy, independent transfer queue + cross-queue semaphores,
-memory sub-allocation pool, multi-device, driving MLIR-emitted shaders
-from host code.
+Deferred (placeholders or partial support present): WMMA/tensor-core lowering
+(`vc.wmma.*` → `spirv.KHR.CooperativeMatrix`), full C/CUDA type system,
+full overload resolution, optimizer passes, true asynchronous peer copies,
+true device-group P2P transfers, independent transfer queue + cross-queue
+semaphores, memory sub-allocation/staging pools, and broader cross-driver
+performance coverage.

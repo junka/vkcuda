@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 
 namespace vc {
 
@@ -1680,6 +1681,301 @@ void Runtime::drainHostFuncs() {
 // Kernels / pipelines
 //----------------------------------------------------------------------------
 
+namespace {
+
+enum SpvOpcode : uint16_t {
+  SpvOpName = 5,
+  SpvOpMemberName = 6,
+  SpvOpDecorate = 71,
+  SpvOpMemberDecorate = 72,
+  SpvOpTypeInt = 21,
+  SpvOpTypeFloat = 22,
+  SpvOpTypeVector = 23,
+  SpvOpTypeArray = 28,
+  SpvOpTypeRuntimeArray = 29,
+  SpvOpTypeStruct = 30,
+  SpvOpTypePointer = 32,
+  SpvOpConstant = 43,
+  SpvOpVariable = 59,
+};
+
+enum SpvDecoration : uint32_t {
+  SpvDecArrayStride = 6,
+  SpvDecOffset = 35,
+  SpvDecBinding = 33,
+  SpvDecDescriptorSet = 34,
+};
+
+enum SpvStorageClass : uint32_t {
+  SpvStorageUniform = 2,
+  SpvStoragePushConstant = 9,
+  SpvStorageStorageBuffer = 12,
+};
+
+struct SpirvTypeInfo {
+  enum Kind { Unknown, Int, Float, Vector, Array, RuntimeArray, Struct, Pointer } kind = Unknown;
+  uint32_t bitWidth = 0;
+  uint32_t elementType = 0;
+  uint32_t elementCount = 0;
+  uint32_t arrayStride = 0;
+  uint32_t storageClass = 0;
+  std::vector<uint32_t> memberTypes;
+};
+
+struct SpirvVariableInfo {
+  uint32_t resultType = 0;
+  uint32_t storageClass = 0;
+  uint32_t descriptorSet = 0;
+  uint32_t binding = std::numeric_limits<uint32_t>::max();
+  std::string name;
+};
+
+struct SpirvReflectionInfo {
+  std::vector<uint32_t> storageBufferBindings;
+  std::vector<uint32_t> pushConstantOffsets;
+  uint32_t pushConstantSize = 0;
+};
+
+static uint32_t alignTo(uint32_t value, uint32_t alignment) {
+  if (alignment == 0) return value;
+  return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static std::string spirvLiteralString(const uint32_t *words, uint32_t wordCount,
+                                      uint32_t firstWord) {
+  if (firstWord >= wordCount) return {};
+  std::string out;
+  const char *bytes = reinterpret_cast<const char *>(words + firstWord);
+  uint32_t byteCount = (wordCount - firstWord) * 4;
+  for (uint32_t i = 0; i < byteCount && bytes[i] != '\0'; ++i)
+    out.push_back(bytes[i]);
+  return out;
+}
+
+static uint32_t spirvTypeSize(
+    uint32_t typeId, const std::unordered_map<uint32_t, SpirvTypeInfo> &types,
+    const std::unordered_map<uint32_t, uint32_t> &constants,
+    const std::unordered_map<uint32_t, std::unordered_map<uint32_t, uint32_t>> &memberOffsets);
+
+static uint32_t spirvStructSize(
+    uint32_t typeId, const SpirvTypeInfo &type,
+    const std::unordered_map<uint32_t, SpirvTypeInfo> &types,
+    const std::unordered_map<uint32_t, uint32_t> &constants,
+    const std::unordered_map<uint32_t, std::unordered_map<uint32_t, uint32_t>> &memberOffsets) {
+  auto offIt = memberOffsets.find(typeId);
+  uint32_t end = 0;
+  for (uint32_t i = 0; i < type.memberTypes.size(); ++i) {
+    uint32_t offset = 0;
+    if (offIt != memberOffsets.end()) {
+      auto mit = offIt->second.find(i);
+      if (mit != offIt->second.end()) offset = mit->second;
+    } else {
+      offset = end;
+    }
+    uint32_t memberSize = spirvTypeSize(type.memberTypes[i], types, constants,
+                                        memberOffsets);
+    end = std::max(end, offset + memberSize);
+  }
+  return alignTo(end, 4);
+}
+
+static uint32_t spirvTypeSize(
+    uint32_t typeId, const std::unordered_map<uint32_t, SpirvTypeInfo> &types,
+    const std::unordered_map<uint32_t, uint32_t> &constants,
+    const std::unordered_map<uint32_t, std::unordered_map<uint32_t, uint32_t>> &memberOffsets) {
+  auto it = types.find(typeId);
+  if (it == types.end()) return 0;
+  const SpirvTypeInfo &type = it->second;
+  switch (type.kind) {
+  case SpirvTypeInfo::Int:
+  case SpirvTypeInfo::Float:
+    return std::max<uint32_t>(1, type.bitWidth / 8);
+  case SpirvTypeInfo::Vector:
+    return spirvTypeSize(type.elementType, types, constants, memberOffsets) *
+           type.elementCount;
+  case SpirvTypeInfo::Array: {
+    uint32_t count = type.elementCount;
+    auto cit = constants.find(count);
+    if (cit != constants.end()) count = cit->second;
+    uint32_t stride = type.arrayStride ? type.arrayStride
+        : spirvTypeSize(type.elementType, types, constants, memberOffsets);
+    return stride * count;
+  }
+  case SpirvTypeInfo::Struct:
+    return spirvStructSize(typeId, type, types, constants, memberOffsets);
+  case SpirvTypeInfo::Pointer:
+    return spirvTypeSize(type.elementType, types, constants, memberOffsets);
+  case SpirvTypeInfo::RuntimeArray:
+  case SpirvTypeInfo::Unknown:
+    return 0;
+  }
+  return 0;
+}
+
+static SpirvReflectionInfo reflectSpirvResources(const uint32_t *words,
+                                                 size_t wordCount,
+                                                 const std::string &entryPoint) {
+  SpirvReflectionInfo out;
+  if (!words || wordCount < 5 || words[0] != 0x07230203) return out;
+
+  std::unordered_map<uint32_t, SpirvTypeInfo> types;
+  std::unordered_map<uint32_t, uint32_t> constants;
+  std::unordered_map<uint32_t, SpirvVariableInfo> vars;
+  std::unordered_map<uint32_t, std::unordered_map<uint32_t, uint32_t>> memberOffsets;
+
+  for (size_t offset = 5; offset < wordCount;) {
+    uint32_t inst = words[offset];
+    uint16_t op = static_cast<uint16_t>(inst & 0xffffu);
+    uint16_t wc = static_cast<uint16_t>(inst >> 16);
+    if (wc == 0 || offset + wc > wordCount) break;
+    const uint32_t *w = words + offset;
+    switch (op) {
+    case SpvOpName:
+      if (wc >= 3)
+        vars[w[1]].name = spirvLiteralString(w, wc, 2);
+      break;
+    case SpvOpMemberName:
+      break;
+    case SpvOpDecorate:
+      if (wc >= 3) {
+        uint32_t target = w[1];
+        uint32_t decoration = w[2];
+        if (decoration == SpvDecBinding && wc >= 4)
+          vars[target].binding = w[3];
+        else if (decoration == SpvDecDescriptorSet && wc >= 4)
+          vars[target].descriptorSet = w[3];
+        else if (decoration == SpvDecArrayStride && wc >= 4)
+          types[target].arrayStride = w[3];
+      }
+      break;
+    case SpvOpMemberDecorate:
+      if (wc >= 5 && w[3] == SpvDecOffset)
+        memberOffsets[w[1]][w[2]] = w[4];
+      break;
+    case SpvOpTypeInt:
+      if (wc >= 4) {
+        auto &t = types[w[1]];
+        t.kind = SpirvTypeInfo::Int;
+        t.bitWidth = w[2];
+      }
+      break;
+    case SpvOpTypeFloat:
+      if (wc >= 3) {
+        auto &t = types[w[1]];
+        t.kind = SpirvTypeInfo::Float;
+        t.bitWidth = w[2];
+      }
+      break;
+    case SpvOpTypeVector:
+      if (wc >= 4) {
+        auto &t = types[w[1]];
+        t.kind = SpirvTypeInfo::Vector;
+        t.elementType = w[2];
+        t.elementCount = w[3];
+      }
+      break;
+    case SpvOpTypeArray:
+      if (wc >= 4) {
+        auto &t = types[w[1]];
+        t.kind = SpirvTypeInfo::Array;
+        t.elementType = w[2];
+        t.elementCount = w[3];
+      }
+      break;
+    case SpvOpTypeRuntimeArray:
+      if (wc >= 3) {
+        auto &t = types[w[1]];
+        t.kind = SpirvTypeInfo::RuntimeArray;
+        t.elementType = w[2];
+      }
+      break;
+    case SpvOpTypeStruct:
+      if (wc >= 2) {
+        auto &t = types[w[1]];
+        t.kind = SpirvTypeInfo::Struct;
+        t.memberTypes.assign(w + 2, w + wc);
+      }
+      break;
+    case SpvOpTypePointer:
+      if (wc >= 4) {
+        auto &t = types[w[1]];
+        t.kind = SpirvTypeInfo::Pointer;
+        t.storageClass = w[2];
+        t.elementType = w[3];
+      }
+      break;
+    case SpvOpConstant:
+      if (wc >= 4)
+        constants[w[2]] = w[3];
+      break;
+    case SpvOpVariable:
+      if (wc >= 4) {
+        auto &v = vars[w[2]];
+        v.resultType = w[1];
+        v.storageClass = w[3];
+      }
+      break;
+    default:
+      break;
+    }
+    offset += wc;
+  }
+
+  struct Binding { uint32_t set; uint32_t binding; uint32_t id; };
+  std::vector<Binding> buffers;
+  std::vector<Binding> entryNamedBuffers;
+  std::string entryArgPrefix = entryPoint + "_arg_";
+  for (const auto &kv : vars) {
+    const SpirvVariableInfo &v = kv.second;
+    if ((v.storageClass == SpvStorageUniform ||
+         v.storageClass == SpvStorageStorageBuffer) &&
+        v.binding != std::numeric_limits<uint32_t>::max()) {
+      buffers.push_back({v.descriptorSet, v.binding, kv.first});
+      if (!entryArgPrefix.empty() && v.name.rfind(entryArgPrefix, 0) == 0)
+        entryNamedBuffers.push_back({v.descriptorSet, v.binding, kv.first});
+    }
+    if (v.storageClass == SpvStoragePushConstant) {
+      auto typeIt = types.find(v.resultType);
+      if (typeIt == types.end() || typeIt->second.kind != SpirvTypeInfo::Pointer)
+        continue;
+      uint32_t structTypeId = typeIt->second.elementType;
+      auto structIt = types.find(structTypeId);
+      if (structIt == types.end() || structIt->second.kind != SpirvTypeInfo::Struct)
+        continue;
+      auto offsetsIt = memberOffsets.find(structTypeId);
+      for (uint32_t i = 0; i < structIt->second.memberTypes.size(); ++i) {
+        uint32_t memberOffset = out.pushConstantSize;
+        if (offsetsIt != memberOffsets.end()) {
+          auto mit = offsetsIt->second.find(i);
+          if (mit != offsetsIt->second.end()) memberOffset = mit->second;
+        }
+        out.pushConstantOffsets.push_back(memberOffset);
+        uint32_t memberSize = spirvTypeSize(structIt->second.memberTypes[i],
+                                            types, constants, memberOffsets);
+        out.pushConstantSize = std::max(out.pushConstantSize,
+                                        memberOffset + memberSize);
+      }
+      out.pushConstantSize = std::max(out.pushConstantSize,
+          spirvTypeSize(structTypeId, types, constants, memberOffsets));
+    }
+  }
+
+  if (!entryNamedBuffers.empty())
+    buffers = std::move(entryNamedBuffers);
+
+  std::sort(buffers.begin(), buffers.end(), [](const Binding &a, const Binding &b) {
+    if (a.set != b.set) return a.set < b.set;
+    if (a.binding != b.binding) return a.binding < b.binding;
+    return a.id < b.id;
+  });
+  for (const Binding &b : buffers) {
+    if (b.set == 0) out.storageBufferBindings.push_back(b.binding);
+  }
+  return out;
+}
+
+} // namespace
+
 VCError Runtime::loadKernel(const uint32_t *words, size_t wordCount,
                             const char *entryPoint, VCKernel &out) {
   if (!init_) return VCError::InitializationError;
@@ -1688,6 +1984,12 @@ VCError Runtime::loadKernel(const uint32_t *words, size_t wordCount,
   // pipelines are created lazily on first launch on each device.
   out.spirvWords.assign(words, words + wordCount);
   out.entryPoint = entryPoint ? entryPoint : "main";
+  SpirvReflectionInfo refl = reflectSpirvResources(words, wordCount,
+                                                   out.entryPoint);
+  out.storageBufferBindings = std::move(refl.storageBufferBindings);
+  out.hasResourceReflection = !out.storageBufferBindings.empty();
+  out.pushConstantOffsets = std::move(refl.pushConstantOffsets);
+  out.pcSize = refl.pushConstantSize;
   return VCError::Success;
 }
 
@@ -1740,8 +2042,9 @@ void Runtime::releaseKernel(VCKernel &k) {
 }
 
 // Build the descriptor-set + pipeline layouts for `k` on `deviceIdx`. Pointer
-// args get consecutive SSBO bindings; scalar args are packed into a single
-// push-constant range (so they don't need per-launch staging buffers).
+// args use reflected SSBO bindings when available (falling back to dense
+// zero-based bindings for older shaders); scalar args are packed into a single
+// push-constant range using reflected member offsets when present.
 // `args`/`argCount` define the arrangement; the layout is built once per
 // device and cached on the per-device state.
 bool Runtime::buildLayout(VCKernel &k, int deviceIdx,
@@ -1752,19 +2055,28 @@ bool Runtime::buildLayout(VCKernel &k, int deviceIdx,
   k.argCount = argCount;
   // Collect pointer bindings + measure push-constant size for scalars.
   std::vector<VkDescriptorSetLayoutBinding> bindings;
-  uint32_t pcSize = 0;
+  uint32_t pointerOrdinal = 0;
+  uint32_t scalarOrdinal = 0;
+  uint32_t pcSize = k.pcSize;
   for (int i = 0; i < argCount; ++i) {
     if (args[i].kind == VCKernelArg::Pointer) {
       VkDescriptorSetLayoutBinding b{};
-      b.binding = static_cast<uint32_t>(bindings.size());
+      b.binding = pointerOrdinal;
+      if (pointerOrdinal < k.storageBufferBindings.size())
+        b.binding = k.storageBufferBindings[pointerOrdinal];
       b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       b.descriptorCount = 1;
       b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
       bindings.push_back(b);
+      ++pointerOrdinal;
     } else {
       // Round scalar size up to 4 bytes for std140-friendly packing.
       uint32_t sz = static_cast<uint32_t>((args[i].size + 3) & ~size_t(3));
-      pcSize += sz;
+      if (scalarOrdinal < k.pushConstantOffsets.size())
+        pcSize = std::max(pcSize, k.pushConstantOffsets[scalarOrdinal] + sz);
+      else
+        pcSize += sz;
+      ++scalarOrdinal;
     }
   }
 
@@ -1882,7 +2194,8 @@ VkPipeline Runtime::bindKernelForDispatch(VkCommandBuffer cb,
   }
   if (hasPointer && !set) return VK_NULL_HANDLE;
 
-  // Write descriptor bindings for pointer args (consecutive binding index).
+  // Write descriptor bindings for pointer args. Reflected binding numbers keep
+  // the API argument order independent from SPIR-V declaration order.
   std::vector<VkDescriptorBufferInfo> bufInfos;
   std::vector<VkWriteDescriptorSet> writes;
   bufInfos.reserve(argCount);
@@ -1899,7 +2212,10 @@ VkPipeline Runtime::bindKernelForDispatch(VkCommandBuffer cb,
     VkWriteDescriptorSet w{};
     w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w.dstSet = set;
-    w.dstBinding = bindIdx++;
+    w.dstBinding = bindIdx;
+    if (bindIdx < k.storageBufferBindings.size())
+      w.dstBinding = k.storageBufferBindings[bindIdx];
+    ++bindIdx;
     w.descriptorCount = 1;
     w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     w.pBufferInfo = &bufInfos.back();
@@ -1912,12 +2228,19 @@ VkPipeline Runtime::bindKernelForDispatch(VkCommandBuffer cb,
   std::vector<uint8_t> pcData;
   pcData.reserve(k.pcSize);
   if (k.pcSize > 0) {
+    pcData.resize(k.pcSize, 0);
+    uint32_t scalarOrdinal = 0;
+    uint32_t sequentialOffset = 0;
     for (int i = 0; i < argCount; ++i) {
       if (args[i].kind != VCKernelArg::Scalar) continue;
       uint32_t sz = static_cast<uint32_t>((args[i].size + 3) & ~size_t(3));
-      size_t off = pcData.size();
-      pcData.resize(off + sz, 0);
+      uint32_t off = sequentialOffset;
+      if (scalarOrdinal < k.pushConstantOffsets.size())
+        off = k.pushConstantOffsets[scalarOrdinal];
+      if (off + sz > pcData.size()) pcData.resize(off + sz, 0);
       std::memcpy(pcData.data() + off, args[i].data, args[i].size);
+      sequentialOffset += sz;
+      ++scalarOrdinal;
     }
   }
 
@@ -2534,4 +2857,3 @@ VCError vcLaunchKernelIndirect(VCKernelHandle kernel, void *indirectArgs,
 }
 
 } // namespace vc
-

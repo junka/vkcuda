@@ -924,6 +924,28 @@ private:
       }
       return true;
     }
+    if (n->getNodeType() == ASTNode::NodeKind::UnaryExpr) {
+      auto *u = static_cast<UnaryExpr *>(n);
+      if (u->op != UnaryOp::Deref) return false;
+      Value base = visitExpr(u->operand.get());
+      if (!base) return false;
+      if (auto ptr = base.getType().dyn_cast<spirv::PointerType>()) {
+        (void)ptr;
+        mem = base;
+        indices.clear();
+        return true;
+      }
+      if (auto mr = base.getType().dyn_cast<MemRefType>()) {
+        mem = base;
+        indices.clear();
+        if (mr.getRank() == 0) return true;
+        if (mr.getRank() == 1) {
+          indices.push_back(builder.create<arith::ConstantIndexOp>(loc(n), 0));
+          return true;
+        }
+      }
+      return false;
+    }
     return false;
   }
 
@@ -4000,6 +4022,26 @@ private:
 
   Value emitUnary(const UnaryExpr *u) {
     Location l = loc(u);
+    if (u->op == UnaryOp::AddrOf) {
+      Value mem;
+      SmallVector<Value> indices;
+      if (!lvalueAddress(u->operand.get(), mem, indices))
+        return error(u, "& requires an addressable lvalue");
+      if (!indices.empty())
+        return error(u, "address of indexed memref element is unsupported");
+      return mem;
+    }
+    if (u->op == UnaryOp::Deref) {
+      Value mem;
+      SmallVector<Value> indices;
+      if (!lvalueAddress(const_cast<UnaryExpr *>(u), mem, indices))
+        return error(u, "* requires a pointer or pointer-like parameter");
+      if (auto ptr = mem.getType().dyn_cast<spirv::PointerType>())
+        return builder.create<spirv::LoadOp>(l, ptr.getPointeeType(), mem,
+                                            spirv::MemoryAccessAttr(),
+                                            IntegerAttr());
+      return builder.create<memref::LoadOp>(l, mem, indices);
+    }
     Value v = visitExpr(u->operand.get());
     switch (u->op) {
     case UnaryOp::Neg: {
@@ -4052,8 +4094,6 @@ private:
       return isPost ? cur : nxt;
     }
     default:
-      // Deref / AddrOf: degenerate to the operand value (TODO: real lvalue
-      // semantics when struct/array members need them).
       return v;
     }
   }
