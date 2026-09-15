@@ -96,6 +96,11 @@ struct VCStream {
   VkCommandPool commandPool = VK_NULL_HANDLE;
   std::vector<StreamFrame> frames;
   size_t frameIdx = 0; // next frame to record into
+  // Reusable host-visible staging buffers. Completed frame staging buffers move
+  // here instead of immediately destroying VkBuffer/VkDeviceMemory, reducing
+  // allocation churn for repeated async H2D/D2H copies.
+  std::vector<std::unique_ptr<VCBuffer>> stagingCache;
+  size_t stagingCacheBytes = 0;
   // When non-null, the stream is in graph-capture mode: launches and copies
   // are appended to this graph's secondary command buffer instead of being
   // submitted. Set by vcGraphBeginRecord on the default stream.

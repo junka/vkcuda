@@ -55,6 +55,9 @@ debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
 static bool initStream(VulkanDevice &dev, VCStream &s, size_t frameRing = 2);
 static void teardownStream(VulkanDevice &dev, VCStream &s);
 
+static constexpr size_t kMaxCachedStagingBuffers = 16;
+static constexpr size_t kMaxCachedStagingBytes = 64ull * 1024ull * 1024ull;
+
 Runtime::~Runtime() {
   // Safety net: if the program exits without vcShutdown, the singleton's
   // destructor still runs. Join the host-func thread to avoid std::terminate
@@ -332,10 +335,46 @@ static void teardownStream(VulkanDevice &dev, VCStream &s) {
     if (f.fence) vkDestroyFence(dev.device, f.fence, nullptr);
     if (f.cb) cbs.push_back(f.cb);
   }
+  for (auto &sb : s.stagingCache) {
+    if (sb->mapped) vkUnmapMemory(dev.device, sb->memory);
+    if (sb->buffer) vkDestroyBuffer(dev.device, sb->buffer, nullptr);
+    if (sb->memory) vkFreeMemory(dev.device, sb->memory, nullptr);
+  }
+  s.stagingCache.clear();
+  s.stagingCacheBytes = 0;
   if (!cbs.empty() && s.commandPool)
     vkFreeCommandBuffers(dev.device, s.commandPool,
                          static_cast<uint32_t>(cbs.size()), cbs.data());
   if (s.commandPool) vkDestroyCommandPool(dev.device, s.commandPool, nullptr);
+}
+
+static bool shouldCacheStaging(const VCBuffer &buf) {
+  return buf.hostVisible && buf.mapped && !buf.managed && buf.buffer &&
+         buf.memory && buf.size <= kMaxCachedStagingBytes;
+}
+
+static std::unique_ptr<VCBuffer> takeCachedStaging(VCStream &s, size_t bytes) {
+  auto best = s.stagingCache.end();
+  for (auto it = s.stagingCache.begin(); it != s.stagingCache.end(); ++it) {
+    if (!*it || (*it)->size < bytes) continue;
+    if (best == s.stagingCache.end() || (*it)->size < (*best)->size)
+      best = it;
+  }
+  if (best == s.stagingCache.end()) return nullptr;
+  std::unique_ptr<VCBuffer> out = std::move(*best);
+  s.stagingCacheBytes -= out->size;
+  s.stagingCache.erase(best);
+  return out;
+}
+
+static bool cacheCompletedStaging(VCStream &s, std::unique_ptr<VCBuffer> &buf) {
+  if (!buf || !shouldCacheStaging(*buf)) return false;
+  if (s.stagingCache.size() >= kMaxCachedStagingBuffers ||
+      s.stagingCacheBytes + buf->size > kMaxCachedStagingBytes)
+    return false;
+  s.stagingCacheBytes += buf->size;
+  s.stagingCache.push_back(std::move(buf));
+  return true;
 }
 
 //----------------------------------------------------------------------------
@@ -449,8 +488,11 @@ VkCommandBuffer Runtime::beginFrame(VCStream &s) {
   for (auto &rb : f.d2hReadbacks)
     std::memcpy(resolveHostAccess(rb.hostDst), rb.staging->mapped, rb.bytes);
   f.d2hReadbacks.clear();
-  // Drop the frame's staging buffers now that the GPU is done with them.
-  for (auto &sb : f.stagingBuffers) freeBuffer(*sb);
+  // Recycle completed staging buffers now that the GPU is done with them.
+  for (auto &sb : f.stagingBuffers) {
+    if (cacheCompletedStaging(s, sb)) continue;
+    if (sb) freeBuffer(*sb);
+  }
   f.stagingBuffers.clear();
 
   vkResetFences(dev, 1, &f.fence);
@@ -919,7 +961,7 @@ VCError Runtime::copyDeviceToDevice(VCBuffer &dst, const VCBuffer &src,
 }
 
 // H2D: copy `bytes` from a host pointer into device buffer `dst` on stream s.
-// Stages through a transient host-visible scratch buffer.
+// Uses the async staging path, then synchronizes for the synchronous API.
 VCError Runtime::copyHostToDevice(VCBuffer &dst, const void *hostSrc,
                                   size_t bytes, VCStream &s) {
   // Graph capture: allocate a persistent staging buffer owned by the graph
@@ -937,18 +979,9 @@ VCError Runtime::copyHostToDevice(VCBuffer &dst, const void *hostSrc,
     g.stagingBuffers.push_back(std::move(staging));
     return VCError::Success;
   }
-  VCBuffer scratch{};
-  if (mallocHostBufferOn(s.deviceIdx, bytes, scratch) != VCError::Success)
-    return VCError::OutOfMemory;
-  std::memcpy(scratch.mapped,
-              resolveHostAccess(const_cast<void *>(hostSrc)), bytes);
-  VkCommandBuffer cb = beginFrame(s);
-  VkBufferCopy region{0, 0, bytes};
-  vkCmdCopyBuffer(cb, scratch.buffer, dst.buffer, 1, &region);
-  endFrame(s);
-  streamSynchronize(s); // scratch must survive until the copy executes
-  freeBuffer(scratch);
-  return VCError::Success;
+  VCError e = copyHostToDeviceAsync(dst, hostSrc, bytes, s);
+  if (e != VCError::Success) return e;
+  return streamSynchronize(s);
 }
 
 // D2H: copy `bytes` from device buffer `src` into a host pointer. Syncs so
@@ -977,17 +1010,9 @@ VCError Runtime::copyDeviceToHost(void *hostDst, const VCBuffer &src,
     g.stagingBuffers.push_back(std::move(staging));
     return VCError::Success;
   }
-  VCBuffer scratch{};
-  if (mallocHostBufferOn(s.deviceIdx, bytes, scratch) != VCError::Success)
-    return VCError::OutOfMemory;
-  VkCommandBuffer cb = beginFrame(s);
-  VkBufferCopy region{0, 0, bytes};
-  vkCmdCopyBuffer(cb, src.buffer, scratch.buffer, 1, &region);
-  endFrame(s);
-  streamSynchronize(s);
-  std::memcpy(resolveHostAccess(hostDst), scratch.mapped, bytes);
-  freeBuffer(scratch);
-  return VCError::Success;
+  VCError e = copyDeviceToHostAsync(hostDst, src, bytes, s);
+  if (e != VCError::Success) return e;
+  return streamSynchronize(s);
 }
 
 // Async H2D: snapshot host data into a frame-owned staging buffer, submit the
@@ -1009,9 +1034,12 @@ VCError Runtime::copyHostToDeviceAsync(VCBuffer &dst, const void *hostSrc,
     g.stagingBuffers.push_back(std::move(staging));
     return VCError::Success;
   }
-  auto staging = std::make_unique<VCBuffer>();
-  if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
-    return VCError::OutOfMemory;
+  auto staging = takeCachedStaging(s, bytes);
+  if (!staging) {
+    staging = std::make_unique<VCBuffer>();
+    if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
+      return VCError::OutOfMemory;
+  }
   // Snapshot the host source NOW so the caller can overwrite it immediately.
   std::memcpy(staging->mapped,
               resolveHostAccess(const_cast<void *>(hostSrc)), bytes);
@@ -1044,9 +1072,12 @@ VCError Runtime::copyDeviceToHostAsync(void *hostDst, const VCBuffer &src,
     g.stagingBuffers.push_back(std::move(staging));
     return VCError::Success;
   }
-  auto staging = std::make_unique<VCBuffer>();
-  if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
-    return VCError::OutOfMemory;
+  auto staging = takeCachedStaging(s, bytes);
+  if (!staging) {
+    staging = std::make_unique<VCBuffer>();
+    if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
+      return VCError::OutOfMemory;
+  }
   size_t submitIdx = s.frameIdx;
   VkCommandBuffer cb = beginFrame(s);
   VkBufferCopy region{0, 0, bytes};
