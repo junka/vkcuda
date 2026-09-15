@@ -32,6 +32,17 @@ import tempfile
 BUILD_TIMEOUT = 180   # g++ link of the host .cpp + embed
 RUN_TIMEOUT = 120     # kernel launch + vcDeviceSynchronize + copy-back
 
+# Demos the MLIR backend does not support (but the GLSL backend does). These are
+# skipped on the MLIR backend rather than counted as failures, with the reason
+# logged. Add a demo here only when the MLIR backend deliberately does not
+# implement the feature (and emits a clear diagnostic, not a silent misbuild).
+MLIR_UNSUPPORTED = {
+    # Kernel-internal printf lowers to GL_EXT_debug_printf (NonSemantic.DebugPrintf
+    # SPIR-V) in the GLSL backend; the MLIR SPIR-V path does not emit arbitrary
+    # NonSemantic ExtInst sets and emits a diagnostic instead.
+    "printf.vc": "kernel printf not implemented in MLIR backend (GLSL only)",
+}
+
 
 def expand_demos(arguments):
     """Accept a mix of .vc files and directories (globs *.vc, no recursion)."""
@@ -122,6 +133,11 @@ def main():
             continue
         for backend, tool in backends:
             label = f"{name} :: {backend}"
+            if backend == "mlir" and name in MLIR_UNSUPPORTED:
+                skips += 1
+                if args.verbose:
+                    print(f"SKIP: {label} ({MLIR_UNSUPPORTED[name]})")
+                continue
             with tempfile.TemporaryDirectory() as td:
                 out_exe = os.path.join(td, "demo")
                 ok, detail = build(backend, tool, path, out_exe)

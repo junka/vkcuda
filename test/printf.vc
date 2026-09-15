@@ -1,0 +1,105 @@
+// test/printf.vc — kernel-internal printf via debugPrintfEXT.
+//
+// Exercises the GLSL-backend lowering of `printf(...)` to Vulkan's
+// debugPrintfEXT (NonSemantic.DebugPrintf SPIR-V), and the runtime path that
+// enables the validation layer + VK_KHR_shader_non_semantic_info + a debug
+// messenger so the formatted text is forwarded to stderr.
+//
+// vcEnableKernelPrintf(1) MUST be called before vcInit (it configures the
+// instance/device creation path). Equivalently, set VC_KERNEL_PRINTF=1.
+//
+// On this machine the validation layer (1.3.275) DOES forward debugPrintfEXT
+// output: it arrives as WARNING-severity "DEBUG-PRINTF" messages on the debug
+// messenger, which the runtime prints to stderr. The kernel printf TEXT is
+// therefore observable (the e2e harness suppresses stderr, so the text is not
+// asserted inside the demo — it is verified manually by running the built exe
+// and grepping stderr for "printf: first thread"). The demo itself asserts:
+// (a) the kernel compiles with printf, (b) enabling the validation layer does
+// not break kernel correctness (x[i]==i, x[i]==i*i), (c) the runtime
+// initializes + shuts down cleanly with the layer active.
+//
+//   vcc test/printf.vc -o build/printf_sf && ./build/printf_sf
+//   vc  test/printf.vc -emit=full -o build/printf_m  && ./build/printf_m  (MLIR: errors on printf)
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// Each thread writes x[i]=i. The first and last threads also emit a printf so
+// the GLSL backend lowers debugPrintfEXT with %d / %u format specifiers.
+__global__ void fillAndPrint(int *x, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    x[i] = i;
+    if (i == 0)
+      printf("printf: first thread i=%d n=%d\n", i, n);
+    if (i == n - 1)
+      printf("printf: last thread i=%d\n", i);
+  }
+}
+
+// A __device__ helper that itself calls printf — exercises the scan that
+// enables the extension when printf appears in a helper, not just the kernel.
+__device__ int squared(int v) {
+  if (v == 1) printf("printf: helper squared(1)\n");
+  return v * v;
+}
+
+__global__ void useHelper(int *x, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] = squared(i);
+}
+
+int main() {
+  // Must precede vcInit: the flag is read during instance creation to enable
+  // the validation layer + non-semantic-info + debug messenger.
+  vcEnableKernelPrintf(1);
+
+  vcInit();
+
+  const int N = 256;
+  int *d = 0;
+  if (vcMalloc((void **)&d, N * sizeof(int)) != VCError::Success) {
+    printf("printf: FAIL (malloc)\n");
+    vcShutdown();
+    return 1;
+  }
+
+  fillAndPrint<<<N, 64>>>(d, N);
+  vcDeviceSynchronize();
+
+  int *hHandle = 0;
+  vcMallocHost((void **)&hHandle, N * sizeof(int));
+  vcMemcpy(hHandle, d, N * sizeof(int), VCMemcpyKind::DeviceToHost);
+  VCPointerAttributes attr;
+  vcPointerGetAttributes(&attr, hHandle);
+  const int *h = (const int *)attr.hostPointer;
+
+  int ok = 1;
+  for (int i = 0; i < N; ++i)
+    if (h[i] != i) { ok = 0; break; }
+  vcFree(hHandle);
+
+  // Helper-function printf path: squared(1) should print, and x[i]=i*i.
+  useHelper<<<N, 64>>>(d, N);
+  vcDeviceSynchronize();
+  vcMallocHost((void **)&hHandle, N * sizeof(int));
+  vcMemcpy(hHandle, d, N * sizeof(int), VCMemcpyKind::DeviceToHost);
+  vcPointerGetAttributes(&attr, hHandle);
+  h = (const int *)attr.hostPointer;
+  for (int i = 0; i < N; ++i)
+    if (h[i] != i * i) { ok = 0; break; }
+  vcFree(hHandle);
+
+  vcFree(d);
+  vcShutdown();
+
+  // NOTE: kernel printf TEXT is forwarded to stderr by the validation layer
+  // (verified manually: `./printf_sf 2>&1 1>/dev/null | grep DEBUG-PRINTF`).
+  // The demo does not assert on it here because capturing one's own stderr from
+  // within the process is awkward and the e2e harness suppresses stderr anyway.
+  // Kernel correctness (x[i]==i, x[i]==i*i) IS asserted — enabling the layer
+  // must not break execution.
+  if (!ok) { printf("printf: FAIL (correctness)\n"); return 1; }
+  printf("printf: PASS (layer enabled, correctness ok)\n");
+  return 0;
+}

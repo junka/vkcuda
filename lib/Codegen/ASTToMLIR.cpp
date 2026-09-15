@@ -2517,6 +2517,15 @@ private:
           builder.create<vc::BarrierOp>(l);
           return Value();
         }
+        // Kernel-internal printf is supported only in the GLSL backend (it
+        // lowers to GL_EXT_debug_printf -> NonSemantic.DebugPrintf, captured by
+        // the validation layer). The MLIR SPIR-V path does not emit arbitrary
+        // NonSemantic ExtInst sets, so emit a clear diagnostic instead of
+        // silently mis-lowering. Use the GLSL backend (vcc) for kernel printf.
+        if (ref->name == "printf") {
+          return error(n, "kernel printf is not supported in the MLIR backend; "
+                          "use the GLSL backend (vcc) or build with -emit=glsl");
+        }
         // Vector constructors: float4(...) / int3(...) / make_float4(...) /
         // uint4(...) / double2(...) / long4(...) / float3(...) / float2(...).
         // CUDA's make_<vec> drops the "make_" prefix to yield the vec name.
