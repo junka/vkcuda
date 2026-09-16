@@ -135,7 +135,6 @@ private:
   // Helpers.
   bool isThreadBuiltin(StringRef name) const;
   bool isMathBuiltin(StringRef name) const;
-  bool isVectorCtorName(StringRef name) const;
   static bool isValidSwizzle(StringRef s);
   Type *builtin(BuiltinTypeKind k) const;
 

@@ -1,0 +1,38 @@
+// namespace_nested.vc — verify nested-namespace device mangling.
+//
+// Before replacing Sema's recursive nsPrefix key with deviceMangledName (which
+// reads FunctionDecl::nsName), confirm both produce the same key for nested
+// namespaces:
+//   namespace a { namespace b { __device__ f; __global__ k } }
+// device symbol: a_b_f / a_b_k
+//
+//   vcc namespace_nested.vc -o build/namespace_nested && ./build/namespace_nested
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+namespace a {
+namespace b {
+
+__device__ int f(int x) { return x + 1; }
+
+__global__ void k(int *out) {
+  out[0] = a::b::f(41);
+}
+
+} // namespace b
+} // namespace a
+
+int main() {
+  vcInit();
+  void *dOut = 0;
+  vcMalloc(&dOut, 4);
+  a::b::k<<<1, 32>>>(dOut);
+  vcDeviceSynchronize();
+  int h = 0;
+  vcMemcpy(&h, dOut, 4, VCMemcpyKind::DeviceToHost);
+  printf("nested_ns: %s (got %d, want 42)\n", h == 42 ? "PASS" : "FAIL", h);
+  vcFree(dOut);
+  vcShutdown();
+  return h == 42 ? 0 : 1;
+}

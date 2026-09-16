@@ -12,19 +12,14 @@
 
 #include "vc/Frontend/Sema.h"
 
+#include "vc/Frontend/BuiltinRegistry.h"
+#include "vc/Frontend/Mangle.h"
+
 #include "llvm/Support/raw_ostream.h"
 
 using namespace vc;
 
 namespace {
-// Small set of CUDA thread-index identifiers that are implicitly available in
-// every kernel/device function. Resolved to a placeholder int type — the GLSL
-// backend handles the real lowering.
-bool isThreadBuiltinName(llvm::StringRef n) {
-  return n == "threadIdx" || n == "blockIdx" || n == "blockDim" ||
-         n == "gridDim" || n == "warpSize";
-}
-
 // Build the source spelling of a `::`-qualified MemberAccessExpr chain as
 // "A::B::C". The chain is left-nested: MemberAccessExpr(base=MemberAccessExpr(
 // base=DeclRefExpr("A"), member="B"), member="C"). Non-scope bases (an object
@@ -56,23 +51,6 @@ std::string scopeChainStr(const MemberAccessExpr *ma) {
   return out;
 }
 
-// "A::B::C" -> "A_B_C" (device mangle).
-std::string mangleScopeChain(StringRef chain) {
-  std::string out;
-  StringRef rest = chain;
-  bool first = true;
-  while (!rest.empty()) {
-    size_t pos = rest.find("::");
-    StringRef part = (pos == StringRef::npos) ? rest : rest.substr(0, pos);
-    if (!first) out += "_";
-    out += part.str();
-    first = false;
-    if (pos == StringRef::npos) break;
-    rest = rest.substr(pos + 2);
-  }
-  return out;
-}
-
 // Fold a constant integer expression to its value: plain literals and
 // unary-minus literals (e.g. -1). Returns false if the node isn't one, so
 // checks that need a statically-known integer can skip dynamic expressions.
@@ -94,73 +72,17 @@ bool constIntValue(const ASTNode *n, int64_t &out) {
 }
 } // namespace
 
+// Builtin recognition is centralized in BuiltinRegistry so Sema and both
+// backends share one name list. These forward to it.
+
 bool Sema::isThreadBuiltin(StringRef name) const {
-  return isThreadBuiltinName(name);
+  return builtinClass(name) == BuiltinClass::ThreadIndex;
 }
 
-// A permissive set of math / GLSL builtins so calls like sinf(...) or
-// __syncthreads() don't get flagged as unknown functions. Real resolution
-// would need a full builtin table; this covers the kernels we ship.
+// True for any builtin (math, atomics, sync, warp, vector ctors, ...). Used at
+// call sites to skip the undeclared-function warning — the backend lowers it.
 bool Sema::isMathBuiltin(StringRef name) const {
-  // CUDA __f-prefixed and f-suffixed math intrinsics, plus common GLSL math.
-  static const char *names[] = {
-      "__syncthreads", "sin", "cos", "tan", "asin", "acos", "atan",
-      "exp", "log", "pow", "sqrt", "abs", "fabs", "fmin", "fmax", "min", "max",
-      "floor", "ceil", "fract", "mix", "clamp", "step", "smoothstep", "mod",
-      "fma", "trunc", "round", "sign", "inversesqrt", "isnan", "isinf",
-      "exp2", "log2", "degrees", "radians",
-      "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "expf", "logf",
-      "powf", "sqrtf", "fabsf", "fminf", "fmaxf", "floorf", "ceilf", "__sinf",
-      "__cosf", "__expf", "__logf", "__powf", "__fabsf",
-      // GLSL vector/geometric builtins.
-      "dot", "cross", "length", "normalize", "reflect", "refract",
-      "distance", "faceforward", "all", "any", "lessThan", "greaterThan",
-      // CUDA atomics (lowered by the GLSL backend to GLSL atomic* functions).
-      "atomicAdd", "atomicSub", "atomicExch", "atomicMin", "atomicMax",
-      "atomicInc", "atomicDec", "atomicCAS", "atomicAnd", "atomicOr",
-      "atomicXor",
-      // CUDA synchronization primitives (lowered to GLSL barriers by the
-      // backend). __syncthreads is the pure execution barrier; the fence
-      // variants are memory-ordering barriers; the _count/_and/_or variants
-      // are voting barriers returning a reduced value.
-      "__syncthreads", "__threadfence", "__threadfence_block",
-      "__syncthreads_count", "__syncthreads_and", "__syncthreads_or",
-      // CUDA warp intrinsics (lowered by the GLSL backend to Vulkan subgroup
-      // ops; the leading mask argument is dropped at codegen time).
-      "__syncwarp", "__ballot_sync", "__anySync", "__allSync", "__activemask",
-      "__shfl_sync", "__shfl_up_sync", "__shfl_down_sync", "__shfl_xor_sync",
-      // VC async-copy approximation builtins (lowered by the GLSL backend to a
-      // software cooperative copy + barrier). vcMemcpyAsync(dst, src, nElems,
-      // pipe); vcPipeline* are barrier() wrappers. No hardware DMA in Vulkan.
-      "vcMemcpyAsync", "vcPipelineProducerCommit", "vcPipelineConsumerWait",
-      "vcPipelineConsumerCommit",
-      // CUDA launch dimension constructor `dim3(x, y)` — recognized so the
-      // grid/block slots of a kernel<<<...>>> launch don't warn as unknown.
-      "dim3",
-  };
-  for (const char *m : names)
-    if (name == m) return true;
-  // CUDA make_<vec>(...) vector constructors and <base><N> vector constructors
-  // (float4, int3, uint4, long4, ...) pass through as GLSL constructors.
-  if (name.starts_with("make_"))
-    return isVectorCtorName(name.substr(5));
-  return isVectorCtorName(name);
-}
-
-// Recognize CUDA-style vector type names: <base><2..4> where base is one of
-// float/int/uint/double/bool/long/ulong/half. Mirrors Parser::makeVectorType so
-// the Sema pass doesn't need access to Parser internals.
-bool Sema::isVectorCtorName(StringRef name) const {
-  static const char *bases[] = {"float", "int", "uint", "double",
-                                "bool", "long", "ulong", "half"};
-  for (const char *b : bases) {
-    StringRef p = b;
-    if (name.size() == p.size() + 1 && name.starts_with(p)) {
-      char d = name.back();
-      if (d >= '2' && d <= '4') return true;
-    }
-  }
-  return false;
+  return isBuiltin(name);
 }
 
 // A legal GLSL swizzle: 1-4 chars drawn from only xyzw, only rgba, or only stpq,
@@ -499,22 +421,6 @@ void Sema::collectTopLevel() {
   collectDecls(tu.decls, StringRef());
 }
 
-// Compute the device-side mangled symbol name for a function under a namespace
-// prefix. A method becomes `Class_method` (or `ns_Class_method`); a free
-// function becomes `ns_func` (or just `func` at top level). The FunctionDecl's
-// own `name`/`className` fields are left untouched so the HOST backend can emit
-// the original `Class::method` / `ns::func` spelling — only the device symbol
-// table key is mangled.
-static std::string mangledFuncName(const FunctionDecl *f, StringRef nsPrefix) {
-  std::string base;
-  if (f->isMethod && !f->className.empty())
-    base = f->className.str() + "_" + f->name.str();
-  else
-    base = f->name.str();
-  if (nsPrefix.empty()) return base;
-  return nsPrefix.str() + "_" + base;
-}
-
 // Mangle a plain name (struct/typedef/var/enum-const) under a namespace prefix.
 static std::string mangleScoped(StringRef prefix, StringRef name) {
   if (prefix.empty()) return name.str();
@@ -539,8 +445,10 @@ void Sema::collectDecls(const std::vector<NodePtr> &decls, StringRef nsPrefix) {
       auto *f = static_cast<FunctionDecl *>(d.get());
       // Register under the mangled device symbol name so scoped call sites
       // (`ns::f()`, `Class::m()`, `obj.m()`) resolve. The original name is
-      // preserved on the FunctionDecl for host-side emission.
-      std::string key = mangledFuncName(f, nsPrefix);
+      // preserved on the FunctionDecl for host-side emission. The key is
+      // derived from f->nsName (colon form) via the shared deviceMangledName,
+      // which matches what the GLSL/MLIR backends emit.
+      std::string key = deviceMangledName(f);
       static std::vector<std::unique_ptr<std::string>> fstore;
       fstore.push_back(std::make_unique<std::string>(std::move(key)));
       functions[*fstore.back()] = f;
@@ -1071,7 +979,7 @@ Type *Sema::checkExpr(const ASTNode *n) {
       if (ma->isScope) {
         calleeIsScoped = true;
         std::string chain = scopeChainStr(ma);       // "A::B::func"
-        std::string mangled = mangleScopeChain(chain); // "A_B_func"
+        std::string mangled = mangleScopeName(chain); // "A_B_func"
         static std::vector<std::unique_ptr<std::string>> cstore;
         cstore.push_back(std::make_unique<std::string>(std::move(mangled)));
         calleeName = *cstore.back();

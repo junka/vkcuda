@@ -6,6 +6,8 @@ add_library(VCFrontend STATIC
   Parser.cpp
   ASTHelpers.cpp
   ASTDumper.cpp
+  BuiltinRegistry.cpp
+  Mangle.cpp
   Sema.cpp
   ../Codegen/ASTToGLSL.cpp
   ../Codegen/ASTToHost.cpp

@@ -3,6 +3,8 @@
 #include "vc/Codegen/ASTToGLSL.h"
 
 #include "vc/Frontend/AST.h"
+#include "vc/Frontend/BuiltinRegistry.h"
+#include "vc/Frontend/Mangle.h"
 
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
@@ -87,7 +89,7 @@ public:
     for (auto *d : flat) {
       if (d->getNodeType() == ASTNode::NodeKind::FunctionDecl) {
         auto *f = static_cast<const FunctionDecl *>(d);
-        funcDecls[deviceFuncName(f)] = f;
+        funcDecls[deviceMangledName(f)] = f;
       }
     }
 
@@ -149,7 +151,7 @@ public:
     for (auto *d : flat) {
       if (d->getNodeType() == ASTNode::NodeKind::FunctionDecl) {
         auto *f = static_cast<const FunctionDecl *>(d);
-        funcDecls[deviceFuncName(f)] = f;
+        funcDecls[deviceMangledName(f)] = f;
       }
     }
     std::vector<glsl::GLSLModule> out;
@@ -164,7 +166,7 @@ public:
       emitOneForKernel(f, flat);
       os = saved;
       buf.flush();
-      out.push_back({deviceFuncName(f), std::move(src)});
+      out.push_back({deviceMangledName(f), std::move(src)});
     }
     return out;
   }
@@ -180,30 +182,6 @@ public:
       }
       out.push_back(d.get());
     }
-  }
-
-  // The device-side symbol name for a function: a method becomes
-  // `Class_method` (this is the free-function lowering GLSL needs, since GLSL
-  // structs have no member functions); a namespace member `ns::func` becomes
-  // `ns_func` (nested `outer::inner::func` -> `outer_inner_func`). Top-level
-  // free functions keep their name. This mirrors Sema's mangledFuncName.
-  static std::string deviceFuncName(const FunctionDecl *f) {
-    if (f->isMethod && !f->className.empty())
-      return f->className.str() + "_" + f->name.str();
-    if (!f->nsName.empty()) {
-      // Compose "outer::inner::func" -> "outer_inner_func": split on "::",
-      // join with single underscores.
-      std::string out;
-      llvm::StringRef rest = f->nsName;
-      while (!rest.empty()) {
-        auto pair = rest.split("::");
-        if (!out.empty()) out += '_';
-        out += pair.first.str();
-        rest = pair.second;
-      }
-      return out + "_" + f->name.str();
-    }
-    return f->name.str();
   }
 
 private:
@@ -706,7 +684,7 @@ private:
   // parameter — the body already references `_this` (the parser mapped `this`
   // to that name), so no body rewrite is needed. Free functions emit as-is.
   void emitFunction(const FunctionDecl *f) {
-    (*os) << glslType(f->returnType) << " " << deviceFuncName(f) << "(";
+    (*os) << glslType(f->returnType) << " " << deviceMangledName(f) << "(";
     bool emittedParam = false;
     if (f->isMethod && !f->className.empty()) {
       // `this` as the first parameter, typed as the class record. Build a
@@ -821,10 +799,7 @@ private:
   // atomicInc/atomicDec (no direct GLSL form) map to atomicAdd/atomicSub by 1.
   // atomicExch -> atomicExchange, atomicCAS -> atomicCompSwap.
   static bool isAtomicName(StringRef name) {
-    return name == "atomicAdd" || name == "atomicSub" || name == "atomicExch" ||
-           name == "atomicMin" || name == "atomicMax" || name == "atomicInc" ||
-           name == "atomicDec" || name == "atomicCAS" || name == "atomicAnd" ||
-           name == "atomicOr" || name == "atomicXor";
+    return builtinClass(name) == BuiltinClass::Atomic;
   }
 
   // --- CUDA warp -> Vulkan subgroup lowering --------------------------------
@@ -835,10 +810,7 @@ private:
   // and is dropped — subgroup ops act on the currently-active invocations,
   // which matches the common `mask = 0xffffffff` usage.
   static bool isWarpIntrinsicName(StringRef name) {
-    return name == "__syncwarp" || name == "__ballot_sync" ||
-           name == "__anySync" || name == "__allSync" || name == "__activemask" ||
-           name == "__shfl_sync" || name == "__shfl_up_sync" ||
-           name == "__shfl_down_sync" || name == "__shfl_xor_sync";
+    return builtinClass(name) == BuiltinClass::Warp;
   }
 
   // Map a CUDA atomic name to its GLSL counterpart. atomicInc/atomicDec are
@@ -1023,8 +995,7 @@ private:
   // barrier exists in Vulkan). They must sit in uniform control flow because
   // GLSL barrier() is only legal when all invocations reach it.
   static bool isAsyncCopyBuiltin(StringRef name) {
-    return name == "vcMemcpyAsync" || name == "vcPipelineProducerCommit" ||
-           name == "vcPipelineConsumerWait" || name == "vcPipelineConsumerCommit";
+    return builtinClass(name) == BuiltinClass::AsyncCopy;
   }
 
   // vcMemcpyAsync(dst, src, nElems, pipe)
@@ -1345,7 +1316,9 @@ private:
   }
 
   // Build the device mangled name for a `::`-scoped MemberAccessExpr chain:
-  // `ns::func` -> "ns_func", `A::B::C` -> "A_B_C". Mirrors Sema's mangle.
+  // `ns::func` -> "ns_func", `A::B::C` -> "A_B_C". Collects the chain parts
+  // from the AST, joins them with "::", then reuses the shared mangleScopeName
+  // so there is one mangling rule.
   static std::string mangleScopeChainGLSL(const MemberAccessExpr *ma) {
     if (!ma) return {};
     std::vector<std::string> parts;
@@ -1365,12 +1338,12 @@ private:
       }
     }
     std::reverse(parts.begin(), parts.end());
-    std::string out;
+    std::string chain;
     for (size_t i = 0; i < parts.size(); ++i) {
-      if (i) out += "_";
-      out += parts[i];
+      if (i) chain += "::";
+      chain += parts[i];
     }
-    return out;
+    return mangleScopeName(chain);
   }
 
   // For `obj.method(...)`, recover the mangled free-function name

@@ -19,6 +19,7 @@
 #include "vc/Frontend/AST.h"
 #include "vc/Frontend/ASTDumper.h"
 #include "vc/Frontend/Lexer.h"
+#include "vc/Frontend/Mangle.h"
 #include "vc/Frontend/Parser.h"
 #include "vc/Frontend/Sema.h"
 
@@ -502,20 +503,6 @@ int main(int argc, char **argv) {
   // OpEntryPoint carries the same symbol. A bare `fn->name` would mismatch the
   // spirv entry point and the host's launch handle. Kernels nested in
   // namespaces are found by recursing into NamespaceDecl bodies.
-  auto deviceSymName = [](const FunctionDecl *fn) -> std::string {
-    if (!fn->nsName.empty()) {
-      std::string out;
-      llvm::StringRef rest = fn->nsName;
-      while (!rest.empty()) {
-        auto pair = rest.split("::");
-        if (!out.empty()) out += '_';
-        out += pair.first.str();
-        rest = pair.second;
-      }
-      return out + "_" + fn->name.str();
-    }
-    return fn->name.str();
-  };
   std::vector<host::HostSpirvModule> hostModules;
   std::function<void(const std::vector<NodePtr> &)> collectKernels =
       [&](const std::vector<NodePtr> &decls) {
@@ -528,7 +515,7 @@ int main(int argc, char **argv) {
           auto *fn = static_cast<FunctionDecl *>(d.get());
           if (fn->deviceAttr != DeviceAttr::Global)
             continue;
-          std::string sym = deviceSymName(fn);
+          std::string sym = deviceMangledName(fn);
           hostModules.push_back({sym, binary.data(), binary.size(),
                                  /*entryPoint=*/sym});
         }

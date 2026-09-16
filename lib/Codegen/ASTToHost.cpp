@@ -16,6 +16,7 @@
 #include "vc/Codegen/ASTToHost.h"
 
 #include "vc/Frontend/AST.h"
+#include "vc/Frontend/Mangle.h"
 
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -929,12 +930,14 @@ private:
         }
       }
       std::reverse(parts.begin(), parts.end());
-      std::string out;
+      // Reuse the shared scope-name mangler: assemble the chain in "::" form
+      // and mangle to underscore form (one rule shared with the device path).
+      std::string chain;
       for (auto &p : parts) {
-        if (!out.empty()) out += "_";
-        out += p;
+        if (!chain.empty()) chain += "::";
+        chain += p;
       }
-      return out;
+      return mangleScopeName(chain);
     }
     return "main";
   }

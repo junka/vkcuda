@@ -22,6 +22,8 @@
 
 #include "vc/Dialect/VC/Ops.h"
 #include "vc/Frontend/AST.h"
+#include "vc/Frontend/BuiltinRegistry.h"
+#include "vc/Frontend/Mangle.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -477,29 +479,6 @@ private:
     return mlir::Type();
   }
 
-  // The device-side symbol name for a function: a namespace member `ns::func`
-  // becomes `ns_func` (nested `outer::inner::func` -> `outer_inner_func`), so
-  // the host's launchHandleName (`math::fill` -> `math_fill`) and the device
-  // func.func symbol agree. Top-level free functions keep their name. A class
-  // method `Class::method` becomes `Class_method` (the leading `_this` arg is
-  // synthesized in buildFunction, mirroring GLSL's `inout Class _this`).
-  static std::string deviceFuncName(const FunctionDecl *f) {
-    if (f->isMethod && !f->className.empty())
-      return f->className.str() + "_" + f->name.str();
-    if (!f->nsName.empty()) {
-      std::string out;
-      llvm::StringRef rest = f->nsName;
-      while (!rest.empty()) {
-        auto pair = rest.split("::");
-        if (!out.empty()) out += '_';
-        out += pair.first.str();
-        rest = pair.second;
-      }
-      return out + "_" + f->name.str();
-    }
-    return f->name.str();
-  }
-
   // Collect the flat scalar MLIR types of a struct's fields, expanding array
   // fields element-by-element (e.g. `struct Vec4 { float c[4]; }` -> [f32,f32,
   // f32,f32]). Used to scalarize a by-value struct function parameter: each
@@ -571,7 +550,7 @@ private:
     if (!fn) return;
     // Mangled device symbol (ns_func, or Class_method for a class method); the
     // host launch resolves `ns::func` / `obj.method` to the same key.
-    std::string symName = deviceFuncName(fn);
+    std::string symName = deviceMangledName(fn);
 
     // A class method is never emitted as a func.func here: SPIR-V cannot pass
     // the Function-storage struct memref `_this` as a by-ref parameter through
@@ -2602,7 +2581,7 @@ private:
       }
       // Scoped call `ns::func(args)` (MemberAccessExpr callee with isScope):
       // mangle to `ns_func` and look up in funcTable, mirroring the host's
-      // launchHandleName and buildFunction's deviceFuncName. The scope chain is
+      // launchHandleName and buildFunction's deviceMangledName. The scope chain is
       // left-nested: MemberAccessExpr(base=MemberAccessExpr(...), member=f) for
       // `outer::inner::f`, flattened to `outer_inner_f`.
       if (c->callee &&
@@ -2625,11 +2604,12 @@ private:
               break;
           }
           std::reverse(parts.begin(), parts.end());
-          std::string mangled;
+          std::string chain;
           for (auto &p : parts) {
-            if (!mangled.empty()) mangled += '_';
-            mangled += p;
+            if (!chain.empty()) chain += "::";
+            chain += p;
           }
+          std::string mangled = mangleScopeName(chain);
           auto fit = funcTable.find(mangled);
           if (fit != funcTable.end()) {
             SmallVector<Value> args;
@@ -2657,7 +2637,7 @@ private:
         } else {
           // Object method call `obj.method(args)` (non-scope MemberAccessExpr
           // callee). The method is `Class_method` taking `this` as its leading
-          // parameter (see buildFunction / deviceFuncName). SPIR-V's
+          // parameter (see buildFunction / deviceMangledName). SPIR-V's
           // func.call cannot pass a Function-storage struct memref as a by-ref
           // parameter (FuncToSPIRV + GPUToSPIRV leave an
           // unrealized_conversion_cast they can't legalize for memref args), so
@@ -3539,10 +3519,7 @@ private:
   };
 
   static bool isAtomicName(llvm::StringRef name) {
-    return name == "atomicAdd" || name == "atomicSub" || name == "atomicExch" ||
-           name == "atomicMin" || name == "atomicMax" || name == "atomicInc" ||
-           name == "atomicDec" || name == "atomicCAS" || name == "atomicAnd" ||
-           name == "atomicOr" || name == "atomicXor";
+    return builtinClass(name) == BuiltinClass::Atomic;
   }
 
   // Resolve a CUDA atomic pointer argument (`&x`, `&arr[i]`, or bare `ptr`)
