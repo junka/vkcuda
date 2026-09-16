@@ -25,7 +25,50 @@ std::string vc::mangleScopeName(llvm::StringRef scopedName) {
   return out;
 }
 
-std::string vc::deviceMangledName(const FunctionDecl *f) {
+std::string vc::mangleType(const Type *t) {
+  if (!t) return "v"; // unknown -> void/placeholder
+  // Strip typedefs: a TypedefType mangling uses its underlying type so that
+  // `typedef int I; f(I)` and `f(int)` produce the same symbol.
+  if (t->getKind() == TypeKind::Typedef) {
+    auto *td = static_cast<const TypedefType *>(t)->decl;
+    return mangleType(td ? td->underlying : nullptr);
+  }
+  switch (t->getKind()) {
+  case TypeKind::Builtin: {
+    switch (static_cast<const BuiltinType *>(t)->builtin) {
+    case BuiltinTypeKind::Void: return "v";
+    case BuiltinTypeKind::Bool: return "b";
+    case BuiltinTypeKind::Int32: return "i";
+    case BuiltinTypeKind::UInt32: return "u";
+    case BuiltinTypeKind::Int64: return "I";
+    case BuiltinTypeKind::UInt64: return "U";
+    case BuiltinTypeKind::Float16: return "h";
+    case BuiltinTypeKind::Float32: return "f";
+    case BuiltinTypeKind::Float64: return "d";
+    }
+    return "?";
+  }
+  case TypeKind::Pointer:
+    return "p" + mangleType(static_cast<const PointerType *>(t)->pointee);
+  case TypeKind::Reference:
+    return "r" + mangleType(static_cast<const ReferenceType *>(t)->pointee);
+  case TypeKind::Vector: {
+    auto *v = static_cast<const VectorType *>(t);
+    return "V" + std::to_string(v->count) + mangleType(v->elem);
+  }
+  case TypeKind::Record:
+    // Records have no overload-distinct spelling here; use a stable placeholder
+    // keyed on the decl name so distinct structs differ.
+    if (auto *d = static_cast<const RecordType *>(t)->decl)
+      return "S" + d->name.str();
+    return "S";
+  case TypeKind::Typedef:
+    return "?"; // resolved above; unreachable
+  }
+  return "?";
+}
+
+std::string vc::deviceBaseName(const FunctionDecl *f) {
   // Base name: a method lowers to the free-function spelling `Class_method`
   // (the device has no member functions); a free function keeps its name.
   std::string base;
@@ -37,4 +80,28 @@ std::string vc::deviceMangledName(const FunctionDecl *f) {
   if (f->nsName.empty())
     return base;
   return mangleScopeName(f->nsName) + "_" + base;
+}
+
+std::string vc::deviceMangledName(const FunctionDecl *f) {
+  std::string name = deviceBaseName(f);
+
+  // Kernels keep the bare mangled name (no parameter suffix): CUDA disallows
+  // overloading __global__ functions, and the host launch handle (which has no
+  // argument type info) must match the device symbol exactly.
+  if (f->deviceAttr == DeviceAttr::Global)
+    return name;
+
+  // __device__ helpers get a parameter-type suffix so overloads emit distinct
+  // symbols (f(int)->name_i, f(float)->name_f). An empty parameter list gets
+  // _v (void) so f() and f(int) differ.
+  name += "_";
+  if (f->params.empty())
+    name += "v";
+  else {
+    for (size_t i = 0; i < f->params.size(); ++i) {
+      if (i) name += "_";
+      name += mangleType(f->params[i]->type);
+    }
+  }
+  return name;
 }

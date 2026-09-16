@@ -370,6 +370,164 @@ void Sema::checkCallArgs(const ASTNode *call, StringRef calleeName,
   }
 }
 
+// Structural type equality after stripping typedefs. Used by redefinition
+// detection and overload-set dedup; not a full canonical Type (that's a later
+// milestone). Two types are equal iff their resolved kinds match and their
+// distinguishing sub-fields recurse equal: builtins compare their BuiltinTypeKind,
+// pointers/references recurse on pointee, vectors on (elem, count), records on
+// the underlying StructDecl identity, typedefs never reach here (resolved above).
+bool Sema::sameType(const Type *a, const Type *b) {
+  if (!a || !b) return a == b; // null == null, null != non-null
+  const Type *ra = resolveTypedefs(a);
+  const Type *rb = resolveTypedefs(b);
+  if (ra->getKind() != rb->getKind()) return false;
+  switch (ra->getKind()) {
+  case TypeKind::Builtin:
+    return static_cast<const BuiltinType *>(ra)->builtin ==
+           static_cast<const BuiltinType *>(rb)->builtin;
+  case TypeKind::Pointer:
+    return sameType(static_cast<const PointerType *>(ra)->pointee,
+                    static_cast<const PointerType *>(rb)->pointee);
+  case TypeKind::Reference:
+    return sameType(static_cast<const ReferenceType *>(ra)->pointee,
+                    static_cast<const ReferenceType *>(rb)->pointee);
+  case TypeKind::Vector: {
+    const auto *va = static_cast<const VectorType *>(ra);
+    const auto *vb = static_cast<const VectorType *>(rb);
+    return va->count == vb->count && sameType(va->elem, vb->elem);
+  }
+  case TypeKind::Record:
+    // Identity by decl: two RecordTypes are the same type iff they name the
+    // same StructDecl. (Distinct decls with identical fields are distinct
+    // types, matching C++ struct identity.)
+    return static_cast<const RecordType *>(ra)->decl ==
+           static_cast<const RecordType *>(rb)->decl;
+  case TypeKind::Typedef:
+    return false; // resolved above; unreachable
+  }
+  return false;
+}
+
+// Two functions have the same signature (and so collide in an overload set) iff
+// their parameter counts match and each parameter pair is the same type. Return
+// type is intentionally NOT compared: C++ allows overloads differing only in
+// return type to be a redefinition error (return type is not part of the
+// signature for overload resolution).
+bool Sema::sameSignature(const FunctionDecl *a, const FunctionDecl *b) {
+  if (a->params.size() != b->params.size()) return false;
+  for (size_t i = 0; i < a->params.size(); ++i)
+    if (!sameType(a->params[i]->type, b->params[i]->type))
+      return false;
+  return true;
+}
+
+// Conversion rank for binding an argument of type `arg` to a parameter of type
+// `param`. Lower is better. Mirrors C/CUDA's implicit-conversion ladder:
+//   0 exact          — same type (typedefs resolved)
+//   1 promotion      — int->wider int, float->double (lossless widening)
+//   2 standard       — int<->float same-or-narrower width, cross-kind numeric
+//   3 lossy          — float->int, large-int->small-int (narrowing)
+//   4 incompatible   — pointer mismatch, vector/record mismatch, kind mismatch
+// `sameType` and the arithmetic taxonomy (isArithmetic/isIntegerType/isFloatType)
+// are reused so this stays consistent with the existing assignment checks.
+int Sema::conversionRank(const Type *param, const Type *arg) {
+  if (!param || !arg) return 0; // unknown side: treat as exact (don't penalize)
+  if (sameType(param, arg)) return 0; // exact match
+  const Type *p = resolveTypedefs(param);
+  const Type *a = resolveTypedefs(arg);
+  // Arithmetic conversions: rank by direction of conversion.
+  if (isArithmetic(p) && isArithmetic(a)) {
+    bool pInt = isIntegerType(p), aInt = isIntegerType(a);
+    bool pFlt = isFloatType(p), aFlt = isFloatType(a);
+    // float -> int is lossy.
+    if (pInt && aFlt) return 3;
+    // int -> float: standard (legal but may lose int precision for large ints).
+    if (pFlt && aInt) return 2;
+    // int -> int or float -> float: rank by width change.
+    int pw = static_cast<int>(sizeOfType(p));
+    int aw = static_cast<int>(sizeOfType(a));
+    if (pw == aw) return 1;            // same width, different signedness: promotion-ish
+    if (pw < aw) return 1;             // narrowing the value range is a promotion? no —
+    // pw > aw: widening (int -> long, float -> double): lossless promotion.
+    return 1; // any same-kind numeric that isn't exact is at worst promotion/standard
+    // (kept simple: real C++ ranks int->long as promotion, int->short as narrowing,
+    //  but VC has no short type, so width diffs are benign here.)
+  }
+  // Pointer conversions: void* binds to any pointer (rank 2); otherwise pointees
+  // must match exactly (rank 0 handled above, so a mismatch here is incompatible).
+  if (p->getKind() == TypeKind::Pointer && a->getKind() == TypeKind::Pointer) {
+    const Type *pp = resolveTypedefs(static_cast<const PointerType *>(p)->pointee);
+    if (pp && pp->getKind() == TypeKind::Builtin &&
+        static_cast<const BuiltinType *>(pp)->builtin == BuiltinTypeKind::Void)
+      return 2;
+    return 4;
+  }
+  // Same-kind non-arithmetic (vector/record/reference) that isn't exactly equal
+  // is incompatible — no implicit conversions exist for those.
+  return 4;
+}
+
+// Pick the best overload candidate for a call with the given argument types.
+// Each candidate is scored by the WORST conversion rank across its parameters
+// (after applying default arguments for omitted trailing params); the candidate
+// with the lowest worst-rank wins. A tie at the lowest rank is ambiguous and
+// reported as an error listing the tied candidates. No viable candidate (every
+// candidate has an arity mismatch or an incompatible binding) is also an error.
+// On success returns the chosen FunctionDecl and (if outRank set) its rank.
+FunctionDecl *Sema::resolveOverload(const ASTNode *call, StringRef calleeName,
+                                    const llvm::SmallVector<FunctionDecl *, 2> &cands,
+                                    const std::vector<NodePtr> &args,
+                                    int *outRank) {
+  FunctionDecl *best = nullptr;
+  int bestRank = 0;
+  bool ambiguous = false;
+  llvm::SmallVector<FunctionDecl *, 2> tied; // candidates tied with `best`
+
+  for (FunctionDecl *f : cands) {
+    // Arity with default arguments: args may omit trailing defaulted params.
+    if (args.size() > f->params.size()) continue; // too many args: not viable
+    bool viable = true;
+    for (size_t i = args.size(); i < f->params.size(); ++i)
+      if (!f->params[i]->defaultVal) { viable = false; break; }
+    if (!viable) continue;
+
+    int worst = 0;
+    for (size_t i = 0; i < args.size(); ++i) {
+      Type *argTy = checkExpr(args[i].get());
+      int r = conversionRank(f->params[i]->type, argTy);
+      if (r > worst) worst = r;
+    }
+    // rank 4 (incompatible) still counts as "viable-but-bad" so that a single
+    // candidate produces a soft diagnostic rather than a hard no-viable error;
+    // ambiguity is only declared among candidates whose worst rank is < 4.
+    if (!best || worst < bestRank) {
+      best = f;
+      bestRank = worst;
+      ambiguous = false;
+      tied.clear();
+      tied.push_back(f);
+    } else if (worst == bestRank) {
+      tied.push_back(f);
+      if (bestRank < 4) ambiguous = true;
+    }
+  }
+
+  if (!best) {
+    error(call, "no matching function for call to '" + std::string(calleeName) +
+                    "' with " + std::to_string(args.size()) + " argument(s)");
+    return nullptr;
+  }
+  if (ambiguous) {
+    error(call, "call to '" + std::string(calleeName) + "' is ambiguous");
+    for (FunctionDecl *f : tied)
+      warn(f, "candidate: '" + std::string(f->name) + "' (rank " +
+                  std::to_string(bestRank) + ")");
+    return nullptr;
+  }
+  if (outRank) *outRank = bestRank;
+  return best;
+}
+
 void Sema::error(const ASTNode *at, std::string msg) {
   Diagnostic d{DiagnosticKind::Error, at ? at->getLoc() : SourceLocation{},
                std::move(msg)};
@@ -443,15 +601,26 @@ void Sema::collectDecls(const std::vector<NodePtr> &decls, StringRef nsPrefix) {
     }
     case ASTNode::NodeKind::FunctionDecl: {
       auto *f = static_cast<FunctionDecl *>(d.get());
-      // Register under the mangled device symbol name so scoped call sites
-      // (`ns::f()`, `Class::m()`, `obj.m()`) resolve. The original name is
-      // preserved on the FunctionDecl for host-side emission. The key is
-      // derived from f->nsName (colon form) via the shared deviceMangledName,
-      // which matches what the GLSL/MLIR backends emit.
-      std::string key = deviceMangledName(f);
+      // Register under the namespace-mangled BASE name (no parameter suffix) so
+      // overloaded functions (f(int), f(float)) share a key and form one
+      // overload set. The backend emits each under its full deviceMangledName
+      // (with parameter suffix) for distinct symbols. The key is derived from
+      // f->nsName (colon form) via the shared deviceBaseName.
+      std::string key = deviceBaseName(f);
       static std::vector<std::unique_ptr<std::string>> fstore;
       fstore.push_back(std::make_unique<std::string>(std::move(key)));
-      functions[*fstore.back()] = f;
+      StringRef keyRef = *fstore.back();
+      auto &overloadSet = functions[keyRef];
+      // Redefinition check: an identical signature (same param types) in the
+      // same overload set is a redefinition error. Distinct signatures are
+      // legal overloads.
+      for (FunctionDecl *existing : overloadSet) {
+        if (sameSignature(f, existing)) {
+          error(f, "redefinition of '" + std::string(f->name) + "'");
+          break;
+        }
+      }
+      overloadSet.push_back(f);
       // Default-argument contiguity check (same as top-level free functions).
       bool seenDefault = false;
       for (ParamDecl *p : f->params) {
@@ -994,26 +1163,37 @@ Type *Sema::checkExpr(const ASTNode *n) {
       }
       auto it = functions.find(calleeName);
       if (it != functions.end()) {
-        FunctionDecl *f = it->second;
-        // GLSL forbids recursion: a device function calling itself (directly)
-        // would lower to a recursive GLSL function, which is invalid. Reject it
-        // here rather than emit illegal GLSL. Indirect recursion (A->B->A) is
-        // not detected — TODO: needs a call-graph closure.
-        if (currentFunc && f == currentFunc)
-          error(n, "recursive function '" + std::string(calleeName) +
-                       "' is not allowed in GLSL (device functions cannot "
-                       "call themselves)");
-        // Device code may only call __device__/__global__ functions; a plain
-        // (host) function is not callable from a kernel.
-        if ((f->deviceAttr == DeviceAttr::None ||
-             f->deviceAttr == DeviceAttr::Host) &&
-            currentFunc &&
-            (currentFunc->deviceAttr == DeviceAttr::Global ||
-             currentFunc->deviceAttr == DeviceAttr::Device))
-          warn(n, "call to host function '" + std::string(calleeName) +
-                      "' from device code");
-        checkCallArgs(n, calleeName, f, c->args);
-        return f->returnType;
+        const auto &overloadSet = it->second;
+        int rank = 0;
+        FunctionDecl *f = resolveOverload(n, calleeName, overloadSet, c->args, &rank);
+        if (f) {
+          const_cast<CallExpr *>(c)->resolvedCallee =
+              f; // backend emits this callee's mangled symbol
+          // GLSL forbids recursion: a device function calling itself (directly)
+          // would lower to a recursive GLSL function, which is invalid. Reject it
+          // here rather than emit illegal GLSL. Indirect recursion (A->B->A) is
+          // not detected — TODO: needs a call-graph closure.
+          if (currentFunc && f == currentFunc)
+            error(n, "recursive function '" + std::string(calleeName) +
+                         "' is not allowed in GLSL (device functions cannot "
+                         "call themselves)");
+          // Device code may only call __device__/__global__ functions; a plain
+          // (host) function is not callable from a kernel.
+          if ((f->deviceAttr == DeviceAttr::None ||
+               f->deviceAttr == DeviceAttr::Host) &&
+              currentFunc &&
+              (currentFunc->deviceAttr == DeviceAttr::Global ||
+               currentFunc->deviceAttr == DeviceAttr::Device))
+            warn(n, "call to host function '" + std::string(calleeName) +
+                        "' from device code");
+          // checkCallArgs re-type-checks each arg (cheap) and emits the lossy
+          // float->int warning for the chosen candidate.
+          checkCallArgs(n, calleeName, f, c->args);
+          return f->returnType;
+        }
+        // resolveOverload already reported no-viable/ambiguous; nothing more.
+        for (auto &a : c->args) checkExpr(a.get());
+        return nullptr;
       }
       // Unknown callee: could be a GLSL builtin we didn't list (e.g. a
       // vector constructor). Warn softly rather than hard-error, so we don't
@@ -1022,6 +1202,40 @@ Type *Sema::checkExpr(const ASTNode *n) {
       warn(n, "call to undeclared function '" + std::string(calleeName) +
                   "' (assuming builtin)");
       return nullptr;
+    }
+    // Object method call `obj.method(args)` (MemberAccessExpr callee, not a
+    // scope): resolve the method against the object's struct type. The device
+    // backend lowers `Class::method` to a free function `Class_method`, and with
+    // parameter mangling the emitted symbol is `Class_method_<params>`; the
+    // backend cannot recover the param types itself, so Sema must pick the
+    // overload and mark resolvedCallee. Scoped calls (`Class::method(...)`,
+    // `ns::f(...)`) were handled above via calleeName.
+    if (c->callee &&
+        c->callee->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+      auto *ma = static_cast<const MemberAccessExpr *>(c->callee.get());
+      if (!ma->isScope) {
+        Type *baseTy = checkExpr(ma->base.get());
+        const Type *rec = resolveTypedefs(baseTy);
+        if (rec && rec->getKind() == TypeKind::Record) {
+          StructDecl *sd = static_cast<const RecordType *>(rec)->decl;
+          // Gather same-named methods into an overload set and resolve. The
+          // object (`this`) is the implicit first parameter, so the explicit
+          // args bind to params[1..].
+          llvm::SmallVector<FunctionDecl *, 2> methods;
+          for (FunctionDecl *m : sd->methods)
+            if (m->name == ma->member) methods.push_back(m);
+          if (!methods.empty()) {
+            FunctionDecl *f = resolveOverload(n, ma->member, methods, c->args);
+            if (f) {
+              const_cast<CallExpr *>(c)->resolvedCallee = f;
+              checkCallArgs(n, ma->member, f, c->args);
+              return f->returnType;
+            }
+            for (auto &a : c->args) checkExpr(a.get());
+            return nullptr;
+          }
+        }
+      }
     }
     checkExpr(c->callee.get());
     for (auto &a : c->args) checkExpr(a.get());
@@ -1145,12 +1359,26 @@ Type *Sema::checkExpr(const ASTNode *n) {
     if (!name.empty()) {
       auto it = functions.find(name);
       if (it != functions.end()) {
-        FunctionDecl *f = it->second;
-        if (f->deviceAttr != DeviceAttr::Global)
+        const auto &overloadSet = it->second;
+        // Kernels cannot be overloaded (CUDA disallows __global__ overloads; the
+        // launch syntax `k<<<...>>>(args)` cannot disambiguate). Pick the unique
+        // __global__ candidate; a __device__ of the same base name is not a
+        // launch target.
+        FunctionDecl *f = nullptr;
+        for (FunctionDecl *cand : overloadSet)
+          if (cand->deviceAttr == DeviceAttr::Global) { f = cand; break; }
+        if (!f) {
           error(n, "launch target '" + std::string(name) +
                        "' is not a __global__ kernel");
-        else
+          for (auto &a : l->args) checkExpr(a.get());
+        } else if (overloadSet.size() > 1) {
+          // A kernel sharing a base name with a device helper is ambiguous from
+          // a launch site (no param info to disambiguate). CUDA forbids this.
+          error(n, "launch target '" + std::string(name) +
+                       "' is ambiguous (shares name with device functions)");
+        } else {
           checkCallArgs(n, name, f, l->args);
+        }
       } else {
         warn(n, "launch of undeclared kernel '" + std::string(name) + "'");
         for (auto &a : l->args) checkExpr(a.get());

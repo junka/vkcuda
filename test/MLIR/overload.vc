@@ -1,0 +1,27 @@
+// test/MLIR/overload.vc — P3A overload resolution through the MLIR backend.
+//
+// Two __device__ helpers share a base name `sq` but take different parameter
+// types; Sema resolves each call site to the matching overload and the MLIR
+// backend emits + calls them under parameter-mangled device symbols
+// (sq_i for sq(int), sq_f for sq(float)), so the two definitions do not
+// collide in the SPIR-V symbol table.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+// RUN: mlirc -emit=spirv %s -o %t.spv && test -s %t.spv
+
+// Distinct parameter-mangled symbols for the two overloads.
+// CHECK: func.func @sq_i
+// CHECK: func.func @sq_f
+
+__device__ int sq(int x)   { return x * x; }
+__device__ int sq(float x) { return (int)(x * x); }
+
+// CHECK-LABEL: func.func @overloadKernel
+__global__ void overloadKernel(int *out, int n) {
+  int i = threadIdx.x;
+  if (i >= n) return;
+  // The int call binds to sq_i, the float call to sq_f (resolved by Sema).
+  // CHECK: func.call @sq_i
+  // CHECK: func.call @sq_f
+  out[i] = sq(i) + sq((float)i);
+}

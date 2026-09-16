@@ -1,0 +1,60 @@
+// test/overload.vc — P3A function overload resolution, end-to-end.
+//
+// Two __device__ helpers share the base name `sq` but take different parameter
+// types (int vs float). Sema resolves each call to the matching overload by
+// conversion rank; the device backends emit and call them under
+// parameter-mangled symbols (sq_i / sq_f) so the two definitions coexist.
+// The kernel computes sq(i) + sq((float)i) for each thread and the host
+// verifies the result against the same formula in C++.
+//
+//   vcc test/overload.vc -o build/overload_sf && ./build/overload_sf
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__device__ int sq(int x)   { return x * x; }
+__device__ int sq(float x) { return (int)(x * x); }
+
+// A third overload with a different arity (exact match on two ints).
+__device__ int sq(int a, int b) { return a * a + b * b; }
+
+__global__ void overloadKernel(int *result, int N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+  // int overload (exact), float overload (int->float standard conversion),
+  // and the two-int overload (exact) all resolve correctly.
+  result[i] = sq(i) + sq((float)i) + sq(i, 1);
+}
+
+int main() {
+  vcInit();
+
+  const int N = 32;
+  const int block = 32;
+
+  void *dR = 0;
+  vcMalloc(&dR, N * 4);
+  int zeros[32] = {0};
+  vcMemcpy(dR, zeros, N * 4, VCMemcpyKind::HostToDevice);
+
+  overloadKernel<<<N, block>>>(dR, N);
+  vcDeviceSynchronize();
+
+  int hr[32];
+  vcMemcpy(hr, dR, N * 4, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    int expect = (i * i) + (int)((float)i * (float)i) + (i * i + 1);
+    if (hr[i] != expect) {
+      printf("  mismatch i=%d got=%d expect=%d\n", i, hr[i], expect);
+      ok = 0;
+    }
+  }
+
+  printf("overload: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dR);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

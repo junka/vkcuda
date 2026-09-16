@@ -1,0 +1,45 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// P3A function overload resolution: same-name __device__ helpers with distinct
+// parameter lists form one overload set; call sites pick the best candidate by
+// conversion rank, and identical-signature duplicates are redefinition errors.
+
+// Two legal overloads of `pick` differing by parameter type. Their device
+// symbols are pick_i / pick_f (parameter-mangled), so they coexist.
+__device__ int pick(int x)   { return x; }
+__device__ int pick(float x) { return (int)x; }
+
+// An exact-match overload alongside a promotion candidate: pick(3) should bind
+// to pick(int), not pick(float) (rank 0 beats rank 2).
+__device__ int pick(int a, int b) { return a + b; }
+
+__global__ void kern(int *out) {
+  int i = threadIdx.x;
+  // Exact match: int -> pick(int). No diagnostic.
+  out[0] = pick(i);
+  // Exact match: pick(int,int). No diagnostic.
+  out[1] = pick(i, i);
+  // Standard conversion int->float binds to pick(float). Legal; no diagnostic.
+  out[2] = pick(1.0f);
+
+  // An identical signature to an existing overload is a redefinition.
+  // CHECK: error: redefinition of 'dup'
+  // No-viable: no overload of pick takes zero args.
+  // CHECK: error: no matching function for call to 'pick' with 0 argument(s)
+  out[3] = pick();
+}
+
+// Identical signature to pick(int) declared above -> redefinition error.
+__device__ int dup(int x) { return x; }
+__device__ int dup(int x) { return x + 1; }
+
+// Ambiguous overload set: dup(long) and dup(float) both bind to an int argument
+// at the same (standard-conversion) rank, so dup(int_val) is ambiguous.
+__device__ int dup(long x)  { return (int)x; }
+__device__ int dup(float x) { return (int)x; }
+
+__global__ void kern2(int *out) {
+  int i = threadIdx.x;
+  // CHECK: error: call to 'dup' is ambiguous
+  out[0] = dup(i);
+}

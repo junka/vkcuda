@@ -1617,15 +1617,31 @@ private:
         // User __device__ helper or CUDA/math builtin: lower the name and emit
         // a normal GLSL call expression. Complete omitted trailing defaulted
         // parameters from the callee's signature (default arguments).
-        (*os) << lowerBuiltinCall(ref->name) << "(";
+        //
+        // If Sema resolved this call to a specific overload (resolvedCallee),
+        // emit the call under that overload's parameter-mangled device symbol so
+        // distinct overloads (f(int)->f_i, f(float)->f_f) hit the right emitted
+        // function. Builtins have no resolvedCallee and keep the bare lowered
+        // name. For methods called by unqualified name inside the class body,
+        // resolvedCallee is the Class_method decl and its mangled name carries
+        // the Class_ prefix.
+        std::string callName;
+        const FunctionDecl *calleeFn = nullptr;
+        if (c->resolvedCallee) {
+          callName = deviceMangledName(c->resolvedCallee);
+          calleeFn = c->resolvedCallee;
+        } else {
+          callName = lowerBuiltinCall(ref->name);
+          auto fit = funcDecls.find(ref->name);
+          if (fit != funcDecls.end()) calleeFn = fit->second;
+        }
+        (*os) << callName << "(";
         for (unsigned i = 0; i < c->args.size(); ++i) {
           if (i) (*os) << ", ";
           emitExpr(c->args[i].get());
         }
         // Append defaults for any trailing params the call omitted.
-        auto fit = funcDecls.find(ref->name);
-        if (fit != funcDecls.end()) {
-          const FunctionDecl *calleeFn = fit->second;
+        if (calleeFn) {
           for (unsigned i = c->args.size(); i < calleeFn->params.size(); ++i) {
             if (calleeFn->params[i]->defaultVal) {
               if (i) (*os) << ", ";
@@ -1644,23 +1660,45 @@ private:
         if (ma->isScope) {
           // ns::func(args) -> ns_func(args). Class::method(args) -> Class_method(args)
           // (no implicit `this` for scope calls — the caller names the method
-          // directly, e.g. a static-like call).
-          std::string mangled = mangleScopeChainGLSL(ma);
+          // directly, e.g. a static-like call). When Sema resolved the callee,
+          // emit under its parameter-mangled device symbol so overloads bind
+          // correctly; otherwise fall back to the bare scope-chain mangle.
+          std::string mangled = c->resolvedCallee
+                                    ? deviceMangledName(c->resolvedCallee)
+                                    : mangleScopeChainGLSL(ma);
           (*os) << mangled << "(";
           emitCallArgsWithDefaults(mangled, c->args);
           (*os) << ")";
           return;
         }
         // obj.method(args) -> Class_method(obj, args). The object expression
-        // becomes the first argument (`this`). The Class name is recovered from
-        // the object's type when possible; otherwise we look for a method
-        // registered under "<base>_<member>".
-        std::string methodName = memberCallMethodName(ma);
+        // becomes the first argument (`this`). When Sema resolved the method
+        // (resolvedCallee), emit under its parameter-mangled device symbol so
+        // overloaded methods bind to the right definition; otherwise fall back
+        // to the heuristic name recovery (single-method classes, builtins).
+        std::string methodName;
+        const FunctionDecl *calleeFn = nullptr;
+        if (c->resolvedCallee) {
+          methodName = deviceMangledName(c->resolvedCallee);
+          calleeFn = c->resolvedCallee;
+        } else {
+          methodName = memberCallMethodName(ma);
+        }
         (*os) << methodName << "(";
         emitExpr(ma->base.get());
         for (auto &a : c->args) {
           (*os) << ", ";
           emitExpr(a.get());
+        }
+        // Append defaults for omitted trailing params (explicit args only; the
+        // implicit `this` is always present and never defaulted).
+        if (calleeFn) {
+          for (unsigned i = c->args.size(); i < calleeFn->params.size(); ++i) {
+            if (calleeFn->params[i]->defaultVal) {
+              (*os) << ", ";
+              emitExpr(calleeFn->params[i]->defaultVal.get());
+            }
+          }
         }
         (*os) << ")";
         return;

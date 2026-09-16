@@ -2547,7 +2547,15 @@ private:
         if (auto bv = emitBuiltinCall(ref->name, c->args, l, matched))
           return bv;
         if (matched) return Value();
-        auto fit = funcTable.find(ref->name.str());
+        // When Sema resolved this call to a specific overload (resolvedCallee),
+        // look up the callee by its parameter-mangled device symbol so distinct
+        // overloads (f(int)->f_i, f(float)->f_f) hit the right funcTable entry.
+        // Builtins have no resolvedCallee and never reach here (matched above).
+        std::string calleeSym = c->resolvedCallee
+                                    ? deviceMangledName(c->resolvedCallee)
+                                    : ref->name.str();
+        const FunctionDecl *calleeFn = c->resolvedCallee;
+        auto fit = funcTable.find(calleeSym);
         if (fit != funcTable.end()) {
           SmallVector<Value> args;
           for (auto &a : c->args) {
@@ -2562,9 +2570,11 @@ private:
           // Complete trailing defaulted parameters the call omits, mirroring
           // the GLSL backend: append each default expression from the callee
           // signature until the argument count matches the parameter count.
-          auto dit = funcDecls.find(ref->name.str());
-          if (dit != funcDecls.end()) {
-            const FunctionDecl *calleeFn = dit->second;
+          if (!calleeFn) {
+            auto dit = funcDecls.find(calleeSym);
+            if (dit != funcDecls.end()) calleeFn = dit->second;
+          }
+          if (calleeFn) {
             for (unsigned i = c->args.size(); i < calleeFn->params.size(); ++i) {
               if (!calleeFn->params[i]->defaultVal) break;
               Value dv = visitExpr(calleeFn->params[i]->defaultVal.get());
@@ -2609,7 +2619,13 @@ private:
             if (!chain.empty()) chain += "::";
             chain += p;
           }
-          std::string mangled = mangleScopeName(chain);
+          // Prefer the Sema-resolved callee's parameter-mangled symbol so
+          // overloaded scoped functions bind to the right funcTable entry;
+          // fall back to the bare scope-chain mangle when unresolved.
+          std::string mangled = c->resolvedCallee
+                                    ? deviceMangledName(c->resolvedCallee)
+                                    : mangleScopeName(chain);
+          const FunctionDecl *calleeFn = c->resolvedCallee;
           auto fit = funcTable.find(mangled);
           if (fit != funcTable.end()) {
             SmallVector<Value> args;
@@ -2618,9 +2634,11 @@ private:
               if (!av) return error(a.get(), "could not evaluate call argument");
               args.push_back(loadValue(av, loc(a.get())));
             }
-            auto dit = funcDecls.find(mangled);
-            if (dit != funcDecls.end()) {
-              const FunctionDecl *calleeFn = dit->second;
+            if (!calleeFn) {
+              auto dit = funcDecls.find(mangled);
+              if (dit != funcDecls.end()) calleeFn = dit->second;
+            }
+            if (calleeFn) {
               for (unsigned i = c->args.size(); i < calleeFn->params.size(); ++i) {
                 if (!calleeFn->params[i]->defaultVal) break;
                 Value dv = visitExpr(calleeFn->params[i]->defaultVal.get());
@@ -2648,11 +2666,17 @@ private:
           // func.func for completeness, but never func.called.) This mirrors
           // how the GLSL backend's `inout Class _this` achieves by-ref.
           std::string suffix = "_" + ma->member.str();
-          const FunctionDecl *methodFn = nullptr;
-          for (auto &kv : funcDecls) {
-            if (kv.first.ends_with(suffix) && kv.second->isMethod) {
-              if (methodFn) { methodFn = nullptr; break; } // ambiguous
-              methodFn = kv.second;
+          // Prefer the Sema-resolved method (resolvedCallee) so overloaded
+          // methods bind correctly; fall back to the funcDecls suffix scan for
+          // single-method classes when Sema didn't resolve (shouldn't happen
+          // for device code, but keeps the path defensive).
+          const FunctionDecl *methodFn = c->resolvedCallee;
+          if (!methodFn) {
+            for (auto &kv : funcDecls) {
+              if (kv.first.ends_with(suffix) && kv.second->isMethod) {
+                if (methodFn) { methodFn = nullptr; break; } // ambiguous
+                methodFn = kv.second;
+              }
             }
           }
           if (methodFn && methodFn->body) {

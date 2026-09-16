@@ -22,6 +22,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/SourceMgr.h"
 
@@ -38,8 +39,11 @@ class Sema {
   // frame; leaving it pops.
   std::vector<llvm::StringMap<ASTNode *>> scopes;
 
-  // Top-level function table: name -> FunctionDecl*.
-  llvm::StringMap<FunctionDecl *> functions;
+  // Top-level function table: mangled device name -> overload set. The key is
+  // the namespace-mangled name WITHOUT parameter encoding (so `f(int)` and
+  // `f(float)` share a key and form one overload set). Overload resolution
+  // picks among the SmallVector at each call site.
+  llvm::StringMap<llvm::SmallVector<FunctionDecl *, 2>> functions;
 
   // Top-level global variables (__constant__ decls): name -> VarDecl*. These
   // are file-scope, so DeclRefExpr resolves against this map (they aren't in
@@ -110,6 +114,27 @@ private:
   // mismatches and lossy float->int conversions as warnings.
   void checkCallArgs(const ASTNode *call, StringRef calleeName,
                      FunctionDecl *f, const std::vector<NodePtr> &args);
+
+  // Overload resolution: pick the best candidate from `candidates` for a call
+  // with the given (already type-inferred) argument types. Returns the chosen
+  // FunctionDecl, or null if no viable candidate. On ambiguity (two or more
+  // candidates tie for best), reports an error listing the candidates and
+  // returns null. `outRank` (if set) receives the winning rank.
+  FunctionDecl *resolveOverload(const ASTNode *call, StringRef calleeName,
+                                const llvm::SmallVector<FunctionDecl *, 2> &cands,
+                                const std::vector<NodePtr> &args,
+                                int *outRank = nullptr);
+
+  // Conversion rank for a single argument->parameter binding. Lower is better.
+  //   0 exact, 1 promotion, 2 standard, 3 lossy, 4 incompatible.
+  static int conversionRank(const Type *param, const Type *arg);
+
+  // Structural type equality (typedefs resolved). Used for redefinition
+  // detection and overload-set dedup; not a full canonical Type.
+  static bool sameType(const Type *a, const Type *b);
+  // Two functions collide in an overload set iff their parameter type lists
+  // are structurally equal (return type is NOT part of the signature).
+  static bool sameSignature(const FunctionDecl *a, const FunctionDecl *b);
 
   // Diagnostics.
   void error(const ASTNode *at, std::string msg);

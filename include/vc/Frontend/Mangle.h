@@ -21,6 +21,7 @@
 namespace vc {
 
 class FunctionDecl;
+class Type;
 
 /// Mangle a `::`-scoped name to underscore form: `outer::inner` -> `outer_inner`.
 /// Empty input returns an empty string. This is the atomic device mangling
@@ -34,9 +35,24 @@ std::string mangleScopeName(llvm::StringRef scopedName);
 /// `ns_func`; nested `outer::inner::func` -> `outer_inner_func`. Top-level
 /// free functions keep their bare name.
 ///
-/// This preserves the current non-overload ABI. Parameter type encoding is
-/// intentionally NOT included here — it belongs to overload work.
+/// __device__ functions (not __global__ kernels) get a parameter-type suffix so
+/// overloaded helpers (e.g. `f(int)` vs `f(float)`) emit distinct device symbols.
+/// Kernels are excluded: CUDA does not allow overloading __global__ functions
+/// (the launch syntax `k<<<...>>>(args)` cannot disambiguate), and excluding
+/// them keeps the kernel symbol matching the host's launch handle (which has no
+/// parameter type information).
 std::string deviceMangledName(const FunctionDecl *f);
+
+/// The namespace+name mangling WITHOUT the parameter-type suffix. This is the
+/// overload-set key: `f(int)` and `f(float)` share a base name so they form one
+/// overload set. (deviceMangledName adds the parameter suffix on top to produce
+/// the distinct emitted symbol.)
+std::string deviceBaseName(const FunctionDecl *f);
+
+/// Encode a Type as a compact mangling token (e.g. int->_i, float->_f,
+/// int*->_pi, float4->_f4). Used by deviceMangledName for overload distinction.
+/// Not Itanium-ABI compatible — just unique and readable.
+std::string mangleType(const Type *t);
 
 } // namespace vc
 

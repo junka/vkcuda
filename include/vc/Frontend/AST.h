@@ -577,6 +577,11 @@ class CallExpr : public ASTNode {
 public:
   NodePtr callee;     // DeclRefExpr
   std::vector<NodePtr> args;
+  // The callee FunctionDecl selected by Sema overload resolution. Null for
+  // builtins (which have no FunctionDecl), unscoped calls Sema couldn't
+  // resolve, or before Sema runs. Backends use this to emit the call against
+  // the resolved overload's mangled device symbol rather than re-resolving.
+  FunctionDecl *resolvedCallee = nullptr;
   CallExpr(SourceLocation l, NodePtr c) : ASTNode(l), callee(std::move(c)) {}
   NodeKind getNodeType() const override { return NodeKind::CallExpr; }
 };
