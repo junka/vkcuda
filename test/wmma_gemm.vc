@@ -1,0 +1,88 @@
+// test/wmma_gemm.vc — WMMA tensor-core GEMM (MLIR backend e2e demo).
+//
+// One cooperative-matrix tile: A is 8x16 fp16, B is 16x8 fp16, C/D are 8x8
+// fp32. D = A * B + C. Launched as a single workgroup of 32 threads (one
+// subgroup on a subgroup-size-32 device), so the single subgroup owns the one
+// 8x8x16 tile and there is no inter-tile indexing — each load_matrix_sync
+// reads from offset [0,0] of the SSBO with leadDimension = the matrix's row
+// stride (16 for A/B, 8 for C/D). The Vulkan-native 8x8x16 fp16-input/fp32-
+// accumulate shape matches the dev GPU's supported cooperative-matrix tile.
+//
+//   vc -emit=full test/wmma_gemm.vc -o build/wmma_gemm && ./build/wmma_gemm
+//
+// Requires the MLIR backend (`vc`); the GLSL backend (`vcc`) rejects wmma::.
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// D = A * B + C  for a single 8x8x16 tensor-core tile.
+__global__ void wmma_gemm(__half *A, __half *B, float *C, float *D) {
+  wmma::fragment<wmma::matrix_a, 8, 8, 16, half, wmma::row_major> a_frag;
+  wmma::fragment<wmma::matrix_b, 8, 8, 16, half, wmma::row_major> b_frag;
+  wmma::fragment<wmma::accumulator, 8, 8, 16, float> c_frag;
+
+  // A is 8x16 row-major (ldm = 16); B is 16x8 row-major (ldm = 8); C/D are
+  // 8x8 row-major (ldm = 8). Both A and B fragments are row_major, matching
+  // the host-side storage, so D = A * B + C with the usual matmul indexing
+  // D[i][j] = sum_k A[i][k]*B[k][j].
+  wmma::load_matrix_sync(a_frag, A, 16);
+  wmma::load_matrix_sync(b_frag, B, 8);
+  wmma::load_matrix_sync(c_frag, C, 8, wmma::mem_row_major);
+  wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+  wmma::store_matrix_sync(D, c_frag, 8, wmma::mem_row_major);
+}
+
+int main() {
+  vcInit();
+
+  // 8x16 A, 16x8 B, 8x8 C and D.
+  const int M = 8, K = 16, N = 8;
+  __half hA[M * K];
+  __half hB[K * N];
+  float hC[M * N];
+  float hD[M * N];
+  // Fill A and B with small integers; compute the reference in float.
+  for (int i = 0; i < M; i++)
+    for (int k = 0; k < K; k++)
+      hA[i * K + k] = (__half)((i + k) % 5);
+  for (int k = 0; k < K; k++)
+    for (int j = 0; j < N; j++)
+      hB[k * N + j] = (__half)((k - j + 7) % 5);
+  for (int i = 0; i < M; i++)
+    for (int j = 0; j < N; j++)
+      hC[i * N + j] = 1.0f;
+
+  void *dA = 0, *dB = 0, *dC = 0, *dD = 0;
+  vcMalloc(&dA, M * K * 2);
+  vcMalloc(&dB, K * N * 2);
+  vcMalloc(&dC, M * N * 4);
+  vcMalloc(&dD, M * N * 4);
+  vcMemcpy(dA, hA, M * K * 2, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dB, hB, K * N * 2, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dC, hC, M * N * 4, VCMemcpyKind::HostToDevice);
+
+  // One subgroup (32 threads) computes the single 8x8 tile.
+  wmma_gemm<<<1, 32>>>(dA, dB, dC, dD);
+
+  vcDeviceSynchronize();
+  vcMemcpy(hD, dD, M * N * 4, VCMemcpyKind::DeviceToHost);
+
+  // Reference: D = A * B + C, in float.
+  int ok = 1;
+  for (int i = 0; i < M && ok; i++) {
+    for (int j = 0; j < N; j++) {
+      float acc = 1.0f; // C[i][j]
+      for (int k = 0; k < K; k++)
+        acc += (float)hA[i * K + k] * (float)hB[k * N + j];
+      if (hD[i * N + j] != acc) { ok = 0; break; }
+    }
+  }
+  printf("wmma_gemm: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dA);
+  vcFree(dB);
+  vcFree(dC);
+  vcFree(dD);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

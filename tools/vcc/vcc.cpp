@@ -107,6 +107,18 @@ int main(int argc, char **argv) {
   if (syntaxOnly) return 0;
   if (emitOpt == "ast") { dumpAST(tu, outs()); return 0; }
 
+  // wmma:: / cooperative-matrix intrinsics are only lowered by the MLIR
+  // backend (gpu.subgroup_mma -> spirv.KHR.CooperativeMatrix). The GLSL
+  // backend has no tensor-core path, so refuse here with a clear message
+  // rather than emitting broken GLSL.
+  if (sema.usesCoopMatrix()) {
+    errs() << inputFilename
+           << ": error: wmma:: tensor-core intrinsics require the MLIR "
+              "backend (-emit=full via `vc`); the GLSL backend (`vcc`) does "
+              "not support cooperative matrices\n";
+    return 1;
+  }
+
   // 2. Device subset -> one GLSL compute unit per __global__ kernel.
   auto glslModules = glsl::translateASTToGLSLSources(tu);
   if (glslModules.empty()) {

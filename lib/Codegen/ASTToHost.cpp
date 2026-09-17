@@ -1071,10 +1071,13 @@ private:
       case BuiltinTypeKind::UInt64: return "unsigned long";
       case BuiltinTypeKind::Float32: return "float";
       case BuiltinTypeKind::Float64: return "double";
-      // The host has no half type; __half declarations on the host (rare — only
-      // if a host var is typed `half`) degrade to float. Device half is lowered
-      // to float16_t by the GLSL backend and never crosses into host code.
-      case BuiltinTypeKind::Float16: return "float";
+      // Host half type. __half (and `half`) map to the GNU/C11 _Float16, a
+      // real 16-bit float, so a host `__half arr[N]` occupies 2*N bytes —
+      // matching the device SSBO layout a vcMemcpy(2*N) transfers. (The
+      // previous `float` widening made host half arrays 4 bytes/elem, corrupting
+      // the byte stream the device read back as packed f16.) _Float16
+      // arithmetic/casts work directly in g++ and clang.
+      case BuiltinTypeKind::Float16: return "_Float16";
       }
     }
     if (t->getKind() == TypeKind::Pointer) {

@@ -816,6 +816,16 @@ bool Parser::evalConstInt(const ASTNode *e, int64_t &out) {
     default: return false; // comparisons/assign not needed for sizes.
     }
   }
+  case ASTNode::NodeKind::DeclRefExpr: {
+    // Resolve a named `const int` captured at its own declaration so array
+    // dimensions like `T arr[M * K]` fold. Falls through (non-constant) for
+    // any name not in constInts.
+    auto *d = static_cast<const DeclRefExpr *>(e);
+    auto it = constInts.find(d->name);
+    if (it == constInts.end()) return false;
+    out = it->second;
+    return true;
+  }
   default:
     return false;
   }
@@ -898,6 +908,22 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
       v->init = parseAssignment();
     }
   }
+  // Record `const int NAME = <literal>;` so later array dimensions spelled
+  // with NAME (e.g. `T arr[M * K]`) can be folded by evalConstInt. Only plain
+  // integer-literal inits are captured — matches the `#define` literal-only
+  // rule and keeps this single-pass.
+  if (v->isConst && v->init && declTy->getKind() == TypeKind::Builtin) {
+    auto *bt = static_cast<const BuiltinType *>(declTy);
+    bool isInt = bt->builtin == BuiltinTypeKind::Int32 ||
+                 bt->builtin == BuiltinTypeKind::UInt32 ||
+                 bt->builtin == BuiltinTypeKind::Int64 ||
+                 bt->builtin == BuiltinTypeKind::UInt64;
+    if (isInt) {
+      int64_t cv;
+      if (evalConstInt(v->init.get(), cv))
+        constInts[v->name] = cv;
+    }
+  }
   return v;
 }
 
@@ -961,6 +987,98 @@ Type *Parser::parseBaseType() {
   case TokKind::kw_float: base = new BuiltinType(BuiltinTypeKind::Float32); break;
   case TokKind::kw_double: base = new BuiltinType(BuiltinTypeKind::Float64); break;
   case TokKind::kw_half: base = new BuiltinType(BuiltinTypeKind::Float16); break;
+  case TokKind::kw_wmma: {
+    // wmma::fragment < use , M , N , K , precision , layout? >
+    advance(); // consume `wmma`
+    if (!expect(TokKind::coloncolon, "'::'"))
+      return nullptr;
+    if (!curTok.is(TokKind::identifier) || curTok.text != "fragment") {
+      error(curTok, "expected 'fragment' after 'wmma::'");
+      return nullptr;
+    }
+    advance(); // consume `fragment`
+    if (!expect(TokKind::lt, "'<'"))
+      return nullptr;
+    // Accept an optional `wmma::` qualifier on the use/layout names (CUDA spells
+    // them wmma::matrix_a, wmma::row_major, etc.). Consume `wmma ::` if present.
+    auto consumeWmmaScope = [&]() {
+      if (curTok.is(TokKind::kw_wmma) && lexer.peek().is(TokKind::coloncolon)) {
+        advance(); // wmma
+        advance(); // ::
+      }
+    };
+    // use: wmma::matrix_a / wmma::matrix_b / wmma::accumulator
+    consumeWmmaScope();
+    if (!curTok.is(TokKind::identifier)) {
+      error(curTok, "expected fragment use (matrix_a/matrix_b/accumulator)");
+      return nullptr;
+    }
+    std::string useStr = curTok.text.str();
+    WmmaUse use;
+    if (useStr == "matrix_a") use = WmmaUse::MatrixA;
+    else if (useStr == "matrix_b") use = WmmaUse::MatrixB;
+    else if (useStr == "accumulator") use = WmmaUse::Accumulator;
+    else {
+      error(curTok, "unknown fragment use '" + useStr +
+                        "' (expected matrix_a/matrix_b/accumulator)");
+      return nullptr;
+    }
+    advance();
+    expect(TokKind::comma, "','");
+    // M, N, K — integer literals.
+    auto parseDim = [&]() -> unsigned {
+      if (!curTok.is(TokKind::int_literal)) {
+        error(curTok, "expected integer dimension");
+        return 0;
+      }
+      unsigned v = 0;
+      curTok.text.getAsInteger(10, v);
+      advance();
+      return v;
+    };
+    unsigned M = parseDim();
+    expect(TokKind::comma, "','");
+    unsigned N = parseDim();
+    expect(TokKind::comma, "','");
+    unsigned K = parseDim();
+    expect(TokKind::comma, "','");
+    // precision: half / float
+    WmmaPrecision prec;
+    if (curTok.is(TokKind::kw_half)) { prec = WmmaPrecision::F16; advance(); }
+    else if (curTok.is(TokKind::kw_float)) { prec = WmmaPrecision::F32; advance(); }
+    else {
+      error(curTok, "expected 'half' or 'float' for fragment precision");
+      return nullptr;
+    }
+    // optional layout (A/B only): wmma::row_major / wmma::col_major
+    WmmaLayout layout = WmmaLayout::None;
+    if (consume(TokKind::comma)) {
+      consumeWmmaScope();
+      if (!curTok.is(TokKind::identifier)) {
+        error(curTok, "expected layout (row_major/col_major)");
+        return nullptr;
+      }
+      std::string layStr = curTok.text.str();
+      if (layStr == "row_major") layout = WmmaLayout::RowMajor;
+      else if (layStr == "col_major") layout = WmmaLayout::ColMajor;
+      else {
+        error(curTok, "unknown layout '" + layStr +
+                          "' (expected row_major/col_major)");
+        return nullptr;
+      }
+      advance();
+    }
+    if (!expect(TokKind::gt, "'>'"))
+      return nullptr;
+    // An accumulator fragment should not carry a layout (it has no compile-time
+    // Layout in CUDA's API); if one was given, ignore it silently here — Sema
+    // validates accumulator loads use the runtime layout_t argument instead.
+    base = new WmmaFragmentType(use, prec, layout, M, N, K);
+    // The `wmma::fragment<...>` form is fully consumed here (up to and including
+    // `>`), so skip the shared `advance()` below that other cases rely on to
+    // move past a single type keyword. Return directly.
+    return base;
+  }
   case TokKind::identifier:
     // A user-named type (struct/typedef) or a vector name like float4.
     if (auto *vec = makeVectorType(curTok.text))
@@ -1049,6 +1167,17 @@ bool Parser::startsType(const Token &t) {
   case TokKind::kw_double:
   case TokKind::kw_half:
     return true;
+  case TokKind::kw_wmma:
+    // `wmma::fragment<...>` starts a fragment variable declaration, but
+    // `wmma::load_matrix_sync(...)` etc. are call expressions. Both start with
+    // `wmma ::`, so peek two tokens ahead: only treat as a type when the token
+    // after `::` is the identifier `fragment`.
+    if (lexer.peek().is(TokKind::coloncolon)) {
+      Token after = lexer.peek2();
+      if (after.is(TokKind::identifier) && after.text == "fragment")
+        return true;
+    }
+    return false;
   case TokKind::identifier:
     // Vector names (float4, ...) and known struct/typedef names start types.
     if (makeVectorType(t.text)) return true;
@@ -1820,6 +1949,12 @@ NodePtr Parser::parsePrimary() {
     advance();
     // represent as a call to a builtin named __syncthreads
     return NodePtr(new DeclRefExpr(toSourceLoc(t), "__syncthreads"));
+  case TokKind::kw_wmma:
+    // `wmma::fragment<...>` type or `wmma::load_matrix_sync(...)` call. Treat
+    // the keyword as a plain identifier so the `::` scope chain in parsePostfix
+    // composes `wmma::name`; Sema/the backends recognize the `wmma_` prefix.
+    advance();
+    return NodePtr(new DeclRefExpr(toSourceLoc(t), "wmma"));
   case TokKind::kw_this:
     // `this` inside a method body. Represented as a DeclRefExpr naming "_this",
     // which is the synthesized first parameter the device backend injects when

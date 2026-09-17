@@ -83,6 +83,11 @@ class Sema {
   };
   std::vector<SwitchCases> switchStack;
 
+  // Set when any wmma::* intrinsic is used in a device kernel; the MLIR backend
+  // reads this (via the TU) to advertise the CooperativeMatrixKHR capability and
+  // bump the target env to SPIR-V 1.6.
+  bool usesCoopMatrix_ = false;
+
 public:
   Sema(TranslationUnit &unit, llvm::SourceMgr &sm) : tu(unit), srcMgr(sm) {}
 
@@ -97,6 +102,11 @@ public:
     auto it = exprTypes.find(n);
     return it == exprTypes.end() ? nullptr : it->second;
   }
+
+  /// True if the TU uses wmma:: / cooperative-matrix intrinsics. The MLIR
+  /// backend uses this to bump the SPIR-V target env; the GLSL backend uses
+  /// it to reject wmma (no tensor-core path).
+  bool usesCoopMatrix() const { return usesCoopMatrix_; }
 
 private:
   // Scope management.
@@ -162,6 +172,16 @@ private:
   bool isMathBuiltin(StringRef name) const;
   static bool isValidSwizzle(StringRef s);
   Type *builtin(BuiltinTypeKind k) const;
+
+  // WMMA (tensor-core) call checking. `calleeName` is the scope-mangled name
+  // (e.g. `wmma_load_matrix_sync`). Returns the call's result type (the fragment
+  // type for load/mma, void for store) or null if `calleeName` is not a WMMA
+  // intrinsic — so the caller can fall through to normal call resolution. On a
+  // recognized WMMA intrinsic with bad arguments, reports an error and returns
+  // null. Also flags the translation unit as using cooperative matrix so the
+  // MLIR backend bumps the target env.
+  Type *checkWmmaCall(const ASTNode *call, StringRef calleeName,
+                      const std::vector<NodePtr> &args);
 
   // Type taxonomy used by the compatibility checks. Arithmetic covers the
   // builtin scalars between which C-style implicit conversions are legal;

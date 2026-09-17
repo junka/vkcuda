@@ -51,7 +51,8 @@ gpu::Dimension toGpuDim(vc::Dim dim) {
 // SPV_KHR_storage_buffer_storage_class extension. Without it the GPUToSPIRV
 // signature conversion cannot map the kernel arguments and memref.load/store
 // on them fails to legalize (<UNKNOWN SSA VALUE>).
-spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context, bool usesSubgroup) {
+spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context, bool usesSubgroup,
+                                    bool usesCoopMatrix) {
   // Int64/Float64/Float16 capabilities are advertised so 64-bit integer
   // (`long`, `long4`) and double (`double`, `double2`) and half (`__half`)
   // types legalize. Vulkan's core Shader capability already covers i32/f32;
@@ -67,20 +68,31 @@ spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context, bool usesSubgroup) {
   // ShuffleRelative,Arithmetic,Vote} capabilities. When the AST→MLIR emitter
   // flagged subgroup usage (vc.uses_subgroup), bump the target version and
   // advertise those capabilities so GPUToSPIRV legalizes the subgroup ops.
+  //
+  // WMMA (wmma::*) lowers to spirv.KHR.CooperativeMatrix{Load,Store,MulAdd},
+  // which require SPIR-V 1.6 (vulkan1.2) + the CooperativeMatrixKHR capability
+  // + the SPV_KHR_cooperative_matrix extension. When the emitter flagged
+  // cooperative-matrix usage (vc.uses_coopmatrix), bump the target version
+  // (1.6 supersedes 1.3) and advertise the capability/extension.
   spirv::Version version = spirv::Version::V_1_0;
   SmallVector<spirv::Capability, 8> caps = {
       spirv::Capability::Shader, spirv::Capability::Float64,
       spirv::Capability::Int64, spirv::Capability::Float16};
-  SmallVector<spirv::Extension, 1> exts = {
+  SmallVector<spirv::Extension, 2> exts = {
       spirv::Extension::SPV_KHR_storage_buffer_storage_class};
   if (usesSubgroup) {
-    version = spirv::Version::V_1_3;
+    if (version < spirv::Version::V_1_3) version = spirv::Version::V_1_3;
     caps.push_back(spirv::Capability::GroupNonUniform);
     caps.push_back(spirv::Capability::GroupNonUniformVote);
     caps.push_back(spirv::Capability::GroupNonUniformBallot);
     caps.push_back(spirv::Capability::GroupNonUniformShuffle);
     caps.push_back(spirv::Capability::GroupNonUniformShuffleRelative);
     caps.push_back(spirv::Capability::GroupNonUniformArithmetic);
+  }
+  if (usesCoopMatrix) {
+    version = spirv::Version::V_1_6; // supersedes 1.3
+    caps.push_back(spirv::Capability::CooperativeMatrixKHR);
+    exts.push_back(spirv::Extension::SPV_KHR_cooperative_matrix);
   }
   auto triple = spirv::VerCapExtAttr::get(version, caps, exts, context);
   return spirv::TargetEnvAttr::get(triple,
@@ -363,8 +375,10 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
     // Bump to 1.3 + subgroup capabilities when the module uses warp/subgroup
     // intrinsics (flagged by ASTToMLIR via the vc.uses_subgroup module attr).
     bool usesSubgroup = module->hasAttr("vc.uses_subgroup");
+    bool usesCoopMatrix = module->hasAttr("vc.uses_coopmatrix");
     gpuModule->setAttr(spirv::getTargetEnvAttrName(),
-                       getVCTargetEnv(module.getContext(), usesSubgroup));
+                       getVCTargetEnv(module.getContext(), usesSubgroup,
+                                      usesCoopMatrix));
 
     rw.setInsertionPointToStart(gpuModule.getBody());
     auto gpuFn = rw.create<gpu::GPUFuncOp>(k.getLoc(), fn.getName(),

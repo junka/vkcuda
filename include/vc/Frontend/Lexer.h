@@ -119,6 +119,8 @@ public:
   Token lex();
   /// Peek without consuming.
   Token peek();
+  /// Peek two tokens ahead without consuming.
+  Token peek2();
 
   /// Opaque save/restore of the lexer position, for speculative parsing
   /// (e.g. distinguishing a C-style cast `(T)x` from a grouping `(x)`).

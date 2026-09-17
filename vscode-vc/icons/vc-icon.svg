@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <title>VC language icon</title>
+  <desc>VC: a CUDA-like language targeting Vulkan. Icon fuses the Vulkan downward-triangle silhouette with NVIDIA/CUDA green.</desc>
+
+  <defs>
+    <!-- CUDA / NVIDIA green gradient -->
+    <linearGradient id="cudaGreen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#8DE000"/>
+      <stop offset="55%" stop-color="#76B900"/>
+      <stop offset="100%" stop-color="#5A8F00"/>
+    </linearGradient>
+
+    <!-- subtle inner highlight for depth -->
+    <linearGradient id="hilite" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#ffffff" stop-opacity="0.45"/>
+      <stop offset="35%" stop-color="#ffffff" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Vulkan-style downward triangle silhouette, clipped so the inner stripes
+         stay within the triangle. -->
+    <clipPath id="triClip">
+      <path d="M 64 112 L 16 28 L 112 28 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- Backing triangle (Vulkan silhouette) in CUDA green -->
+  <path d="M 64 112 L 16 28 L 112 28 Z" fill="url(#cudaGreen)"/>
+
+  <!-- Three parallel stripes evoking the Vulkan mark + parallel GPU streams.
+       Drawn inside the triangle clip so the geometry reads as a single mark. -->
+  <g clip-path="url(#triClip)" stroke="#0E1A0E" stroke-opacity="0.78" stroke-width="6" stroke-linecap="round">
+    <line x1="34" y1="44" x2="94"  y2="44"/>
+    <line x1="30" y1="60" x2="98"  y2="60"/>
+    <line x1="26" y1="76" x2="102" y2="76"/>
+  </g>
+
+  <!-- top highlight pass for a little dimensionality -->
+  <path d="M 64 112 L 16 28 L 112 28 Z" fill="url(#hilite)"/>
+
+  <!-- crisp outline -->
+  <path d="M 64 112 L 16 28 L 112 28 Z" fill="none" stroke="#3A5E00" stroke-width="3" stroke-linejoin="round"/>
+
+  <!-- VC wordmark -->
+  <g font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-weight="700"
+     text-anchor="middle" text-rendering="geometricPrecision">
+    <text x="64" y="58" font-size="30" fill="#0E1A0E">VC</text>
+  </g>
+</svg>

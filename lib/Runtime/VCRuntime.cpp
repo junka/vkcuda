@@ -329,6 +329,7 @@ bool Runtime::enumerateDevices(VkInstance instance) {
     VkDevice sharedDevice = owner->device;
     VkQueue sharedQueue = owner->computeQueue;
     bool timelineSemaphore = owner->timelineSemaphore;
+    bool coopMatrix = owner->coopMatrix;
 
     std::vector<std::unique_ptr<VulkanDevice>> groupDevices;
     groupDevices.push_back(std::move(owner));
@@ -344,6 +345,7 @@ bool Runtime::enumerateDevices(VkInstance instance) {
       vd->groupSize = static_cast<uint32_t>(members.size());
       vd->groupDeviceMask = 1u << i;
       vd->timelineSemaphore = timelineSemaphore;
+      vd->coopMatrix = coopMatrix;
       groupDevices.push_back(std::move(vd));
     }
 
@@ -378,13 +380,31 @@ bool Runtime::setupLogicalDevice(
   feats12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
   VkPhysicalDeviceVulkan12Features supported12{};
   supported12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+  // Cooperative matrix (VK_KHR_cooperative_matrix) for wmma:: tensor-core
+  // intrinsics. Query support through its own features struct chained off
+  // the Vulkan12 query; if the device advertises `cooperativeMatrix` AND
+  // `shaderFloat16` (the 8x8x16 fp16->fp32 tile needs both), enable them and
+  // pull in the device extension. Enabled opportunistically — kernels that
+  // don't use wmma are unaffected.
+  VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopFeats{};
+  coopFeats.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+  VkPhysicalDeviceCooperativeMatrixFeaturesKHR supportedCoop{};
+  supportedCoop.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
   VkPhysicalDeviceFeatures2 feats2{};
   feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
   feats2.pNext = &supported12;
+  supported12.pNext = &supportedCoop;
   vkGetPhysicalDeviceFeatures2(vd.physical, &feats2);
   if (supported12.timelineSemaphore) {
     feats12.timelineSemaphore = VK_TRUE;
     vd.timelineSemaphore = true;
+  }
+  if (supported12.shaderFloat16 && supportedCoop.cooperativeMatrix) {
+    feats12.shaderFloat16 = VK_TRUE;
+    coopFeats.cooperativeMatrix = VK_TRUE;
+    vd.coopMatrix = true;
   }
 
   VkDeviceGroupDeviceCreateInfo dgci{};
@@ -406,15 +426,30 @@ bool Runtime::setupLogicalDevice(
   // core in Vulkan 1.1+ but enabled explicitly for layer matching on any
   // device (harmless if unsupported — vkCreateDevice would just fail, and we
   // only set it when the user opted into printf).
-  const char *devExts[1];
+  const char *devExts[2];
+  uint32_t devExtCount = 0;
   if (g_kernelPrintfEnabled) {
-    devExts[0] = VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME;
-    dci.enabledExtensionCount = 1;
+    devExts[devExtCount++] = VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME;
+  }
+  if (vd.coopMatrix) {
+    devExts[devExtCount++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+  }
+  if (devExtCount) {
+    dci.enabledExtensionCount = devExtCount;
     dci.ppEnabledExtensionNames = devExts;
   }
 
-  if (vd.timelineSemaphore) {
-    feats12.pNext = useDeviceGroup ? &dgci : nullptr;
+  // Thread the enabled feature structs through pNext. The chain order is
+  // feats12 -> coopFeats -> (dgci if device group). On the non-timeline path
+  // (no feats12 features enabled at all), fall back to a bare features struct.
+  if (vd.timelineSemaphore || vd.coopMatrix) {
+    void *tail = useDeviceGroup ? static_cast<void *>(&dgci) : nullptr;
+    if (vd.coopMatrix) {
+      coopFeats.pNext = tail;
+      feats12.pNext = &coopFeats;
+    } else {
+      feats12.pNext = tail;
+    }
     dci.pNext = &feats12; // replaces pEnabledFeatures chain
   } else {
     if (useDeviceGroup) dci.pNext = &dgci;

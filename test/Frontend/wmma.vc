@@ -1,0 +1,25 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// P3B WMMA fragment type + intrinsics, Sema checks. Uses the Vulkan-native
+// 8x8x16 fp16-input/fp32-accumulate shape (the dev GPU's supported shape).
+
+__global__ void kern(half *A, half *B, float *C) {
+  wmma::fragment<wmma::matrix_a, 8, 8, 16, half, wmma::row_major> a_frag;
+  wmma::fragment<wmma::matrix_b, 8, 8, 16, half, wmma::col_major> b_frag;
+  wmma::fragment<wmma::accumulator, 8, 8, 16, float> c_frag;
+
+  wmma::load_matrix_sync(a_frag, A, 16);
+  wmma::load_matrix_sync(b_frag, B, 16);
+  wmma::load_matrix_sync(c_frag, C, 8, wmma::mem_row_major);
+  wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+  wmma::store_matrix_sync(C, c_frag, 8, wmma::mem_row_major);
+}
+
+// Error: mma_sync with a non-accumulator d.
+// CHECK: error: wmma::mma_sync argument 1 must be a accumulator fragment
+__global__ void bad(half *A, half *B, float *C) {
+  wmma::fragment<wmma::matrix_a, 8, 8, 16, half, wmma::row_major> a;
+  wmma::fragment<wmma::matrix_b, 8, 8, 16, half, wmma::col_major> b;
+  wmma::fragment<wmma::accumulator, 8, 8, 16, float> c;
+  wmma::mma_sync(a, a, b, c);
+}

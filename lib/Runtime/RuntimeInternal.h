@@ -52,6 +52,7 @@ struct VulkanDevice {
   bool timestampAvailable = false; // limits.timestampComputeAndGraphics
   bool headless = true; // no surface/swapchain
   bool timelineSemaphore = false; // VK_KHR_timeline_semaphore / Vulkan 1.2 core
+  bool coopMatrix = false;       // VK_KHR_cooperative_matrix + shaderFloat16
   // Per-device default stream. CUDA gives each device its own default stream;
   // vcSetDevice(i) makes resolveStream(NULL) return devices_[i]->defaultStream.
   // unique_ptr because VCStream is forward-declared at this point.

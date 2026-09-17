@@ -43,6 +43,14 @@ MLIR_UNSUPPORTED = {
     "printf.vc": "kernel printf not implemented in MLIR backend (GLSL only)",
 }
 
+# Demos the GLSL backend cannot build (and intentionally rejects with a
+# diagnostic). wmma:: tensor-core intrinsics need SPIR-V CooperativeMatrixKHR,
+# which only the MLIR backend lowers; vcc rejects them up front. Skip these on
+# the GLSL backend so the suite reports them as skipped, not as build failures.
+GLSL_UNSUPPORTED = {
+    "wmma_gemm.vc": "wmma:: tensor-core intrinsics require the MLIR backend",
+}
+
 
 def expand_demos(arguments):
     """Accept a mix of .vc files and directories (globs *.vc, no recursion)."""
@@ -137,6 +145,11 @@ def main():
                 skips += 1
                 if args.verbose:
                     print(f"SKIP: {label} ({MLIR_UNSUPPORTED[name]})")
+                continue
+            if backend == "glsl" and name in GLSL_UNSUPPORTED:
+                skips += 1
+                if args.verbose:
+                    print(f"SKIP: {label} ({GLSL_UNSUPPORTED[name]})")
                 continue
             with tempfile.TemporaryDirectory() as td:
                 out_exe = os.path.join(td, "demo")

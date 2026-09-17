@@ -60,6 +60,11 @@ class ASTToMLIRImpl {
   std::map<std::string, const FunctionDecl *> funcDecls;
   // name -> Value (block arg / local memref / alloca)
   llvm::StringMap<Value> locals;
+  // name -> spirv::Variable pointer holding a cooperative-matrix value (a
+  // wmma::fragment local). Fragments are SSA values stored in Function-storage
+  // spirv.Variables so they survive across loops/ifs; load_matrix_sync and
+  // mma_sync store into them, mma_sync/store_matrix_sync load from them.
+  llvm::StringMap<Value> wmmaFragments;
   // name -> the AST-level Type of the variable/param. Needed to resolve struct
   // field access: `result[i].f` requires knowing `result` is a `Result*` so the
   // field's byte offset can be looked up in recordLayouts. Scalars/pointers to
@@ -96,6 +101,10 @@ class ASTToMLIRImpl {
   // spirv ops require SPIR-V 1.3 + GroupNonUniform* capabilities; VCToGPU reads
   // the `vc.uses_subgroup` module attr this drives to bump the target env.
   bool usesSubgroup = false;
+  // Set when any wmma::* intrinsic is lowered to spirv.KHR.CooperativeMatrix*.
+  // Requires SPIR-V 1.6 + CooperativeMatrixKHR capability + SPV_KHR_cooperative_matrix
+  // extension; VCToGPU reads the `vc.uses_coopmatrix` module attr this drives.
+  bool usesCoopMatrix = false;
   //--- Struct layout (for `Result*`-style SSBO field access) -------------//
   // The MLIR backend does not emit struct definitions (spirv.module needs no
   // record type declaration for raw-offset field access). Instead, each
@@ -208,6 +217,7 @@ public:
   // __shfl_*, __ballot_sync, __anySync, __allSync, __syncwarp, __activemask),
   // so the driver can bump the SPIR-V target env to 1.3 + subgroup caps.
   bool usedSubgroup() const { return usesSubgroup; }
+  bool usedCoopMatrix() const { return usesCoopMatrix; }
 
 private:
   Location loc(const ASTNode *n) {
@@ -433,6 +443,27 @@ private:
       if (slots < 1) slots = 1;
       return MemRefType::get({slots}, builder.getI32Type());
     }
+    if (isa<WmmaFragmentType>(t)) {
+      // wmma::fragment -> gpu.mma_matrix (lowered to spirv.coopmatrix by the
+      // GPUToSPIRV WMMA->KHR patterns). A/B are M×K / K×N, the accumulator is
+      // M×N. elemTy is f16 for A/B, f32 for the accumulator (the only supported
+      // precision combo). The operand string ("AOp"/"BOp"/"COp") drives the
+      // lowering to the correct SPIR-V CooperativeMatrixUse.
+      auto *wt = cast<WmmaFragmentType>(t);
+      mlir::Type elemTy = wt->prec == WmmaPrecision::F16 ? builder.getF16Type()
+                                                         : builder.getF32Type();
+      StringRef operand;
+      SmallVector<int64_t, 2> shape;
+      switch (wt->use) {
+      case WmmaUse::MatrixA:
+        operand = "AOp"; shape = {wt->M, wt->K}; break;
+      case WmmaUse::MatrixB:
+        operand = "BOp"; shape = {wt->K, wt->N}; break;
+      case WmmaUse::Accumulator:
+        operand = "COp"; shape = {wt->M, wt->N}; break;
+      }
+      return gpu::MMAMatrixType::get(shape, elemTy, operand);
+    }
     if (isa<PointerType>(t)) {
       // pointer-to-T  ->  memref<?xT> in the StorageBuffer (global device
       // memory) storage class; MemRefToSPIRV requires a SPIR-V storage class
@@ -655,6 +686,7 @@ private:
     // locals/entryBlock are per-function state (binding args below).
     entryBlock = entry;
     locals.clear();
+    wmmaFragments.clear();
     localTypes.clear();
 
     // Bind the synthesized `_this` (methods): the leading block arg is the
@@ -1870,6 +1902,18 @@ private:
     case ASTNode::NodeKind::DeclStmt: {
       auto *d = static_cast<DeclStmt *>(n)->decl;
       if (!d) break;
+      // wmma::fragment local: a register-resident gpu.mma_matrix SSA value,
+      // not a storage slot. The fragment has no address; load_matrix_sync /
+      // mma_sync produce a new SSA value which we track in wmmaFragments, and
+      // store_matrix_sync consumes the current value. So a bare decl emits no
+      // IR — it just registers the name (its value is undefined until a load
+      // or mma writes it).
+      if (d->type && isa<WmmaFragmentType>(d->type)) {
+        mlir::Type cmTy = cvtType(d->type);
+        if (!cmTy) { error(d, "unsupported wmma fragment type"); break; }
+        localTypes[d->name] = d->type;
+        break;
+      }
       // Locals become stack allocations tagged with the SPIR-V Function
       // storage class; MemRefToSPIRV refuses to lower allocas whose memory
       // space is not exactly #spirv.storage_class<Function>. __shared__
@@ -2248,6 +2292,164 @@ private:
   }
 
   //===--------------------------------------------------------------------//
+  // WMMA / Cooperative Matrix lowering
+  //
+  // wmma::fragment locals are register-resident gpu.mma_matrix SSA values
+  // (no storage slot). `wmmaFragments` maps a fragment name to its current
+  // SSA value; load_matrix_sync / mma_sync produce a new value which replaces
+  // the entry, and store_matrix_sync consumes it. Reassignment inside control
+  // flow is not supported (would need scf.for iter_args) — the straight-line
+  // load->mma->store pattern is the supported shape.
+
+  // Fold an AST expression to a compile-time integer. #define constants are
+  // substituted at parse time, so a wmma leading dimension is an IntegerLiteral
+  // (or a negated one) in the AST. Used for wmma strides, which must be known
+  // at codegen time.
+  bool evalConstInt(ASTNode *n, int64_t &out) {
+    if (!n) return false;
+    if (n->getNodeType() == ASTNode::NodeKind::UnaryExpr) {
+      auto *u = static_cast<UnaryExpr *>(n);
+      if (u->op == UnaryOp::Neg) {
+        int64_t v;
+        if (evalConstInt(u->operand.get(), v)) { out = -v; return true; }
+      }
+      return false;
+    }
+    if (n->getNodeType() == ASTNode::NodeKind::IntegerLiteral) {
+      out = static_cast<IntegerLiteral *>(n)->value;
+      return true;
+    }
+    return false;
+  }
+
+  // Read a fragment's current SSA value (a gpu.mma_matrix). Does not consume
+  // it — mma_sync's c operand and store's source both read the current value.
+  Value readFragment(StringRef name) {
+    auto it = wmmaFragments.find(name);
+    return it == wmmaFragments.end() ? Value() : it->second;
+  }
+  // Replace a fragment's current SSA value (load / mma write-back).
+  void writeFragment(StringRef name, Value v) { wmmaFragments[name] = v; }
+
+  // Resolve a fragment argument to its current SSA value + AST type.
+  Value fragmentArg(const ASTNode *arg, const WmmaFragmentType *&ty,
+                    Location l) {
+    if (!arg || arg->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+      return Value();
+    auto *ref = static_cast<const DeclRefExpr *>(arg);
+    auto tit = localTypes.find(ref->name);
+    if (tit == localTypes.end() || !isa<WmmaFragmentType>(tit->second))
+      return Value();
+    ty = cast<WmmaFragmentType>(tit->second);
+    return readFragment(ref->name);
+  }
+
+  // The fragment's memory layout vs the operand's default -> transpose flag.
+  // Empirically (on MLIR 18's GPU→SPIR-V KHR lowering), the `transpose` flag
+  // on gpu.subgroup_mma_load_matrix uniformly selects the SPIR-V
+  // CooperativeMatrixLayoutKHR: transpose=false -> RowMajor, transpose=true ->
+  // ColumnMajor, for ALL operands (A, B, and C). So the flag is simply "is the
+  // source matrix stored column-major?" — transpose iff the fragment declares
+  // col_major. (This differs from the CUDA WMMA textbook convention, where
+  // matrix_b's natural layout is col-major; MLIR's lowering does not mirror
+  // that asymmetry, so we map layout directly.)
+  //   row_major  -> no transpose (SPIR-V RowMajor)
+  //   col_major  -> transpose    (SPIR-V ColumnMajor)
+  bool fragTransposed(const WmmaFragmentType *ty) {
+    return ty->layout == WmmaLayout::ColMajor;
+  }
+
+  // Lower a wmma::* intrinsic call to a gpu.subgroup_mma_* op. `mangled` is
+  // `wmma_<intrinsic>`. Returns null (these are statement-form, void).
+  Value lowerWmmaCall(CallExpr *c, StringRef mangled, Location l) {
+    StringRef intr = mangled.substr(5); // strip "wmma_"
+    if (intr == "load_matrix_sync") {
+      // A/B: load_matrix_sync(frag, ptr, ldm)         — layout from type
+      // Acc: load_matrix_sync(frag, ptr, ldm, layout) — runtime layout
+      if (c->args.size() != 3 && c->args.size() != 4)
+        return error(c, "wmma::load_matrix_sync expects 3 or 4 arguments");
+      if (!c->args[0] ||
+          c->args[0]->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+        return error(c, "wmma::load_matrix_sync argument 1 must be a fragment");
+      auto *ref = static_cast<DeclRefExpr *>(c->args[0].get());
+      auto tit = localTypes.find(ref->name);
+      if (tit == localTypes.end() || !isa<WmmaFragmentType>(tit->second))
+        return error(c, "wmma::load_matrix_sync argument 1 must be a fragment");
+      auto *fty = cast<WmmaFragmentType>(tit->second);
+      // arg1: the SSBO memref. gpu.subgroup_mma_load_matrix takes the memref
+      // directly plus a 2-element index vector — no manual AccessChain.
+      Value buf = visitExpr(c->args[1].get());
+      if (!buf) return error(c->args[1].get(), "could not evaluate pointer");
+      // The memref must be a contiguous buffer of the fragment's element
+      // type. A bare T* lowers to memref<?xT> which works; index [0,0].
+      Value c0 = builder.create<arith::ConstantOp>(l, builder.getIndexType(),
+                                                    builder.getIndexAttr(0));
+      // arg2: leading dimension (compile-time constant, in elements).
+      int64_t ldm = 0;
+      if (!evalConstInt(c->args[2].get(), ldm))
+        return error(c->args[2].get(),
+                     "wmma::load_matrix_sync stride must be a constant");
+      mlir::Type mmaTy = cvtType(fty);
+      UnitAttr transpose = fragTransposed(fty) ? builder.getUnitAttr()
+                                               : UnitAttr();
+      auto load = builder.create<gpu::SubgroupMmaLoadMatrixOp>(
+          l, mmaTy, buf, ValueRange{c0, c0},
+          builder.getIndexAttr(ldm), /*transpose=*/transpose);
+      writeFragment(ref->name, load.getResult());
+      return Value();
+    }
+    if (intr == "store_matrix_sync") {
+      // store_matrix_sync(ptr, accum_frag, ldm, layout)
+      if (c->args.size() != 4)
+        return error(c, "wmma::store_matrix_sync expects 4 arguments");
+      const WmmaFragmentType *fty = nullptr;
+      Value frag = fragmentArg(c->args[1].get(), fty, l);
+      if (!frag || !fty)
+        return error(c, "wmma::store_matrix_sync argument 2 must be an accumulator fragment");
+      Value buf = visitExpr(c->args[0].get());
+      if (!buf) return error(c->args[0].get(), "could not evaluate pointer");
+      Value c0 = builder.create<arith::ConstantOp>(l, builder.getIndexType(),
+                                                    builder.getIndexAttr(0));
+      int64_t ldm = 0;
+      if (!evalConstInt(c->args[2].get(), ldm))
+        return error(c->args[2].get(),
+                     "wmma::store_matrix_sync stride must be a constant");
+      builder.create<gpu::SubgroupMmaStoreMatrixOp>(
+          l, frag, buf, ValueRange{c0, c0}, builder.getIndexAttr(ldm),
+          /*transpose=*/UnitAttr());
+      return Value();
+    }
+    if (intr == "mma_sync") {
+      // mma_sync(d, a, b, c) — d = a*b + c
+      if (c->args.size() != 4)
+        return error(c, "wmma::mma_sync expects 4 arguments");
+      const WmmaFragmentType *aty = nullptr, *bty = nullptr, *cty = nullptr;
+      Value a = fragmentArg(c->args[1].get(), aty, l);
+      Value b = fragmentArg(c->args[2].get(), bty, l);
+      Value cv = fragmentArg(c->args[3].get(), cty, l);
+      if (!a || !b || !cv)
+        return error(c, "wmma::mma_sync arguments must be fragments");
+      if (!c->args[0] ||
+          c->args[0]->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+        return error(c, "wmma::mma_sync argument 1 must be a fragment");
+      auto *dref = static_cast<DeclRefExpr *>(c->args[0].get());
+      auto dtit = localTypes.find(dref->name);
+      if (dtit == localTypes.end() || !isa<WmmaFragmentType>(dtit->second))
+        return error(c, "wmma::mma_sync argument 1 must be a fragment");
+      auto *dty = cast<WmmaFragmentType>(dtit->second);
+      if (dty->use != WmmaUse::Accumulator)
+        return error(c, "wmma::mma_sync argument 1 must be a accumulator fragment");
+      mlir::Type dcmTy = cvtType(dty);
+      auto mma = builder.create<gpu::SubgroupMmaComputeOp>(
+          l, dcmTy, a, b, cv,
+          /*a_transpose=*/UnitAttr(), /*b_transpose=*/UnitAttr());
+      writeFragment(dref->name, mma.getResult());
+      return Value();
+    }
+    return error(c, "unknown wmma:: intrinsic '" + std::string(intr.str()) + "'");
+  }
+
+  //===--------------------------------------------------------------------//
   // Expressions
   //===--------------------------------------------------------------------//
 
@@ -2489,6 +2691,27 @@ private:
     }
     case ASTNode::NodeKind::CallExpr: {
       auto *c = static_cast<CallExpr *>(n);
+      // WMMA intrinsics (wmma::load_matrix_sync / store_matrix_sync / mma_sync).
+      // Recognize by the scope-mangled callee name `wmma_*` and lower directly to
+      // spirv.KHR.CooperativeMatrix{Load,Store,MulAdd}. These are not FunctionDecls.
+      if (c->callee &&
+          c->callee->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+        auto *ma = static_cast<MemberAccessExpr *>(c->callee.get());
+        if (ma->isScope) {
+          // Compose the mangled name wmma_<member> (base must be DeclRefExpr
+          // "wmma"; nested scopes aren't supported for wmma).
+          std::string mangled;
+          if (ma->base &&
+              ma->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr &&
+              static_cast<DeclRefExpr *>(ma->base.get())->name == "wmma")
+            mangled = "wmma_" + ma->member.str();
+          if (!mangled.empty() && mangled.substr(0, 5) == "wmma_") {
+            Value r = lowerWmmaCall(c, mangled, l);
+            usesCoopMatrix = true;
+            return r;
+          }
+        }
+      }
       if (c->callee &&
           c->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
         auto *ref = static_cast<DeclRefExpr *>(c->callee.get());
@@ -4590,5 +4813,9 @@ OwningOpRef<ModuleOp> vc::codegen::translateASTToMLIR(const TranslationUnit &tu,
   // advertise the GroupNonUniform* capabilities the lowered warp ops need.
   if (impl.usedSubgroup())
     module->setAttr("vc.uses_subgroup", UnitAttr::get(&ctx));
+  // Flag cooperative-matrix usage so VCToGPU bumps to SPIR-V 1.6 and advertises
+  // CooperativeMatrixKHR + SPV_KHR_cooperative_matrix for the WMMA lowering.
+  if (impl.usedCoopMatrix())
+    module->setAttr("vc.uses_coopmatrix", UnitAttr::get(&ctx));
   return OwningOpRef<ModuleOp>(module);
 }

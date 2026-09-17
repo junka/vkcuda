@@ -46,6 +46,19 @@ class Parser {
   // NOT supported (would need multiple passes).
   llvm::StringMap<std::string> defines;
 
+  // `const int NAME = <literal>;` values seen so far in the current scope, so
+  // array dimensions spelled with named constants (`T arr[M * K]`) can be
+  // constant-folded by evalConstInt. Sema does full symbol resolution later,
+  // but arrayDims are stamped at parse time and the host backend emits them
+  // verbatim — a non-constant dim falls back to 0, which for a sized local
+  // array produces `T arr[0]` and a stack smash at runtime. Only integer
+  // literals (and integer-literal init expressions) are recorded: this mirrors
+  // the `#define` path's "literal only" limitation and keeps the parse
+  // single-pass. Block scoping is approximated (an inner redefinition shadows
+  // the outer entry; entries are not popped on scope exit, which is fine
+  // because a later same-named const just overwrites the value).
+  llvm::StringMap<int64_t> constInts;
+
   // Stable storage for the mangled name strings synthesized for scoped types
   // (`ns::Class` -> "ns_Class"). The StructDecl::name StringRef of a scoped
   // RecordType points into these strings, so they must outlive the parse.
@@ -117,7 +130,10 @@ private:
   /// Best-effort compile-time integer evaluation for array dimensions and
   /// similar constant contexts. Returns true and sets `out` for a literal or
   /// a foldable arithmetic/bitwise expression over literals; false otherwise.
-  static bool evalConstInt(const ASTNode *e, int64_t &out);
+  // Fold a constant integer from an expression node. Handles literals,
+  // unary/binary integer ops, and named `const int` constants (see constInts)
+  // so array dimensions like `T arr[M * K]` fold at parse time.
+  bool evalConstInt(const ASTNode *e, int64_t &out);
 
   // Statements
   NodePtr parseStatement();

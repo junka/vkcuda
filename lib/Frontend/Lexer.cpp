@@ -462,3 +462,25 @@ Token Lexer::peek() {
   hashLineCol = savedHashCol;
   return t;
 }
+
+Token Lexer::peek2() {
+  // Two-token lookahead: lex two tokens past the current, then restore. Used to
+  // disambiguate `wmma::fragment<...>` (a type) from `wmma::name(...)` (a call),
+  // where both start with `wmma ::`.
+  unsigned savedPos = pos;
+  unsigned savedLine = curLine;
+  unsigned savedCol = curCol;
+  bool savedHaveHash = haveHashLine;
+  llvm::StringRef savedHashText = hashLineText;
+  unsigned savedHashLine = hashLineLine, savedHashCol = hashLineCol;
+  lex(); // skip current
+  Token t = lex(); // the one after
+  pos = savedPos;
+  curLine = savedLine;
+  curCol = savedCol;
+  haveHashLine = savedHaveHash;
+  hashLineText = savedHashText;
+  hashLineLine = savedHashLine;
+  hashLineCol = savedHashCol;
+  return t;
+}

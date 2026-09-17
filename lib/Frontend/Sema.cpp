@@ -15,6 +15,7 @@
 #include "vc/Frontend/BuiltinRegistry.h"
 #include "vc/Frontend/Mangle.h"
 
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace vc;
@@ -526,6 +527,156 @@ FunctionDecl *Sema::resolveOverload(const ASTNode *call, StringRef calleeName,
   }
   if (outRank) *outRank = bestRank;
   return best;
+}
+
+// WMMA intrinsic name -> the source spelling without the `wmma_` scope prefix.
+// Returns empty if `mangled` is not a `wmma_*` name.
+static StringRef wmmaIntrinsicName(StringRef mangled) {
+  const char *prefix = "wmma_";
+  const size_t plen = 5;
+  if (mangled.size() <= plen || mangled.substr(0, plen) != prefix)
+    return {};
+  return mangled.substr(plen);
+}
+
+Type *Sema::checkWmmaCall(const ASTNode *call, StringRef calleeName,
+                          const std::vector<NodePtr> &args) {
+  StringRef intr = wmmaIntrinsicName(calleeName);
+  if (intr.empty()) return nullptr; // not a wmma::* call
+
+  // Helper: type-check arg `idx` as a fragment (any use), returning the
+  // fragment type or null (with an error) if it isn't a fragment.
+  auto argFragmentAny = [&](size_t idx) -> WmmaFragmentType * {
+    if (idx >= args.size()) return nullptr;
+    Type *t = checkExpr(args[idx].get());
+    const Type *r = resolveTypedefs(t);
+    if (!r || r->getKind() != TypeKind::WmmaFragment) {
+      error(call, "wmma::" + std::string(intr.str()) + " argument " +
+                      std::to_string(idx + 1) + " must be a wmma::fragment");
+      return nullptr;
+    }
+    return static_cast<WmmaFragmentType *>(t);
+  };
+  // Helper: type-check arg `idx` as a fragment of a specific use, returning the
+  // fragment type or null (with an error) on mismatch.
+  auto argFragment = [&](size_t idx, WmmaUse use) -> WmmaFragmentType * {
+    WmmaFragmentType *wt = argFragmentAny(idx);
+    if (!wt) return nullptr;
+    if (wt->use != use) {
+      const char *need = use == WmmaUse::MatrixA    ? "matrix_a"
+                         : use == WmmaUse::MatrixB  ? "matrix_b"
+                                                    : "accumulator";
+      error(call, "wmma::" + std::string(intr.str()) + " argument " +
+                      std::to_string(idx + 1) + " must be a " + need +
+                      " fragment");
+      return nullptr;
+    }
+    return wt;
+  };
+
+  usesCoopMatrix_ = true;
+
+  // Parse a runtime layout_t argument: `wmma::mem_row_major` or
+  // `wmma::mem_col_major` (a scoped MemberAccessExpr). Returns the layout and
+  // does NOT run checkExpr on it (the `wmma` namespace isn't a declared value).
+  // Returns None and reports an error if the arg isn't a recognized layout.
+  auto layoutArg = [&](size_t idx) -> WmmaLayout {
+    if (idx >= args.size()) return WmmaLayout::None;
+    const ASTNode *a = args[idx].get();
+    if (!a || a->getNodeType() != ASTNode::NodeKind::MemberAccessExpr)
+      return WmmaLayout::None;
+    auto *ma = static_cast<const MemberAccessExpr *>(a);
+    // Accept either the scoped form (wmma::mem_row_major, base=DeclRefExpr
+    // "wmma") or a bare identifier form (mem_row_major spelled as a DeclRefExpr
+    // callee). The CUDA spelling is wmma::mem_row_major.
+    StringRef mem = ma->member;
+    if (mem == "mem_row_major") return WmmaLayout::RowMajor;
+    if (mem == "mem_col_major") return WmmaLayout::ColMajor;
+    return WmmaLayout::None;
+  };
+
+  if (intr == "load_matrix_sync") {
+    // A/B: load_matrix_sync(frag, ptr, ldm)         — 3 args, layout from type
+    // Acc: load_matrix_sync(frag, ptr, ldm, layout) — 4 args, runtime layout_t
+    if (args.size() != 3 && args.size() != 4) {
+      error(call, "wmma::load_matrix_sync expects 3 or 4 arguments, got " +
+                      std::to_string(args.size()));
+      return nullptr;
+    }
+    // 3-arg form: A or B (any non-accumulator). 4-arg form: accumulator.
+    WmmaFragmentType *frag = argFragmentAny(0);
+    if (frag) {
+      if (args.size() == 3 && frag->use == WmmaUse::Accumulator) {
+        error(call, "wmma::load_matrix_sync of an accumulator requires a "
+                    "layout_t argument (4-arg form)");
+        return nullptr;
+      }
+      if (args.size() == 4 && frag->use != WmmaUse::Accumulator) {
+        error(call, "wmma::load_matrix_sync of a matrix_a/matrix_b fragment "
+                    "must not take a layout_t argument (layout is in the type)");
+        return nullptr;
+      }
+    }
+    // type-check ptr (arg1) and ldm (arg2); layout (arg3) is parsed above.
+    checkExpr(args[1].get());
+    checkExpr(args[2].get());
+    if (args.size() == 4) {
+      WmmaLayout l = layoutArg(3);
+      if (l == WmmaLayout::None)
+        error(call, "wmma::load_matrix_sync layout must be "
+                    "wmma::mem_row_major or wmma::mem_col_major");
+    }
+    return frag; // result type is the fragment itself (it is written, not read)
+  }
+
+  if (intr == "store_matrix_sync") {
+    // store_matrix_sync(ptr, accum_frag, ldm, layout) — 4 args
+    if (args.size() != 4) {
+      error(call, "wmma::store_matrix_sync expects 4 arguments, got " +
+                      std::to_string(args.size()));
+      return nullptr;
+    }
+    argFragment(1, WmmaUse::Accumulator);
+    checkExpr(args[0].get()); // ptr
+    checkExpr(args[2].get()); // ldm
+    WmmaLayout l = layoutArg(3);
+    if (l == WmmaLayout::None)
+      error(call, "wmma::store_matrix_sync layout must be "
+                  "wmma::mem_row_major or wmma::mem_col_major");
+    return nullptr; // returns void
+  }
+
+  if (intr == "mma_sync") {
+    // mma_sync(d, a, b, c) — d = a*b + c; d and c are accumulators, a/b are
+    // matrix_a/matrix_b. d may alias c.
+    if (args.size() != 4) {
+      error(call, "wmma::mma_sync expects 4 arguments, got " +
+                      std::to_string(args.size()));
+      return nullptr;
+    }
+    WmmaFragmentType *d = argFragment(0, WmmaUse::Accumulator);
+    WmmaFragmentType *a = argFragment(1, WmmaUse::MatrixA);
+    WmmaFragmentType *b = argFragment(2, WmmaUse::MatrixB);
+    WmmaFragmentType *c = argFragment(3, WmmaUse::Accumulator);
+    // Shape consistency: a.M==c.M==d.M, b.N==c.N==d.N, a.K==b.K.
+    if (a && b && c && d) {
+      if (a->M != c->M || a->M != d->M || b->N != c->N || b->N != d->N ||
+          a->K != b->K)
+        error(call, "wmma::mma_sync fragment shape mismatch: A is " +
+                        std::to_string(a->M) + "x" + std::to_string(a->K) +
+                        ", B is " + std::to_string(b->K) + "x" +
+                        std::to_string(b->N) + ", C/D are " +
+                        std::to_string(c->M) + "x" + std::to_string(c->N));
+      // fp16 input / fp32 accumulate is the only supported precision combo.
+      if (a->prec != WmmaPrecision::F16 || b->prec != WmmaPrecision::F16 ||
+          c->prec != WmmaPrecision::F32 || d->prec != WmmaPrecision::F32)
+        error(call, "wmma::mma_sync only supports fp16 input / fp32 accumulate");
+    }
+    return d; // result type is the accumulator (d)
+  }
+
+  error(call, "unknown wmma:: intrinsic '" + std::string(intr.str()) + "'");
+  return nullptr;
 }
 
 void Sema::error(const ASTNode *at, std::string msg) {
@@ -1157,6 +1308,15 @@ Type *Sema::checkExpr(const ASTNode *n) {
 
     // Vector constructors (float4(...)) and math builtins pass through.
     if (!calleeName.empty()) {
+      // WMMA intrinsics (wmma::load_matrix_sync etc., mangled to wmma_*). Handle
+      // before normal call resolution — they aren't FunctionDecls. Returns null
+      // for non-wmma names so we fall through.
+      if (Type *wt = checkWmmaCall(n, calleeName, c->args))
+        return wt;
+      // A wmma name that checkWmmaCall recognized but rejected (bad args) already
+      // reported an error; stop. A non-wmma name returns null and falls through.
+      if (calleeName.startswith("wmma_"))
+        return nullptr;
       if (isMathBuiltin(calleeName)) {
         for (auto &a : c->args) checkExpr(a.get());
         return nullptr;

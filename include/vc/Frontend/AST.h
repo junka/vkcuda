@@ -60,12 +60,21 @@ enum class BuiltinTypeKind {
   Float64,
 };
 
-enum class TypeKind { Builtin, Pointer, Reference, Vector, Record, Typedef };
+enum class TypeKind { Builtin, Pointer, Reference, Vector, Record, Typedef, WmmaFragment };
 
 // Forward declarations: RecordType/TypedefType point at these decls, which are
 // defined as ASTNodes further down. A pointer is all that's needed here.
 class StructDecl;
 class TypedefDecl;
+
+// CUDA wmma::fragment — a tensor-core tile. The dims (M,N,K) come from the source
+// `wmma::fragment<use, M, N, K, T, layout>` template args and match a shape the
+// Vulkan target actually supports (e.g. 8x8x16 fp16-input/fp32-accumulate). A/B
+// carry their Layout at the type level (CUDA semantics); the accumulator has
+// Layout::None and takes a runtime layout_t at load/store instead.
+enum class WmmaUse { MatrixA, MatrixB, Accumulator };
+enum class WmmaPrecision { F16, F32 };
+enum class WmmaLayout { RowMajor, ColMajor, None };
 
 class Type {
   TypeKind kind;
@@ -136,6 +145,25 @@ public:
 
   TypedefType(TypedefDecl *d) : Type(TypeKind::Typedef), decl(d) {}
   static bool classof(const Type *t) { return t->getKind() == TypeKind::Typedef; }
+};
+
+// A wmma::fragment tile type (tensor-core register tile). Carries the use
+// (matrix_a/matrix_b/accumulator), element precision, compile-time layout (A/B
+// only), and the (M,N,K) shape. Storage is opaque/warp-distributed: fragments
+// are only initialized by load_matrix_sync / mma_sync and consumed by
+// mma_sync / store_matrix_sync; direct element access is not supported.
+class WmmaFragmentType : public Type {
+public:
+  WmmaUse use;
+  WmmaPrecision prec;
+  WmmaLayout layout;
+  unsigned M, N, K;
+
+  WmmaFragmentType(WmmaUse u, WmmaPrecision p, WmmaLayout l, unsigned m,
+                   unsigned n, unsigned k)
+      : Type(TypeKind::WmmaFragment), use(u), prec(p), layout(l), M(m), N(n), K(k) {}
+  static bool classof(const Type *t) { return t->getKind() == TypeKind::WmmaFragment; }
+  bool isAccumulator() const { return use == WmmaUse::Accumulator; }
 };
 
 //===----------------------------------------------------------------------===//

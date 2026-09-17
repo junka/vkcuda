@@ -1,0 +1,38 @@
+// test/MLIR/wmma.vc — WMMA / cooperative-matrix lowering (MLIR backend).
+//
+// wmma::fragment becomes !gpu.mma_matrix; load/store/mma_sync become
+// gpu.subgroup_mma_* ops, which the GPUToSPIRV WMMA->KHR patterns lower to
+// spirv.KHR.CooperativeMatrix{Load,Store,MulAdd}. The Vulkan-native 8x8x16
+// fp16-input/fp32-accumulate shape is used (the dev GPU's supported shape).
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+//
+// Fragment decls produce no storage; the matrix value is register-resident
+// and flows as SSA through load -> compute -> store.
+// CHECK: gpu.subgroup_mma_load_matrix
+// CHECK-SAME: leadDimension = 16 : index
+// CHECK-SAME: !gpu.mma_matrix<8x16xf16, "AOp">
+// CHECK: gpu.subgroup_mma_load_matrix
+// CHECK-SAME: !gpu.mma_matrix<16x8xf16, "BOp">
+// CHECK: gpu.subgroup_mma_load_matrix
+// CHECK-SAME: !gpu.mma_matrix<8x8xf32, "COp">
+// CHECK: gpu.subgroup_mma_compute
+// CHECK-SAME: !gpu.mma_matrix<8x8xf32, "COp">
+// CHECK: gpu.subgroup_mma_store_matrix
+//
+// The GPUToSPIRV pass lowers these to spirv.KHR.CooperativeMatrix* and the
+// serialized binary advertises SPV_KHR_cooperative_matrix (verified by the
+// e2e demo test/wmma_gemm.vc, not here — -emit=spirv yields a binary that
+// FileCheck cannot match as text).
+
+__global__ void kern(half *A, half *B, float *C) {
+  wmma::fragment<wmma::matrix_a, 8, 8, 16, half, wmma::row_major> a_frag;
+  wmma::fragment<wmma::matrix_b, 8, 8, 16, half, wmma::col_major> b_frag;
+  wmma::fragment<wmma::accumulator, 8, 8, 16, float> c_frag;
+
+  wmma::load_matrix_sync(a_frag, A, 16);
+  wmma::load_matrix_sync(b_frag, B, 16);
+  wmma::load_matrix_sync(c_frag, C, 8, wmma::mem_row_major);
+  wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+  wmma::store_matrix_sync(C, c_frag, 8, wmma::mem_row_major);
+}
