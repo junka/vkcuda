@@ -392,10 +392,22 @@ bool Runtime::setupLogicalDevice(
   VkPhysicalDeviceCooperativeMatrixFeaturesKHR supportedCoop{};
   supportedCoop.sType =
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+  // 16-bit storage (VK_KHR_16bit_storage) for scalar __half SSBO load/store:
+  // the shader reads/writes f16 elements directly in a StorageBuffer. Queried
+  // via VkPhysicalDevice16BitStorageFeatures (promoted to Vulkan 1.1 core, but
+  // the extension struct works on 1.0+ and chains cleanly off the Vulkan12
+  // query). Enabled opportunistically alongside shaderFloat16 (Vulkan12).
+  VkPhysicalDevice16BitStorageFeatures f16StorageFeats{};
+  f16StorageFeats.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+  VkPhysicalDevice16BitStorageFeatures supportedF16Storage{};
+  supportedF16Storage.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
   VkPhysicalDeviceFeatures2 feats2{};
   feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
   feats2.pNext = &supported12;
   supported12.pNext = &supportedCoop;
+  supportedCoop.pNext = &supportedF16Storage;
   vkGetPhysicalDeviceFeatures2(vd.physical, &feats2);
   if (supported12.timelineSemaphore) {
     feats12.timelineSemaphore = VK_TRUE;
@@ -405,6 +417,17 @@ bool Runtime::setupLogicalDevice(
     feats12.shaderFloat16 = VK_TRUE;
     coopFeats.cooperativeMatrix = VK_TRUE;
     vd.coopMatrix = true;
+  }
+  // Scalar __half SSBO load/store needs shaderFloat16 (f16 arithmetic) AND
+  // storageBuffer16BitAccess (16-bit values in SSBOs). Enable both when the
+  // device supports them; kernels that don't use __half SSBOs are unaffected.
+  // (coopMatrix above may already have set shaderFloat16; this additionally
+  // gates on 16-bit storage and chains the 16BitStorage struct into dci.)
+  if (supported12.shaderFloat16 &&
+      supportedF16Storage.storageBuffer16BitAccess) {
+    feats12.shaderFloat16 = VK_TRUE;
+    f16StorageFeats.storageBuffer16BitAccess = VK_TRUE;
+    vd.f16Storage = true;
   }
 
   VkDeviceGroupDeviceCreateInfo dgci{};
@@ -440,10 +463,15 @@ bool Runtime::setupLogicalDevice(
   }
 
   // Thread the enabled feature structs through pNext. The chain order is
-  // feats12 -> coopFeats -> (dgci if device group). On the non-timeline path
-  // (no feats12 features enabled at all), fall back to a bare features struct.
-  if (vd.timelineSemaphore || vd.coopMatrix) {
+  // feats12 -> coopFeats -> f16StorageFeats -> (dgci if device group). On the
+  // non-timeline path (no feats12 features enabled at all), fall back to a
+  // bare features struct.
+  if (vd.timelineSemaphore || vd.coopMatrix || vd.f16Storage) {
     void *tail = useDeviceGroup ? static_cast<void *>(&dgci) : nullptr;
+    if (vd.f16Storage) {
+      f16StorageFeats.pNext = tail;
+      tail = &f16StorageFeats;
+    }
     if (vd.coopMatrix) {
       coopFeats.pNext = tail;
       feats12.pNext = &coopFeats;

@@ -1,0 +1,72 @@
+// test/f16_ssbo.vc — scalar __half* SSBO load/store (MLIR backend).
+//
+// Exercises the post-P3C fix for MLIR's MemRef→SPIRV sub-4-byte SSBO
+// widening: a `memref<?xf16, StorageBuffer>` kernel arg (i.e. a scalar
+// `__half*`) is widened to a 4-byte rtarray<f32> by the type converter, which
+// (a) mismatches the host's packed-f16 (2-byte) backing and (b) leaves a
+// type-mismatched `spirv.Store ptr<f32>, %val:f16` that aborts the in-pipeline
+// spirv.module passes. fixupF16StorageBuffers narrows the SSBO back to
+// rtarray<f16, stride=2> + ptr<f16> and rebuilds the scalar Load to yield f16;
+// rerunAbortedSPIRVLegality then finishes the spirv.module legalization the
+// aborted pm.run skipped. The target env is augmented with
+// StorageBuffer16BitAccess + SPV_KHR_16bit_storage, and the runtime enables
+// shaderFloat16 + storageBuffer16BitAccess opportunistically.
+//
+// Unlike half.vc (which deliberately reads/writes a float* SSBO and keeps the
+// half arithmetic internal, to dodge this very bug), this demo reads and
+// writes __half* SSBOs directly — the path the fix unlocks.
+//
+//   vc test/f16_ssbo.vc -emit=full -o build/f16_ssbo && ./build/f16_ssbo
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// Load a __half from an SSBO, scale by 2, store back to a __half SSBO.
+// The host backs each buffer with N*2 bytes of packed __half (2 bytes/elem);
+// the kernel must read/write 2-byte elements, not the 4-byte elements the
+// un-fixed widening would have produced.
+__global__ void f16Scale(__half *A, __half *B, int n) {
+  int i = threadIdx.x;
+  if (i < n) {
+    float v = (float)A[i];
+    B[i] = (__half)(v * 2.0f);
+  }
+}
+
+int main() {
+  vcInit();
+
+  const int N = 8;
+  void *dA = 0, *dB = 0;
+  vcMalloc(&dA, N * 2);  // N __half elements, 2 bytes each
+  vcMalloc(&dB, N * 2);
+
+  // Host-side __half storage: VC's host path lowers __half to _Float16, so a
+  // plain array of __half is 2-byte elements on the host too.
+  __half hA[8];
+  for (int i = 0; i < N; i++) hA[i] = (__half)i;  // 0,1,2,...,7
+  vcMemcpy(dA, hA, N * 2, VCMemcpyKind::HostToDevice);
+
+  f16Scale<<<1, N>>>(dA, dB, N);
+  vcDeviceSynchronize();
+
+  __half hB[8];
+  vcMemcpy(hB, dB, N * 2, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    int expect = i * 2;  // 0,2,4,6,8,10,12,14
+    int got = (int)(float)hB[i];
+    printf("%d: %d\n", i, got);
+    if (got != expect) {
+      printf("  mismatch i=%d got=%d expect=%d\n", i, got, expect);
+      ok = 0;
+    }
+  }
+  printf("f16_ssbo: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dA);
+  vcFree(dB);
+  vcShutdown();
+  return ok ? 0 : 1;
+}
