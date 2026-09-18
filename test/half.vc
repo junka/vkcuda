@@ -8,6 +8,8 @@
 //   - `half2(a,b)` / `make_half2(a,b)` constructors -> `f16vec2(a,b)`.
 //   - A __device__ helper operating on half scalars (real device-function
 //     emission + call lowering).
+//   - Mixed half * int arithmetic: the int operand is promoted to float16_t
+//     (GLSL's explicit-arithmetic-types forbids the implicit mix).
 //
 // To avoid host/device SSBO element-size mismatch (host allocates 4-byte
 // floats; a `float16_t[]` SSBO is 2-byte elements), the kernel reads/writes a
@@ -50,12 +52,20 @@ __global__ void halfKernel(float *result, float *a, float *b, int N) {
   __half4 lh4 = __half4(1.0f, 2.0f, 3.0f, 4.0f);
   half legacy = lh.x + lh.y + lh3.z + lh4.w;   // 1+2+30+4 = 37
 
+  // Mixed half/int arithmetic: GLSL's explicit-arithmetic-types extension
+  // rejects `float16_t * int` outright (no implicit promotion), so the
+  // backend must wrap the int operand in a float16_t(...) constructor. CUDA
+  // would promote the int to half; the result is half-precision. `scaled`
+  // is 2*a per lane (ha * 2), folded into the result below.
+  // (Regression: `ha * 2` failed to compile on the GLSL backend.)
+  half scaled = ha * 2;            // half * int literal -> float16_t(ha)*float16_t(2)
+
   // Use the device helper.
   half r = hfma(ha, hb, hc);
 
   // Store: half result widened back to float for the host-visible buffer.
-  // `legacy` is constant 37 per lane; folded into the per-lane result.
-  result[i] = float(r) + float(dot) + float(legacy);
+  // `legacy` is constant 37, `scaled` is 2*a per lane; folded in.
+  result[i] = float(r) + float(dot) + float(legacy) + float(scaled);
 }
 
 int main() {
@@ -89,8 +99,9 @@ int main() {
   int ok = 1;
   for (int i = 0; i < N; i++) {
     float a = ha[i], b = hb[i];
-    // r = a*b + 1.5 ; dot = (a+2) + (b+3) ; legacy = 37 ; result = r + dot + 37
-    float expect = (a * b + 1.5f) + ((a + 2.0f) + (b + 3.0f)) + 37.0f;
+    // r = a*b + 1.5 ; dot = (a+2) + (b+3) ; legacy = 37 ; scaled = 2*a ;
+    // result = r + dot + legacy + scaled
+    float expect = (a * b + 1.5f) + ((a + 2.0f) + (b + 3.0f)) + 37.0f + 2.0f * a;
     float got = hr[i];
     if (got < expect - 0.5f || got > expect + 0.5f) {
       printf("  mismatch i=%d got=%f expect~%f\n", i, got, expect);

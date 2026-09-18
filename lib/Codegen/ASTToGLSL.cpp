@@ -70,6 +70,14 @@ class GLSLEmitter {
   // (their prologue was already flushed by the pre-pass). During the pre-pass
   // this is false and vote calls push the prologue into preStmts.
   bool emittingVoteRef = false;
+  // Name -> type of every in-scope scalar value (kernel params, __shared__
+  // decls, and locals as they are emitted). GLSL's explicit-arithmetic-types
+  // extension forbids mixed-width arithmetic (`float16_t * int` is a hard
+  // error), so binary expressions must mirror C's usual arithmetic conversions
+  // by wrapping one operand in a constructor cast. The AST stores no result
+  // type on expression nodes, so we reconstruct it from this map plus the
+  // literal/cast structure of the expression subtree (see exprType).
+  llvm::StringMap<const Type *> localTypes;
 
 public:
   GLSLEmitter(raw_ostream &o) : os(&o) {}
@@ -684,6 +692,23 @@ private:
   // parameter — the body already references `_this` (the parser mapped `this`
   // to that name), so no body rewrite is needed. Free functions emit as-is.
   void emitFunction(const FunctionDecl *f) {
+    // Rebuild the in-scope type table for this function's locals: its own
+    // params plus its __shared__ decls. The kernel path seeds localTypes in
+    // emitOneForKernel, but __device__ helpers are emitted via this entry
+    // point and must not inherit the kernel's param names (a helper `a` is a
+    // different variable than the kernel's `a`).
+    localTypes.clear();
+    for (const auto &p : f->params)
+      if (p->type) localTypes[p->name] = p->type;
+    // `_this` (synthesized method receiver) is a struct lvalue that never
+    // participates in arithmetic; leaving it unregistered makes exprType
+    // return null for it, which is safe (no promotion attempted).
+    if (f->body) {
+      SmallVector<const VarDecl *, 8> shared;
+      collectShared(f->body.get(), shared);
+      for (const VarDecl *v : shared)
+        if (v && v->type) localTypes[v->name] = v->type;
+    }
     (*os) << glslType(f->returnType) << " " << deviceMangledName(f) << "(";
     bool emittedParam = false;
     if (f->isMethod && !f->className.empty()) {
@@ -1140,6 +1165,17 @@ private:
     // loaded, not by the entry-point name). shaderc's -fentry-point flag is
     // broken on common distro builds (triggers a glslang built-in parse
     // error), so we avoid it and rely on `main`.
+    // Rebuild localTypes for the kernel now that all __device__ helpers
+    // (each of which repopulated it) have been emitted.
+    localTypes.clear();
+    for (const auto &p : kernel->params)
+      if (p->type) localTypes[p->name] = p->type;
+    if (kernel->body) {
+      SmallVector<const VarDecl *, 8> shared;
+      collectShared(kernel->body.get(), shared);
+      for (const VarDecl *v : shared)
+        if (v && v->type) localTypes[v->name] = v->type;
+    }
     (*os) << "void main() {\n";
     if (kernel->body &&
         kernel->body->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
@@ -1203,6 +1239,10 @@ private:
     case ASTNode::NodeKind::DeclStmt: {
       auto *d = static_cast<const DeclStmt *>(n)->decl;
       if (!d) break;
+      // Register every declarator's type so subsequent expressions (and the
+      // init of later declarators in the same statement) can resolve it.
+      for (VarDecl *vd : static_cast<const DeclStmt *>(n)->decls)
+        if (vd && vd->type) localTypes[vd->name] = vd->type;
       if (d->isShared) break; // hoisted to a `shared` global
       pad(indent);
       if (d->isConst) (*os) << "const ";
@@ -1394,6 +1434,280 @@ private:
     }
   }
 
+  // Best-effort inference of an expression's result type, for operand
+  // promotion in binary expressions. The AST carries no result type on
+  // expression nodes (Sema computes types transiently during checking), so we
+  // reconstruct from literal structure, casts, and the localTypes table. Returns
+  // null when the type cannot be determined — callers treat null as "unknown,
+  // emit as-is" (no promotion), which is always safe (it just leaves the
+  // original expression, which glslc will reject only if it was genuinely
+  // ill-typed, matching today's behavior for unsupported mixes).
+  const Type *exprType(const ASTNode *n) const {
+    if (!n) return nullptr;
+    switch (n->getNodeType()) {
+    case ASTNode::NodeKind::IntegerLiteral: {
+      auto *il = static_cast<const IntegerLiteral *>(n);
+      return new BuiltinType(il->isLong ? BuiltinTypeKind::Int64
+                                        : BuiltinTypeKind::Int32);
+    }
+    case ASTNode::NodeKind::FloatLiteral: {
+      auto *fl = static_cast<const FloatLiteral *>(n);
+      // A bare `1.5` literal is double; `1.5f` is float. There is no half
+      // literal spelling in C (half values arise from __half casts/vars), so a
+      // float literal is never Float16 here.
+      return new BuiltinType(fl->isFloat32 ? BuiltinTypeKind::Float32
+                                          : BuiltinTypeKind::Float64);
+    }
+    case ASTNode::NodeKind::BoolLiteral:
+      return new BuiltinType(BuiltinTypeKind::Bool);
+    case ASTNode::NodeKind::DeclRefExpr: {
+      auto *d = static_cast<const DeclRefExpr *>(n);
+      auto it = localTypes.find(d->name);
+      if (it != localTypes.end()) return it->second;
+      return nullptr;
+    }
+    case ASTNode::NodeKind::CStyleCastExpr:
+      return static_cast<const CStyleCastExpr *>(n)->target;
+    case ASTNode::NodeKind::UnaryExpr:
+      // Negation preserves type; Deref would return the pointee but pointer
+      // derefs rarely appear in mixed-width arithmetic, so the operand type is
+      // a fine approximation.
+      return exprType(static_cast<const UnaryExpr *>(n)->operand.get());
+    case ASTNode::NodeKind::MemberAccessExpr: {
+      // `v.x` on a vector yields the element scalar type; `.xy`/`.xyz`/...
+      // yield a smaller vector of the same element. Struct field access needs
+      // record-layout info we don't keep here, so it falls through to null.
+      auto *m = static_cast<const MemberAccessExpr *>(n);
+      if (m->isScope || m->member.empty()) return nullptr;
+      const Type *baseTy = exprType(m->base.get());
+      if (!baseTy || baseTy->getKind() != TypeKind::Vector) return nullptr;
+      auto *vty = static_cast<const VectorType *>(baseTy);
+      if (m->member.size() == 1) return vty->elem;
+      unsigned n = m->member.size();
+      if (n >= 2 && n <= 4)
+        return new VectorType(vty->elem, n);
+      return nullptr;
+    }
+    case ASTNode::NodeKind::CallExpr: {
+      // A constructor-style call whose callee names a builtin/vector type
+      // (float(...), int(...), __half(...), float4(...)) yields that type.
+      // Resolved user overloads would need the callee's return type, which we
+      // don't track here; return null for those (rare in arithmetic).
+      auto *c = static_cast<const CallExpr *>(n);
+      if (!c->callee ||
+          c->callee->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+        return nullptr;
+      StringRef name = static_cast<const DeclRefExpr *>(c->callee.get())->name;
+      return ctorResultType(name);
+    }
+    case ASTNode::NodeKind::BinaryExpr: {
+      auto *b = static_cast<const BinaryExpr *>(n);
+      // Comparison/logical operators yield bool; arithmetic yields the
+      // promoted operand type (mirrors C usual conversions via promoteTypes).
+      if (b->op == BinaryOp::LAnd || b->op == BinaryOp::LOr ||
+          b->op == BinaryOp::Eq || b->op == BinaryOp::NEq ||
+          b->op == BinaryOp::Lt || b->op == BinaryOp::Gt ||
+          b->op == BinaryOp::Le || b->op == BinaryOp::Ge)
+        return new BuiltinType(BuiltinTypeKind::Bool);
+      const Type *lt = exprType(b->lhs.get());
+      const Type *rt = exprType(b->rhs.get());
+      if (b->op == BinaryOp::Assign) return lt ? lt : rt;
+      return promoteTypes(lt, rt);
+    }
+    default:
+      return nullptr;
+    }
+  }
+
+  // Map a CUDA scalar/vector ctor name to its result Type, or null.
+  const Type *ctorResultType(StringRef name) const {
+    // Scalar type names.
+    if (name == "float") return new BuiltinType(BuiltinTypeKind::Float32);
+    if (name == "double") return new BuiltinType(BuiltinTypeKind::Float64);
+    if (name == "int") return new BuiltinType(BuiltinTypeKind::Int32);
+    if (name == "uint") return new BuiltinType(BuiltinTypeKind::UInt32);
+    if (name == "long") return new BuiltinType(BuiltinTypeKind::Int64);
+    if (name == "ulong") return new BuiltinType(BuiltinTypeKind::UInt64);
+    if (name == "bool") return new BuiltinType(BuiltinTypeKind::Bool);
+    if (name == "half" || name == "__half")
+      return new BuiltinType(BuiltinTypeKind::Float16);
+    // Vector ctor names: float4, int3, __half2, ... reuse the same base table
+    // the emitter uses to map them to GLSL constructors.
+    struct Base { const char *prefix; BuiltinTypeKind kind; };
+    static constexpr Base bases[] = {
+        {"float", BuiltinTypeKind::Float32},
+        {"int", BuiltinTypeKind::Int32},
+        {"uint", BuiltinTypeKind::UInt32},
+        {"double", BuiltinTypeKind::Float64},
+        {"long", BuiltinTypeKind::Int64},
+        {"ulong", BuiltinTypeKind::UInt64},
+        {"bool", BuiltinTypeKind::Bool},
+        {"half", BuiltinTypeKind::Float16},
+        {"__half", BuiltinTypeKind::Float16},
+    };
+    for (const Base &b : bases) {
+      StringRef p = b.prefix;
+      if (name.size() > p.size() && name.starts_with(p)) {
+        unsigned count = 0;
+        if (name.substr(p.size()).getAsInteger(10, count) && count >= 2 &&
+            count <= 4)
+          return new VectorType(new BuiltinType(b.kind), count);
+      }
+    }
+    return nullptr;
+  }
+
+  // Resolve typedefs to the underlying type (defensive; most device types are
+  // already builtin).
+  static const Type *resolveTypedef(const Type *t) {
+    while (t && t->getKind() == TypeKind::Typedef)
+      t = static_cast<const TypedefType *>(t)->decl->underlying;
+    return t;
+  }
+
+  static bool isFloatType(const Type *t) {
+    t = resolveTypedef(t);
+    return t && t->getKind() == TypeKind::Builtin &&
+           (static_cast<const BuiltinType *>(t)->builtin ==
+                BuiltinTypeKind::Float16 ||
+            static_cast<const BuiltinType *>(t)->builtin ==
+                BuiltinTypeKind::Float32 ||
+            static_cast<const BuiltinType *>(t)->builtin ==
+                BuiltinTypeKind::Float64);
+  }
+  static bool isIntType(const Type *t) {
+    t = resolveTypedef(t);
+    if (!t || t->getKind() != TypeKind::Builtin) return false;
+    switch (static_cast<const BuiltinType *>(t)->builtin) {
+    case BuiltinTypeKind::Int32: case BuiltinTypeKind::UInt32:
+    case BuiltinTypeKind::Int64: case BuiltinTypeKind::UInt64:
+    case BuiltinTypeKind::Bool:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  // C usual arithmetic conversions restricted to the cases GLSL's explicit-
+  // arithmetic-types extension rejects outright. GLSL implicitly promotes
+  // int/float/double mixes the way C does (`int * double` compiles), but it
+  // will NOT implicitly involve float16_t — `float16_t * int`, `float16_t *
+  // float`, even `float16_t + float` are hard errors. So we only need to
+  // synthesize a common type when one side is float16 and the other is a
+  // different numeric type; in every other case we return null and emit the
+  // operands as-is (letting GLSL's own promotion handle it, matching the
+  // pre-promotion behavior). Returns null when no coercion is needed/known.
+  //
+  // When float16 meets:
+  //   - int    -> common = float16 (CUDA: int converts to half)
+  //   - float  -> common = float  (CUDA: half widens to float)
+  //   - double -> common = double (CUDA: half widens to double)
+  //   - float16-> common = float16 (no-op; emitExprCoerced skips matching)
+  static const Type *promoteTypes(const Type *lt, const Type *rt) {
+    lt = resolveTypedef(lt);
+    rt = resolveTypedef(rt);
+    if (!lt || !rt) return nullptr;
+    // Vector operand: recurse on the element type; if a common element type
+    // emerges, the common vector type keeps the LHS count (no implicit
+    // broadcast). Only handle same-count vectors / scalar-vs-scalar here.
+    if (lt->getKind() == TypeKind::Vector || rt->getKind() == TypeKind::Vector) {
+      const VectorType *lv = lt->getKind() == TypeKind::Vector
+                                 ? static_cast<const VectorType *>(lt) : nullptr;
+      const VectorType *rv = rt->getKind() == TypeKind::Vector
+                                 ? static_cast<const VectorType *>(rt) : nullptr;
+      // Need at least one vector and matching counts when both are vectors.
+      unsigned count = 0;
+      if (lv && rv) { if (lv->count != rv->count) return nullptr; count = lv->count; }
+      else count = lv ? lv->count : rv->count;
+      const Type *le = lv ? lv->elem : lt;
+      const Type *re = rv ? rv->elem : rt;
+      const Type *ce = promoteTypes(le, re);
+      if (!ce) return nullptr;
+      return new VectorType(const_cast<Type *>(ce), count);
+    }
+    if (!isFloatType(lt) && !isFloatType(rt)) return nullptr;
+    bool lh = isHalfTy(lt), rh = isHalfTy(rt);
+    if (!lh && !rh) return nullptr; // float/double/int mix without float16
+    // Exactly one or both sides are float16.
+    if (lh && rh) return lt;                 // both float16, no coercion needed
+    const Type *halfTy = lh ? lt : rt;
+    const Type *otherTy = lh ? rt : lt;
+    if (isIntType(otherTy)) return halfTy;   // int -> float16
+    // float/double: widen half to the other float's width.
+    return otherTy;
+  }
+  static bool isHalfTy(const Type *t) {
+    t = resolveTypedef(t);
+    return t && t->getKind() == TypeKind::Builtin &&
+           static_cast<const BuiltinType *>(t)->builtin ==
+               BuiltinTypeKind::Float16;
+  }
+
+  // Emit `n` wrapped in `glslType(target)(...)` unless its inferred type already
+  // matches target (or is unknown — emit as-is, the caller took the risk).
+  void emitExprCoerced(const ASTNode *n, const Type *target) {
+    if (!n) { emitExpr(n); return; }
+    const Type *et = resolveTypedef(exprType(n));
+    const Type *tt = resolveTypedef(target);
+    if (et && tt && sameScalarType(et, tt)) { emitExpr(n); return; }
+    (*os) << glslType(target) << "(";
+    emitExpr(n);
+    (*os) << ")";
+  }
+  static bool sameScalarType(const Type *a, const Type *b) {
+    if (a->getKind() != b->getKind()) return false;
+    if (a->getKind() == TypeKind::Builtin)
+      return static_cast<const BuiltinType *>(a)->builtin ==
+             static_cast<const BuiltinType *>(b)->builtin;
+    if (a->getKind() == TypeKind::Vector) {
+      auto *va = static_cast<const VectorType *>(a);
+      auto *vb = static_cast<const VectorType *>(b);
+      return va->count == vb->count && sameScalarType(va->elem, vb->elem);
+    }
+    return false;
+  }
+
+  // Emit a binary expression, inserting constructor casts so both operands are
+  // the common promoted type. GLSL's GL_EXT_shader_explicit_arithmetic_types
+  // forbids implicit mixed-width arithmetic (`float16_t * int` is a hard
+  // error), so we apply C's usual arithmetic conversions explicitly: the
+  // operand whose inferred type differs from the common type is wrapped in
+  // `commonType(...)`. Assignment uses the LHS type as the target.
+  void emitBinary(const BinaryExpr *b) {
+    (*os) << "(";
+    if (b->op == BinaryOp::Assign) {
+      // Coerce the RHS to the LHS type ONLY when the LHS is float16 and the RHS
+      // is a different numeric type — GLSL accepts ordinary narrowing assigns
+      // (`float x = 1.0;`), but `float16_t h = 2;` (int) / `= 1.0;` (double)
+      // is a hard error under explicit arithmetic types. Wrap the RHS in a
+      // float16_t(...) constructor in that case.
+      emitExpr(b->lhs.get());
+      (*os) << " " << binopStr(b->op) << " ";
+      const Type *lt = resolveTypedef(exprType(b->lhs.get()));
+      const Type *rt = resolveTypedef(exprType(b->rhs.get()));
+      if (lt && isHalfTy(lt) && !(rt && isHalfTy(rt)) && rt &&
+          (isFloatType(rt) || isIntType(rt) ||
+           rt->getKind() == TypeKind::Vector))
+        emitExprCoerced(b->rhs.get(), lt);
+      else
+        emitExpr(b->rhs.get());
+    } else {
+      const Type *lt = exprType(b->lhs.get());
+      const Type *rt = exprType(b->rhs.get());
+      const Type *common = promoteTypes(lt, rt);
+      if (common) {
+        emitExprCoerced(b->lhs.get(), common);
+        (*os) << " " << binopStr(b->op) << " ";
+        emitExprCoerced(b->rhs.get(), common);
+      } else {
+        emitExpr(b->lhs.get());
+        (*os) << " " << binopStr(b->op) << " ";
+        emitExpr(b->rhs.get());
+      }
+    }
+    (*os) << ")";
+  }
+
   void emitExpr(const ASTNode *n) {
     if (!n) { (*os) << "/*null*/"; return; }
     switch (n->getNodeType()) {
@@ -1462,12 +1776,7 @@ private:
       break;
     }
     case ASTNode::NodeKind::BinaryExpr: {
-      auto *b = static_cast<const BinaryExpr *>(n);
-      (*os) << "(";
-      emitExpr(b->lhs.get());
-      (*os) << " " << binopStr(b->op) << " ";
-      emitExpr(b->rhs.get());
-      (*os) << ")";
+      emitBinary(static_cast<const BinaryExpr *>(n));
       break;
     }
     case ASTNode::NodeKind::UnaryExpr: {
