@@ -70,6 +70,14 @@ class ASTToMLIRImpl {
   // field's byte offset can be looked up in recordLayouts. Scalars/pointers to
   // builtin types are not consulted, so a missing entry is non-fatal for them.
   llvm::StringMap<const vc::Type *> localTypes;
+  // name -> (base memref, offset index) for a derived pointer local
+  // (`int *q = out + i;`, `int *r = &out[i];`, `int *s = out;`). MLIR has no
+  // first-class pointer arithmetic on an SSBO memref (a `memref<?xT>` block
+  // arg can only be indexed by an absolute index, and `out + i` would emit a
+  // bogus `arith.addi` on a memref). Instead of allocating a broken
+  // memref-of-memref slot, we carry the (base, offset) pair and rewrite
+  // derefs/subscripts to load/store at base[off (+k)].
+  llvm::StringMap<std::pair<Value, Value>> pointerLocalsML;
   // By-value struct parameters (features2's `sumcomp(Vec4 v)`) are scalarized
   // into N field-typed block args (a memref parameter would carry SSBO-pointer
   // semantics and fail to legalize as a by-value value). At the callee entry,
@@ -688,6 +696,7 @@ private:
     locals.clear();
     wmmaFragments.clear();
     localTypes.clear();
+    pointerLocalsML.clear();
 
     // Bind the synthesized `_this` (methods): the leading block arg is the
     // caller's memref<Nxi32> slot for the object; register it as a bare
@@ -805,6 +814,77 @@ private:
     if (ty.isIntOrIndex())
       return builder.create<arith::CmpIOp>(l, arith::CmpIPredicate::ne, v, zero);
     return builder.create<arith::CmpFOp>(l, arith::CmpFPredicate::UNE, v, zero);
+  }
+
+  // Coerce a scalar value to the index type used by memref.load/store
+  // subscripts. Derived-pointer offsets and element subscripts are computed as
+  // i32 (the storage rep of an int) but memref indexing requires `index`.
+  Value toIndexValue(Value v, Location l) {
+    v = loadValue(v, l);
+    if (!v) return v;
+    if (v.getType().isIndex()) return v;
+    return builder.create<arith::IndexCastOp>(l, builder.getIndexType(), v);
+  }
+
+  // Resolve a use of a derived pointer local to a concrete (base memref,
+  // absolute index) pair that load/store can target directly. Handles:
+  //   `*q`   -> (q.base, q.off)                     [n is the Deref expr]
+  //   `q[k]` -> (q.base, q.off + k)                 [n is the IndexExpr]
+  //   `q`    -> (q.base, q.off)  (rare; bare value use of the pointer)
+  // Returns true and fills out params when `n` (or its operand) names a
+  // registered pointer local. The base is always a rank-1 memref<?xT> SSBO, so
+  // the absolute index is the single subscript.
+  bool pointerLValue(ASTNode *n, Value &base, Value &index) {
+    if (!n) return false;
+    auto resolveLocal = [&](StringRef nm, Value &b, Value &off,
+                            Value &extra) -> bool {
+      auto p = pointerLocalsML.find(nm);
+      if (p == pointerLocalsML.end()) return false;
+      b = p->second.first;
+      off = p->second.second;
+      extra = Value();
+      return true;
+    };
+    if (n->getNodeType() == ASTNode::NodeKind::UnaryExpr &&
+        static_cast<const UnaryExpr *>(n)->op == UnaryOp::Deref) {
+      const ASTNode *operand = static_cast<const UnaryExpr *>(n)->operand.get();
+      if (operand &&
+          operand->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+        Value b, off, extra;
+        if (resolveLocal(static_cast<const DeclRefExpr *>(operand)->name,
+                         b, off, extra)) {
+          base = b;
+          index = toIndexValue(off, loc(n));
+          return true;
+        }
+      }
+      return false;
+    }
+    if (n->getNodeType() == ASTNode::NodeKind::IndexExpr) {
+      auto *ie = static_cast<const IndexExpr *>(n);
+      if (ie->base &&
+          ie->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+        Value b, off, extra;
+        if (resolveLocal(static_cast<const DeclRefExpr *>(ie->base.get())->name,
+                         b, off, extra)) {
+          base = b;
+          Value k = toIndexValue(visitExpr(ie->index.get()), loc(n));
+          Value offIdx = toIndexValue(off, loc(n));
+          index = builder.create<arith::AddIOp>(loc(n), offIdx, k);
+          return true;
+        }
+      }
+      return false;
+    }
+    if (n->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+      Value b, off, extra;
+      if (resolveLocal(static_cast<const DeclRefExpr *>(n)->name, b, off, extra)) {
+        base = b;
+        index = toIndexValue(off, loc(n));
+        return true;
+      }
+    }
+    return false;
   }
 
   // Resolve an lvalue (a local-var slot or an array element) to a memref plus
@@ -2001,6 +2081,76 @@ private:
         // (no host-visible init); ignore any initializer for the global.
         continue;
       }
+      // A pointer-typed local whose initializer is a tracked derived-pointer
+      // pattern (`int *q = out + i`, `int *r = &out[i]`, `int *s = out`) is
+      // NOT lowered to an alloca: cvtType(PointerType) is a memref<?xT,
+      // StorageBuffer>, so a slot of that type would be a Function-storage
+      // memref-of-SSBO-memref that fails to legalize. Instead register the
+      // (base memref, offset index) pair and rewrite derefs/subscripts to
+      // load/store at base[off (+k)]. Returns true when registered (caller
+      // must then skip the alloca + init store).
+      auto registerPointerLocal = [&](VarDecl *vd) -> bool {
+        if (!vd || !vd->type || !isa<PointerType>(vd->type) || !vd->init)
+          return false;
+        auto resolveBase = [&](const ASTNode *n, Value &base) -> bool {
+          if (!n || n->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+            return false;
+          StringRef nm = static_cast<const DeclRefExpr *>(n)->name;
+          if (auto p = pointerLocalsML.find(nm); p != pointerLocalsML.end()) {
+            // `q = p` (alias of another derived pointer): inherit base, and
+            // carry p's offset as the new offset.
+            base = p->second.first;
+            return true;
+          }
+          auto it = locals.find(nm);
+          if (it == locals.end()) return false;
+          base = it->second;
+          return true;
+        };
+        const ASTNode *init = vd->init.get();
+        // `int *q = base;` (bare alias of an SSBO param/local array).
+        if (init->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+          Value base;
+          if (!resolveBase(init, base)) return false;
+          Value zero = builder.create<arith::ConstantOp>(
+              l, builder.getIndexType(), builder.getIndexAttr(0));
+          pointerLocalsML[vd->name] = {base, zero};
+          localTypes[vd->name] = vd->type;
+          return true;
+        }
+        // `int *q = base + off;` (pointer arithmetic).
+        if (init->getNodeType() == ASTNode::NodeKind::BinaryExpr) {
+          auto *b = static_cast<const BinaryExpr *>(init);
+          if (b->op != BinaryOp::Add) return false;
+          Value base, off;
+          if (resolveBase(b->lhs.get(), base))
+            off = toIndexValue(visitExpr(b->rhs.get()), l);
+          else if (resolveBase(b->rhs.get(), base))
+            off = toIndexValue(visitExpr(b->lhs.get()), l);
+          else
+            return false;
+          pointerLocalsML[vd->name] = {base, off};
+          localTypes[vd->name] = vd->type;
+          return true;
+        }
+        // `int *q = &arr[i];` (address-of indexed element).
+        if (init->getNodeType() == ASTNode::NodeKind::UnaryExpr &&
+            static_cast<const UnaryExpr *>(init)->op == UnaryOp::AddrOf) {
+          const ASTNode *operand = static_cast<const UnaryExpr *>(init)->operand.get();
+          if (!operand ||
+              operand->getNodeType() != ASTNode::NodeKind::IndexExpr)
+            return false;
+          auto *ie = static_cast<const IndexExpr *>(operand);
+          Value base;
+          if (!resolveBase(ie->base.get(), base)) return false;
+          Value off = toIndexValue(visitExpr(ie->index.get()), l);
+          pointerLocalsML[vd->name] = {base, off};
+          localTypes[vd->name] = vd->type;
+          return true;
+        }
+        return false;
+      };
+      if (registerPointerLocal(d)) continue;
       MemRefType slotTy = MemRefType::get(
           shape, elemTy, MemRefLayoutAttrInterface(),
           spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
@@ -2638,6 +2788,10 @@ private:
       // loadVectorPointerElement for why the memref can't be <?xvector<...>>.
       if (ie->base && ie->base->getNodeType() ==
                           ASTNode::NodeKind::DeclRefExpr) {
+        // `q[k]` where q is a derived pointer local -> load base[off + k].
+        Value pBase, pIdx;
+        if (pointerLValue(ie, pBase, pIdx))
+          return builder.create<memref::LoadOp>(l, pBase, ValueRange{pIdx});
         if (Value v = loadVectorPointerElement(ie, l))
           return v;
       }
@@ -2998,6 +3152,7 @@ private:
             // Bind `_this` to the caller's object slot.
             locals.clear();
             localTypes.clear();
+            pointerLocalsML.clear();
             locals["_this"] = base;
             localTypes["_this"] = objRec;
             // Bind the method's parameters to fresh slots holding the arg
@@ -4301,6 +4456,10 @@ private:
       return mem;
     }
     if (u->op == UnaryOp::Deref) {
+      // `*q` where q is a registered derived pointer local -> load base[off].
+      Value pBase, pIdx;
+      if (pointerLValue(const_cast<UnaryExpr *>(u), pBase, pIdx))
+        return builder.create<memref::LoadOp>(l, pBase, ValueRange{pIdx});
       Value mem;
       SmallVector<Value> indices;
       if (!lvalueAddress(const_cast<UnaryExpr *>(u), mem, indices))
@@ -4722,6 +4881,16 @@ private:
           b->lhs->getNodeType() == ASTNode::NodeKind::IndexExpr) {
         auto *ie = static_cast<IndexExpr *>(b->lhs.get());
         if (storeVectorPointerElement(ie, rhs, l)) return rhs;
+      }
+      // Derived pointer local write: `*q = v`, `q[k] = v` (also `*q += 1` and
+      // `q[k] += 1`, which lower to an Assign whose RHS already encodes the
+      // read-modify-write). Resolve to base[off (+k)] and store.
+      {
+        Value pBase, pIdx;
+        if (pointerLValue(b->lhs.get(), pBase, pIdx)) {
+          storeTo(pBase, {pIdx}, rhs, l);
+          return rhs;
+        }
       }
       Value mem;
       SmallVector<Value> indices;

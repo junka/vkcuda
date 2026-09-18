@@ -7,3 +7,6 @@
 *.spv
 .cache/
 compile_commands.json
+
+# VSCode extension build artifact
+vscode-vc/*.vsix

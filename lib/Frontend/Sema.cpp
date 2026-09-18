@@ -1179,9 +1179,17 @@ Type *Sema::checkExpr(const ASTNode *n) {
         rr->getKind() == TypeKind::Pointer)
       warn(n, "invalid operands to binary '+' (two pointers)");
     if (b->op == BinaryOp::Assign) {
-      // LHS must be an lvalue.
+      // LHS must be an lvalue. In C, `*p` (deref) and `p[k]` (which desugars
+      // to `*(p+k)`) are lvalues, so a Deref UnaryExpr is a valid assignment
+      // target. The GLSL/MLIR backends lower a tracked pointer local's deref
+      // to a concrete SSBO/memref element, making it writable.
       auto k = b->lhs->getNodeType();
-      if (k != ASTNode::NodeKind::DeclRefExpr &&
+      bool derefLvalue = false;
+      if (k == ASTNode::NodeKind::UnaryExpr &&
+          static_cast<const UnaryExpr *>(b->lhs.get())->op == UnaryOp::Deref)
+        derefLvalue = true;
+      if (!derefLvalue &&
+          k != ASTNode::NodeKind::DeclRefExpr &&
           k != ASTNode::NodeKind::IndexExpr &&
           k != ASTNode::NodeKind::MemberAccessExpr)
         warn(n, "assignment to non-lvalue");
@@ -1230,6 +1238,14 @@ Type *Sema::checkExpr(const ASTNode *n) {
       warn(n, "operands of '" + std::string(opName(b->op)) +
                   "' have incompatible types (" + typeName(lt) + " and " +
                   typeName(rt) + ")");
+    // C: `ptr + int` and `int + ptr` yield a pointer of the same type as the
+    // pointer operand (pointer arithmetic). `ptr - int` likewise. Returning
+    // the pointer side (not rt, which is the int) lets downstream codegen see
+    // the result is address-valued.
+    if (ptrArith) {
+      if (lt && lt->getKind() == TypeKind::Pointer) return lt;
+      return rt;
+    }
     return rt ? rt : lt;
   }
   case ASTNode::NodeKind::UnaryExpr: {
@@ -1243,6 +1259,11 @@ Type *Sema::checkExpr(const ASTNode *n) {
       return t && t->getKind() == TypeKind::Pointer
                  ? static_cast<PointerType *>(t)->pointee
                  : t;
+    case UnaryOp::AddrOf:
+      // `&x` yields a pointer to x's type. This is the type-inference side of
+      // address-of; codegen must still lower it (only some forms are valid,
+      // e.g. `&arr[i]` on an SSBO/shared array).
+      return t ? new PointerType(t) : t;
     case UnaryOp::Neg:
       if (t && !isArithmetic(t) && t->getKind() != TypeKind::Vector)
         warn(n, "unary '-' on non-numeric type " + typeName(t));

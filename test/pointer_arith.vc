@@ -1,0 +1,73 @@
+// test/pointer_arith.vc — CUDA pointer arithmetic and write-through.
+//
+// Regression for the pointer-arithmetic gap on both backends. CUDA code
+// freely forms pointers via `base + offset` and `&arr[i]`, then reads/writes
+// through them. Neither backend previously supported this:
+//   - GLSL: a local `int *q` lowered to a scalar `int q` (glslType strips
+//     Pointer->pointee), so `out + i` was "array + int" (no such op) and
+//     `*q`/`q[k]` indexed a non-array. The backend now tracks a pointer
+//     local as a (base, offset) pair and rewrites uses to `base[offset (+k)]`.
+//   - MLIR: `&out[i]` hit "address of indexed memref element unsupported";
+//     `out + i` had no offset lowering. The backend now represents a derived
+//     pointer as the base memref plus a carried index.
+// Sema was also fixed: `ptr + int` and `&x` now infer PointerType (they
+// previously returned the int side / the operand type).
+//
+// Covers:
+//   - `int *q = out + i; *q = v;`        (ptr + int, deref write)
+//   - `int *r = &out[i]; *r += 1;`       (address-of indexed, read-modify-write)
+//   - `int *s = out; s[i] = ...;`        (ptr alias, index-through)
+//   - `int *t = out + i; int x = *t;`    (deref read)
+//
+//   vcc test/pointer_arith.vc -o build/pointer_arith_sf && ./build/pointer_arith_sf
+//   vc  test/pointer_arith.vc -emit=full -o build/pointer_arith_m && ./build/pointer_arith_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void ptrKernel(int *out, int n) {
+  int i = threadIdx.x;
+  if (i >= n) return;
+
+  // ptr + int, then write through deref
+  int *q = out + i;
+  *q = i * 10;
+
+  // address-of indexed element, read-modify-write through the pointer
+  int *r = &out[i];
+  *r += 1;            // out[i] is now i*10 + 1
+
+  // ptr alias + index-through
+  int *s = out;
+  s[i] += 100;        // out[i] is now i*10 + 101
+
+  // deref read
+  int *t = out + i;
+  int x = *t;         // should be i*10 + 101
+  out[i] = x + 1000;  // i*10 + 1101
+}
+
+int main() {
+  vcInit();
+  const int N = 8;
+  void *d = 0;
+  vcMalloc(&d, N * 4);
+  ptrKernel<<<1, N>>>(d, N);
+  vcDeviceSynchronize();
+  int h[8] = {0};
+  vcMemcpy(h, d, N * 4, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    int expect = i * 10 + 1101;
+    if (h[i] != expect) {
+      printf("  i=%d got=%d expect=%d\n", i, h[i], expect);
+      ok = 0;
+    }
+  }
+  printf("pointer_arith: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

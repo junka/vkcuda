@@ -79,6 +79,16 @@ class GLSLEmitter {
   // literal/cast structure of the expression subtree (see exprType).
   llvm::StringMap<const Type *> localTypes;
 
+  // CUDA pointer-typed locals (`int *q = out + i;`) have no GLSL
+  // representation: glslType strips Pointer->pointee, so a plain decl would
+  // emit `int q = out_ + i` (a scalar, useless for `*q`/`q[k]`). Instead we
+  // track each such local as a (baseName, offsetExpr) pair and rewrite uses
+  // to `base[offset (+k)]`. baseName is the GLSL SSBO/local-array name; the
+  // offset is a GLSL expression string (or "0" for a bare alias). Cleared
+  // per function alongside localTypes (see emitFunction).
+  struct PtrLocal { std::string base; std::string offset; };
+  llvm::StringMap<PtrLocal> pointerLocals;
+
 public:
   GLSLEmitter(raw_ostream &o) : os(&o) {}
 
@@ -698,6 +708,7 @@ private:
     // point and must not inherit the kernel's param names (a helper `a` is a
     // different variable than the kernel's `a`).
     localTypes.clear();
+    pointerLocals.clear();
     for (const auto &p : f->params)
       if (p->type) localTypes[p->name] = p->type;
     // `_this` (synthesized method receiver) is a struct lvalue that never
@@ -1168,6 +1179,7 @@ private:
     // Rebuild localTypes for the kernel now that all __device__ helpers
     // (each of which repopulated it) have been emitted.
     localTypes.clear();
+    pointerLocals.clear();
     for (const auto &p : kernel->params)
       if (p->type) localTypes[p->name] = p->type;
     if (kernel->body) {
@@ -1249,7 +1261,34 @@ private:
       // init of later declarators in the same statement) can resolve it.
       for (VarDecl *vd : ds->decls)
         if (vd && vd->type) localTypes[vd->name] = vd->type;
+      // Pre-register any pointer-typed local that models a tracked pattern
+      // (ptr+int, &arr[i], bare alias). These emit NO GLSL decl — a plain
+      // `int q = ...` would be a broken scalar — and their uses are rewritten
+      // to `base[offset (+k)]` in emitExpr. A DeclStmt may consist entirely
+      // of such locals, so we must skip the whole type/name emission when the
+      // first declarator is registered.
+      bool firstIsPtr = d && tryRegisterPointerLocal(d);
       if (d->isShared) break; // hoisted to a `shared` global
+      if (firstIsPtr) {
+        // First declarator is elided. Emit any additional (non-pointer) ones
+        // as fresh declarations — they can't reuse the elided type prefix.
+        for (unsigned i = 1; i < ds->decls.size(); ++i) {
+          VarDecl *vd = ds->decls[i];
+          if (!vd || tryRegisterPointerLocal(vd)) continue;
+          pad(indent);
+          if (vd->isConst) (*os) << "const ";
+          (*os) << glslType(vd->type) << " " << glslName(vd->name);
+          for (int64_t dim : vd->arrayDims)
+            (*os) << "[" << dim << "]";
+          emitVarInit(vd, indent);
+          (*os) << ";\n";
+          if (!deferredArrInit.empty()) {
+            (*os) << deferredArrInit;
+            deferredArrInit.clear();
+          }
+        }
+        break;
+      }
       pad(indent);
       if (d->isConst) (*os) << "const ";
       (*os) << glslType(d->type) << " " << glslName(d->name);
@@ -1666,6 +1705,84 @@ private:
                BuiltinTypeKind::Bool;
   }
 
+  // Try to register a pointer-typed local (`int *q = ...`) into pointerLocals
+  // so its uses can be rewritten to `base[offset (+k)]`. Returns true if the
+  // local was registered (caller must then SKIP emitting any GLSL decl for
+  // it — a plain `int q = ...` would be a broken scalar). Returns false for
+  // non-pointer locals or pointer inits we don't model (those emit normally,
+  // likely producing a glslc error, preserving prior behavior).
+  bool tryRegisterPointerLocal(const VarDecl *d) {
+    if (!d || !d->type || d->type->getKind() != TypeKind::Pointer || !d->init)
+      return false;
+    auto set = [&](const std::string &base, const std::string &off) {
+      pointerLocals[d->name] = {base, off};
+    };
+    // Resolve the GLSL base name for a DeclRefExpr operand: an SSBO kernel
+    // param (its glslName is the array name), another pointer local (inherit
+    // its base+offset), or a local array name.
+    auto baseNameOf = [&](const ASTNode *n, std::string &out) -> bool {
+      if (!n || n->getNodeType() != ASTNode::NodeKind::DeclRefExpr) return false;
+      StringRef nm = static_cast<const DeclRefExpr *>(n)->name;
+      if (auto p = pointerLocals.find(nm); p != pointerLocals.end()) {
+        // Inherit: q = p  =>  q uses p's base, offset 0 (alias of p's element
+        // 0... but for `q = p` as a pointer alias we want the same base+off).
+        out = p->second.base;
+        return true;
+      }
+      out = glslName(nm);
+      return true;
+    };
+    auto offsetStr = [&](const ASTNode *n) -> std::string {
+      std::string s;
+      raw_string_ostream o(s);
+      raw_ostream *saved = os;
+      os = &o;
+      emitExpr(n);
+      os = saved;
+      o.flush();
+      return s;
+    };
+
+    const ASTNode *init = d->init.get();
+    // `int *q = base;` — bare alias of an SSBO param or local array.
+    if (init->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+      std::string base;
+      if (baseNameOf(init, base)) { set(base, "0"); return true; }
+      return false;
+    }
+    // `int *q = base + off;` — pointer arithmetic.
+    if (init->getNodeType() == ASTNode::NodeKind::BinaryExpr) {
+      auto *b = static_cast<const BinaryExpr *>(init);
+      if (b->op == BinaryOp::Add) {
+        std::string base;
+        if (baseNameOf(b->lhs.get(), base)) {
+          set(base, offsetStr(b->rhs.get()));
+          return true;
+        }
+        if (baseNameOf(b->rhs.get(), base)) {
+          set(base, offsetStr(b->lhs.get()));
+          return true;
+        }
+      }
+      return false;
+    }
+    // `int *q = &arr[i];` — address-of indexed element.
+    if (init->getNodeType() == ASTNode::NodeKind::UnaryExpr &&
+        static_cast<const UnaryExpr *>(init)->op == UnaryOp::AddrOf) {
+      const ASTNode *operand = static_cast<const UnaryExpr *>(init)->operand.get();
+      if (operand && operand->getNodeType() == ASTNode::NodeKind::IndexExpr) {
+        auto *ie = static_cast<const IndexExpr *>(operand);
+        std::string base;
+        if (baseNameOf(ie->base.get(), base)) {
+          set(base, offsetStr(ie->index.get()));
+          return true;
+        }
+      }
+      return false;
+    }
+    return false;
+  }
+
   // Emit the initializer part of a declarator (` = <expr>`), OR, for a multi-
   // dimensional array with an InitListExpr initializer, defer element-wise
   // assignments into `deferredArrInit` (flushed by the caller after the
@@ -1899,6 +2016,19 @@ private:
         (*os) << "int(!bool(";
         emitExpr(u->operand.get());
         (*os) << "))";
+      } else if (u->op == UnaryOp::Deref &&
+                 u->operand &&
+                 u->operand->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+        // `*q` where q is a tracked pointer local -> base[off]. (GLSL has no
+        // pointer type; a pointer local is a (base, offset) pair, so a deref
+        // is a single-element array index.)
+        StringRef bn = static_cast<const DeclRefExpr *>(u->operand.get())->name;
+        if (auto p = pointerLocals.find(bn); p != pointerLocals.end()) {
+          (*os) << p->second.base << "[" << p->second.offset << "]";
+          break;
+        }
+        (*os) << unaryopStr(u->op);
+        emitExpr(u->operand.get());
       } else {
         (*os) << unaryopStr(u->op);
         emitExpr(u->operand.get());
@@ -1956,6 +2086,22 @@ private:
     }
     case ASTNode::NodeKind::IndexExpr: {
       auto *ie = static_cast<const IndexExpr *>(n);
+      // `q[k]` where q is a tracked pointer local -> base[off + k].
+      if (ie->base &&
+          ie->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+        StringRef bn = static_cast<const DeclRefExpr *>(ie->base.get())->name;
+        if (auto p = pointerLocals.find(bn); p != pointerLocals.end()) {
+          (*os) << p->second.base << "[";
+          if (p->second.offset == "0") {
+            emitExpr(ie->index.get());
+          } else {
+            (*os) << "(" << p->second.offset << ") + ";
+            emitExpr(ie->index.get());
+          }
+          (*os) << "]";
+          break;
+        }
+      }
       emitExpr(ie->base.get());
       (*os) << "[";
       emitExpr(ie->index.get());
