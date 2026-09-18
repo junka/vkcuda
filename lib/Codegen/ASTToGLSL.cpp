@@ -1242,11 +1242,12 @@ private:
       break;
     }
     case ASTNode::NodeKind::DeclStmt: {
-      auto *d = static_cast<const DeclStmt *>(n)->decl;
+      auto *ds = static_cast<const DeclStmt *>(n);
+      auto *d = ds->decl;
       if (!d) break;
       // Register every declarator's type so subsequent expressions (and the
       // init of later declarators in the same statement) can resolve it.
-      for (VarDecl *vd : static_cast<const DeclStmt *>(n)->decls)
+      for (VarDecl *vd : ds->decls)
         if (vd && vd->type) localTypes[vd->name] = vd->type;
       if (d->isShared) break; // hoisted to a `shared` global
       pad(indent);
@@ -1254,21 +1255,27 @@ private:
       (*os) << glslType(d->type) << " " << glslName(d->name);
       for (int64_t dim : d->arrayDims)
         (*os) << "[" << dim << "]";
-      if (d->init) { (*os) << " = "; emitExpr(d->init.get()); }
+      emitVarInit(d, indent);
       // Additional declarators sharing this statement's type (`int a, b;`).
       // C/GLSL multi-declarator syntax: the type appears once before the first
       // declarator; later declarators are just names (re-emitting the type, as
       // in `int a, int b;`, is a syntax error). `const` is a type-qualifier
       // shared by the whole declaration, so it is not repeated either.
-      for (unsigned i = 1; i < static_cast<const DeclStmt *>(n)->decls.size();
-           ++i) {
-        VarDecl *vd = static_cast<const DeclStmt *>(n)->decls[i];
+      for (unsigned i = 1; i < ds->decls.size(); ++i) {
+        VarDecl *vd = ds->decls[i];
         (*os) << ", " << glslName(vd->name);
         for (int64_t dim : vd->arrayDims)
           (*os) << "[" << dim << "]";
-        if (vd->init) { (*os) << " = "; emitExpr(vd->init.get()); }
+        emitVarInit(vd, indent);
       }
       (*os) << ";\n";
+      // Multi-dimensional array initializers are lowered as element-wise
+      // assignments after the declaration (glslc rejects C-style `{}` init for
+      // multi-dim arrays), collected during emitVarInit.
+      if (!deferredArrInit.empty()) {
+        (*os) << deferredArrInit;
+        deferredArrInit.clear();
+      }
       break;
     }
     case ASTNode::NodeKind::ExprStmt: {
@@ -1659,6 +1666,71 @@ private:
                BuiltinTypeKind::Bool;
   }
 
+  // Emit the initializer part of a declarator (` = <expr>`), OR, for a multi-
+  // dimensional array with an InitListExpr initializer, defer element-wise
+  // assignments into `deferredArrInit` (flushed by the caller after the
+  // declaration statement). glslc rejects C-style `{}` init for multi-dim
+  // arrays (`int b[2][3] = {{1,2,3},{4,5,6}}` is a hard error), so those are
+  // lowered as `b[i][j] = v;` assignments. Single-dim array `{}` init and all
+  // scalar inits use the normal `= expr` form, which glslc accepts.
+  std::string deferredArrInit;
+  void emitVarInit(const VarDecl *d, unsigned indent) {
+    if (!d->init) return;
+    if (d->arrayDims.size() > 1 &&
+        d->init->getNodeType() == ASTNode::NodeKind::InitListExpr) {
+      SmallVector<const ASTNode *, 16> flat;
+      flattenInitList(static_cast<const InitListExpr *>(d->init.get()), flat);
+      int64_t total = 1;
+      for (int64_t dim : d->arrayDims) total *= dim;
+      // Redirect emission into a string buffer so the element-wise assignments
+      // land after the declaration statement (the caller flushes
+      // deferredArrInit after `;`). pad()/emitExpr() both write through `os`.
+      raw_string_ostream buf(deferredArrInit);
+      raw_ostream *saved = os;
+      os = &buf;
+      for (size_t i = 0; i < flat.size() && (int64_t)i < total; ++i) {
+        pad(indent);
+        (*os) << glslName(d->name);
+        // Row-major linear index -> per-dimension subscripts. The last
+        // dimension varies fastest, so peel it off first; store subscripts
+        // dimension-major (subs[0] is outermost) for `[subs[0]][subs[1]]...`.
+        int64_t rem = (int64_t)i;
+        SmallVector<int64_t, 4> subs(d->arrayDims.size());
+        for (int d2 = (int)d->arrayDims.size() - 1; d2 >= 0; --d2) {
+          subs[d2] = rem % d->arrayDims[d2];
+          rem /= d->arrayDims[d2];
+        }
+        for (int64_t s : subs)
+          (*os) << "[" << s << "]";
+        (*os) << " = ";
+        emitExpr(flat[i]);
+        (*os) << ";\n";
+      }
+      os = saved;
+      buf.flush();
+      return;
+    }
+    (*os) << " = ";
+    emitExpr(d->init.get());
+  }
+
+  // Recursively flatten a (possibly nested) InitListExpr into a flat list of
+  // scalar/ctor-call elements. Only InitListExpr children are descended into;
+  // any other element (IntegerLiteral, FloatLiteral, CallExpr, ...) is kept as
+  // a leaf. This turns `{{1,2,3},{4,5,6}}` into `{1,2,3,4,5,6}` for GLSL's
+  // multi-dim array initializer, while leaving `float4(1,2,3,4)` constructor
+  // calls intact.
+  void flattenInitList(const InitListExpr *il,
+                       SmallVectorImpl<const ASTNode *> &out) const {
+    for (const auto &e : il->elements) {
+      if (!e) continue;
+      if (e->getNodeType() == ASTNode::NodeKind::InitListExpr)
+        flattenInitList(static_cast<const InitListExpr *>(e.get()), out);
+      else
+        out.push_back(e.get());
+    }
+  }
+
   // Emit a condition expression coerced to bool. C/CUDA accept any scalar as a
   // truth value (`if (n & 1)`, `while (n)`, `(a & 1) ? x : y`, `!a`); GLSL
   // requires a genuine bool, so a condition whose type is not provably bool is
@@ -1863,11 +1935,21 @@ private:
       break;
     }
     case ASTNode::NodeKind::InitListExpr: {
+      // GLSL's glslc rejects nested initializer lists for multi-dimensional
+      // arrays (`int b[2][3] = {{1,2,3},{4,5,6}}` -> "cannot convert parameter
+      // 1 from const int to 3-element array"), but accepts the flattened form
+      // (`{1,2,3,4,5,6}`). C permits both, so we flatten nested InitListExprs
+      // into a single scalar list. We only descend into child InitListExpr
+      // elements; non-InitListExpr elements (scalars, ctor calls like
+      // float4(...)) are emitted verbatim, so a vector/struct array init that
+      // uses constructor calls is not broken apart.
       auto *il = static_cast<const InitListExpr *>(n);
+      SmallVector<const ASTNode *, 8> flat;
+      flattenInitList(il, flat);
       (*os) << "{ ";
-      for (unsigned i = 0; i < il->elements.size(); ++i) {
+      for (unsigned i = 0; i < flat.size(); ++i) {
         if (i) (*os) << ", ";
-        emitExpr(il->elements[i].get());
+        emitExpr(flat[i]);
       }
       (*os) << " }";
       break;

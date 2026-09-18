@@ -1,0 +1,61 @@
+// test/multidim_init.vc — multi-dimensional array initializers.
+//
+// Regression for the multi-dim array init gap on both backends.
+//   - GLSL: glslc rejects C-style `{}` init for multi-dim arrays
+//     (`int b[2][3] = {{1,2,3},{4,5,6}}` -> "cannot convert parameter 1 from
+//     const int to 3-element array"). The GLSL backend now lowers a multi-dim
+//     InitListExpr to a declaration followed by element-wise assignments
+//     (`b[0][0] = 1; b[0][1] = 2; ...`). Single-dim `{}` init is left as-is
+//     (glslc accepts it).
+//   - MLIR: `int b[2][3] = {{1,2,3},{4,5,6}}` used to fail "cannot lower init
+//     list" — the InitListExpr was not recursed into, and the linear store
+//     index did not match the multi-dim memref shape. Now nested init lists
+//     are flattened and stored at the correct row-major subscripts.
+//
+// Covers 2D nested ({{...},{...}}), 2D flat ({a,b,c,d,e,f}), and 1D, plus
+// reads back via [i/3][i%3] subscripts.
+//
+//   vcc test/multidim_init.vc -o build/multidim_init_sf && ./build/multidim_init_sf
+//   vc  test/multidim_init.vc -emit=full -o build/multidim_init_m && ./build/multidim_init_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void mdKernel(int *out, int n) {
+  int i = threadIdx.x;
+  if (i >= n) return;
+
+  int a[3] = {10, 20, 30};                       // 1D
+  int b[2][3] = {{1, 2, 3}, {4, 5, 6}};          // 2D nested
+  int c[2][3] = {1, 2, 3, 4, 5, 6};              // 2D flat (C permits)
+
+  // i in [0,6): read one element from each via row/col subscripts.
+  int row = i / 3, col = i % 3;
+  out[i] = a[col] + b[row][col] + c[row][col];   // a=10/20/30, b/c = i+1, i+1
+}
+
+int main() {
+  vcInit();
+  const int N = 6;
+  void *d = 0;
+  vcMalloc(&d, N * 4);
+  mdKernel<<<1, N>>>(d, N);
+  vcDeviceSynchronize();
+  int h[6] = {0};
+  vcMemcpy(h, d, N * 4, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    int col = i % 3;
+    int expect = (10 + col * 10) + (i + 1) + (i + 1);
+    if (h[i] != expect) {
+      printf("  i=%d got=%d expect=%d\n", i, h[i], expect);
+      ok = 0;
+    }
+  }
+  printf("multidim_init: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

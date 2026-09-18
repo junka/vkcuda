@@ -1880,6 +1880,20 @@ private:
     visitStmt(thenBlock);
   }
 
+  // Recursively flatten a (possibly nested) InitListExpr into a flat list of
+  // scalar/ctor-call element AST nodes. `{{1,2,3},{4,5,6}}` -> {1,2,3,4,5,6}.
+  // Non-InitListExpr elements (literals, ctor calls) are leaves.
+  void flattenInitListAST(ASTNode *n,
+                          SmallVectorImpl<ASTNode *> &out) {
+    if (!n) return;
+    if (n->getNodeType() == ASTNode::NodeKind::InitListExpr) {
+      for (auto &e : static_cast<InitListExpr *>(n)->elements)
+        flattenInitListAST(e.get(), out);
+    } else {
+      out.push_back(n);
+    }
+  }
+
   void visitStmt(ASTNode *n) {
     if (!n) return;
     Location l = loc(n);
@@ -2006,14 +2020,28 @@ private:
       localTypes[d->name] = d->type;
       if (d->init) {
         if (d->init->getNodeType() == ASTNode::NodeKind::InitListExpr) {
-          auto *il = static_cast<InitListExpr *>(d->init.get());
+          // Recursively flatten nested init lists (`{{1,2,3},{4,5,6}}` ->
+          // {1,2,3,4,5,6}) into a scalar element list, then store each at its
+          // linear position. The memref may be multi-dimensional
+          // (memref<2x3xi32>); a linear index is decomposed into per-dim
+          // subscripts in row-major order.
+          SmallVector<ASTNode *, 16> flat;
+          flattenInitListAST(d->init.get(), flat);
           int64_t total = 1;
           for (int64_t dim : shape) total *= dim;
-          for (size_t i = 0; i < il->elements.size() && (int64_t)i < total; ++i) {
-            SmallVector<Value, 1> idx;
-            idx.push_back(builder.create<arith::ConstantOp>(
-                l, builder.getIndexType(), builder.getIndexAttr(i)));
-            storeTo(addr, idx, visitExpr(il->elements[i].get()), l);
+          for (size_t i = 0; i < flat.size() && (int64_t)i < total; ++i) {
+            SmallVector<Value, 4> idx;
+            int64_t rem = (int64_t)i;
+            for (int d2 = (int)shape.size() - 1; d2 >= 0; --d2) {
+              idx.insert(idx.begin(), builder.create<arith::ConstantOp>(
+                  l, builder.getIndexType(),
+                  builder.getIndexAttr(rem % shape[d2])));
+              rem /= shape[d2];
+            }
+            if (idx.empty())
+              idx.push_back(builder.create<arith::ConstantOp>(
+                  l, builder.getIndexType(), builder.getIndexAttr(0)));
+            storeTo(addr, idx, visitExpr(flat[i]), l);
           }
         } else {
           storeValue(addr, visitExpr(d->init.get()), loc(d));

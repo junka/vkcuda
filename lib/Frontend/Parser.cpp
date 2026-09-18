@@ -1716,7 +1716,8 @@ NodePtr Parser::parseUnary() {
                         TokKind::float_literal, TokKind::l_paren,
                         TokKind::minus, TokKind::bang, TokKind::tilde,
                         TokKind::star, TokKind::amp, TokKind::plus_plus,
-                        TokKind::minus_minus, TokKind::char_literal)) {
+                        TokKind::minus_minus, TokKind::char_literal,
+                        TokKind::kw_sizeof)) {
         advance(); // ')'
         NodePtr sub = parseUnary();
         return NodePtr(new CStyleCastExpr(toSourceLoc(lp), ty, std::move(sub)));
