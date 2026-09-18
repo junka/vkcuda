@@ -4794,6 +4794,20 @@ private:
           fv = builder.create<arith::ExtSIOp>(l, t, fv);
       }
     }
+    // Vector result with a scalar (i1) condition: SPIR-V's OpSelect selects
+    // component-wise and requires the condition to be a boolean *vector* of the
+    // same width. arith.select with a scalar condition on a vector result has no
+    // legal SPIR-V lowering (ConvertArithToSPIRV legalizes only the
+    // matching-vector-condition form), so broadcast the scalar i1 into a
+    // vector<N x i1> via CompositeConstruct before the select.
+    if (auto vty = tv.getType().dyn_cast<mlir::VectorType>()) {
+      if (cond.getType().isInteger(1)) {
+        SmallVector<Value, 4> lanes(vty.getNumElements(), cond);
+        cond = builder.create<spirv::CompositeConstructOp>(
+            l, mlir::VectorType::get(vty.getNumElements(), builder.getI1Type()),
+            lanes);
+      }
+    }
     return builder.create<arith::SelectOp>(l, tv.getType(), cond, tv, fv);
   }
 };

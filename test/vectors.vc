@@ -9,6 +9,7 @@
 //   - .xy / .xyz / .xz swizzle (read), .xz = swizzle (write)
 //   - componentwise a + b, scalar broadcast
 //   - dot(a, b), cross(a, b)
+//   - vector ternary `(cond) ? vecA : vecB` (scalar cond, vector result)
 //
 //   vcc test/vectors.vc -o build/vectors_sf && ./build/vectors_sf
 
@@ -57,9 +58,18 @@ __global__ void vecKernel(Result *result) {
   float3 z = cross(x, y);                      // (0,0,1)
   float zlen = z.z;                            // 1
 
+  // --- vector ternary (?: with vector result + scalar condition) ---
+  // On the MLIR backend this lowers to arith.select on a vector; SPIR-V's
+  // OpSelect is component-wise and needs a boolean *vector* condition, so the
+  // scalar i1 must be broadcast to <N x i1>. (Regression: vector ternary used
+  // to fail "failed to legalize operation 'arith.select'".) a.x<b.x is true,
+  // so this picks a=(1,2,3,4); sum of components = 10.
+  float4 pick = (a.x < b.x) ? a : b;           // a, since 1 < 10
+  int picksum = int(pick.x) + int(pick.y) + int(pick.z) + int(pick.w);  // 10
+
   result[0].f = float(d) + float(swsum) + float(zlen);  // 300 + 44 + 1 = 345
   result[0].i = isum + usum;                             // 40
-  result[0].u = 0;
+  result[0].u = picksum;                                 // 10
   result[0].d = dval;                                    // 4.0
   result[0].l = lval;                                    // 1000
 }
@@ -80,6 +90,7 @@ int main() {
   int ok = 1;
   if (std::fabs(h.f - 345.0) > 1e-3) ok = 0;
   if (h.i != 40) ok = 0;
+  if (h.u != 10) ok = 0;
   if (std::fabs(h.d - 4.0) > 1e-3) ok = 0;
   if (h.l != 1000) ok = 0;
   printf("vectors: %s\n", ok ? "PASS" : "FAIL");
