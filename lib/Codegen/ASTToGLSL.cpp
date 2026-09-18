@@ -1197,8 +1197,13 @@ private:
       for (VarDecl *d : ds->decls) {
         if (!d) continue;
         if (!first) (*os) << ", ";
+        // C multi-declarator syntax: the type appears once, then `a = 0, b = 3`.
+        // Emitting the type per-declarator (`int a = 0, int b = 3`) is a GLSL
+        // (and C) syntax error, so only the first declarator carries the type.
+        if (first)
+          (*os) << glslType(d->type) << " ";
         first = false;
-        (*os) << glslType(d->type) << " " << glslName(d->name);
+        (*os) << glslName(d->name);
         for (int64_t dim : d->arrayDims)
           (*os) << "[" << dim << "]";
         if (d->init) { (*os) << " = "; emitExpr(d->init.get()); }
@@ -1251,13 +1256,14 @@ private:
         (*os) << "[" << dim << "]";
       if (d->init) { (*os) << " = "; emitExpr(d->init.get()); }
       // Additional declarators sharing this statement's type (`int a, b;`).
-      // GLSL allows comma-separated declarations in the same statement.
+      // C/GLSL multi-declarator syntax: the type appears once before the first
+      // declarator; later declarators are just names (re-emitting the type, as
+      // in `int a, int b;`, is a syntax error). `const` is a type-qualifier
+      // shared by the whole declaration, so it is not repeated either.
       for (unsigned i = 1; i < static_cast<const DeclStmt *>(n)->decls.size();
            ++i) {
         VarDecl *vd = static_cast<const DeclStmt *>(n)->decls[i];
-        (*os) << ", ";
-        if (vd->isConst) (*os) << "const ";
-        (*os) << glslType(vd->type) << " " << glslName(vd->name);
+        (*os) << ", " << glslName(vd->name);
         for (int64_t dim : vd->arrayDims)
           (*os) << "[" << dim << "]";
         if (vd->init) { (*os) << " = "; emitExpr(vd->init.get()); }
@@ -1281,7 +1287,7 @@ private:
       break;
     case ASTNode::NodeKind::IfStmt: {
       auto *iff = static_cast<const IfStmt *>(n);
-      pad(indent); (*os) << "if ("; emitExpr(iff->cond.get()); (*os) << ") {\n";
+      pad(indent); (*os) << "if ("; emitCondition(iff->cond.get()); (*os) << ") {\n";
       if (iff->thenStmt) emitStmt(iff->thenStmt.get(), indent + 1);
       pad(indent); (*os) << "}\n";
       if (iff->elseStmt) {
@@ -1297,7 +1303,7 @@ private:
       if (fs->init)
         emitForInit(fs->init.get()); // emits without trailing newline
       (*os) << "; ";
-      if (fs->cond) emitExpr(fs->cond.get());
+      if (fs->cond) emitCondition(fs->cond.get());
       (*os) << "; ";
       if (fs->step) emitExpr(fs->step.get());
       (*os) << ") {\n";
@@ -1307,7 +1313,7 @@ private:
     }
     case ASTNode::NodeKind::WhileStmt: {
       auto *ws = static_cast<const WhileStmt *>(n);
-      pad(indent); (*os) << "while ("; emitExpr(ws->cond.get()); (*os) << ") {\n";
+      pad(indent); (*os) << "while ("; emitCondition(ws->cond.get()); (*os) << ") {\n";
       if (ws->body) emitStmt(ws->body.get(), indent + 1);
       pad(indent); (*os) << "}\n";
       break;
@@ -1316,7 +1322,7 @@ private:
       auto *ds = static_cast<const DoStmt *>(n);
       pad(indent); (*os) << "do {\n";
       if (ds->body) emitStmt(ds->body.get(), indent + 1);
-      pad(indent); (*os) << "} while ("; emitExpr(ds->cond.get()); (*os) << ");\n";
+      pad(indent); (*os) << "} while ("; emitCondition(ds->cond.get()); (*os) << ");\n";
       break;
     }
     case ASTNode::NodeKind::BreakStmt:
@@ -1469,9 +1475,12 @@ private:
     case ASTNode::NodeKind::CStyleCastExpr:
       return static_cast<const CStyleCastExpr *>(n)->target;
     case ASTNode::NodeKind::UnaryExpr:
-      // Negation preserves type; Deref would return the pointee but pointer
-      // derefs rarely appear in mixed-width arithmetic, so the operand type is
-      // a fine approximation.
+      // `!` yields int in C (0/1); other unary ops (Neg, Not, Deref, ++/--)
+      // preserve or approximate the operand type. Deref would return the
+      // pointee but pointer derefs rarely appear in mixed-width arithmetic, so
+      // the operand type is a fine approximation there.
+      if (static_cast<const UnaryExpr *>(n)->op == UnaryOp::LNot)
+        return new BuiltinType(BuiltinTypeKind::Int32);
       return exprType(static_cast<const UnaryExpr *>(n)->operand.get());
     case ASTNode::NodeKind::MemberAccessExpr: {
       // `v.x` on a vector yields the element scalar type; `.xy`/`.xyz`/...
@@ -1643,6 +1652,31 @@ private:
                BuiltinTypeKind::Float16;
   }
 
+  static bool isBoolTy(const Type *t) {
+    t = resolveTypedef(t);
+    return t && t->getKind() == TypeKind::Builtin &&
+           static_cast<const BuiltinType *>(t)->builtin ==
+               BuiltinTypeKind::Bool;
+  }
+
+  // Emit a condition expression coerced to bool. C/CUDA accept any scalar as a
+  // truth value (`if (n & 1)`, `while (n)`, `(a & 1) ? x : y`, `!a`); GLSL
+  // requires a genuine bool, so a condition whose type is not provably bool is
+  // wrapped in `bool(...)`. exprType is conservative (returns null for many
+  // int-typed expressions like `a & 1`), so null is treated as "needs coercion"
+  // — wrapping a real bool in `bool(...)` is a harmless no-op constructor.
+  void emitCondition(const ASTNode *n) {
+    if (!n) { emitExpr(n); return; }
+    const Type *et = resolveTypedef(exprType(n));
+    if (!isBoolTy(et)) {
+      (*os) << "bool(";
+      emitExpr(n);
+      (*os) << ")";
+      return;
+    }
+    emitExpr(n);
+  }
+
   // Emit `n` wrapped in `glslType(target)(...)` unless its inferred type already
   // matches target (or is unknown — emit as-is, the caller took the risk).
   void emitExprCoerced(const ASTNode *n, const Type *target) {
@@ -1785,6 +1819,14 @@ private:
       if (u->op == UnaryOp::PostInc || u->op == UnaryOp::PostDec) {
         emitExpr(u->operand.get());
         (*os) << unaryopStr(u->op);
+      } else if (u->op == UnaryOp::LNot) {
+        // C's `!` yields an int (0/1); GLSL's `!` yields bool and requires a
+        // bool operand. Emit `int(!bool(operand))` so the result is usable as
+        // both a scalar (`int x = !a;`) and a condition (emitCondition sees an
+        // int and wraps `bool(...)` — redundant but glslc folds it).
+        (*os) << "int(!bool(";
+        emitExpr(u->operand.get());
+        (*os) << "))";
       } else {
         (*os) << unaryopStr(u->op);
         emitExpr(u->operand.get());
@@ -1794,7 +1836,7 @@ private:
     case ASTNode::NodeKind::ConditionalExpr: {
       auto *c = static_cast<const ConditionalExpr *>(n);
       (*os) << "(";
-      emitExpr(c->cond.get());
+      emitCondition(c->cond.get());
       (*os) << " ? ";
       emitExpr(c->thenExpr.get());
       (*os) << " : ";

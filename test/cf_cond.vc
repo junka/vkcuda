@@ -1,0 +1,86 @@
+// test/cf_cond.vc — control-flow conditions + multi-declarator for.
+//
+// Regression for two GLSL/MLIR gaps fixed together:
+//   1. GLSL requires a genuine bool wherever C/CUDA accept any scalar as a
+//      truth value. `if (a & 1)`, `while (n)`, `(a & 1) ? x : y`, and `!a`
+//      used to fail glslc ("boolean expression expected" / "no operation '!'
+//      exists"). The GLSL backend now wraps non-bool conditions in `bool(...)`
+//      and lowers `!int` to `int(!bool(...))`. The MLIR backend already
+//      coerced via arith.cmpi ne,0, so this is a GLSL-parity fix.
+//   2. Multi-declarator for-loops (`for (int a = 0, b = 3; a < b; a++)`).
+//      GLSL used to re-emit the type per declarator (`int a, int b` — a syntax
+//      error); MLIR used to register only the first declarator (`b` undeclared).
+//      Both backends now handle the full declarator list.
+//
+// Also exercises switch/case/default, do-while, break, continue, compound
+// assignment — all of which already worked but are kept here as a consolidated
+// control-flow correctness anchor.
+//
+//   vcc test/cf_cond.vc -o build/cf_cond_sf && ./build/cf_cond_sf
+//   vc  test/cf_cond.vc -emit=full -o build/cf_cond_m && ./build/cf_cond_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void cfKernel(int *out, int n) {
+  int i = threadIdx.x;
+  if (i >= n) return;
+
+  // int-cond ternary + int-cond if (the GLSL bool-coercion gap).
+  int parity = (i & 1) ? 100 : 200;        // 100 for odd, 200 for even
+  int branch = 0;
+  if (i & 1) branch = 11; else branch = 22; // 11 odd, 22 even
+  int lg = !i;                              // 1 only when i==0, else 0
+
+  // Multi-declarator for: two declarators in one init clause.
+  int s = 0;
+  for (int a = 0, b = 3; a < b; a++) s += a + 1;   // 1+2+3 = 6
+  for (int x = 5, y = 7; x < y; x++) s += x;        // 5+6 = 11 -> 17
+
+  // switch/case/default + break.
+  int sw = 0;
+  switch (i & 3) {
+    case 0: sw = 1; break;
+    case 1: sw = 2; break;
+    default: sw = 3; break;
+  }
+
+  // do-while + while + break/continue in a for.
+  int d = 0; do { d++; } while (d < 2);     // 2
+  int w = 0; while (w < 3) w++;             // 3
+  int br = 0;
+  for (int j = 0; j < 10; j++) { if (j == 5) break; br++; }   // 5
+  int ct = 0;
+  for (int j = 0; j < 10; j++) { if (j & 1) continue; ct++; } // even 0..8 = 5
+
+  out[i] = parity + branch + lg * 1000 + s + sw + d + w + br * 100 + ct * 10;
+}
+
+int main() {
+  vcInit();
+  const int N = 8;
+  void *d = 0;
+  vcMalloc(&d, N * 4);
+  cfKernel<<<1, N>>>(d, N);
+  vcDeviceSynchronize();
+  int h[8] = {0};
+  vcMemcpy(h, d, N * 4, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    int parity = (i & 1) ? 100 : 200;
+    int branch = (i & 1) ? 11 : 22;
+    int lg = !i;
+    int sw = (i & 3) == 0 ? 1 : ((i & 3) == 1 ? 2 : 3);
+    int expect = parity + branch + lg * 1000 + 17 + sw + 2 + 3 + 5 * 100 + 5 * 10;
+    if (h[i] != expect) {
+      printf("  i=%d got=%d expect=%d\n", i, h[i], expect);
+      ok = 0;
+    }
+  }
+  printf("cf_cond: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

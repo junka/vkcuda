@@ -1900,8 +1900,14 @@ private:
       break;
     }
     case ASTNode::NodeKind::DeclStmt: {
-      auto *d = static_cast<DeclStmt *>(n)->decl;
-      if (!d) break;
+      // A DeclStmt may carry several declarators (`int a = 0, b = 3;`); each
+      // needs its own slot + localTypes registration. The AST exposes the first
+      // as `->decl` and the full list as `->decls`; iterate the list so later
+      // declarators are not silently dropped (they used to be, leaving `b`
+      // undeclared in `for (int a = 0, b = 3; ...)`).
+      auto *ds = static_cast<DeclStmt *>(n);
+      for (VarDecl *d : ds->decls) {
+        if (!d) continue;
       // wmma::fragment local: a register-resident gpu.mma_matrix SSA value,
       // not a storage slot. The fragment has no address; load_matrix_sync /
       // mma_sync produce a new SSA value which we track in wmmaFragments, and
@@ -1910,9 +1916,9 @@ private:
       // or mma writes it).
       if (d->type && isa<WmmaFragmentType>(d->type)) {
         mlir::Type cmTy = cvtType(d->type);
-        if (!cmTy) { error(d, "unsupported wmma fragment type"); break; }
+        if (!cmTy) { error(d, "unsupported wmma fragment type"); continue; }
         localTypes[d->name] = d->type;
-        break;
+        continue;
       }
       // Locals become stack allocations tagged with the SPIR-V Function
       // storage class; MemRefToSPIRV refuses to lower allocas whose memory
@@ -1922,7 +1928,7 @@ private:
       // thread allocas, so __shared__ decls become memref.global symbols
       // fetched via memref.get_global in the body.
       mlir::Type ty = cvtType(d->type);
-      if (!ty) { error(d, "unsupported local type"); break; }
+      if (!ty) { error(d, "unsupported local type"); continue; }
       // Build the memref shape from arrayDims. A scalar decl (no arrayDims)
       // uses a 0-d memref as a mutable slot; `float a[16]` -> memref<16xf32>;
       // `float a[16][8]` -> memref<16x8xf32>. An unsized dimension
@@ -1979,7 +1985,7 @@ private:
         localTypes[d->name] = d->type;
         // __shared__ decls may not have a non-constant initializer in CUDA
         // (no host-visible init); ignore any initializer for the global.
-        break;
+        continue;
       }
       MemRefType slotTy = MemRefType::get(
           shape, elemTy, MemRefLayoutAttrInterface(),
@@ -2013,6 +2019,7 @@ private:
           storeValue(addr, visitExpr(d->init.get()), loc(d));
         }
       }
+      } // end for (VarDecl *d : ds->decls)
       break;
     }
     case ASTNode::NodeKind::ExprStmt:
@@ -4288,10 +4295,16 @@ private:
                                                      builder.getZeroAttr(ty));
       return builder.create<arith::SubIOp>(l, zero, loaded);
     }
-    case UnaryOp::LNot:
-      return builder.create<arith::XOrIOp>(
+    case UnaryOp::LNot: {
+      // C's `!v` yields an int (0/1), not a bool. Compute `v == 0` as i1, then
+      // zero-extend to i32 so the result is usable in arithmetic (`lg * 1000`)
+      // — a bare i1 would sign-extend to -1 when true on SPIR-V.
+      Value notZero = builder.create<arith::XOrIOp>(
           l, toI1(v, l), builder.create<arith::ConstantOp>(
                              l, builder.getBoolAttr(true)));
+      return builder.create<arith::ExtUIOp>(
+          l, builder.getI32Type(), notZero);
+    }
     case UnaryOp::Not: {
       Value loaded = loadValue(v, l);
       mlir::Type ty = loaded.getType();
