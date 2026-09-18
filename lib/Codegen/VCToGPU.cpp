@@ -52,7 +52,7 @@ gpu::Dimension toGpuDim(vc::Dim dim) {
 // signature conversion cannot map the kernel arguments and memref.load/store
 // on them fails to legalize (<UNKNOWN SSA VALUE>).
 spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context, bool usesSubgroup,
-                                    bool usesCoopMatrix) {
+                                    bool usesCoopMatrix, bool usesF16Storage) {
   // Int64/Float64/Float16 capabilities are advertised so 64-bit integer
   // (`long`, `long4`) and double (`double`, `double2`) and half (`__half`)
   // types legalize. Vulkan's core Shader capability already covers i32/f32;
@@ -93,6 +93,20 @@ spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context, bool usesSubgroup,
     version = spirv::Version::V_1_6; // supersedes 1.3
     caps.push_back(spirv::Capability::CooperativeMatrixKHR);
     exts.push_back(spirv::Extension::SPV_KHR_cooperative_matrix);
+  }
+  // A by-value f16 vector kernel arg (`__half2 v`, `half4 v`) is pushed through
+  // a PushConstant struct member `vector<Nxf16>` (lowerScalarArgsToPushConstant).
+  // spirv-lower-abi-attrs legalizes that load only with StoragePushConstant16
+  // (SPV_KHR_16bit_storage, SPIR-V >= 1.3). The SSBO f16 path is repaired
+  // post-conversion by fixupF16StorageBuffers, but the push-constant path is
+  // rejected DURING pm.run before a spirv.module even exists — so the cap must
+  // be advertised up front here. `usesF16Storage` is set by packKernels when it
+  // sees an f16 vector scalar param.
+  if (usesF16Storage) {
+    if (version < spirv::Version::V_1_3) version = spirv::Version::V_1_3;
+    caps.push_back(spirv::Capability::StoragePushConstant16);
+    if (!llvm::is_contained(exts, spirv::Extension::SPV_KHR_16bit_storage))
+      exts.push_back(spirv::Extension::SPV_KHR_16bit_storage);
   }
   auto triple = spirv::VerCapExtAttr::get(version, caps, exts, context);
   return spirv::TargetEnvAttr::get(triple,
@@ -144,13 +158,19 @@ void rewriteIndexingOps(ModuleOp module, IRRewriter &rw) {
 static void lowerScalarArgsToPushConstant(gpu::GPUFuncOp gpuFn,
                                           OpBuilder &builder) {
   // Partition args: which are scalar (to move into the PC block) vs pointer
-  // (memref, to keep as interface variables).
+  // (memref, to keep as interface variables). A by-value vector arg
+  // (vector<NxELEM>, e.g. `float4 v` / `__half2 v`) is NOT a pointer — it is
+  // a value passed through push constants just like a scalar. ShapedType
+  // covers both MemRefType and VectorType, so we must test MemRefType
+  // specifically; otherwise a vector arg gets misclassified as a pointer,
+  // handed a descriptor binding it cannot satisfy, and spirv.func legalization
+  // fails ("explicitly marked illegal").
   SmallVector<Type> scalarTys;
   SmallVector<unsigned> scalarArgIdxs;
   SmallVector<unsigned> pointerArgIdxs;
   TypeRange inputTys = gpuFn.getFunctionType().getInputs();
   for (auto [i, ty] : llvm::enumerate(inputTys)) {
-    if (isa<ShapedType>(ty))
+    if (isa<MemRefType>(ty))
       pointerArgIdxs.push_back(i);
     else {
       scalarArgIdxs.push_back(i);
@@ -181,7 +201,15 @@ static void lowerScalarArgsToPushConstant(gpu::GPUFuncOp gpuFn,
   uint32_t off = 0;
   for (Type ty : scalarTys) {
     offsets.push_back(off);
-    uint32_t sz = ty.isIntOrFloat() ? (ty.getIntOrFloatBitWidth() / 8) : 4;
+    // Byte size of one push-constant member. Scalars use their bit width;
+    // vectors pack element_count * (elem_bit_width/8) contiguously with no
+    // per-lane padding (mirrors the host's sizeof of the emitted C++ vector
+    // struct, e.g. half2 = 2*_Float16 = 4 bytes, float4 = 4*float = 16).
+    uint32_t sz;
+    if (auto vty = ty.dyn_cast<mlir::VectorType>())
+      sz = (vty.getNumElements() * vty.getElementTypeBitWidth()) / 8;
+    else
+      sz = ty.isIntOrFloat() ? (ty.getIntOrFloatBitWidth() / 8) : 4;
     off += (sz + 3u) & ~3u; // round up to 4 bytes (std140-friendly)
   }
   Type pcStructTy = spirv::StructType::get(scalarTys, offsets);
@@ -357,6 +385,23 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
   if (kernels.empty()) return;
 
   gpu::GPUModuleOp gpuModule;
+  // Pre-scan every kernel's signature for a by-value f16 vector param
+  // (`__half2 v`): such a param becomes a PushConstant struct member
+  // vector<Nxf16>, which needs StoragePushConstant16 advertised up front in
+  // the target env (see getVCTargetEnv). Computed once over all kernels.
+  auto kernelUsesF16VectorParam = [&]() {
+    for (vc::KernelOp k : kernels) {
+      func::FuncOp fn = module.lookupSymbol<func::FuncOp>(k.getFunction());
+      if (!fn) continue;
+      for (Type ty : fn.getFunctionType().getInputs()) {
+        if (auto vty = ty.dyn_cast<mlir::VectorType>();
+            vty && vty.getElementType().isF16())
+          return true;
+      }
+    }
+    return false;
+  };
+  bool usesF16Storage = kernelUsesF16VectorParam();
   for (vc::KernelOp k : kernels) {
     func::FuncOp fn = module.lookupSymbol<func::FuncOp>(k.getFunction());
     if (!fn) {
@@ -378,7 +423,7 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
     bool usesCoopMatrix = module->hasAttr("vc.uses_coopmatrix");
     gpuModule->setAttr(spirv::getTargetEnvAttrName(),
                        getVCTargetEnv(module.getContext(), usesSubgroup,
-                                      usesCoopMatrix));
+                                      usesCoopMatrix, usesF16Storage));
 
     rw.setInsertionPointToStart(gpuModule.getBody());
     auto gpuFn = rw.create<gpu::GPUFuncOp>(k.getLoc(), fn.getName(),

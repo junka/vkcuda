@@ -171,7 +171,79 @@ private:
     // definition so a `dim3(N,N)` expression type-checks even though the launch
     // translator normally splits it into X/Y before emitting it.
     os << "struct dim3 { unsigned x=1,y=1,z=1; "
-          "dim3(unsigned X=1,unsigned Y=1,unsigned Z=1):x(X),y(Y),z(Z){} };\n\n";
+          "dim3(unsigned X=1,unsigned Y=1,unsigned Z=1):x(X),y(Y),z(Z){} };\n";
+    // CUDA-style vector types (float4/int3/half2/...) are device-only in
+    // spirit, but a by-value vector can reach host code as a scalar kernel
+    // argument (`k<<<1,1>>>(float4(1,2,3,4), out)`). Emit host definitions
+    // whose sizeof matches the device's packed layout (elem*count, no padding:
+    // float3=12, half2=4, half3=6, half4=8, ...), with x/y/z/w members and a
+    // per-count constructor so the ctor call and .x/.y swizzle the host
+    // emitter produces verbatim type-check. _Float16 backs `half` (see cppType).
+    // make_<vec> aliases map to the same structs.
+    os << "struct float2{float x,y;float2(float a=0,float b=0):x(a),y(b){}};"
+          "struct float3{float x,y,z;float3(float a=0,float b=0,float c=0)"
+          ":x(a),y(b),z(c){}};struct float4{float x,y,z,w;float4(float a=0,"
+          "float b=0,float c=0,float d=0):x(a),y(b),z(c),w(d){}};\n";
+    os << "struct int2{int x,y;int2(int a=0,int b=0):x(a),y(b){}};"
+          "struct int3{int x,y,z;int3(int a=0,int b=0,int c=0):x(a),y(b),"
+          "z(c){}};struct int4{int x,y,z,w;int4(int a=0,int b=0,int c=0,"
+          "int d=0):x(a),y(b),z(c),w(d){}};\n";
+    os << "struct uint2{unsigned x,y;uint2(unsigned a=0,unsigned b=0):x(a),"
+          "y(b){}};struct uint3{unsigned x,y,z;uint3(unsigned a=0,unsigned b=0,"
+          "unsigned c=0):x(a),y(b),z(c){}};struct uint4{unsigned x,y,z,w;"
+          "uint4(unsigned a=0,unsigned b=0,unsigned c=0,unsigned d=0):x(a),"
+          "y(b),z(c),w(d){}};\n";
+    os << "struct double2{double x,y;double2(double a=0,double b=0):x(a),"
+          "y(b){}};struct double3{double x,y,z;double3(double a=0,double b=0,"
+          "double c=0):x(a),y(b),z(c){}};struct double4{double x,y,z,w;"
+          "double4(double a=0,double b=0,double c=0,double d=0):x(a),y(b),"
+          "z(c),w(d){}};\n";
+    os << "struct long2{long x,y;long2(long a=0,long b=0):x(a),y(b){}};"
+          "struct long3{long x,y,z;long3(long a=0,long b=0,long c=0):x(a),"
+          "y(b),z(c){}};struct long4{long x,y,z,w;long4(long a=0,long b=0,"
+          "long c=0,long d=0):x(a),y(b),z(c),w(d){}};\n";
+    os << "struct ulong2{unsigned long x,y;ulong2(unsigned long a=0,"
+          "unsigned long b=0):x(a),y(b){}};struct ulong3{unsigned long x,y,z;"
+          "ulong3(unsigned long a=0,unsigned long b=0,unsigned long c=0):x(a),"
+          "y(b),z(c){}};struct ulong4{unsigned long x,y,z,w;ulong4(unsigned "
+          "long a=0,unsigned long b=0,unsigned long c=0,unsigned long d=0):"
+          "x(a),y(b),z(c),w(d){}};\n";
+    os << "struct half2{_Float16 x,y;half2(_Float16 a=0,_Float16 b=0):x(a),"
+          "y(b){}};struct half3{_Float16 x,y,z;half3(_Float16 a=0,_Float16 b=0,"
+          "_Float16 c=0):x(a),y(b),z(c){}};struct half4{_Float16 x,y,z,w;"
+          "half4(_Float16 a=0,_Float16 b=0,_Float16 c=0,_Float16 d=0):x(a),"
+          "y(b),z(c),w(d){}};\n";
+    // Legacy CUDA double-underscore spellings alias the bare names.
+    os << "using __half2=half2;using __half3=half3;using __half4=half4;\n";
+    // make_<vec>(...) constructor aliases.
+    os << "inline float2 make_float2(float a,float b){return float2(a,b);}"
+          "inline float3 make_float3(float a,float b,float c){return float3(a,b"
+          ",c);}inline float4 make_float4(float a,float b,float c,float d)"
+          "{return float4(a,b,c,d);}\n";
+    os << "inline int2 make_int2(int a,int b){return int2(a,b);}inline int3 "
+          "make_int3(int a,int b,int c){return int3(a,b,c);}inline int4 "
+          "make_int4(int a,int b,int c,int d){return int4(a,b,c,d);}\n";
+    os << "inline uint2 make_uint2(unsigned a,unsigned b){return uint2(a,b);}"
+          "inline uint3 make_uint3(unsigned a,unsigned b,unsigned c){return "
+          "uint3(a,b,c);}inline uint4 make_uint4(unsigned a,unsigned b,"
+          "unsigned c,unsigned d){return uint4(a,b,c,d);}\n";
+    os << "inline double2 make_double2(double a,double b){return double2(a,b);}"
+          "inline double3 make_double3(double a,double b,double c){return "
+          "double3(a,b,c);}inline double4 make_double4(double a,double b,"
+          "double c,double d){return double4(a,b,c,d);}\n";
+    os << "inline long2 make_long2(long a,long b){return long2(a,b);}inline "
+          "long3 make_long3(long a,long b,long c){return long3(a,b,c);}"
+          "inline long4 make_long4(long a,long b,long c,long d){return "
+          "long4(a,b,c,d);}\n";
+    os << "inline ulong2 make_ulong2(unsigned long a,unsigned long b){return "
+          "ulong2(a,b);}inline ulong3 make_ulong3(unsigned long a,unsigned long "
+          "b,unsigned long c){return ulong3(a,b,c);}inline ulong4 make_ulong4("
+          "unsigned long a,unsigned long b,unsigned long c,unsigned long d)"
+          "{return ulong4(a,b,c,d);}\n";
+    os << "inline half2 make_half2(_Float16 a,_Float16 b){return half2(a,b);}"
+          "inline half3 make_half3(_Float16 a,_Float16 b,_Float16 c){return "
+          "half3(a,b,c);}inline half4 make_half4(_Float16 a,_Float16 b,"
+          "_Float16 c,_Float16 d){return half4(a,b,c,d);}\n\n";
   }
 
   void emitSpirvEmbed() {
@@ -1094,10 +1166,28 @@ private:
       return cppType(static_cast<const ReferenceType *>(t)->pointee) + "&";
     }
     if (t->getKind() == TypeKind::Vector) {
-      // float4 etc. aren't real host types; emit the name best-effort. Host
-      // code shouldn't use these (documented limitation).
+      // float4 etc. are real host types now (see emitPreamble): a struct with
+      // x/y/z/w members and sizeof matching the device's packed layout. Used
+      // when a by-value vector is a scalar kernel param (the host spill local
+      // `auto __vc_aK = (float4(...))` needs the type to resolve). Build the
+      // CUDA spelling from the element kind (UInt64 -> "ulong", not the
+      // cppType spelling "unsigned long") + count, mirroring the parser's
+      // makeVectorType base table.
       auto *v = static_cast<const VectorType *>(t);
-      return "int/*vec" + std::to_string(v->count) + "*/";
+      const char *base = "float";
+      if (v->elem->getKind() == TypeKind::Builtin) {
+        switch (static_cast<const BuiltinType *>(v->elem)->builtin) {
+        case BuiltinTypeKind::Float32: base = "float"; break;
+        case BuiltinTypeKind::Int32:   base = "int"; break;
+        case BuiltinTypeKind::UInt32:  base = "uint"; break;
+        case BuiltinTypeKind::Float64: base = "double"; break;
+        case BuiltinTypeKind::Bool:    base = "bool"; break;
+        case BuiltinTypeKind::Int64:   base = "long"; break;
+        case BuiltinTypeKind::UInt64:  base = "ulong"; break;
+        case BuiltinTypeKind::Float16: base = "half"; break;
+        }
+      }
+      return std::string(base) + std::to_string(v->count);
     }
     if (t->getKind() == TypeKind::Record) {
       auto *r = static_cast<const RecordType *>(t);

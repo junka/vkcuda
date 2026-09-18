@@ -1,0 +1,50 @@
+// test/vec_arg.vc — by-value vector kernel parameters.
+//
+// CUDA kernels can take small vector types as scalar (by-value) parameters:
+// `__global__ void k(float4 a, int4 b, __half2 c, ...)`. VC lowers each such
+// arg through the push-constant block (the device reads a vector<NxELEM> field
+// out of the PC struct; the host emits a real C++ vector struct whose sizeof
+// matches the device's packed layout and spills it to `auto __vc_aK = (vec(...))`).
+//
+// This exercises:
+//   - float4 / int4 / __half2 scalar params (different element widths + counts)
+//   - host-side vector struct definitions (float4/int4/half2) with constructors
+//     + .x/.y/.z/.w member access, and the `__half2` legacy spelling
+//   - the StoragePushConstant16 capability path for the f16 vector param
+//
+//   vcc test/vec_arg.vc -o build/vec_arg_sf && ./build/vec_arg_sf
+//   vc  test/vec_arg.vc -emit=full -o build/vec_arg_m && ./build/vec_arg_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+// Multiple by-value vector params of different widths. Result combines one
+// lane from each so a wrong-width or misaligned push would read garbage.
+//   a=(1,2,3,4) b=(10,20,30,40) c=(5,6)
+//   a.x + a.w + b.y + b.z + c.x + c.y = 1+4 + 20+30 + 5+6 = 66
+__global__ void vecArgKernel(float4 a, int4 b, __half2 c, float *out) {
+  if (threadIdx.x == 0)
+    out[0] = a.x + a.w + b.y + b.z + (float)c.x + (float)c.y;
+}
+
+int main() {
+  vcInit();
+
+  void *dOut = 0;
+  vcMalloc(&dOut, 4);
+
+  vecArgKernel<<<1, 32>>>(float4(1.0f, 2.0f, 3.0f, 4.0f),
+                          int4(10, 20, 30, 40),
+                          __half2(5.0f, 6.0f), dOut);
+  vcDeviceSynchronize();
+
+  float h = 0;
+  vcMemcpy(&h, dOut, 4, VCMemcpyKind::DeviceToHost);
+
+  int ok = (h == 66.0f);
+  printf("vec_arg: %s (got=%.1f expect=66.0)\n", ok ? "PASS" : "FAIL", h);
+
+  vcFree(dOut);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

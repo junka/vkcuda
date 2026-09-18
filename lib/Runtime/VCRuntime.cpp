@@ -423,10 +423,21 @@ bool Runtime::setupLogicalDevice(
   // device supports them; kernels that don't use __half SSBOs are unaffected.
   // (coopMatrix above may already have set shaderFloat16; this additionally
   // gates on 16-bit storage and chains the 16BitStorage struct into dci.)
+  //
+  // A by-value f16 vector kernel arg (`__half2 v`) is pushed through a push
+  // constant whose struct member is `vector<Nxf16>`; loading it requires
+  // storagePushConstant16 (same VK_KHR_16bit_storage). Enable it alongside
+  // when supported so f16 vector scalar params work.
   if (supported12.shaderFloat16 &&
       supportedF16Storage.storageBuffer16BitAccess) {
     feats12.shaderFloat16 = VK_TRUE;
     f16StorageFeats.storageBuffer16BitAccess = VK_TRUE;
+    vd.f16Storage = true;
+  }
+  if (supported12.shaderFloat16 &&
+      supportedF16Storage.storagePushConstant16) {
+    feats12.shaderFloat16 = VK_TRUE;
+    f16StorageFeats.storagePushConstant16 = VK_TRUE;
     vd.f16Storage = true;
   }
 

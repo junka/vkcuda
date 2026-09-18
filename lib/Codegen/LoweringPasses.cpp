@@ -288,26 +288,62 @@ static void fixupF16StorageBuffers(ModuleOp module) {
     // stamps a vce_triple that admits the 16-bit-storage ops; otherwise
     // spirv-lower-abi-attrs rejects the spirv.Bitcast ("requires
     // SPV_KHR_16bit_storage"). Done only when we actually narrowed an f16 SSBO.
-    if (auto envAttr = spvModule->getAttrOfType<spirv::TargetEnvAttr>(
-            spirv::getTargetEnvAttrName())) {
-      auto triple = envAttr.getTripleAttr();
-      auto version = triple.getVersion();
-      if (version < spirv::Version::V_1_3)
-        version = spirv::Version::V_1_3;
-      SmallVector<spirv::Capability, 8> caps(
-          triple.getCapabilities().begin(), triple.getCapabilities().end());
-      if (!llvm::is_contained(caps, spirv::Capability::StorageBuffer16BitAccess))
-        caps.push_back(spirv::Capability::StorageBuffer16BitAccess);
-      SmallVector<spirv::Extension, 4> exts(
-          triple.getExtensions().begin(), triple.getExtensions().end());
-      if (!llvm::is_contained(exts, spirv::Extension::SPV_KHR_16bit_storage))
-        exts.push_back(spirv::Extension::SPV_KHR_16bit_storage);
-      auto newTriple = spirv::VerCapExtAttr::get(version, caps, exts, ctx);
-      spvModule->setAttr(spirv::getTargetEnvAttrName(),
-                         spirv::TargetEnvAttr::get(
-                             newTriple, envAttr.getResourceLimits(),
-                             envAttr.getClientAPI(), envAttr.getVendorID(),
-                             envAttr.getDeviceType(), envAttr.getDeviceID()));
+    //
+    // A by-value f16 vector kernel arg (`__half2 v`) takes a second path: it
+    // becomes a spirv.GlobalVariable in PushConstant storage whose struct
+    // member is `vector<Nxf16>` (lowerScalarArgsToPushConstant). Loading f16
+    // from a push constant requires StoragePushConstant16 (same
+    // SPV_KHR_16bit_storage extension). Detect that case independently of the
+    // SSBO narrowing — it occurs even when no f16 SSBO was narrowed — and add
+    // StoragePushConstant16 alongside.
+    bool hasF16PushConstant = false;
+    spvModule.walk([&](spirv::GlobalVariableOp gv) {
+      // Only PushConstant globals can carry the f16 vector member.
+      auto ptrTy = gv.getType().dyn_cast<spirv::PointerType>();
+      if (!ptrTy || ptrTy.getStorageClass() != spirv::StorageClass::PushConstant)
+        return;
+      // Walk the pointee struct for any f16 element (scalar or vector).
+      if (auto structTy =
+              ptrTy.getPointeeType().dyn_cast<spirv::StructType>()) {
+        for (auto memberTy : structTy.getElementTypes()) {
+          if (auto vecTy = memberTy.dyn_cast<mlir::VectorType>())
+            memberTy = vecTy.getElementType();
+          if (memberTy.isF16()) {
+            hasF16PushConstant = true;
+            return;
+          }
+        }
+      }
+    });
+    if (!f16Bases.empty() || hasF16PushConstant) {
+      if (auto envAttr = spvModule->getAttrOfType<spirv::TargetEnvAttr>(
+              spirv::getTargetEnvAttrName())) {
+        auto triple = envAttr.getTripleAttr();
+        auto version = triple.getVersion();
+        if (version < spirv::Version::V_1_3)
+          version = spirv::Version::V_1_3;
+        SmallVector<spirv::Capability, 8> caps(
+            triple.getCapabilities().begin(),
+            triple.getCapabilities().end());
+        if (!f16Bases.empty() &&
+            !llvm::is_contained(caps,
+                                spirv::Capability::StorageBuffer16BitAccess))
+          caps.push_back(spirv::Capability::StorageBuffer16BitAccess);
+        if (hasF16PushConstant &&
+            !llvm::is_contained(caps,
+                                spirv::Capability::StoragePushConstant16))
+          caps.push_back(spirv::Capability::StoragePushConstant16);
+        SmallVector<spirv::Extension, 4> exts(
+            triple.getExtensions().begin(), triple.getExtensions().end());
+        if (!llvm::is_contained(exts, spirv::Extension::SPV_KHR_16bit_storage))
+          exts.push_back(spirv::Extension::SPV_KHR_16bit_storage);
+        auto newTriple = spirv::VerCapExtAttr::get(version, caps, exts, ctx);
+        spvModule->setAttr(spirv::getTargetEnvAttrName(),
+                           spirv::TargetEnvAttr::get(
+                               newTriple, envAttr.getResourceLimits(),
+                               envAttr.getClientAPI(), envAttr.getVendorID(),
+                               envAttr.getDeviceType(), envAttr.getDeviceID()));
+      }
     }
   });
 }
