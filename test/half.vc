@@ -41,11 +41,21 @@ __global__ void halfKernel(float *result, float *a, float *b, int N) {
   half2 vs = va + vb;            // f16vec2 add
   half dot = vs.x + vs.y;        // .x / .y swizzle on f16vec2 -> float16_t
 
+  // Legacy CUDA double-underscore spellings must resolve to the same f16
+  // vector types/ctors as the bare names: __half2/3/4 ctor + .x/.y/.z/.w
+  // swizzle + make_half2. (Regression: __half2 used to lex as a bare
+  // identifier and reach codegen as an unknown struct/call.)
+  __half2 lh = __half2(1.0f, 2.0f);
+  __half3 lh3 = __half3(10.0f, 20.0f, 30.0f);
+  __half4 lh4 = __half4(1.0f, 2.0f, 3.0f, 4.0f);
+  half legacy = lh.x + lh.y + lh3.z + lh4.w;   // 1+2+30+4 = 37
+
   // Use the device helper.
   half r = hfma(ha, hb, hc);
 
   // Store: half result widened back to float for the host-visible buffer.
-  result[i] = float(r) + float(dot);
+  // `legacy` is constant 37 per lane; folded into the per-lane result.
+  result[i] = float(r) + float(dot) + float(legacy);
 }
 
 int main() {
@@ -79,8 +89,8 @@ int main() {
   int ok = 1;
   for (int i = 0; i < N; i++) {
     float a = ha[i], b = hb[i];
-    // r = a*b + 1.5 ; dot = (a+2) + (b+3) ; result = r + dot
-    float expect = (a * b + 1.5f) + ((a + 2.0f) + (b + 3.0f));
+    // r = a*b + 1.5 ; dot = (a+2) + (b+3) ; legacy = 37 ; result = r + dot + 37
+    float expect = (a * b + 1.5f) + ((a + 2.0f) + (b + 3.0f)) + 37.0f;
     float got = hr[i];
     if (got < expect - 0.5f || got > expect + 0.5f) {
       printf("  mismatch i=%d got=%f expect~%f\n", i, got, expect);

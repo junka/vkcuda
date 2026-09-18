@@ -934,6 +934,10 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
 Type *Parser::makeVectorType(StringRef name) {
   // CUDA/HLSL-style vector names: <base><count>, count in 2..4.
   // Recognized bases: float, int, uint, double, bool, long, ulong, half.
+  // `__half` is accepted alongside `half` so the legacy CUDA spelling
+  // `__half2`/`__half3`/`__half4` resolves to the same f16 vector type —
+  // `__half` lexes as kw_half but `__half2` is a single identifier token, so
+  // it reaches here and must be matched explicitly.
   struct Base { const char *prefix; BuiltinTypeKind kind; };
   static constexpr Base bases[] = {
       {"float", BuiltinTypeKind::Float32},
@@ -944,6 +948,7 @@ Type *Parser::makeVectorType(StringRef name) {
       {"long", BuiltinTypeKind::Int64},
       {"ulong", BuiltinTypeKind::UInt64},
       {"half", BuiltinTypeKind::Float16},
+      {"__half", BuiltinTypeKind::Float16},
   };
   for (const Base &b : bases) {
     StringRef p = b.prefix;

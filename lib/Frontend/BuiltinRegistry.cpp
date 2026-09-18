@@ -15,9 +15,10 @@ namespace {
 
 // CUDA-style vector base names: <base><2..4> e.g. float4, int3, ulong2.
 // Mirrors the set Parser::makeVectorType and Sema::isVectorCtorName used, so
-// recognition stays identical.
+// recognition stays identical. `__half` is alongside `half` so the legacy
+// `__half2`/`__half3`/`__half4` spellings are recognized too.
 const char *kVectorBases[] = {"float", "int", "uint", "double",
-                              "bool",  "long", "ulong", "half"};
+                              "bool",  "long", "ulong", "half", "__half"};
 
 bool isPlainVectorCtorName(llvm::StringRef name) {
   for (const char *b : kVectorBases) {

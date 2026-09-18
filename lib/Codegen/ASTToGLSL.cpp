@@ -773,7 +773,7 @@ private:
         {"float", "vec"}, {"int", "ivec"}, {"uint", "uvec"},
         {"double", "dvec"}, {"bool", "bvec"},
         {"long", "i64vec"}, {"ulong", "u64vec"},
-        {"half", "f16vec"},
+        {"half", "f16vec"}, {"__half", "f16vec"},
     };
     for (const Base &b : bases) {
       StringRef p = b.prefix;

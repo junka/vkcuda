@@ -3031,6 +3031,7 @@ private:
         {"long", BuiltinTypeKind::Int64},
         {"ulong", BuiltinTypeKind::UInt64},
         {"half", BuiltinTypeKind::Float16},
+        {"__half", BuiltinTypeKind::Float16},
     };
     for (const Base &b : bases) {
       llvm::StringRef p = b.prefix;

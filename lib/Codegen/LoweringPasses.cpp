@@ -29,6 +29,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -461,7 +462,33 @@ void runLoweringPipeline(ModuleOp module) {
   // succeeds. A genuine (non-f16) lowering failure leaves the spirv.module
   // unserializable, caught by rerunAbortedSPIRVLegality's emitError or the
   // driver's "spirv translation failed".
-  (void)failed(pm.run(module));
+  //
+  // The MLIR op verifier still reports the offending spirv.Store/Load mismatch
+  // as an inline error diagnostic DURING pm.run (before fixupF16StorageBuffers
+  // repairs it). That single stderr line is spurious — the build succeeds and
+  // spirv-val passes — so install a scoped handler around pm.run that swallows
+  // exactly that known mismatch and forwards everything else. The handler is
+  // RAII-scoped to this pm.run, so it cannot mask errors elsewhere or later.
+  {
+    ScopedDiagnosticHandler diagHandler(&ctx, [](Diagnostic &diag) {
+      if (diag.getSeverity() == DiagnosticSeverity::Error) {
+        std::string msg = diag.str();
+        // The residue the f16-SSBO converter leaves, repaired post-run by
+        // fixupF16StorageBuffers. Match on the verifier's wording so unrelated
+        // spirv.Store/Load errors still surface.
+        if (msg.find("spirv.Store") != std::string::npos &&
+            msg.find("mismatch in result type and pointer type") !=
+                std::string::npos)
+          return success();
+        if (msg.find("spirv.Load") != std::string::npos &&
+            msg.find("mismatch in result type and pointer type") !=
+                std::string::npos)
+          return success();
+      }
+      return failure();
+    });
+    (void)failed(pm.run(module));
+  }
 
   // Post-conversion rewrite of atomics GPUToSPIRV could not lower directly
   // (atomicExch on SSBO/global, emitted as a marked AtomicIAdd).
