@@ -340,9 +340,10 @@ void Sema::checkUnusedInFrame(const llvm::StringMap<ASTNode *> &frame) {
 // uses), counting consumed dims; returns the decl iff at least one dim remains.
 VarDecl *Sema::subArrayDecayOf(const ASTNode *n, unsigned &dimsConsumed) {
   dimsConsumed = 0;
-  if (!n || n->getNodeType() != ASTNode::NodeKind::IndexExpr)
-    return nullptr;
+  if (!n) return nullptr;
   const ASTNode *cur = n;
+  // Either a bare array reference (`T arr[N]; T *p = arr` — full decay) or a
+  // chain of IndexExprs rooted at one (`arr[i]`, `arr[i][j]` — partial decay).
   while (cur && cur->getNodeType() == ASTNode::NodeKind::IndexExpr)
     cur = static_cast<const IndexExpr *>(cur)->base.get(), ++dimsConsumed;
   if (!cur || cur->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
@@ -982,9 +983,27 @@ void Sema::checkStmt(const ASTNode *n) {
             static_cast<BuiltinType *>(initTy)->builtin ==
                 BuiltinTypeKind::Void)
           warn(v, "initializer has type void");
-        else if (v->type && !isCompatibleForAssign(v->type, initTy))
-          warn(v, "initializer of type " + typeName(initTy) +
-                      " does not match declared type " + typeName(v->type));
+        else if (v->type && !isCompatibleForAssign(v->type, initTy)) {
+          // Array-to-pointer decay on init: `T *p = arr` or `T *p = arr[i]`
+          // where arr is a (multi-dim) array of T. checkExpr returns the
+          // element type for an array reference (no ArrayType node), so the
+          // binding looks like T -> T*; allow it when the pointee matches.
+          bool decayOk = false;
+          if (v->type->getKind() == TypeKind::Pointer) {
+            unsigned dc = 0;
+            if (VarDecl *av = subArrayDecayOf(v->init.get(), dc)) {
+              const Type *pointee = resolveTypedefs(
+                  static_cast<const PointerType *>(resolveTypedefs(v->type))
+                      ->pointee);
+              if (!pointee ||
+                  sameType(pointee, resolveTypedefs(av->type)))
+                decayOk = true;
+            }
+          }
+          if (!decayOk)
+            warn(v, "initializer of type " + typeName(initTy) +
+                        " does not match declared type " + typeName(v->type));
+        }
       }
     }
     // Back-compat: a DeclStmt built with a single decl also sets `decl`.

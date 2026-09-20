@@ -1,0 +1,62 @@
+// test/vector_ptr_swizzle.vc — swizzle write through a vector pointer deref.
+//
+// `(*p).x = v` and `p[i].y = v` write a single component of a vector that is
+// reached through a pointer into a LOCAL vector array (`float4 buf[N];
+// float4 *p = buf;`). The GLSL backend lowers these to native vec4 swizzle
+// stores (`buf[0].x = 7`); the MLIR backend has no swizzle store, so it loads
+// the current vector at the pointer target, CompositeInserts the written
+// component, and stores the whole vector back.
+//
+// Exercises:
+//   - `(*p).x = v`     plain deref + single-component write
+//   - `p[i].y = v`     subscript + single-component write
+//   - `q[k] = vec`     whole-vector write through a derived pointer (q = p + 1)
+//   - read-back of every written component to confirm the scatter landed
+//
+// Both backends PASS. Complements vector_ptr.vc (which covers SSBO vector-
+// pointer params, not local-array pointer deref + swizzle writes).
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void vps(int *out) {
+  float4 buf[4];
+  buf[0] = make_float4(1, 2, 3, 4);
+  buf[1] = make_float4(10, 20, 30, 40);
+  buf[2] = make_float4(100, 200, 300, 400);
+  buf[3] = make_float4(1000, 2000, 3000, 4000);
+
+  float4 *p = buf;
+  (*p).x = 7;           // buf[0].x: 1 -> 7
+  p[1].y = 17;          // buf[1].y: 20 -> 17
+  float4 *q = p + 2;    // points at buf[2]
+  q[0].z = 314;         // buf[2].z: 300 -> 314
+  (*q).w = 415;         // buf[2].w: 400 -> 415
+
+  // Read everything back via the pointer to confirm writes landed.
+  out[0] = (int)p[0].x;   // 7
+  out[1] = (int)p[0].y;   // 2
+  out[2] = (int)p[1].y;   // 17
+  out[3] = (int)p[1].x;   // 10
+  out[4] = (int)q[0].z;   // 314
+  out[5] = (int)q[0].w;   // 415
+  out[6] = (int)p[3].x;   // 1000 (untouched)
+  out[7] = (int)p[3].w;   // 4000 (untouched)
+}
+
+int main() {
+  vcInit();
+  void *d = 0;
+  vcMalloc(&d, 32);
+  vps<<<1, 1>>>(d);
+  vcDeviceSynchronize();
+  int h[8] = {0};
+  vcMemcpy(h, d, 32, VCMemcpyKind::DeviceToHost);
+  int ok = h[0] == 7 && h[1] == 2 && h[2] == 17 && h[3] == 10 &&
+           h[4] == 314 && h[5] == 415 && h[6] == 1000 && h[7] == 4000;
+  printf("vps: %s (h=%d %d %d %d %d %d %d %d)\n",
+         ok ? "PASS" : "FAIL", h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

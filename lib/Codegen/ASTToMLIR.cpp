@@ -1265,6 +1265,162 @@ private:
     return true;
   }
 
+  // Write a single component (or multi-char swizzle) of a vector that lives
+  // behind a pointer dereference: `(*p).x = v`, `p[i].y = v`, `(*q).xy = w`.
+  // The base (`*p` / `p[i]`) is a vector-typed lvalue reached through a
+  // pointer local, not a plain named vector slot (the swizzle-store path in
+  // emitBinary already covers `name.x = v`). Strategy: load the current vector
+  // at the pointer target, CompositeInsert the written component(s), and store
+  // the whole vector back through the same pointer lvalue. Returns true if
+  // handled (caller returns); false if `m` is not such a pointer-deref vector
+  // swizzle (caller falls through to other lvalue paths).
+  bool storePointerVectorSwizzle(MemberAccessExpr *m, Value rhs, Location l) {
+    if (!m || !m->base) return false;
+    ASTNode *base = m->base.get();
+    mlir::VectorType vecTy;
+    Value cur;  // current vector value at the target
+    // Captured target address, kept alive for the writeBack closure (the
+    // branches below scope their locals, so we hoist the resolved address
+    // here rather than capturing branch-local references by &).
+    Value tgtBase;
+    SmallVector<Value, 2> tgtIdx;
+    bool tgtIsVectorSlot = false;  // memref<Nxvector<...>>: store whole vector
+    // SSBO scalarized vector pointer: re-run storeVectorPointerElement on the
+    // base IndexExpr with the updated vector.
+    IndexExpr *tgtScatterIE = nullptr;
+
+    auto resolvePtrLocal = [&](const ASTNode *node,
+                               StringRef &name) -> PtrLocal * {
+      if (!node) return nullptr;
+      if (node->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+        name = static_cast<const DeclRefExpr *>(node)->name;
+      } else if (node->getNodeType() == ASTNode::NodeKind::UnaryExpr &&
+                 static_cast<const UnaryExpr *>(node)->op == UnaryOp::Deref) {
+        const ASTNode *op = static_cast<const UnaryExpr *>(node)->operand.get();
+        if (op && op->getNodeType() == ASTNode::NodeKind::DeclRefExpr)
+          name = static_cast<const DeclRefExpr *>(op)->name;
+      }
+      if (name.empty()) return nullptr;
+      auto it = pointerLocalsML.find(name);
+      return it == pointerLocalsML.end() ? nullptr : &it->second;
+    };
+
+    // Determine the vc pointee vector type from localTypes (the pointer decl's
+    // declared type carries the real vector element/count).
+    auto pointeeVecType = [&](StringRef name) -> mlir::VectorType {
+      auto tit = localTypes.find(name);
+      if (tit == localTypes.end() || !tit->second) return nullptr;
+      auto *ptrTy = dyn_cast<vc::PointerType>(tit->second);
+      if (!ptrTy) return nullptr;
+      auto *vty = dyn_cast<vc::VectorType>(ptrTy->pointee);
+      if (!vty) return nullptr;
+      mlir::Type elemTy = cvtType(vty->elem);
+      if (!elemTy) return nullptr;
+      return mlir::VectorType::get({(int64_t)vty->count}, elemTy);
+    };
+
+    if (base->getNodeType() == ASTNode::NodeKind::UnaryExpr &&
+        static_cast<const UnaryExpr *>(base)->op == UnaryOp::Deref) {
+      // `(*p).comp = v`: pointer-local deref. pointerLValue gives the vector
+      // slot (base memref + offset index); the memref element type must be a
+      // vector (local vector array -> memref<Nxvector<...>>).
+      Value pBase;
+      SmallVector<Value, 2> pIdx;
+      if (!pointerLValue(base, pBase, pIdx)) return false;
+      auto mty = pBase.getType().dyn_cast<MemRefType>();
+      if (!mty) return false;
+      auto vty = mty.getElementType().dyn_cast<mlir::VectorType>();
+      if (!vty) return false;  // scalar memref (SSBO scalarized pointer) not here
+      vecTy = vty;
+      cur = builder.create<memref::LoadOp>(l, pBase, pIdx);
+      tgtBase = pBase;
+      tgtIdx = pIdx;
+      tgtIsVectorSlot = true;
+    } else if (base->getNodeType() == ASTNode::NodeKind::IndexExpr) {
+      // `p[i].comp = v`: vector-pointer subscript. The pointer is scalarized
+      // to memref<?xELEM> (SSBO) OR a local vector-array memref<Nxvector<...>>.
+      // Handle both: local vector array uses pointerLValue directly; SSBO
+      // scalarized pointer uses load/storeVectorPointerElement's N-slot scatter.
+      auto *ie = static_cast<IndexExpr *>(base);
+      Value pBase;
+      SmallVector<Value, 2> pIdx;
+      if (pointerLValue(base, pBase, pIdx)) {
+        auto mty = pBase.getType().dyn_cast<MemRefType>();
+        if (!mty) return false;
+        auto vty = mty.getElementType().dyn_cast<mlir::VectorType>();
+        if (!vty) return false;  // not a vector-element memref
+        vecTy = vty;
+        cur = builder.create<memref::LoadOp>(l, pBase, pIdx);
+        tgtBase = pBase;
+        tgtIdx = pIdx;
+        tgtIsVectorSlot = true;
+      } else {
+        // SSBO scalarized vector pointer: p[i] spans N scalar slots. Reuse the
+        // element load/store helpers (they take the IndexExpr directly). The
+        // pointee vector type comes from localTypes.
+        StringRef nm;
+        PtrLocal *pl = resolvePtrLocal(ie->base.get(), nm);
+        if (!pl) return false;
+        vecTy = pointeeVecType(nm);
+        if (!vecTy) return false;
+        cur = loadVectorPointerElement(ie, l);
+        if (!cur) return false;
+        if (cur.getType() != vecTy) cur = castValue(cur, vecTy, l);
+        tgtScatterIE = ie;
+      }
+    } else {
+      return false;
+    }
+
+    if (!cur || !vecTy) return false;
+
+    // Resolve swizzle component indices.
+    auto charToIdx = [](char c) -> int {
+      switch (c) {
+      case 'x': case 'r': case 's': return 0;
+      case 'y': case 'g': case 't': return 1;
+      case 'z': case 'b': case 'p': return 2;
+      case 'w': case 'a': case 'q': return 3;
+      default: return -1;
+      }
+    };
+    StringRef sw = m->member;
+    SmallVector<int32_t, 4> dstIdxs;
+    bool ok = !sw.empty();
+    for (char c : sw) {
+      int i = charToIdx(c);
+      if (i < 0 || (unsigned)i >= vecTy.getNumElements()) { ok = false; break; }
+      dstIdxs.push_back(i);
+    }
+    if (!ok) {
+      error(m, "invalid vector swizzle on pointer-deref LHS");
+      return false;
+    }
+
+    rhs = loadValue(rhs, l);
+    Value updated = cur;
+    for (size_t i = 0; i < dstIdxs.size(); ++i) {
+      Value part;
+      if (rhs.getType().isa<mlir::VectorType>()) {
+        part = builder.create<spirv::CompositeExtractOp>(
+            l, rhs.getType().cast<mlir::VectorType>().getElementType(), rhs,
+            builder.getI32ArrayAttr({(int32_t)i}));
+      } else {
+        part = castValue(rhs, vecTy.getElementType(), l);
+      }
+      updated = builder.create<spirv::CompositeInsertOp>(
+          l, vecTy, part, updated, builder.getI32ArrayAttr({dstIdxs[i]}));
+    }
+    // Write the updated vector back to the deref target.
+    if (tgtIsVectorSlot) {
+      builder.create<memref::StoreOp>(l, updated, tgtBase, tgtIdx);
+    } else if (tgtScatterIE) {
+      if (!storeVectorPointerElement(tgtScatterIE, updated, l))
+        error(tgtScatterIE, "could not write back vector-pointer swizzle target");
+    }
+    return true;
+  }
+
   // Store into a memref slot, bridging index<->int / widening ints.
   void storeTo(Value mem, ArrayRef<Value> indices, Value v, Location l) {
     if (!v) return;
@@ -5163,6 +5319,17 @@ private:
       }
       Value rhs = visitExpr(b->rhs.get());
       if (!rhs) return error(b->rhs.get(), "could not evaluate assignment RHS");
+      // Vector component write through a pointer deref: `(*p).x = v`,
+      // `p[i].y = v` — the LHS member's base is a vector reached via a pointer
+      // local (not a plain named vector slot, handled above). Load current,
+      // CompositeInsert, store back. Try before storeStructField: a `(*p).x`
+      // LHS is a MemberAccessExpr that storeStructField would (correctly)
+      // reject, but this path owns it.
+      if (b->lhs &&
+          b->lhs->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+        auto *m = static_cast<MemberAccessExpr *>(b->lhs.get());
+        if (storePointerVectorSwizzle(m, rhs, l)) return rhs;
+      }
       // Struct field write: `result[i].field = rhs` (or `result.field` for a
       // scalar struct ptr). `result` is a memref<?xi32> SSBO view of the struct
       // buffer; the field's byte offset (from recordLayouts) becomes an i32
