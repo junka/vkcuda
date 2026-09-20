@@ -70,14 +70,27 @@ class ASTToMLIRImpl {
   // field's byte offset can be looked up in recordLayouts. Scalars/pointers to
   // builtin types are not consulted, so a missing entry is non-fatal for them.
   llvm::StringMap<const vc::Type *> localTypes;
-  // name -> (base memref, offset index) for a derived pointer local
-  // (`int *q = out + i;`, `int *r = &out[i];`, `int *s = out;`). MLIR has no
-  // first-class pointer arithmetic on an SSBO memref (a `memref<?xT>` block
-  // arg can only be indexed by an absolute index, and `out + i` would emit a
-  // bogus `arith.addi` on a memref). Instead of allocating a broken
-  // memref-of-memref slot, we carry the (base, offset) pair and rewrite
-  // derefs/subscripts to load/store at base[off (+k)].
-  llvm::StringMap<std::pair<Value, Value>> pointerLocalsML;
+  // A derived pointer local (`int *q = out + i;`, `int *r = &out[i];`,
+  // `int *s = out;`) or an inlined sub-array-decay parameter
+  // (`sumRow(b[i])` where `int sumRow(int *row)` — `row` aliases row `i` of a
+  // multi-dim local array). MLIR has no first-class pointer arithmetic on an
+  // SSBO memref (a `memref<?xT>` block arg can only be indexed by an absolute
+  // index, and `out + i` would emit a bogus `arith.addi` on a memref), and a
+  // local sub-array cannot be passed as a `memref<?xT>` pointer parameter
+  // (storage-class mismatch with the SSBO-typed param, and FuncToSPIRV cannot
+  // legalize a memref by-ref call arg). Instead we carry a resolution recipe
+  // and rewrite derefs/subscripts at the use site:
+  //   - derived pointer: base is a rank-1 `memref<?xT>`; `offset` is added to
+  //     the single subscript (`q[k]` -> base[offset + k]).
+  //   - sub-array decay: base is the (possibly multi-dim) local array memref;
+  //     `fixedLeading` holds the consumed dims' indices, and further
+  //     subscripts append (`row[k]` on `b[i]` -> base[i, k]).
+  struct PtrLocal {
+    Value base;
+    Value offset;                 // derived-pointer scalar offset (rank-1 base)
+    SmallVector<Value, 2> fixedLeading; // sub-array-decay fixed leading indices
+  };
+  llvm::StringMap<PtrLocal> pointerLocalsML;
   // By-value struct parameters (features2's `sumcomp(Vec4 v)`) are scalarized
   // into N field-typed block args (a memref parameter would carry SSBO-pointer
   // semantics and fail to legalize as a by-value value). At the callee entry,
@@ -197,7 +210,41 @@ public:
       }
       visitTopLevel(d.get());
     }
+    // Sub-array-decay call sites are inlined into the caller (see
+    // inlineCallWithDecay), so the callee's func.func is left dangling with no
+    // func.call users. A non-kernel helper whose SSBO-memref pointer parameter
+    // was the reason for inlining would then fail FuncToSPIRV/GPUToSPIRV
+    // legalization (storage-class memref params only legalize for entry-point
+    // gpu.funcs, leaving an unrealized_conversion_cast). Erase dead helpers to
+    // a fixpoint so the module only carries functions still reachable by call.
+    eraseDeadHelpers();
     return module;
+  }
+
+  // Erase non-kernel func.func ops that have no remaining func.call users, to a
+  // fixpoint (erasing one helper can orphan another). Kernel entry points
+  // (vc.kernel attr) and class methods (never emitted here) are never erased.
+  void eraseDeadHelpers() {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      llvm::DenseSet<StringRef> called;
+      module.walk([&](func::CallOp call) {
+        if (auto callee = call.getCallableForCallee())
+          if (auto sym = callee.get<SymbolRefAttr>())
+            called.insert(sym.getLeafReference());
+      });
+      SmallVector<func::FuncOp, 4> toErase;
+      module.walk([&](func::FuncOp f) {
+        if (f->hasAttr("vc.kernel")) return;
+        if (called.contains(f.getSymName())) return;
+        toErase.push_back(f);
+      });
+      for (func::FuncOp f : toErase) {
+        f.erase();
+        changed = true;
+      }
+    }
   }
 
   // Walk a decl tree collecting StructDecls into structDecls + recordLayouts.
@@ -826,23 +873,24 @@ private:
     return builder.create<arith::IndexCastOp>(l, builder.getIndexType(), v);
   }
 
-  // Resolve a use of a derived pointer local to a concrete (base memref,
-  // absolute index) pair that load/store can target directly. Handles:
-  //   `*q`   -> (q.base, q.off)                     [n is the Deref expr]
-  //   `q[k]` -> (q.base, q.off + k)                 [n is the IndexExpr]
-  //   `q`    -> (q.base, q.off)  (rare; bare value use of the pointer)
-  // Returns true and fills out params when `n` (or its operand) names a
-  // registered pointer local. The base is always a rank-1 memref<?xT> SSBO, so
-  // the absolute index is the single subscript.
-  bool pointerLValue(ASTNode *n, Value &base, Value &index) {
+  // Resolve a use of a derived pointer local (or an inlined sub-array-decay
+  // parameter) to a concrete (base memref, index list) that load/store can
+  // target directly. Handles:
+  //   `*q`   -> (q.base, [q.off])                   [n is the Deref expr]
+  //   `q[k]` -> (q.base, [q.off + k])               [rank-1 derived pointer]
+  //   `row[k]`-> (b, [fixedLeading..., k])          [sub-array-decay param]
+  //   `q`    -> (q.base, [q.off])  (rare; bare value use of the pointer)
+  // Returns true and fills out `base` + `indices` when `n` (or its operand)
+  // names a registered pointer local. For a rank-1 derived pointer the base is
+  // a `memref<?xT>` SSBO and there is one index; for a sub-array-decay param
+  // the base is the (possibly multi-dim) local array and the index list is the
+  // fixed leading indices followed by the callee's subscripts.
+  bool pointerLValue(ASTNode *n, Value &base, SmallVectorImpl<Value> &indices) {
     if (!n) return false;
-    auto resolveLocal = [&](StringRef nm, Value &b, Value &off,
-                            Value &extra) -> bool {
+    auto resolveLocal = [&](StringRef nm, PtrLocal &pl) -> bool {
       auto p = pointerLocalsML.find(nm);
       if (p == pointerLocalsML.end()) return false;
-      b = p->second.first;
-      off = p->second.second;
-      extra = Value();
+      pl = p->second;
       return true;
     };
     if (n->getNodeType() == ASTNode::NodeKind::UnaryExpr &&
@@ -850,11 +898,18 @@ private:
       const ASTNode *operand = static_cast<const UnaryExpr *>(n)->operand.get();
       if (operand &&
           operand->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
-        Value b, off, extra;
-        if (resolveLocal(static_cast<const DeclRefExpr *>(operand)->name,
-                         b, off, extra)) {
-          base = b;
-          index = toIndexValue(off, loc(n));
+        PtrLocal pl;
+        if (resolveLocal(static_cast<const DeclRefExpr *>(operand)->name, pl)) {
+          base = pl.base;
+          // `*q`: for a rank-1 derived pointer, index = offset. A sub-array-
+          // decay param deref (`*row`) would need a complete index list; the
+          // demos don't deref a sub-array param, so only the offset path is
+          // supported here.
+          if (pl.offset)
+            indices.push_back(toIndexValue(pl.offset, loc(n)));
+          else
+            for (Value v : pl.fixedLeading)
+              indices.push_back(toIndexValue(v, loc(n)));
           return true;
         }
       }
@@ -864,30 +919,82 @@ private:
       auto *ie = static_cast<const IndexExpr *>(n);
       if (ie->base &&
           ie->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
-        Value b, off, extra;
+        PtrLocal pl;
         if (resolveLocal(static_cast<const DeclRefExpr *>(ie->base.get())->name,
-                         b, off, extra)) {
-          base = b;
+                         pl)) {
+          base = pl.base;
           Value k = toIndexValue(visitExpr(ie->index.get()), loc(n));
-          Value offIdx = toIndexValue(off, loc(n));
-          index = builder.create<arith::AddIOp>(loc(n), offIdx, k);
+          if (pl.offset) {
+            // Rank-1 derived pointer: q[k] -> base[offset + k].
+            Value offIdx = toIndexValue(pl.offset, loc(n));
+            indices.push_back(
+                builder.create<arith::AddIOp>(loc(n), offIdx, k));
+          } else {
+            // Sub-array-decay param: row[k] -> base[fixedLeading..., k].
+            for (Value v : pl.fixedLeading)
+              indices.push_back(toIndexValue(v, loc(n)));
+            indices.push_back(k);
+          }
           return true;
         }
       }
       return false;
     }
     if (n->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
-      Value b, off, extra;
-      if (resolveLocal(static_cast<const DeclRefExpr *>(n)->name, b, off, extra)) {
-        base = b;
-        index = toIndexValue(off, loc(n));
+      PtrLocal pl;
+      if (resolveLocal(static_cast<const DeclRefExpr *>(n)->name, pl)) {
+        base = pl.base;
+        if (pl.offset)
+          indices.push_back(toIndexValue(pl.offset, loc(n)));
+        else
+          for (Value v : pl.fixedLeading)
+            indices.push_back(toIndexValue(v, loc(n)));
         return true;
       }
     }
     return false;
   }
 
-  // Resolve an lvalue (a local-var slot or an array element) to a memref plus
+  // Resolve a sub-array-decay argument (`b[i]` on `int b[2][3]`, or `v[a][b]`
+  // on a 3D array) to the underlying local array memref plus the list of
+  // already-consumed leading index values. The callee's further subscripts
+  // append to `fixedLeading`, so `row[k]` on a `b[i]` decay becomes
+  // `memref.load(b, [i, k])`. Returns false if `n` is not a partial subscript
+  // of a local array leaving dims remaining (mirrors Sema's subArrayDecayOf).
+  bool subArrayDecayView(const ASTNode *n, Value &base,
+                         SmallVectorImpl<Value> &fixedLeading) {
+    if (!n || n->getNodeType() != ASTNode::NodeKind::IndexExpr)
+      return false;
+    // Collect the IndexExpr chain (outermost first) and walk to the root.
+    SmallVector<const IndexExpr *, 4> chain;
+    const ASTNode *cur = n;
+    while (cur && cur->getNodeType() == ASTNode::NodeKind::IndexExpr) {
+      auto *ie = static_cast<const IndexExpr *>(cur);
+      chain.push_back(ie);
+      cur = ie->base.get();
+    }
+    if (!cur || cur->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+      return false;
+    auto it = locals.find(static_cast<const DeclRefExpr *>(cur)->name);
+    if (it == locals.end()) return false;
+    Value arr = it->second;
+    if (!arr.getType().isa<MemRefType>()) return false;
+    auto mty = arr.getType().cast<MemRefType>();
+    // The chain must leave at least one dim unconsumed (partial subscript).
+    if (chain.size() >= (size_t)mty.getRank()) return false;
+    base = arr;
+    // Emit each consumed dim's index (outermost first = chain.back() first,
+    // since chain[0] is the outermost IndexExpr and its index is the leading
+    // dim; the walk pushed outermost-first, so iterate in that order).
+    for (const IndexExpr *ie : chain) {
+      Value iv = toIndexValue(visitExpr(ie->index.get()), loc(n));
+      if (!iv) return false;
+      fixedLeading.push_back(iv);
+    }
+    return true;
+  }
+
+
   // its index list for load/store. Function params (block args) are scalars
   // and are not writable slots, so they fail here. Multi-dimensional indexing
   // `a[i][j]` is a chain of IndexExprs; we descend to the base memref and
@@ -2099,7 +2206,7 @@ private:
           if (auto p = pointerLocalsML.find(nm); p != pointerLocalsML.end()) {
             // `q = p` (alias of another derived pointer): inherit base, and
             // carry p's offset as the new offset.
-            base = p->second.first;
+            base = p->second.base;
             return true;
           }
           auto it = locals.find(nm);
@@ -2789,9 +2896,10 @@ private:
       if (ie->base && ie->base->getNodeType() ==
                           ASTNode::NodeKind::DeclRefExpr) {
         // `q[k]` where q is a derived pointer local -> load base[off + k].
-        Value pBase, pIdx;
+        Value pBase;
+        SmallVector<Value, 2> pIdx;
         if (pointerLValue(ie, pBase, pIdx))
-          return builder.create<memref::LoadOp>(l, pBase, ValueRange{pIdx});
+          return builder.create<memref::LoadOp>(l, pBase, pIdx);
         if (Value v = loadVectorPointerElement(ie, l))
           return v;
       }
@@ -2967,8 +3075,39 @@ private:
                                     ? deviceMangledName(c->resolvedCallee)
                                     : ref->name.str();
         const FunctionDecl *calleeFn = c->resolvedCallee;
+        if (!calleeFn) {
+          auto dit = funcDecls.find(calleeSym);
+          if (dit != funcDecls.end()) calleeFn = dit->second;
+        }
         auto fit = funcTable.find(calleeSym);
         if (fit != funcTable.end()) {
+          // Sub-array-to-pointer decay: if any argument is a partial subscript
+          // of a local multi-dim array (`sumRow(b[i], 3)` with `int *row`),
+          // the sub-array cannot be passed as the SSBO-typed `memref<?xT>`
+          // pointer parameter (storage-class mismatch + FuncToSPIRV can't
+          // legalize a memref by-ref call arg). Inline the callee body at the
+          // call site instead, binding each such pointer param to a
+          // pointerLocalsML entry (base = the local array memref, fixedLeading
+          // = the consumed dims' indices) so the body's `row[k]` resolves to
+          // `b[i, k]` directly in the caller's storage. Mirrors the method-
+          // inlining path.
+          bool hasDecayArg = false;
+          if (calleeFn && calleeFn->body) {
+            unsigned nArgs = std::min(c->args.size(), calleeFn->params.size());
+            for (unsigned i = 0; i < nArgs; ++i) {
+              if (!calleeFn->params[i]->type ||
+                  !isa<PointerType>(calleeFn->params[i]->type))
+                continue;
+              Value base;
+              SmallVector<Value, 2> lead;
+              if (subArrayDecayView(c->args[i].get(), base, lead)) {
+                hasDecayArg = true;
+                break;
+              }
+            }
+          }
+          if (hasDecayArg)
+            return inlineCallWithDecay(c, calleeFn, l);
           SmallVector<Value> args;
           for (auto &a : c->args) {
             // A by-value struct argument is scalarized into N field scalars
@@ -2982,10 +3121,6 @@ private:
           // Complete trailing defaulted parameters the call omits, mirroring
           // the GLSL backend: append each default expression from the callee
           // signature until the argument count matches the parameter count.
-          if (!calleeFn) {
-            auto dit = funcDecls.find(calleeSym);
-            if (dit != funcDecls.end()) calleeFn = dit->second;
-          }
           if (calleeFn) {
             for (unsigned i = c->args.size(); i < calleeFn->params.size(); ++i) {
               if (!calleeFn->params[i]->defaultVal) break;
@@ -3197,6 +3332,170 @@ private:
     default:
       return error(n, std::string("MLIR backend cannot lower ") +
                           nodeKindName(n->getNodeType()));
+    }
+  }
+
+  // Inline a __device__ helper at the call site when one of its pointer
+  // parameters receives a sub-array decay (e.g. `sumRow(b[i], 3)` with
+  // `int *row`). The sub-array cannot cross a func.call boundary (storage-class
+  // mismatch), so the body is emitted directly in the caller's region with the
+  // pointer param bound to a pointerLocalsML entry: base = the local array
+  // memref, fixedLeading = the consumed dims' indices. The body's `row[k]`
+  // then lowers to `b[i, k]` via pointerLValue. Non-decay params are bound to
+  // fresh scalar slots holding the argument values (by value), mirroring the
+  // method-inline path. Returns the callee's return value (or null for void).
+  Value inlineCallWithDecay(const CallExpr *c, const FunctionDecl *calleeFn,
+                            Location l) {
+    if (!calleeFn || !calleeFn->body)
+      return error(c, "cannot inline callee for sub-array decay (no body)");
+
+    // Evaluate every explicit argument in the CALLER's scope BEFORE swapping
+    // in the callee's parameter bindings, so arg expressions still see the
+    // caller's locals. For a sub-array-decay arg, capture the (base,
+    // fixedLeading) view instead of evaluating it as a scalar.
+    struct ArgBinding {
+      const ParamDecl *param;
+      Value scalar;                       // by-value scalar arg (loaded)
+      bool isDecay = false;
+      Value decayBase;
+      SmallVector<Value, 2> decayLead;
+    };
+    SmallVector<ArgBinding, 4> bindings;
+    unsigned nArgs = std::min(c->args.size(), calleeFn->params.size());
+    for (unsigned i = 0; i < nArgs; ++i) {
+      const ParamDecl *p = calleeFn->params[i];
+      ArgBinding ab;
+      ab.param = p;
+      if (p->type && isa<PointerType>(p->type) &&
+          subArrayDecayView(c->args[i].get(), ab.decayBase, ab.decayLead)) {
+        ab.isDecay = true;
+      } else {
+        Value av = visitExpr(c->args[i].get());
+        if (!av)
+          return error(c->args[i].get(), "could not evaluate call argument");
+        ab.scalar = loadValue(av, loc(c->args[i].get()));
+      }
+      bindings.push_back(std::move(ab));
+    }
+    // Complete trailing defaulted params (scalar slots).
+    for (unsigned i = nArgs; i < calleeFn->params.size(); ++i) {
+      const ParamDecl *p = calleeFn->params[i];
+      if (!p->defaultVal) break;
+      ArgBinding ab;
+      ab.param = p;
+      Value dv = visitExpr(p->defaultVal.get());
+      if (!dv)
+        return error(p->defaultVal.get(), "could not evaluate default argument");
+      ab.scalar = loadValue(dv, loc(p->defaultVal.get()));
+      bindings.push_back(std::move(ab));
+    }
+
+    // Reject early returns: the inlined body must be straight-line with a
+    // single trailing return (the common row-helper shape). A callee with an
+    // early return inside a loop/if would need scf.if yield wiring that the
+    // inline path doesn't set up (currentRetTy/structuredDepth belong to the
+    // caller). Detect any ReturnStmt that is not the last top-level statement.
+    if (!calleeFn->body ||
+        calleeFn->body->getNodeType() != ASTNode::NodeKind::CompoundStmt)
+      return error(calleeFn, "cannot inline callee with sub-array decay: "
+                             "body is not a compound statement");
+    auto *cs = static_cast<const CompoundStmt *>(calleeFn->body.get());
+    for (size_t i = 0; i + 1 < cs->statements.size(); ++i)
+      if (containsReturn(cs->statements[i].get()))
+        return error(calleeFn, "cannot inline callee with sub-array decay: "
+                               "early return not supported (restructure the "
+                               "helper to return only at the end)");
+
+    // Save the caller's per-function symbol state; the inlined body gets a
+    // fresh scope with the callee's params bound.
+    llvm::StringMap<Value> savedLocals = locals;
+    llvm::StringMap<const vc::Type *> savedLocalTypes = localTypes;
+    auto savedPtrLocals = pointerLocalsML;
+    auto savedRetTy = currentRetTy;
+    mlir::Type calleeRetTy = cvtType(calleeFn->returnType);
+    currentRetTy = calleeRetTy;
+
+    locals.clear();
+    localTypes.clear();
+    pointerLocalsML.clear();
+    for (const ArgBinding &ab : bindings) {
+      if (!ab.param) continue;
+      if (ab.isDecay) {
+        // Bind the pointer param to a sub-array view: row[k] -> base[lead..., k].
+        PtrLocal pl;
+        pl.base = ab.decayBase;
+        pl.fixedLeading = ab.decayLead;
+        pointerLocalsML[ab.param->name] = pl;
+        localTypes[ab.param->name] = ab.param->type;
+      } else {
+        // By-value scalar param: fresh slot holding the arg value.
+        mlir::Type pt = cvtType(ab.param->type);
+        if (!pt) continue;
+        MemRefType slotTy = MemRefType::get(
+            {}, pt, MemRefLayoutAttrInterface(),
+            spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
+        Value slot = builder.create<memref::AllocaOp>(loc(ab.param), slotTy);
+        locals[ab.param->name] = slot;
+        localTypes[ab.param->name] = ab.param->type;
+        storeValue(slot, ab.scalar, loc(ab.param));
+      }
+    }
+
+    // Emit all statements except a trailing ReturnStmt; the trailing return's
+    // value (if any) becomes the inline call's result.
+    Value retVal;
+    for (size_t i = 0; i < cs->statements.size(); ++i) {
+      ASTNode *s = cs->statements[i].get();
+      if (s->getNodeType() == ASTNode::NodeKind::ReturnStmt) {
+        auto *r = static_cast<ReturnStmt *>(s);
+        if (r->value) {
+          retVal = visitExpr(r->value.get());
+          if (retVal) retVal = loadValue(retVal, loc(r->value.get()));
+        }
+        break;
+      }
+      visitStmt(s);
+    }
+
+    // Restore the caller's scope.
+    locals = savedLocals;
+    localTypes = savedLocalTypes;
+    pointerLocalsML = savedPtrLocals;
+    currentRetTy = savedRetTy;
+    return retVal;
+  }
+
+  // Does a statement (recursively) contain a ReturnStmt? Used by the inline
+  // path to reject helpers with early returns (only a trailing top-level
+  // return is supported when inlining for sub-array decay).
+  bool containsReturn(const ASTNode *n) {
+    if (!n) return false;
+    if (n->getNodeType() == ASTNode::NodeKind::ReturnStmt) return true;
+    // Recurse into compound bodies and control-flow statements.
+    switch (n->getNodeType()) {
+    case ASTNode::NodeKind::CompoundStmt: {
+      auto *cs = static_cast<const CompoundStmt *>(n);
+      for (auto &s : cs->statements)
+        if (containsReturn(s.get())) return true;
+      return false;
+    }
+    case ASTNode::NodeKind::IfStmt: {
+      auto *is = static_cast<const IfStmt *>(n);
+      if (containsReturn(is->thenStmt.get())) return true;
+      if (is->elseStmt && containsReturn(is->elseStmt.get())) return true;
+      return false;
+    }
+    case ASTNode::NodeKind::ForStmt:
+      return containsReturn(
+          static_cast<const ForStmt *>(n)->body.get());
+    case ASTNode::NodeKind::WhileStmt:
+      return containsReturn(
+          static_cast<const WhileStmt *>(n)->body.get());
+    case ASTNode::NodeKind::DoStmt:
+      return containsReturn(
+          static_cast<const DoStmt *>(n)->body.get());
+    default:
+      return false;
     }
   }
 
@@ -4457,9 +4756,10 @@ private:
     }
     if (u->op == UnaryOp::Deref) {
       // `*q` where q is a registered derived pointer local -> load base[off].
-      Value pBase, pIdx;
+      Value pBase;
+      SmallVector<Value, 2> pIdx;
       if (pointerLValue(const_cast<UnaryExpr *>(u), pBase, pIdx))
-        return builder.create<memref::LoadOp>(l, pBase, ValueRange{pIdx});
+        return builder.create<memref::LoadOp>(l, pBase, pIdx);
       Value mem;
       SmallVector<Value> indices;
       if (!lvalueAddress(const_cast<UnaryExpr *>(u), mem, indices))
@@ -4886,9 +5186,10 @@ private:
       // `q[k] += 1`, which lower to an Assign whose RHS already encodes the
       // read-modify-write). Resolve to base[off (+k)] and store.
       {
-        Value pBase, pIdx;
+        Value pBase;
+        SmallVector<Value, 2> pIdx;
         if (pointerLValue(b->lhs.get(), pBase, pIdx)) {
-          storeTo(pBase, {pIdx}, rhs, l);
+          storeTo(pBase, pIdx, rhs, l);
           return rhs;
         }
       }

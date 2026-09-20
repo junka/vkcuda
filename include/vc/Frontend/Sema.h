@@ -167,6 +167,15 @@ private:
   Type *checkExpr(const ASTNode *n);
   void checkCond(const ASTNode *cond, const char *what);
 
+  // Array-to-pointer decay: a partial subscript of a multi-dimensional array
+  // (`b[i]` on `int b[2][3]`) yields a sub-array that decays to a pointer to
+  // its element type when bound to a pointer parameter (`int *row`), mirroring
+  // C's implicit array->pointer conversion. Returns the underlying array
+  // VarDecl and how many leading dims the subscript chain has consumed, or
+  // null if `n` is not a partial subscript leaving dims remaining. The decayed
+  // pointer's pointee is the array's declared element type.
+  VarDecl *subArrayDecayOf(const ASTNode *n, unsigned &dimsConsumed);
+
   // Helpers.
   bool isThreadBuiltin(StringRef name) const;
   bool isMathBuiltin(StringRef name) const;

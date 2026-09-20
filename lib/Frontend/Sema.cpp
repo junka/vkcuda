@@ -332,6 +332,37 @@ void Sema::checkUnusedInFrame(const llvm::StringMap<ASTNode *> &frame) {
   }
 }
 
+// Array-to-pointer decay predicate (see header). A partial subscript of a
+// multi-dimensional array — `b[i]` on `int b[2][3]`, or `v[a][b]` on a 3D
+// array — leaves trailing dims unconsumed, so the result is a sub-array that
+// may decay to a pointer to the element type. Walks the nested IndexExpr chain
+// to the underlying array VarDecl (the same walk checkExpr's IndexExpr case
+// uses), counting consumed dims; returns the decl iff at least one dim remains.
+VarDecl *Sema::subArrayDecayOf(const ASTNode *n, unsigned &dimsConsumed) {
+  dimsConsumed = 0;
+  if (!n || n->getNodeType() != ASTNode::NodeKind::IndexExpr)
+    return nullptr;
+  const ASTNode *cur = n;
+  while (cur && cur->getNodeType() == ASTNode::NodeKind::IndexExpr)
+    cur = static_cast<const IndexExpr *>(cur)->base.get(), ++dimsConsumed;
+  if (!cur || cur->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+    return nullptr;
+  auto *bref = static_cast<const DeclRefExpr *>(cur);
+  ASTNode *sym = lookup(bref->name);
+  if (!sym) {
+    auto gv = globalVars.find(bref->name);
+    if (gv != globalVars.end()) sym = gv->second;
+  }
+  if (!sym || sym->getNodeType() != ASTNode::NodeKind::VarDecl)
+    return nullptr;
+  auto *vd = static_cast<VarDecl *>(sym);
+  if (vd->arrayDims.empty()) return nullptr;
+  // A partial subscript leaves dims remaining: the chain has consumed
+  // `dimsConsumed` leading dims, so any remaining dim means a sub-array.
+  if (dimsConsumed >= vd->arrayDims.size()) return nullptr;
+  return vd;
+}
+
 // Match a call's argument types against a callee's parameter types (each
 // argument is type-checked here, so callers must not pre-check them).
 // Structural mismatches (e.g. passing a float* where an int was expected) are
@@ -363,6 +394,25 @@ void Sema::checkCallArgs(const ASTNode *call, StringRef calleeName,
     std::string msg = "argument " + std::to_string(i + 1) + " of '" +
                       std::string(calleeName) + "' has type " +
                       typeName(argTy) + ", expected " + typeName(paramTy);
+    // Array-to-pointer decay: a partial subscript sub-array (`b[i]` on
+    // `int b[2][3]`) bound to a pointer parameter (`int *row`) is legal C —
+    // the sub-array decays to a pointer to its element type. checkExpr returns
+    // the element type for a partial subscript (there is no ArrayType node),
+    // so without this rule the binding looks like int -> int* and warns.
+    if (!isCompatibleForAssign(paramTy, argTy) &&
+        paramTy && resolveTypedefs(paramTy)->getKind() == TypeKind::Pointer) {
+      unsigned dc = 0;
+      if (VarDecl *av = subArrayDecayOf(args[i].get(), dc)) {
+        const Type *pointee = resolveTypedefs(
+            static_cast<const PointerType *>(resolveTypedefs(paramTy))
+                ->pointee);
+        // The decayed pointer addresses the sub-array's element type, which is
+        // the array decl's own declared element type (`av->type`).
+        if (!pointee ||
+            sameType(pointee, resolveTypedefs(av->type)))
+          continue; // legal decay; no warning
+      }
+    }
     if (!isCompatibleForAssign(paramTy, argTy))
       warn(args[i].get(), msg);
     else if (isFloatType(resolveTypedefs(argTy)) &&

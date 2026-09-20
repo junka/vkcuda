@@ -1,0 +1,46 @@
+// test/sub_array_decay.vc — sub-array decays to a pointer parameter.
+//
+// `sumRow(b[i], 3)` passes the i-th row of `int b[2][3]` to a helper taking
+// `int *row`. In C this is array-to-pointer decay: `b[i]` (a sub-array of 3
+// ints) decays to `int*` pointing at the row's first element. The helper then
+// indexes `row[k]`, which must address the same storage as `b[i][k]`.
+//
+// The MLIR backend inlines the callee at the call site, binding the pointer
+// parameter to a (base, fixedLeading) view so `row[k]` resolves to `b[i, k]`
+// directly in the caller's local array memref. The GLSL backend has no pointer
+// type and rejects this with a clear `#error` (see GLSL_UNSUPPORTED in the e2e
+// harness).
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__device__ int sumRow(int *row, int m) {
+  int s = 0;
+  for (int i = 0; i < m; i++) s += row[i];
+  return s;
+}
+
+__global__ void sub_array_decay(int *out, int n) {
+  // 2D local array; b[i] decays to int* for sumRow.
+  int b[2][3] = {{1, 2, 3}, {4, 5, 6}};
+  int i = threadIdx.x;
+  if (i >= n) return;
+  out[i] = sumRow(b[i], 3);
+}
+
+int main() {
+  vcInit();
+  void *d = 0;
+  vcMalloc(&d, 16);
+  sub_array_decay<<<1, 2>>>(d, 2);
+  vcDeviceSynchronize();
+  int h[4] = {0};
+  vcMemcpy(h, d, 16, VCMemcpyKind::DeviceToHost);
+  // Row 0: 1+2+3 = 6, row 1: 4+5+6 = 15.
+  int ok = h[0] == 6 && h[1] == 15;
+  printf("sub_array_decay: %s (h0=%d h1=%d)\n",
+         ok ? "PASS" : "FAIL", h[0], h[1]);
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

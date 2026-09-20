@@ -6,6 +6,7 @@
 #include "vc/Frontend/BuiltinRegistry.h"
 #include "vc/Frontend/Mangle.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -62,6 +63,11 @@ class GLSLEmitter {
   // NonSemantic.DebugPrintf SPIR-V). Flipped by scanDims when a `printf(...)`
   // call is seen in the kernel body or any __device__ helper it can call.
   bool usesPrintf = false;
+  // Set by scanSubArrayDecay when a call passes a sub-array (`b[i]` of `int
+  // b[2][3]`) where a pointer parameter is expected — unsupported on the GLSL
+  // backend (no pointer type). emitHeader emits a `#error` so glslc fails with
+  // a clear message instead of an opaque parse error from the broken body.
+  bool hasSubArrayDecayCall = false;
   // Hoisted statements to emit before the current enclosing statement. The
   // vote intrinsics push their reduction prologue here; emitStmt flushes and
   // clears this before emitting each statement node.
@@ -78,6 +84,12 @@ class GLSLEmitter {
   // type on expression nodes, so we reconstruct it from this map plus the
   // literal/cast structure of the expression subtree (see exprType).
   llvm::StringMap<const Type *> localTypes;
+  // Name -> VarDecl for in-scope locals/params/shared decls. Mirrors
+  // localTypes but retains the VarDecl so its arrayDims (which the Type does
+  // not carry) are available — used to detect a partial subscript of a
+  // multi-dim local array (sub-array-to-pointer decay), which the GLSL
+  // backend cannot lower.
+  llvm::StringMap<const VarDecl *> localVarDecls;
 
   // CUDA pointer-typed locals (`int *q = out + i;`) have no GLSL
   // representation: glslType strips Pointer->pointee, so a plain decl would
@@ -141,6 +153,7 @@ public:
     usesVote = false;
     usesDouble = false;
     usesPrintf = false;
+    hasSubArrayDecayCall = false;
     preStmts.clear();
     emittingVoteRef = false;
     if (k->body) scanDims(k->body.get());
@@ -149,6 +162,9 @@ public:
     // device function body reachable from this kernel's translation unit.
     for (const auto &kv : funcDecls)
       if (kv.second->body) scanDims(kv.second->body.get());
+    // Detect sub-array-to-pointer decay calls (unsupported on this backend)
+    // before emitting the header, so emitHeader can raise a clear `#error`.
+    if (k->body) scanSubArrayDecay(k->body.get());
 
     emitHeader();
     emitStructDecls(flat);
@@ -262,6 +278,217 @@ private:
     case ASTNode::NodeKind::SwitchStmt:
       if (auto *sw = static_cast<const SwitchStmt *>(n)->body.get())
         scanDoubleDecls(sw, mark);
+      break;
+    default:
+      break;
+    }
+  }
+
+  // Pre-scan for sub-array-to-pointer decay calls (e.g. `sumRow(b[i], 3)` with
+  // `int *row` and `int b[2][3]`). The GLSL backend can't lower these (no
+  // pointer type); set hasSubArrayDecayCall so emitHeader raises a clear
+  // `#error` before the broken body reaches glslc. Self-contained: builds a
+  // body-wide name->VarDecl table so the decay check resolves locals without
+  // the emit pass's localVarDecls (not populated yet).
+  void scanSubArrayDecay(const ASTNode *n) {
+    if (!n) return;
+    llvm::StringMap<const VarDecl *> vars;
+    collectBodyVarDecls(n, vars);
+    auto resolve = [&](llvm::StringRef name) -> const VarDecl * {
+      auto it = vars.find(name);
+      return it == vars.end() ? nullptr : it->second;
+    };
+    scanDecayCalls(n, resolve);
+  }
+
+  // Recursively collect every VarDecl declared in `n`'s subtree (DeclStmt
+  // declarators) into `out`. Mirrors the local seeding the emit pass does, but
+  // body-wide and read-only.
+  void collectBodyVarDecls(
+      const ASTNode *n,
+      llvm::StringMap<const VarDecl *> &out) {
+    if (!n) return;
+    if (n->getNodeType() == ASTNode::NodeKind::DeclStmt) {
+      auto *ds = static_cast<const DeclStmt *>(n);
+      for (VarDecl *vd : ds->decls)
+        if (vd) out[vd->name] = vd;
+    }
+    // Recurse into every child AST node. We use the same structural cases as
+    // scanDims (compound/control-flow) plus expression children for completeness.
+    switch (n->getNodeType()) {
+    case ASTNode::NodeKind::CompoundStmt:
+      for (auto &s : static_cast<const CompoundStmt *>(n)->statements)
+        collectBodyVarDecls(s.get(), out);
+      break;
+    case ASTNode::NodeKind::DeclStmt:
+      if (auto *d = static_cast<const DeclStmt *>(n)->decl)
+        collectBodyVarDecls(d->init.get(), out);
+      break;
+    case ASTNode::NodeKind::ExprStmt:
+      collectBodyVarDecls(static_cast<const ExprStmt *>(n)->expr.get(), out);
+      break;
+    case ASTNode::NodeKind::ReturnStmt:
+      collectBodyVarDecls(static_cast<const ReturnStmt *>(n)->value.get(), out);
+      break;
+    case ASTNode::NodeKind::IfStmt: {
+      auto *iff = static_cast<const IfStmt *>(n);
+      collectBodyVarDecls(iff->cond.get(), out);
+      collectBodyVarDecls(iff->thenStmt.get(), out);
+      collectBodyVarDecls(iff->elseStmt.get(), out);
+      break;
+    }
+    case ASTNode::NodeKind::ForStmt: {
+      auto *fs = static_cast<const ForStmt *>(n);
+      collectBodyVarDecls(fs->init.get(), out);
+      collectBodyVarDecls(fs->cond.get(), out);
+      collectBodyVarDecls(fs->step.get(), out);
+      collectBodyVarDecls(fs->body.get(), out);
+      break;
+    }
+    case ASTNode::NodeKind::WhileStmt: {
+      auto *ws = static_cast<const WhileStmt *>(n);
+      collectBodyVarDecls(ws->cond.get(), out);
+      collectBodyVarDecls(ws->body.get(), out);
+      break;
+    }
+    case ASTNode::NodeKind::DoStmt: {
+      auto *ds = static_cast<const DoStmt *>(n);
+      collectBodyVarDecls(ds->cond.get(), out);
+      collectBodyVarDecls(ds->body.get(), out);
+      break;
+    }
+    case ASTNode::NodeKind::SwitchStmt: {
+      auto *sw = static_cast<const SwitchStmt *>(n);
+      collectBodyVarDecls(sw->cond.get(), out);
+      collectBodyVarDecls(sw->body.get(), out);
+      break;
+    }
+    case ASTNode::NodeKind::CaseStmt: {
+      auto *cs = static_cast<const CaseStmt *>(n);
+      collectBodyVarDecls(cs->value.get(), out);
+      collectBodyVarDecls(cs->sub.get(), out);
+      break;
+    }
+    default:
+      break;
+    }
+  }
+
+  // Walk `n` for CallExprs; for each, resolve the callee (via resolvedCallee or
+  // funcDecls by bare/scoped name) and check whether any argument bound to a
+  // pointer parameter is a sub-array decay. Sets hasSubArrayDecayCall on hit.
+  void scanDecayCalls(
+      const ASTNode *n,
+      llvm::function_ref<const VarDecl *(llvm::StringRef)> resolveVar) {
+    if (!n) return;
+    if (n->getNodeType() == ASTNode::NodeKind::CallExpr) {
+      auto *c = static_cast<const CallExpr *>(n);
+      const FunctionDecl *calleeFn = c->resolvedCallee;
+      if (!calleeFn) {
+        // Resolve by bare name (DeclRefExpr callee) or scoped name.
+        std::string nm;
+        if (c->callee &&
+            c->callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr)
+          nm = static_cast<const DeclRefExpr *>(c->callee.get())->name.str();
+        else if (c->callee && c->callee->getNodeType() ==
+                                  ASTNode::NodeKind::MemberAccessExpr)
+          nm = mangleScopeChainGLSL(
+              static_cast<const MemberAccessExpr *>(c->callee.get()));
+        if (!nm.empty()) {
+          auto fit = funcDecls.find(nm);
+          if (fit != funcDecls.end()) calleeFn = fit->second;
+        }
+      }
+      if (calleeFn) {
+        unsigned nArgs = std::min(c->args.size(), calleeFn->params.size());
+        for (unsigned i = 0; i < nArgs; ++i) {
+          const ParamDecl *p = calleeFn->params[i];
+          if (!p->type || p->type->getKind() != TypeKind::Pointer) continue;
+          if (isSubArrayDecayArg(c->args[i].get(), resolveVar)) {
+            hasSubArrayDecayCall = true;
+            break;
+          }
+        }
+      }
+      // Still recurse into args (a decay call may nest inside another's arg).
+      for (auto &a : c->args) scanDecayCalls(a.get(), resolveVar);
+      if (c->callee) scanDecayCalls(c->callee.get(), resolveVar);
+      return;
+    }
+    // Recurse structurally (same cases as collectBodyVarDecls).
+    switch (n->getNodeType()) {
+    case ASTNode::NodeKind::CompoundStmt:
+      for (auto &s : static_cast<const CompoundStmt *>(n)->statements)
+        scanDecayCalls(s.get(), resolveVar);
+      break;
+    case ASTNode::NodeKind::DeclStmt:
+      if (auto *d = static_cast<const DeclStmt *>(n)->decl)
+        scanDecayCalls(d->init.get(), resolveVar);
+      break;
+    case ASTNode::NodeKind::ExprStmt:
+      scanDecayCalls(static_cast<const ExprStmt *>(n)->expr.get(), resolveVar);
+      break;
+    case ASTNode::NodeKind::ReturnStmt:
+      scanDecayCalls(static_cast<const ReturnStmt *>(n)->value.get(), resolveVar);
+      break;
+    case ASTNode::NodeKind::IfStmt: {
+      auto *iff = static_cast<const IfStmt *>(n);
+      scanDecayCalls(iff->cond.get(), resolveVar);
+      scanDecayCalls(iff->thenStmt.get(), resolveVar);
+      scanDecayCalls(iff->elseStmt.get(), resolveVar);
+      break;
+    }
+    case ASTNode::NodeKind::ForStmt: {
+      auto *fs = static_cast<const ForStmt *>(n);
+      scanDecayCalls(fs->init.get(), resolveVar);
+      scanDecayCalls(fs->cond.get(), resolveVar);
+      scanDecayCalls(fs->step.get(), resolveVar);
+      scanDecayCalls(fs->body.get(), resolveVar);
+      break;
+    }
+    case ASTNode::NodeKind::WhileStmt: {
+      auto *ws = static_cast<const WhileStmt *>(n);
+      scanDecayCalls(ws->cond.get(), resolveVar);
+      scanDecayCalls(ws->body.get(), resolveVar);
+      break;
+    }
+    case ASTNode::NodeKind::DoStmt: {
+      auto *ds = static_cast<const DoStmt *>(n);
+      scanDecayCalls(ds->cond.get(), resolveVar);
+      scanDecayCalls(ds->body.get(), resolveVar);
+      break;
+    }
+    case ASTNode::NodeKind::SwitchStmt: {
+      auto *sw = static_cast<const SwitchStmt *>(n);
+      scanDecayCalls(sw->cond.get(), resolveVar);
+      scanDecayCalls(sw->body.get(), resolveVar);
+      break;
+    }
+    case ASTNode::NodeKind::CaseStmt: {
+      auto *cs = static_cast<const CaseStmt *>(n);
+      scanDecayCalls(cs->value.get(), resolveVar);
+      scanDecayCalls(cs->sub.get(), resolveVar);
+      break;
+    }
+    case ASTNode::NodeKind::BinaryExpr: {
+      auto *b = static_cast<const BinaryExpr *>(n);
+      scanDecayCalls(b->lhs.get(), resolveVar);
+      scanDecayCalls(b->rhs.get(), resolveVar);
+      break;
+    }
+    case ASTNode::NodeKind::UnaryExpr:
+      scanDecayCalls(static_cast<const UnaryExpr *>(n)->operand.get(),
+                     resolveVar);
+      break;
+    case ASTNode::NodeKind::IndexExpr: {
+      auto *ie = static_cast<const IndexExpr *>(n);
+      scanDecayCalls(ie->base.get(), resolveVar);
+      scanDecayCalls(ie->index.get(), resolveVar);
+      break;
+    }
+    case ASTNode::NodeKind::MemberAccessExpr:
+      scanDecayCalls(static_cast<const MemberAccessExpr *>(n)->base.get(),
+                     resolveVar);
       break;
     default:
       break;
@@ -487,6 +714,15 @@ private:
   void emitHeader() {
     (*os) << "#version 460 core\n";
     (*os) << "#extension GL_EXT_shader_explicit_arithmetic_types : enable\n";
+    if (hasSubArrayDecayCall) {
+      // A call passes a sub-array (`b[i]` of `int b[2][3]`) where a pointer
+      // parameter is expected. GLSL has no pointer type, so this can't lower
+      // here; the MLIR backend inlines the callee instead. Fail loudly with a
+      // clear message at the top of the source so glslc reports THIS error,
+      // not an opaque parse failure from the broken body below.
+      (*os) << "#error sub-array to pointer parameter is not supported on the "
+               "GLSL backend (use the MLIR backend, or pass a flat pointer)\n";
+    }
     if (usesDouble) {
       // The base extension gives us the double *type* and any-width builtins
       // (sqrt/floor/fabs/min/max on a double), but the transcendental overloads
@@ -709,6 +945,7 @@ private:
     // different variable than the kernel's `a`).
     localTypes.clear();
     pointerLocals.clear();
+    localVarDecls.clear();
     // A helper's parameters are ordinary GLSL function parameters, NOT the
     // kernel's push-constant scalars. The kernel path (emitOneForKernel)
     // populates scalarParams with the kernel's scalar arg names so they emit
@@ -727,7 +964,10 @@ private:
       SmallVector<const VarDecl *, 8> shared;
       collectShared(f->body.get(), shared);
       for (const VarDecl *v : shared)
-        if (v && v->type) localTypes[v->name] = v->type;
+        if (v && v->type) {
+          localTypes[v->name] = v->type;
+          localVarDecls[v->name] = v;
+        }
     }
     (*os) << glslType(f->returnType) << " " << deviceMangledName(f) << "(";
     bool emittedParam = false;
@@ -1190,13 +1430,17 @@ private:
     // (each of which repopulated it) have been emitted.
     localTypes.clear();
     pointerLocals.clear();
+    localVarDecls.clear();
     for (const auto &p : kernel->params)
       if (p->type) localTypes[p->name] = p->type;
     if (kernel->body) {
       SmallVector<const VarDecl *, 8> shared;
       collectShared(kernel->body.get(), shared);
       for (const VarDecl *v : shared)
-        if (v && v->type) localTypes[v->name] = v->type;
+        if (v && v->type) {
+          localTypes[v->name] = v->type;
+          localVarDecls[v->name] = v;
+        }
     }
     (*os) << "void main() {\n";
     if (kernel->body &&
@@ -1269,8 +1513,10 @@ private:
       if (!d) break;
       // Register every declarator's type so subsequent expressions (and the
       // init of later declarators in the same statement) can resolve it.
-      for (VarDecl *vd : ds->decls)
+      for (VarDecl *vd : ds->decls) {
         if (vd && vd->type) localTypes[vd->name] = vd->type;
+        if (vd) localVarDecls[vd->name] = vd;
+      }
       // Pre-register any pointer-typed local that models a tracked pattern
       // (ptr+int, &arr[i], bare alias). These emit NO GLSL decl — a plain
       // `int q = ...` would be a broken scalar — and their uses are rewritten
@@ -1478,6 +1724,35 @@ private:
 
   // Emit call arguments followed by default-argument completions, looked up by
   // the callee's mangled device name.
+  // Detect a sub-array-to-pointer decay argument: a partial subscript of a
+  // local multi-dim array (`b[i]` on `int b[2][3]`) passed where a pointer
+  // parameter (`int *row`) is expected. The GLSL backend has no pointer type
+  // and no way to view a sub-array as one, so this is unsupported here — the
+  // MLIR backend inlines the callee instead. `resolveVar` maps a root
+  // DeclRefExpr name to its VarDecl (so the same logic works during the emit
+  // pass, against localVarDecls, and during the pre-scan, against a temporary
+  // body-wide VarDecl table). Returns true if `arg` is such a partial
+  // subscript leaving array dimensions unconsumed.
+  bool isSubArrayDecayArg(
+      const ASTNode *arg,
+      llvm::function_ref<const VarDecl *(StringRef)> resolveVar) const {
+    if (!arg || arg->getNodeType() != ASTNode::NodeKind::IndexExpr)
+      return false;
+    // Walk the IndexExpr chain to its root, counting subscripts consumed.
+    const ASTNode *cur = arg;
+    unsigned dimsConsumed = 0;
+    while (cur && cur->getNodeType() == ASTNode::NodeKind::IndexExpr) {
+      ++dimsConsumed;
+      cur = static_cast<const IndexExpr *>(cur)->base.get();
+    }
+    if (!cur || cur->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+      return false;
+    const auto *ref = static_cast<const DeclRefExpr *>(cur);
+    const VarDecl *vd = resolveVar(ref->name);
+    if (!vd || vd->arrayDims.empty()) return false;
+    return dimsConsumed < vd->arrayDims.size();
+  }
+
   void emitCallArgsWithDefaults(StringRef mangledName,
                                 const std::vector<NodePtr> &args) {
     for (unsigned i = 0; i < args.size(); ++i) {
