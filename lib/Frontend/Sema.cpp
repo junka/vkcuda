@@ -1433,21 +1433,36 @@ Type *Sema::checkExpr(const ASTNode *n) {
 
     // An array variable (`float a[16]`) is typed as its element type but
     // carries trailing array dims — legal to subscript, unlike a plain scalar.
+    // For a multi-dimensional array `b[2][3]`, `b[0]` is itself a `int[3]`
+    // sub-array (one fewer dim than `b`); indexing it again (`b[0][i]`) is
+    // legal. The base of this IndexExpr may therefore be a nested IndexExpr
+    // rather than a DeclRefExpr — walk down the chain to the underlying array
+    // variable, counting how many leading dims have already been consumed.
     VarDecl *arrayVar = nullptr;
-    if (ie->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
-      auto *bref = static_cast<const DeclRefExpr *>(ie->base.get());
-      ASTNode *sym = lookup(bref->name);
-      // Global (__constant__ / file-scope) arrays aren't in the local scope;
-      // fall back to the translation-unit symbol table.
-      if (!sym) {
-        auto gv = globalVars.find(bref->name);
-        if (gv != globalVars.end()) sym = gv->second;
-      }
-      if (sym && sym->getNodeType() == ASTNode::NodeKind::VarDecl) {
-        auto *vd = static_cast<VarDecl *>(sym);
-        if (!vd->arrayDims.empty()) arrayVar = vd;
+    unsigned dimsConsumed = 0;
+    {
+      const ASTNode *cur = ie->base.get();
+      while (cur && cur->getNodeType() == ASTNode::NodeKind::IndexExpr)
+        cur = static_cast<const IndexExpr *>(cur)->base.get(), ++dimsConsumed;
+      if (cur && cur->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+        auto *bref = static_cast<const DeclRefExpr *>(cur);
+        ASTNode *sym = lookup(bref->name);
+        // Global (__constant__ / file-scope) arrays aren't in the local scope;
+        // fall back to the translation-unit symbol table.
+        if (!sym) {
+          auto gv = globalVars.find(bref->name);
+          if (gv != globalVars.end()) sym = gv->second;
+        }
+        if (sym && sym->getNodeType() == ASTNode::NodeKind::VarDecl) {
+          auto *vd = static_cast<VarDecl *>(sym);
+          if (!vd->arrayDims.empty()) { arrayVar = vd; }
+        }
       }
     }
+    // Whether `ie->base` is a still-array sub-array: the underlying decl has
+    // more dims than the chain has consumed so far.
+    bool baseIsSubArray =
+        arrayVar && dimsConsumed + 1 < arrayVar->arrayDims.size();
 
     if (rb && rb->getKind() != TypeKind::Pointer &&
         rb->getKind() != TypeKind::Vector && !arrayVar)
@@ -1471,21 +1486,28 @@ Type *Sema::checkExpr(const ASTNode *n) {
                                       static_cast<const VectorType *>(rb)->count) +
                                   ")");
       else if (arrayVar && !arrayVar->arrayDims.empty() &&
-               arrayVar->arrayDims.back() > 0 &&
-               (iv < 0 || iv >= arrayVar->arrayDims.back()))
+               dimsConsumed < arrayVar->arrayDims.size() &&
+               arrayVar->arrayDims[dimsConsumed] > 0 &&
+               (iv < 0 || iv >= arrayVar->arrayDims[dimsConsumed]))
         warn(ie->index.get(),
              "array index " + std::to_string(iv) +
                  " out of bounds (declared size " +
-                 std::to_string(arrayVar->arrayDims.back()) + ")");
+                 std::to_string(arrayVar->arrayDims[dimsConsumed]) + ")");
     }
 
-    // Indexing yields the pointee / element type.
+    // Indexing yields the pointee / element type. For a multi-dim array,
+    // a partial subscript `b[0]` (when more dims remain) yields a sub-array —
+    // represented as the element type, since array-ness lives on the decl's
+    // trailing dims and is recovered by the nested-IndexExpr chain above. A
+    // full subscript (`b[r][c]`, dimsConsumed+1 == total dims) yields the
+    // scalar element type. Either way the element type is the right return.
     if (rb) {
       if (rb->getKind() == TypeKind::Pointer)
         return static_cast<const PointerType *>(rb)->pointee;
       if (rb->getKind() == TypeKind::Vector)
         return static_cast<const VectorType *>(rb)->elem;
     }
+    (void)baseIsSubArray;
     return base;
   }
   case ASTNode::NodeKind::MemberAccessExpr: {
