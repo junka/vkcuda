@@ -104,6 +104,14 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // SPIR-V forbids recursion; rewrite bounded linear self-recursion in
+  // __device__ functions into iterative loops before codegen. A recursive
+  // function whose shape the pass can't handle is a hard error here.
+  if (!unrollDeviceRecursion(tu)) {
+    errs() << "recursion: aborting due to errors\n";
+    return 1;
+  }
+
   if (syntaxOnly) return 0;
   if (emitOpt == "ast") { dumpAST(tu, outs()); return 0; }
 

@@ -15,6 +15,7 @@
 
 #include <memory>
 #include <string>
+#include <deque>
 #include <vector>
 
 namespace vc {
@@ -235,6 +236,7 @@ using NodePtr = std::unique_ptr<ASTNode>;
 /// statements/decls. Defined in ASTHelpers.cpp.
 NodePtr cloneExpr(const ASTNode *n);
 
+
 //===----------------------------------------------------------------------===//
 // Declarations
 //===----------------------------------------------------------------------===//
@@ -255,6 +257,12 @@ public:
     return {decls.begin(), decls.end()};
   }
 };
+
+/// Rewrite bounded linear self-recursion in __device__ functions into
+/// iterative accumulator loops (SPIR-V forbids recursive calls). Returns
+/// false if a recursive function could not be rewritten (diagnostic emitted).
+/// Defined in AstTransforms.cpp.
+bool unrollDeviceRecursion(TranslationUnit &tu);
 
 // CUDA __global__/__device__/__host__ attributes on a function.
 enum class DeviceAttr { None, Global, Device, Host };
@@ -307,6 +315,18 @@ public:
   // out-of-line class method). Methods declared inside a class body may have a
   // null body; methods defined out-of-line (`void C::f() {...}`) have one.
   bool hasBody = false;
+  // Set by Sema when the body contains a direct self-call (resolvedCallee ==
+  // this function). SPIR-V forbids recursion; the AstTransforms pass
+  // (unrollDeviceRecursion) rewrites a bounded linear self-recursion into an
+  // iterative form before codegen, and errors on shapes it can't rewrite.
+  bool isRecursive = false;
+  // Durable storage for names synthesized by AstTransforms (e.g. `_vc_p`,
+  // `_vc_acc`). DeclRefExpr/VarDecl store names as StringRef pointing into
+  // stable storage (the source buffer or string literals); synthesized names
+  // have no source buffer, so they live here for the function's lifetime so
+  // the StringRefs stay valid through codegen. A deque (not vector) keeps
+  // earlier string storage stable as later names are added.
+  std::deque<std::string> synthNames;
 
   FunctionDecl(SourceLocation l) : ASTNode(l) {}
   NodeKind getNodeType() const override { return NodeKind::FunctionDecl; }

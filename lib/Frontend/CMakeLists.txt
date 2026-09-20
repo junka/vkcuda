@@ -5,6 +5,7 @@ add_library(VCFrontend STATIC
   Lexer.cpp
   Parser.cpp
   ASTHelpers.cpp
+  AstTransforms.cpp
   ASTDumper.cpp
   BuiltinRegistry.cpp
   Mangle.cpp

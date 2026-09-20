@@ -1,0 +1,91 @@
+// test/recursion.vc — bounded device recursion, lowered to iteration.
+//
+// SPIR-V forbids recursive function calls (GLSL rejects them outright;
+// spirv.FunctionCall cannot form a cycle — GPU shaders have no call stack).
+// CUDA device code nonetheless uses bounded self-recursion (factorial,
+// sum-to-n, power-by-repeated-multiply, tail-call loops). The AstTransforms
+// pass (unrollDeviceRecursion) rewrites a recognized bounded *linear*
+// self-recursion into an iterative accumulator loop before either backend
+// sees it, so neither backend has to model recursion.
+//
+// Recognized shape (single or multi-parameter, one recursive call, optional
+// combine):  T f(P p[, Q q...]) { if (C) return B; return [X op] f(A); }
+// where exactly one parameter strictly decreases (p-k, p/k, p>>k, p&(p-1))
+// and the rest are passed through. Branching recursion (fib: two self-calls)
+// and indirect recursion are rejected with a clear error rather than emitting
+// illegal SPIR-V.
+//
+// Covers:
+//   - `fact`: linear recursion with a left combine (`n * fact(n-1)`).
+//   - `sumTo`: linear recursion with a left combine (`n + sumTo(n-1)`).
+//   - `countdown`: tail recursion (no combine, `return countdown(n-1)`).
+//   - `powi`: multi-parameter recursion decreasing only `e`, passing `b`
+//     through unchanged.
+//   - `rightform`: right combine (`f(A) op X` — the self-call is on the lhs).
+//
+//   vcc test/recursion.vc -o build/recursion_sf && ./build/recursion_sf
+//   vc  test/recursion.vc -emit=full -o build/recursion_m && ./build/recursion_m
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__device__ int fact(int n) {
+  if (n <= 1) return 1;
+  return n * fact(n - 1);
+}
+
+__device__ int sumTo(int n) {
+  if (n == 0) return 0;
+  return n + sumTo(n - 1);
+}
+
+__device__ int countdown(int n) {
+  if (n == 0) return 42;
+  return countdown(n - 1);
+}
+
+__device__ int powi(int b, int e) {
+  if (e == 0) return 1;
+  return b * powi(b, e - 1);
+}
+
+__device__ int rightform(int n) {
+  if (n <= 0) return 1;
+  return rightform(n - 1) * 2;
+}
+
+__global__ void recKernel(int *out, int n) {
+  int i = threadIdx.x;
+  if (i >= n) return;
+  out[i] = fact(i) * 100 + sumTo(i) + countdown(i) + powi(2, i) * 1000 +
+           rightform(i) * 100000;
+}
+
+int main() {
+  vcInit();
+  const int N = 8;
+  void *d = 0;
+  vcMalloc(&d, N * 4);
+  recKernel<<<1, N>>>(d, N);
+  vcDeviceSynchronize();
+  int h[16] = {0};
+  vcMemcpy(h, d, N * 4, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    int f = 1;
+    for (int j = 2; j <= i; ++j) f *= j;
+    int rf = 1;
+    for (int j = 0; j < i; ++j) rf *= 2;
+    int expect = f * 100 + i * (i + 1) / 2 + 42 + (1 << i) * 1000 + rf * 100000;
+    if (h[i] != expect) {
+      printf("  i=%d got=%d expect=%d\n", i, h[i], expect);
+      ok = 0;
+    }
+  }
+  printf("recursion: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

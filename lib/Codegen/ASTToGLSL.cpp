@@ -709,6 +709,15 @@ private:
     // different variable than the kernel's `a`).
     localTypes.clear();
     pointerLocals.clear();
+    // A helper's parameters are ordinary GLSL function parameters, NOT the
+    // kernel's push-constant scalars. The kernel path (emitOneForKernel)
+    // populates scalarParams with the kernel's scalar arg names so they emit
+    // as `pc.name`; that set must not leak into a helper body, or a helper
+    // parameter that happens to share a name with a kernel scalar (e.g. both
+    // `int n`) would wrongly emit as `pc.n`. Save and clear it for this emit.
+    SmallVector<StringRef, 8> savedScalarParams;
+    savedScalarParams = scalarParams;
+    scalarParams.clear();
     for (const auto &p : f->params)
       if (p->type) localTypes[p->name] = p->type;
     // `_this` (synthesized method receiver) is a struct lvalue that never
@@ -746,6 +755,7 @@ private:
         emitStmt(s.get(), 1);
     }
     (*os) << "}\n\n";
+    scalarParams = savedScalarParams;
   }
 
   // Map a CUDA/math builtin name to its GLSL equivalent. Returns the name

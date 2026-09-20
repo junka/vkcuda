@@ -1350,14 +1350,17 @@ Type *Sema::checkExpr(const ASTNode *n) {
         if (f) {
           const_cast<CallExpr *>(c)->resolvedCallee =
               f; // backend emits this callee's mangled symbol
-          // GLSL forbids recursion: a device function calling itself (directly)
-          // would lower to a recursive GLSL function, which is invalid. Reject it
-          // here rather than emit illegal GLSL. Indirect recursion (A->B->A) is
-          // not detected — TODO: needs a call-graph closure.
+          // Direct self-recursion is NOT rejected here: SPIR-V forbids
+          // recursive calls, but a bounded linear self-recursion can be
+          // rewritten to an iterative form by the AstTransforms pass
+          // (unrollDeviceRecursion) before codegen. Sema only marks the
+          // function so the pass knows to inspect it; the pass emits a hard
+          // error for shapes it can't rewrite (branching/indirect recursion),
+          // so unsupported recursion still fails loudly rather than producing
+          // illegal SPIR-V. resolvedCallee (set above) is what the pass uses
+          // to detect the self-call.
           if (currentFunc && f == currentFunc)
-            error(n, "recursive function '" + std::string(calleeName) +
-                         "' is not allowed in GLSL (device functions cannot "
-                         "call themselves)");
+            currentFunc->isRecursive = true;
           // Device code may only call __device__/__global__ functions; a plain
           // (host) function is not callable from a kernel.
           if ((f->deviceAttr == DeviceAttr::None ||
