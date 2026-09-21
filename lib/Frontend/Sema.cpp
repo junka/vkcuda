@@ -132,6 +132,9 @@ bool Sema::isArithmetic(const Type *t) {
 }
 
 bool Sema::isIntegerType(const Type *t) {
+  // Look through aliases (`typedef int Idx;` / `using Idx = int;`).
+  if (t && t->getKind() == TypeKind::Typedef)
+    t = static_cast<const TypedefType *>(t)->decl->underlying;
   if (!t || t->getKind() != TypeKind::Builtin) return false;
   switch (static_cast<const BuiltinType *>(t)->builtin) {
   case BuiltinTypeKind::Bool:

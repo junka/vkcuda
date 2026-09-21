@@ -1,0 +1,28 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck --allow-empty %s
+//
+// `using Name = Type;` alias declarations: file scope, inside a namespace, and
+// mixed with plain `typedef`. An alias is the same declaration as a typedef
+// (TypedefType, resolved by every backend), so it types-checks with zero
+// diagnostics.
+
+using Idx = int;
+using Real = float;
+typedef float Scalar;
+
+namespace ns {
+using Local = float;
+__device__ Local half_(Local v) { return v * 0.5f; }
+}
+
+__device__ Real scale(Real v, Scalar k) { return v * k; }
+
+__global__ void kern(int n, float *a, float *b, float *c) {
+  Idx i = threadIdx.x;
+  if (i < n) {
+    c[i] = scale(a[i], 2.0f) + ns::half_(b[i]);
+  }
+  c[0] = (float)i;
+
+  // CHECK-NOT: error:
+  // CHECK-NOT: warning:
+}

@@ -313,7 +313,14 @@ private:
         os << pad << "};\n";
       } else if (d->getNodeType() == ASTNode::NodeKind::TypedefDecl) {
         auto *td = static_cast<const TypedefDecl *>(d.get());
-        os << pad << "typedef " << cppType(td->underlying) << " " << td->name << ";\n";
+        // Spell the alias back the way the source wrote it: `using A = T;` vs
+        // `typedef T A;` — the host preamble is compiled verbatim by g++.
+        if (td->isUsing)
+          os << pad << "using " << td->name << " = " << cppType(td->underlying)
+             << ";\n";
+        else
+          os << pad << "typedef " << cppType(td->underlying) << " " << td->name
+             << ";\n";
       } else if (d->getNodeType() == ASTNode::NodeKind::EnumDecl) {
         // GLSL has no enum, but C++ does — however emitting the constants as
         // `const int` keeps the host and device backends identical and avoids

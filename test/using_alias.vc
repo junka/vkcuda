@@ -1,0 +1,70 @@
+// test/using_alias.vc — `using Name = Type;` alias declarations.
+//
+// Exercises using-aliases at file scope and inside a namespace, mixed with
+// plain `typedef`, and used for locals, params and a vector type. Aliases are
+// resolved to their underlying type by every backend (same TypedefDecl as
+// typedef); the host preamble spells each back the way the source wrote it.
+//
+//   vcc test/using_alias.vc -o build/using_alias_sf && ./build/using_alias_sf
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+using Idx = int;
+using Vec = float4;
+typedef float weight_t;
+
+namespace mathx {
+using Scalar = float;
+__device__ Scalar scale(Scalar w, Scalar v) { return w * v; }
+}
+
+__device__ weight_t bump(weight_t v, weight_t d) { return v + d; }
+
+__global__ void kern(float *out, int *out2) {
+  Idx i = blockIdx.x * blockDim.x + threadIdx.x;
+  Vec v = make_float4(1.0f, 2.0f, 3.0f, 4.0f);
+  weight_t w = 0.5f;
+  float s = mathx::scale(w, (float)i);
+  out[i] = bump(s, v.x) + v.y;
+  out2[i] = i;
+}
+
+int main() {
+  vcInit();
+
+  const int N = 64;
+  float hOut[64];
+  int hIdx[64];
+  for (int i = 0; i < N; i++) {
+    hOut[i] = 0.0f;
+    hIdx[i] = 0;
+  }
+
+  void *dOut = 0, *dIdx = 0;
+  vcMalloc(&dOut, N * 4);
+  vcMalloc(&dIdx, N * 4);
+
+  kern<<<N, N>>>(dOut, dIdx);
+
+  vcDeviceSynchronize();
+  vcMemcpy(hOut, dOut, N * 4, VCMemcpyKind::DeviceToHost);
+  vcMemcpy(hIdx, dIdx, N * 4, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int i = 0; i < N; i++) {
+    // Reference: bump(scale(0.5, i), 1.0) + 2.0 = 0.5*i + 3.0
+    float expect = 0.5f * (float)i + 3.0f;
+    if (std::fabs(hOut[i] - expect) > 1e-4f)
+      ok = 0;
+    if (hIdx[i] != i)
+      ok = 0;
+  }
+  printf("using_alias: %s\n", ok ? "PASS" : "FAIL");
+
+  vcFree(dOut);
+  vcFree(dIdx);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

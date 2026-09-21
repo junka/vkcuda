@@ -90,6 +90,8 @@ bool Parser::parseTopLevelDecl() {
     return parseClassDecl();
   if (curTok.is(TokKind::kw_typedef))
     return parseTypedefDecl();
+  if (curTok.is(TokKind::kw_using))
+    return parseUsingDecl();
   if (curTok.is(TokKind::kw_enum))
     return parseEnumDecl();
   if (curTok.is(TokKind::kw_constant))
@@ -533,6 +535,43 @@ bool Parser::parseTypedefDecl() {
   typeNames[nameTok.text] = new TypedefType(td);
 
   if (!expect(TokKind::semi, "';' after typedef"))
+    return false;
+  tu.decls.emplace_back(td);
+  return true;
+}
+
+// `using Name = Type;` — an alias declaration, semantically identical to
+// `typedef Type Name;`. Builds the same TypedefDecl (with isUsing set so the
+// host backend spells it back) and registers the name in `typeNames`, so Sema,
+// Mangle, GLSL and MLIR need no changes. `using namespace X;` is a host
+// passthrough line and is deliberately NOT accepted here.
+bool Parser::parseUsingDecl() {
+  Token usingTok = curTok;
+  advance(); // 'using'
+  if (curTok.is(TokKind::kw_namespace)) {
+    error(curTok, "'using namespace' is not supported in device code; "
+                  "qualify the name instead");
+    return false;
+  }
+  if (!curTok.is(TokKind::identifier)) {
+    error(curTok, "expected alias name after 'using'");
+    return false;
+  }
+  Token nameTok = curTok;
+  advance();
+  if (!expect(TokKind::assign, "'=' in using-alias declaration"))
+    return false;
+  Type *underlying = parseType();
+  if (!underlying) {
+    error(curTok, "expected type after '='");
+    return false;
+  }
+
+  auto *td = new TypedefDecl(toSourceLoc(usingTok), nameTok.text, underlying);
+  td->isUsing = true;
+  typeNames[nameTok.text] = new TypedefType(td);
+
+  if (!expect(TokKind::semi, "';' after using declaration"))
     return false;
   tu.decls.emplace_back(td);
   return true;

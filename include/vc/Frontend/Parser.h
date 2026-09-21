@@ -91,6 +91,9 @@ private:
   bool parseStructDecl();
   bool parseClassDecl();
   bool parseTypedefDecl();
+  // `using Name = Type;` — alias declaration, lowered to the same TypedefDecl
+  // as `typedef`.
+  bool parseUsingDecl();
   bool parseEnumDecl();
   bool parseConstantDecl();
   bool parseNamespaceDecl();

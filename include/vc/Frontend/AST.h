@@ -413,11 +413,13 @@ public:
 };
 
 // `typedef <underlying> <name>;` — defines a TypedefType alias. GLSL has no
-// typedef, so emit resolves to the underlying type.
+// typedef, so emit resolves to the underlying type. `using <name> = <underlying>;`
+// is the same declaration with isUsing set (the host backend spells it back).
 class TypedefDecl : public ASTNode {
 public:
   StringRef name;
   Type *underlying;
+  bool isUsing = false;
 
   TypedefDecl(SourceLocation l, StringRef n, Type *u)
       : ASTNode(l), name(n), underlying(u) {}
