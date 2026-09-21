@@ -51,24 +51,24 @@ cmake --build build
 ## Run
 
 ```bash
-# End-to-end via the GLSL backend (works now, no MLIR):
-./build/tools/vc-glsl/vc-glsl test/vadd.vc -emit=ast     # dump AST
-./build/tools/vc-glsl/vc-glsl test/vadd.vc -emit=glsl    # dump GLSL source
-./build/tools/vc-glsl/vc-glsl test/vadd.vc -o build/vadd.spv   # GLSL -> glslc -> .spv
-./build/examples/vector_add build/vadd.spv               # runs on Vulkan -> PASS
-
-# Run all four demos (compile kernels + run hosts):
-for d in vadd:vector_add reduce:block_reduce matmul:matmul; do
-  k=${d%%:*}; b=${d##*:}
-  ./build/tools/vc-glsl/vc-glsl test/$k.vc -o build/$k.spv && \
-  ./build/examples/$b build/$k.spv
-done
-./build/examples/async_overlap build/vadd.spv            # async stream overlap -> PASS
+# End-to-end via the GLSL backend (single-file CUDA-style driver):
+./build/tools/vcc/vcc test/vadd.vc -emit=ast     # dump AST
+./build/tools/vcc/vcc test/vadd.vc -emit=glsl    # dump GLSL source
+./build/tools/vcc/vcc test/vadd.vc -o build/vadd.spv   # GLSL -> glslc -> .spv, link host exe, run
 
 # MLIR backend (vc driver; -emit=mlir dumps IR, -emit=spirv writes binary):
-./build/tools/vc/vc test/vadd.vc -emit=mlir
-./build/tools/vc/vc test/vadd.vc -emit=spirv -o build/vadd_mlir.spv
+./build-mlir/tools/vc/vc test/vadd.vc -emit=mlir
+./build-mlir/tools/vc/vc test/vadd.vc -emit=spirv -o build/vadd_mlir.spv
+./build-mlir/tools/vc/vc test/vadd.vc -emit=full -o build/vadd_mlir  # SPIR-V + linked host exe
+
+# Full self-checking demo suite, both backends at once:
+python3 test/run_e2e.py --vcc build/tools/vcc/vcc --mlirc build-mlir/tools/vc/vc test/
 ```
+
+The e2e harness builds and runs every `test/*.vc` demo through **both** backends
+and checks the `PASS`/`FAIL` the program prints. As of this commit: **131
+(backend, demo) pairs pass, 3 skipped** (constructs one backend can't lower are
+skip-listed rather than failing the suite).
 
 See [examples/README.md](examples/README.md) for per-demo details, the
 stream/memcpy semantics table, and the specialization-constant mechanism
@@ -105,7 +105,7 @@ CUDA device surface; everything else lowers to `scf`/`arith`/`memref`/`func`.
 | `vc.block_dim` | `blockDim.{x,y,z}`  | `WorkgroupSize` builtin                     |
 | `vc.grid_dim`  | `gridDim.{x,y,z}`   | `NumWorkgroups` builtin                     |
 | `vc.barrier`   | `__syncthreads()`   | `OpControlBarrier(Workgroup)`               |
-| `vc.wmma.*`    | tensor-core ops     | `spirv.KHR.CooperativeMatrix` (placeholder) |
+| `vc.wmma.*`    | tensor-core ops     | `spirv.KHR.CooperativeMatrix`               |
 
 ### Lowering decisions
 
@@ -151,10 +151,10 @@ smoke test. `vc-check` covers the frontend diagnostics.
 
 ### Deferred
 
-`vc.barrier` GPU lowering and shared-memory semantics, WMMA/tensor-core
-lowering (`vc.wmma.*` → `spirv.KHR.CooperativeMatrix`), optimizer passes,
-and running the MLIR-emitted shaders through the Vulkan runtime
-(only the GLSL backend is driveable from host code today).
+Optimizer passes and broader cross-driver performance coverage. (The
+`vc.barrier`/shared-memory, WMMA/cooperative-matrix, and runtime-driven
+MLIR-shader paths listed as deferred in earlier revisions are now implemented
+— see the surface table above.)
 
 ## Runtime
 
@@ -193,22 +193,128 @@ The Vulkan runtime implements a CUDA-style host API over Vulkan compute:
   `vc-check` / `mlir-check`)
 - `docs/language-spec.md` — language design notes
 
+## Implemented language surface
+
+Both backends (GLSL and MLIR/SPIR-V) cover the device subset below unless a
+row notes otherwise. The e2e demo named in each row is the living spec — if
+the demo passes on a backend, that construct works there.
+
+### Core C/CUDA
+
+| Construct | Demo | Notes |
+| --- | --- | --- |
+| `if`/`for`/`while`/`do`/`switch` | `cf_cond.vc`, `sync.vc` | `for`→`scf.while` (preserves C eval order); `switch`→`scf.if` chain |
+| `break`/`continue` | `cf_cond.vc` | loop-carried i1 flag slots + `scf.if` guards (MLIR) |
+| Early returns (`if (cond) return;`) | `recursion.vc`, `ref_return.vc` | inverted into `scf.if(!cond){…}`; value-returning early returns via yield chains |
+| Scalars / arrays / `struct` / `class` | `struct.vc`, `class.vc`, `nested_struct.vc` | struct-as-value = flat memref; methods inlined at call site |
+| `enum` | `enum.vc` | const-fold to `int` |
+| `namespace` / `::` scope | `namespace.vc`, `namespace_nested.vc` | `ns::f`→`ns_f` device mangle |
+| `using Name = Type;` aliases | `using_alias.vc` | |
+| `sizeof` | `sizeof.vc` | |
+| Multi-dim arrays + init lists | `multidim_init.vc`, `multidim_subscript.vc` | nested `InitListExpr`; partial subscript `b[0][i]` |
+| Default arguments | `default_arg.vc` | right-to-left contiguity enforced |
+| `#define NAME <literal>` macros | `define.vc` | object-like, single literal only |
+| Storage classes `static`/`extern` | — | host passthrough; device rejects function-local `static` |
+| CUDA keyword compat | `keyword_compat.vc` | `__restrict__`, `nullptr`, `constexpr` accepted |
+
+### Functions / overloading / references
+
+| Construct | Demo | Notes |
+| --- | --- | --- |
+| `__device__` helper calls | `features.vc` | hoist `func.func` into `gpu.module` + ConvertFuncToSPIRV |
+| Overload resolution | `overload.vc` | `conversionRank`/`resolveOverload`; `__device__` param-mangled symbols |
+| Bounded device recursion | `recursion.vc` | SPIR-V forbids recursion → AstTransforms pass unrolls bounded linear self-recursion to an accumulator loop |
+| Sub-array-to-pointer decay | `sub_array_decay.vc` | MLIR inlines callee at call site; GLSL rejects via `#error` |
+| Pointer arithmetic | `pointer_arith.vc` | derived pointers (base+offset), `&x`/`*p` |
+| Reference params `T&` / locals | `references.vc`, `ref_swap.vc` | Function-storage memref by-value to `func.call`→`spirv.ptr<struct<array<1×T>>,Function>`; GLSL `inout` |
+| `const T&` overload | `const_overload.vc` | `K` mangle marker; const-aware conversion rank; GLSL→`in` (by-value) |
+| Reference return `int &f()` | `ref_return.vc` | lvalue call (`pick(x,y,1)=v`); `HoistRefReturnIfYieldsPass` rewrites `scf.if`-yielding-memref to yield `spirv.ptr`; GLSL inlines to ternary/if-else |
+| Ref-from-element `f(out[i])` | `ref_elem.vc` | Function-storage temp + copy-in/copy-out for non-const `T&` |
+| Struct references `P&`/`const P&` | `ref_struct.vc` | |
+
+### Types / vectors
+
+| Construct | Demo | Notes |
+| --- | --- | --- |
+| `int`/`float`/`double`/`bool` | `bool.vc`, `math_width.vc` | `bool`→`i32` (i1 has no SPIR-V storage) |
+| `__half` / `f16` | `half.vc`, `f16_ssbo.vc` | `float16_t`; f16 SSBO scalar load/store (rtarray widen + post-convert narrow) |
+| Vectors `float4`/`int3`/swizzle | `vectors.vc`, `vector_ptr.vc` | `make_float4`/`dot`/`cross`; vector-ptr swizzle write `(*p).x=v` |
+| By-value vector kernel args | `vec_arg.vc` | push-constant vector field |
+
+### Memory model
+
+| Construct | Demo | Notes |
+| --- | --- | --- |
+| `__shared__` workgroup memory | `sync.vc` | `spirv.GlobalVariable`+`addressof`+`AccessChain` (not `memref.global`) |
+| Dynamic `extern __shared__ T s[]` | `dyn_shared.vc` | post-serialize SPIR-V binary patch (`__vc_dynshared_`→`OpTypeArray` length) |
+| `__constant__` globals | `constant.vc`, `const_local.vc` | lazily materialized per-kernel; **no `cudaMemcpyToSymbol`** (compile-time init only) |
+| Atomics | `atomics.vc` | `spirv.Atomic*` / `memref.atomic_rmw`; SSBO `atomicExch` via ordinal-marker rewrite |
+| `__threadfence()` | `sync.vc` | `spirv.MemoryBarrier` (no `barrier()`) |
+
+### Intrinsics / builtins
+
+| Construct | Demo | Notes |
+| --- | --- | --- |
+| Math builtins (`sqrt`/`sin`/`pow`/…) | `math_builtins2/3.vc` | `spirv.GL.*` |
+| Warp shuffles / ballot | `warp.vc` | `gpu.subgroup_size`+`GroupNonUniform*`; needs SPIR-V 1.3 (vulkan1.1) on demand |
+| Vote (`__syncthreads_count/and/or`) | `vote.vc` | shared-array reduction |
+| WMMA / cooperative matrix | `wmma_gemm.vc` | `gpu.subgroup_mma`→`spirv.KHR.CooperativeMatrix`; runtime opportunistic coopMatrix+shaderFloat16 |
+| Kernel `printf` | `printf.vc` | `debugPrintfEXT` (GLSL only; MLIR skip-listed) |
+
+### Host runtime API
+
+| Area | Demos | Notes |
+| --- | --- | --- |
+| Memory | `vadd`, `matmul` | `vcMalloc` (device-local), `vcMallocHost` (pinned), `vcMallocManaged` (unified), `vcMemset`/`vcMemcpy` (+async +2D) |
+| Streams / events | `async_overlap`, `async_memcpy`, `event.vc`, `stream_query.vc` | async queues, timeline-semaphore events, `vcLaunchKernelIndirect` |
+| Graphs | `graph.vc` | record/replay via Vulkan secondary command buffers |
+| Multi-device | `multigpu.vc` | `vcGetDevice/SetDevice/Count`, `vcMemcpyPeer` (host-bridge) |
+| Introspection | `profiling.vc`, `occupancy.vc` | `vcGetDeviceProperties`, `vcPointerGetAttributes`, `vcEventElapsedTime`, `vcOccupancyMaxPotentialBlockSize` |
+| Host callbacks | `stream_query.vc` | `vcLaunchHostFunc` (timeline sem + bg thread) |
+
+## Long tail — deliberately not done
+
+These are real CUDA constructs VC does **not** support, with the reason each
+was left out. They are skip-listed (one backend) or rejected loudly rather
+than silently miscompiling.
+
+- **`__device__` mutable globals** (`__device__ int g = 0;`). VC models no
+  `cudaMemcpyToSymbol` runtime path, so a mutable device-global would be a
+  compile-time-initialized shader global with no host write surface — a
+  "looks like CUDA but behaves differently" trap. Use `__constant__` (read-only)
+  or a kernel parameter for mutable state. (Parser rejects the declaration.)
+- **Reference-to-array parameters** `int (&arr)[4]` (and the `T (&)[N]`
+  overload-set form). Niche syntax; the existing pointer-decay path
+  (`int *row`, `sub_array_decay.vc`) covers the common case. Parser errors
+  with "expected parameter name".
+- **3+ level nested init lists** (`int a[2][2][2] = {{{…}}}`). 2-level
+  nesting works (`multidim_init.vc`); deeper Sema gaps remain.
+- **Function-like / conditional macros** (`#define F(x) …`, `#ifdef`). Only
+  object-like single-literal `#define` is supported.
+- **General C++ templates / exceptions / RTTI.** Out of scope for a shader
+  language; VC is a CUDA **subset**, not a C++ compiler.
+- **True async peer copies / transfer queues.** `vcMemcpyPeer` uses a
+  host-bridge fallback (D2H→H2D), not a device-to-device copy engine.
+- **General-purpose device-memory sub-allocation.** Each `vcMalloc` is a
+  standalone `VkBuffer`; no arena/allocator.
+- **Optimizer passes.** No IR-level optimization beyond MLIR's default
+  legalization canonicalization; performance-tuning passes are deferred.
+- **WMMA beyond the demo shapes.** `wmma_gemm.vc` covers the cooperative-matrix
+  path; arbitrary fragment layouts / non-`f16`/`f32` accumulation combos are
+  not exercised.
+
 ## What is scaffolded vs. TODO
 
-Done: lexer, parser (CUDA subset + `if`/`for`/`while`/`do`/`switch`,
-`__shared__`, `__syncthreads`, 2D launch), AST, AST dumper, Sema
-(unused-var / argument type / extra diagnostics), Vulkan runtime
-(instance/device/queue/buffer/stream/pipeline/dispatch), CUDA-style host API
-(async streams, events, graphs, managed memory, multi-device selection,
-device-group P2P peer copies with host-bridge fallback, device-local memory,
-reusable staging buffers, push-constant scalar args, pipeline caching), CMake
-with optional MLIR, and the
-**MLIR backend**: `vc` dialect, AST→MLIR translation, `vc→gpu` lowering,
-shared memory/barriers, atomics, warp/vote intrinsics, serialized SPIR-V
-(`vc -emit=spirv`), and host executable generation (`vc -emit=full`).
+Done: lexer, parser (CUDA subset — see the table above), AST, AST dumper, Sema
+(unused-var / argument type / overload / reference / extra diagnostics),
+Vulkan runtime (instance/device/queue/buffer/stream/pipeline/dispatch), the
+full CUDA-style host API (async streams, events, graphs, managed memory,
+multi-device selection, device-group P2P peer copies with host-bridge
+fallback, device-local memory, reusable staging buffers, push-constant scalar
+args, pipeline caching, indirect dispatch, occupancy/profiling/attributes),
+CMake with optional MLIR, and the **MLIR backend**: `vc` dialect, AST→MLIR
+translation, `vc→gpu` lowering, shared memory/barriers, atomics, warp/vote
+intrinsics, WMMA/cooperative matrix, serialized SPIR-V (`vc -emit=spirv`),
+and host executable generation (`vc -emit=full`).
 
-Deferred (placeholders or partial support present): WMMA/tensor-core lowering
-(`vc.wmma.*` → `spirv.KHR.CooperativeMatrix`), full C/CUDA type system,
-full overload resolution, optimizer passes, true asynchronous peer copies,
-independent transfer queue + cross-queue semaphores, general-purpose device
-memory sub-allocation, and broader cross-driver performance coverage.
+Deferred: see **Long tail** above.
