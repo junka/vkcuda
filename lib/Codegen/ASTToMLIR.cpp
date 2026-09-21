@@ -91,6 +91,14 @@ class ASTToMLIRImpl {
     SmallVector<Value, 2> fixedLeading; // sub-array-decay fixed leading indices
   };
   llvm::StringMap<PtrLocal> pointerLocalsML;
+  // A reference *local* (`int &r = x;`, `float &f = a[0];`) is an alias with no
+  // storage of its own, so it gets neither an alloca nor a locals[] slot.
+  // Instead we remember the lvalue it was bound to and resolve every later use
+  // of the name to that node — `r` then lowers exactly as `x` (or `a[0]`)
+  // would, through the ordinary lvalueAddress path. This mirrors the GLSL
+  // backend's textual substitution of the bound lvalue (refLocals), which is
+  // the same idea one level up: GLSL has no aliasing construct at all.
+  llvm::StringMap<const ASTNode *> refLocalBinds;
   // By-value struct parameters (features2's `sumcomp(Vec4 v)`) are scalarized
   // into N field-typed block args (a memref parameter would carry SSBO-pointer
   // semantics and fail to legalize as a by-value value). At the callee entry,
@@ -519,6 +527,31 @@ private:
       }
       return gpu::MMAMatrixType::get(shape, elemTy, operand);
     }
+    if (isa<vc::ReferenceType>(t)) {
+      // `T&` is a real by-reference parameter/alias: the callee must see the
+      // caller's own storage, so the MLIR counterpart of the referred-to `T` is
+      // the *address* of a T slot, i.e. a Function-storage memref of the same
+      // element type/shape the caller's local alloca has. A Function-storage
+      // memref is not an SSBO pointer (no StorageBuffer class), so it passes
+      // through func.call + ConvertFuncToSPIRV as a plain pointer to a Function
+      // variable — the same mechanism the method `_this` argument relies on.
+      const vc::Type *pointee = cast<vc::ReferenceType>(t)->pointee;
+      mlir::Type inner = cvtType(pointee);
+      if (!inner) return mlir::Type();
+      // A referred-to struct (`Accumulator &a`) converts to its flat
+      // memref<Nxi32> slot form; splice that shape so we build memref<Nxi32>
+      // rather than the illegal memref<memref<Nxi32>>. A scalar/vector pointee
+      // converts to a bare i32/vector, giving a 0-d slot — exactly the type of
+      // a local `int x;` / `float4 v;` alloca.
+      SmallVector<int64_t, 4> shape;
+      if (auto mty = inner.dyn_cast<MemRefType>()) {
+        for (int64_t d : mty.getShape()) shape.push_back(d);
+        inner = mty.getElementType();
+      }
+      return MemRefType::get(
+          shape, inner, MemRefLayoutAttrInterface(),
+          spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
+    }
     if (isa<PointerType>(t)) {
       // pointer-to-T  ->  memref<?xT> in the StorageBuffer (global device
       // memory) storage class; MemRefToSPIRV requires a SPIR-V storage class
@@ -743,6 +776,7 @@ private:
     locals.clear();
     wmmaFragments.clear();
     localTypes.clear();
+    refLocalBinds.clear();
     pointerLocalsML.clear();
 
     // Bind the synthesized `_this` (methods): the leading block arg is the
@@ -808,9 +842,15 @@ private:
         argIdx = sp.startArg + sp.fieldTys.size();
         continue;
       }
+
       if (argIdx < entry->getNumArguments())
         locals[p->name] = entry->getArgument(argIdx);
-      localTypes[p->name] = p->type;
+      // A `T&` parameter is stored with its *referred-to* type so struct-field
+      // resolution (`Class &c` -> `c.field`) finds the record; a plain `T` param
+      // keeps its declared type unchanged.
+      localTypes[p->name] = (p->type && isa<ReferenceType>(p->type))
+                                ? cast<ReferenceType>(p->type)->pointee
+                                : p->type;
       ++argIdx;
     }
 
@@ -1013,6 +1053,9 @@ private:
     if (!n) return false;
     if (n->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
       auto *ref = static_cast<DeclRefExpr *>(n);
+      // A reference local has no slot of its own; resolve to the bound lvalue.
+      if (refLocalBinds.count(ref->name))
+        return refLocalTarget(ref->name, mem, indices);
       auto it = locals.find(ref->name);
       if (it == locals.end()) return false;
       mem = it->second;
@@ -1145,6 +1188,41 @@ private:
       return false;
     }
     return false;
+  }
+
+  // Follow a chain of reference-local aliases (`int &r = x; int &s = r;`) to
+  // the underlying lvalue node. Returns `n` unchanged when `n` is not a
+  // reference local. Bounded by the map size so a pathological cycle cannot
+  // spin; a well-formed program has no cycles (Sema rejects use-before-decl).
+  const ASTNode *resolveRefAlias(const ASTNode *n) const {
+    for (size_t i = 0, e = refLocalBinds.size() + 1; i < e; ++i) {
+      if (!n || n->getNodeType() != ASTNode::NodeKind::DeclRefExpr) return n;
+      auto it = refLocalBinds.find(static_cast<const DeclRefExpr *>(n)->name);
+      if (it == refLocalBinds.end()) return n;
+      n = it->second;
+    }
+    return n;
+  }
+
+  // Build the address of a reference-local's target: the bound lvalue's slot,
+  // possibly at a fixed index (`float &f = a[0];` -> the a-slot plus index 0).
+  bool refLocalTarget(StringRef name, Value &mem,
+                      SmallVectorImpl<Value> &indices) {
+    auto it = refLocalBinds.find(name);
+    if (it == refLocalBinds.end()) return false;
+    ASTNode *bound = const_cast<ASTNode *>(it->second);
+    if (!bound) return false;
+    // A plain name is the one case where the bound node resolves to a
+    // first-class slot value we can hand over directly; an indexed/field
+    // target has no single address here, so we return the base plus indices
+    // for the caller to load/store through.
+    if (bound->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+      auto lit = locals.find(static_cast<DeclRefExpr *>(bound)->name);
+      if (lit == locals.end()) return false;
+      mem = lit->second;
+      return true;
+    }
+    return lvalueAddress(bound, mem, indices);
   }
 
   // Read the current value of an lvalue node (slot or array element).
@@ -2414,6 +2492,26 @@ private:
         return false;
       };
       if (registerPointerLocal(d)) continue;
+      // `int &r = x;` — a reference local is an alias, not storage: record the
+      // bound lvalue node and resolve every later mention of `r` to it, so
+      // reads and writes hit the same slot as `x` (or the array element it was
+      // bound to). Emitting an alloca plus a copy would detach the alias — the
+      // same reason the pointer-local path above declines to allocate. An
+      // explicit leading `&` (`int &r = &x;`) is accepted and stripped, since
+      // the parser keeps it on the initializer.
+      if (d->type && isa<ReferenceType>(d->type) && d->init) {
+        const ASTNode *bound = d->init.get();
+        if (bound->getNodeType() == ASTNode::NodeKind::UnaryExpr &&
+            static_cast<const UnaryExpr *>(bound)->op == UnaryOp::AddrOf)
+          bound = static_cast<const UnaryExpr *>(bound)->operand.get();
+        // Resolve through any enclosing alias (`int &s = r;`) so every
+        // reference local points straight at the underlying lvalue — the
+        // map is then a flat name -> object table and needs no walking at
+        // use sites.
+        refLocalBinds[d->name] = resolveRefAlias(bound);
+        localTypes[d->name] = cast<ReferenceType>(d->type)->pointee;
+        continue;
+      }
       MemRefType slotTy = MemRefType::get(
           shape, elemTy, MemRefLayoutAttrInterface(),
           spirv::StorageClassAttr::get(&ctx, spirv::StorageClass::Function));
@@ -2932,6 +3030,21 @@ private:
                  static_cast<BoolLiteral *>(n)->value ? 1 : 0));
     case ASTNode::NodeKind::DeclRefExpr: {
       auto name = static_cast<DeclRefExpr *>(n)->name;
+      // A reference local bound to a direct object (`int &r = x;`) forwards the
+      // read to the object it aliases; an alias of an indexed element is not a
+      // first-class slot, so emit the load here instead.
+      if (refLocalBinds.count(name)) {
+        Value mem;
+        SmallVector<Value> indices;
+        if (refLocalTarget(name, mem, indices)) {
+          if (indices.empty()) return mem; // same slot as the bound object
+          if (auto ptr = mem.getType().dyn_cast<spirv::PointerType>())
+            return builder.create<spirv::LoadOp>(l, ptr.getPointeeType(), mem,
+                                                spirv::MemoryAccessAttr(),
+                                                IntegerAttr());
+          return builder.create<memref::LoadOp>(l, mem, indices);
+        }
+      }
       auto it = locals.find(name);
       if (it != locals.end())
         return it->second; // a memref slot or block arg
@@ -3265,14 +3378,41 @@ private:
           if (hasDecayArg)
             return inlineCallWithDecay(c, calleeFn, l);
           SmallVector<Value> args;
+          unsigned argNo = 0;
           for (auto &a : c->args) {
             // A by-value struct argument is scalarized into N field scalars
             // matching the callee's scalarized signature (see buildFunction).
-            if (expandStructArg(a.get(), args, loc(a.get())))
+            if (expandStructArg(a.get(), args, loc(a.get()))) {
+              ++argNo;
               continue;
+            }
+            // A `T&` parameter takes the argument's *address* (a
+            // Function-storage memref slot), not its value — that is what makes
+            // the callee's writes visible to the caller. The callee's
+            // signature already carries the slot type (see cvtType's
+            // ReferenceType branch), so we must hand func.call the matching
+            // lvalue address; loading the value here would produce an i32 where
+            // a memref is expected.
+            bool wantsRef = calleeFn && argNo < calleeFn->params.size() &&
+                            calleeFn->params[argNo]->type &&
+                            isa<ReferenceType>(calleeFn->params[argNo]->type);
+            if (wantsRef) {
+              Value mem;
+              SmallVector<Value> indices;
+              if (!lvalueAddress(a.get(), mem, indices) || !indices.empty()) {
+                error(a.get(), "reference argument must be a plain named object "
+                               "(cannot pass an indexed element or temporary "
+                               "by reference)");
+                return Value();
+              }
+              args.push_back(mem);
+              ++argNo;
+              continue;
+            }
             Value av = visitExpr(a.get());
             if (!av) return error(a.get(), "could not evaluate call argument");
             args.push_back(loadValue(av, loc(a.get())));
+            ++argNo;
           }
           // Complete trailing defaulted parameters the call omits, mirroring
           // the GLSL backend: append each default expression from the callee
@@ -5348,6 +5488,23 @@ private:
           b->lhs->getNodeType() == ASTNode::NodeKind::IndexExpr) {
         auto *ie = static_cast<IndexExpr *>(b->lhs.get());
         if (storeVectorPointerElement(ie, rhs, l)) return rhs;
+      }
+      // Reference-local write: `r = v`, `f = f * 2.0f` where the name was bound
+      // by `int &r = x;` / `float &f = a[0];`. The write must land on the bound
+      // lvalue, so resolve the target and store through it. (`r` bound to a
+      // plain name aliases the same slot, so it may also arrive here through
+      // lvalueAddress once locals[] carries it — this path covers both.)
+      if (b->lhs && b->lhs->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+        auto nm = static_cast<DeclRefExpr *>(b->lhs.get())->name;
+        if (refLocalBinds.count(nm)) {
+          Value mem;
+          SmallVector<Value> indices;
+          if (!refLocalTarget(nm, mem, indices))
+            return error(b->lhs.get(),
+                         "reference local target is not assignable");
+          storeTo(mem, indices, rhs, l);
+          return rhs;
+        }
       }
       // Derived pointer local write: `*q = v`, `q[k] = v` (also `*q += 1` and
       // `q[k] += 1`, which lower to an Assign whose RHS already encodes the

@@ -17,6 +17,10 @@
 
 #include "mlir/Conversion/FuncToSPIRV/FuncToSPIRVPass.h"
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
+#include "mlir/Conversion/MemRefToSPIRV/MemRefToSPIRVPass.h"
+#include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include <cstdlib>
@@ -30,6 +34,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -432,6 +437,85 @@ static void populateEntryPointInterfaces(ModuleOp module) {
 }
 
 
+// ConvertMemRefToSPIRV lowers a Function-storage memref (a local array slot, or
+// a reference parameter's slot) to a spirv.Variable + AccessChain, but it emits
+// the access chain's index as `builtin.unrealized_conversion_cast %i : index to
+// i32` — a *materialization* of the index operand, not the
+// `arith.index_cast index -> i32` the SPIR-V conversion patterns know how to
+// legalize. Nothing downstream folds or legalizes it: convert-index-to-spirv
+// has no pattern for it and reconcile-unrealized-casts cannot eliminate it
+// either (its operand is still an index value, so the pair never becomes a
+// no-op). GPUToSPIRV then fails with "failed to legalize operation
+// 'builtin.unrealized_conversion_cast'".
+//
+// The cast is exactly an index -> i32 truncation/sign-extend, so rewriting it
+// into the arith op the conversion patterns *do* handle makes the remainder of
+// the pipeline (convert-gpu-to-spirv + a trailing reconcile) complete. Only
+// casts whose source type is index and whose result is an integer are touched —
+// the ref-param / call-convention casts this pipeline relies on have
+// memref/ptr types and must survive untouched.
+namespace {
+struct RewriteResidualIndexCastsPass
+    : public PassWrapper<RewriteResidualIndexCastsPass,
+                         OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RewriteResidualIndexCastsPass)
+
+  StringRef getArgument() const final {
+    return "vc-rewrite-residual-index-casts";
+  }
+  StringRef getDescription() const final {
+    return "rewrite index->i32 unrealized_conversion_cast into arith.index_cast";
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    IRRewriter rw(&getContext());
+    module.walk([&](UnrealizedConversionCastOp cast) {
+      if (cast->getNumOperands() != 1 || cast->getNumResults() != 1)
+        return;
+      Type src = cast.getOperand(0).getType();
+      Type dst = cast.getResult(0).getType();
+      if (!src.isIndex() || !dst.isIntOrIndex())
+        return;
+      rw.setInsertionPoint(cast);
+      rw.replaceOpWithNewOp<arith::IndexCastOp>(cast, dst, cast.getOperand(0));
+    });
+  }
+};
+} // namespace
+
+// Does any func.func in the module carry a Function-storage memref parameter?
+// That is the shape a reference parameter (`void f(int &r)`, emitted as a
+// Function-storage memref passed by value to func.call) has BEFORE
+// ConvertFuncToSPIRV runs (after which it becomes a
+// ptr<struct<array<1 x T>>, Function> spirv.func parameter). When none exists,
+// the reference-parameter legalization stage below is both unnecessary and
+// harmful: ConvertMemRefToSPIRV rebuilds a legality target that rejects a
+// `spirv.ReturnValue : f16` left untouched in a pure f16-returning __device__
+// helper's body (no memref ops to convert there), so the stage must not run on
+// f16-device-helper-only modules like half.vc, which otherwise regressed here.
+static bool hasFunctionStorageRefParams(ModuleOp module) {
+  bool found = false;
+  module.walk([&](func::FuncOp fn) {
+    if (found)
+      return;
+    for (auto argTy : fn.getFunctionType().getInputs()) {
+      auto memrefTy = argTy.dyn_cast<mlir::MemRefType>();
+      if (!memrefTy)
+        continue;
+      auto scAttr =
+          memrefTy.getMemorySpace()
+              .dyn_cast_or_null<spirv::StorageClassAttr>();
+      if (scAttr &&
+          scAttr.getValue() == spirv::StorageClass::Function) {
+        found = true;
+        return;
+      }
+    }
+  });
+  return found;
+}
+
 void runLoweringPipeline(ModuleOp module) {
   MLIRContext &ctx = *module.getContext();
   ctx.getOrLoadDialect<mlir::spirv::SPIRVDialect>();
@@ -482,6 +566,32 @@ void runLoweringPipeline(ModuleOp module) {
   auto markedPositions = collectMarkedAtomicPositions(module);
 
   pm.addNestedPass<gpu::GPUModuleOp>(createConvertFuncToSPIRVPass());
+  // A reference parameter (`void f(int &r)`) is emitted as a Function-storage
+  // memref passed by value to func.call. ConvertFuncToSPIRV cannot express
+  // that: it wraps the parameter in
+  // `!spirv.ptr<!spirv.struct<(!spirv.array<1 x i32>)>, Function>` (the
+  // by-value call convention's aggregate shape) and leaves an
+  // unrealized_conversion_cast back to the memref for the body — a cast whose
+  // two sides have unrelated underlying types, so reconcile-unrealized-casts
+  // alone cannot collapse it and nothing else legalizes it. Lowering the
+  // memref ops to SPIR-V pointers *before* GPUToSPIRV keeps the memref type as
+  // the single source of truth: the body's load/store/AccessChain already
+  // operate on the SPIR-V pointer, and the leftover cast reconciles away. The
+  // resulting signature keeps the ptr<struct<array<1 x T>>> spelling (SPIR-V
+  // has no bare-pointer parameter type), which is exactly the shape the
+  // call site then produces.
+  //
+  // Run this stage only when a reference parameter is actually present
+  // (hasFunctionStorageRefParams). ConvertMemRefToSPIRV rebuilds a conversion
+  // target whose legality check rejects a `spirv.ReturnValue : f16` left
+  // untouched in a pure f16-returning __device__ helper's body (no memref ops
+  // to convert there), so the stage must not run on f16-device-helper-only
+  // modules like half.vc, which otherwise regressed here.
+  if (hasFunctionStorageRefParams(module)) {
+    pm.addPass(createConvertMemRefToSPIRVPass());
+    pm.addPass(std::make_unique<RewriteResidualIndexCastsPass>());
+    pm.addPass(createReconcileUnrealizedCastsPass());
+  }
   pm.addPass(createConvertGPUToSPIRVPass());
   // spirv-lower-abi-attrs runs on spirv.module (the op produced by the pass
   // above), not on the top-level module.

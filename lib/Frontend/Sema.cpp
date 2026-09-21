@@ -115,7 +115,22 @@ const Type *Sema::resolveTypedefs(const Type *t) {
   return t;
 }
 
+// A reference type is transparent everywhere an *expression* type is compared:
+// reading `int &r` yields an int lvalue, and binding an int lvalue to an `int&`
+// parameter is exact. Strip the reference (then any typedef alias) so the
+// assignment/arithmetic/rank predicates see the referred-to type. `sameType`
+// deliberately does NOT call this — `void f(int&)` and `void f(int)` are
+// distinct overloads and must not collapse into one signature.
+const Type *Sema::stripRef(const Type *t) {
+  t = resolveTypedefs(t);
+  while (t && t->getKind() == TypeKind::Reference) {
+    t = resolveTypedefs(static_cast<const ReferenceType *>(t)->pointee);
+  }
+  return t;
+}
+
 bool Sema::isArithmetic(const Type *t) {
+  t = stripRef(t);
   if (!t || t->getKind() != TypeKind::Builtin) return false;
   switch (static_cast<const BuiltinType *>(t)->builtin) {
   case BuiltinTypeKind::Bool:
@@ -132,9 +147,9 @@ bool Sema::isArithmetic(const Type *t) {
 }
 
 bool Sema::isIntegerType(const Type *t) {
-  // Look through aliases (`typedef int Idx;` / `using Idx = int;`).
-  if (t && t->getKind() == TypeKind::Typedef)
-    t = static_cast<const TypedefType *>(t)->decl->underlying;
+  // Look through aliases (`typedef int Idx;` / `using Idx = int;`) and
+  // references (`int &r` is an integer lvalue).
+  t = stripRef(t);
   if (!t || t->getKind() != TypeKind::Builtin) return false;
   switch (static_cast<const BuiltinType *>(t)->builtin) {
   case BuiltinTypeKind::Bool:
@@ -149,6 +164,7 @@ bool Sema::isIntegerType(const Type *t) {
 }
 
 bool Sema::isFloatType(const Type *t) {
+  t = stripRef(t);
   if (!t || t->getKind() != TypeKind::Builtin) return false;
   switch (static_cast<const BuiltinType *>(t)->builtin) {
   case BuiltinTypeKind::Float32:
@@ -260,13 +276,17 @@ const char *Sema::opName(BinaryOp op) {
 
 bool Sema::isCompatibleKinds(const Type *a, const Type *b) {
   if (!a || !b) return true; // unknown side: don't complain
-  return resolveTypedefs(a)->getKind() == resolveTypedefs(b)->getKind();
+  const Type *ra = stripRef(a);
+  const Type *rb = stripRef(b);
+  if (!ra || !rb) return true;
+  return ra->getKind() == rb->getKind();
 }
 
 bool Sema::isCompatibleForAssign(const Type *dst, const Type *src) {
   if (!dst || !src) return true; // unknown side: don't complain
-  const Type *d = resolveTypedefs(dst);
-  const Type *s = resolveTypedefs(src);
+  const Type *d = stripRef(dst);
+  const Type *s = stripRef(src);
+  if (!d || !s) return true;
   if (isArithmetic(d) && isArithmetic(s)) return true; // implicit conversions
   // Pointer to pointer needs identical pointees: int* vs float* is a mismatch
   // even though both share the pointer kind. void* accepts any pointee,
@@ -488,8 +508,15 @@ bool Sema::sameSignature(const FunctionDecl *a, const FunctionDecl *b) {
 int Sema::conversionRank(const Type *param, const Type *arg) {
   if (!param || !arg) return 0; // unknown side: treat as exact (don't penalize)
   if (sameType(param, arg)) return 0; // exact match
-  const Type *p = resolveTypedefs(param);
-  const Type *a = resolveTypedefs(arg);
+  // Binding an lvalue to a `T&` parameter (or reading through `T&`) is exact
+  // when the referred-to types match, so rank it like an unqualified match.
+  if (stripRef(param) && resolveTypedefs(param) &&
+      resolveTypedefs(param)->getKind() == TypeKind::Reference) {
+    if (sameType(stripRef(param), stripRef(arg))) return 0;
+  }
+  const Type *p = stripRef(param);
+  const Type *a = stripRef(arg);
+  if (!p || !a) return 0;
   // Arithmetic conversions: rank by direction of conversion.
   if (isArithmetic(p) && isArithmetic(a)) {
     bool pInt = isIntegerType(p), aInt = isIntegerType(a);
@@ -1275,7 +1302,20 @@ Type *Sema::checkExpr(const ASTNode *n) {
       if (k == ASTNode::NodeKind::DeclRefExpr) {
         ASTNode *sym =
             lookup(static_cast<const DeclRefExpr *>(b->lhs.get())->name);
-        if (sym &&
+        // Writing *through a reference* (`void f(int &r) { r = 1; }`) is a use
+        // of the parameter, not a store-only variable: the assignment's effect
+        // is visible at the caller. Only plain locals/by-value params reset.
+        bool throughRef = false;
+        if (sym) {
+          const Type *st = resolveTypedefs(
+              sym->getNodeType() == ASTNode::NodeKind::VarDecl
+                  ? static_cast<VarDecl *>(sym)->type
+                  : sym->getNodeType() == ASTNode::NodeKind::ParamDecl
+                        ? static_cast<ParamDecl *>(sym)->type
+                        : nullptr);
+          throughRef = st && st->getKind() == TypeKind::Reference;
+        }
+        if (sym && !throughRef &&
             (sym->getNodeType() == ASTNode::NodeKind::VarDecl ||
              sym->getNodeType() == ASTNode::NodeKind::ParamDecl))
           used[sym] = false;

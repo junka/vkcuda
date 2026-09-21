@@ -1,0 +1,41 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck --allow-empty %s
+//
+// Reference declarations (`T&`) type-check with zero diagnostics: reference
+// parameters in __device__ helpers (including a `const T&` read-only one) and
+// reference locals bound to a plain object, to an array element, and to
+// another reference. Sema treats a reference as transparent for *expression*
+// types (`stripRef`) while keeping the reference itself distinct in
+// `sameType`, so re-binding and by-reference argument passing are both legal.
+
+__device__ void bump(int &r, int d) { r = r + d; }
+
+__device__ int app(int x) { x = x + 1; return x; }
+
+__device__ int readOnly(const int &r) { return r + 1; }
+
+__device__ float half_(float &v) { v = v * 0.5f; return v; }
+
+__global__ void kern(int *out, float *fa) {
+  int a = 5;
+  bump(a, 3);
+
+  int &r = a;
+  int &s = r;
+  s = s + 1;
+
+  int b[4];
+  b[0] = 1;
+  int &e = b[0];
+  e = e + 2;
+
+  float f = 2.0f;
+  float &fr = f;
+  half_(fr);
+
+  int v = app(a);
+  out[0] = readOnly(a) + v + r + s + e + (int)f;
+  fa[0] = fr;
+
+  // CHECK-NOT: error:
+  // CHECK-NOT: warning:
+}

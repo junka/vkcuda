@@ -1,0 +1,91 @@
+// test/references.vc — CUDA reference parameters and reference locals.
+//
+// A `T&` in VC is a real by-reference binding, not a copy:
+//   - as a *parameter* (`void bump(int &r)`), the callee's writes must be
+//     visible to the caller. GLSL emits `inout`; MLIR emits a Function-storage
+//     memref passed by value to func.call, which ConvertFuncToSPIRV /
+//     ConvertMemRefToSPIRV turn into a SPIR-V Function pointer.
+//   - as a *local* (`int &r = x;`, `int &f = b[2];`), there is no storage of
+//     its own: every later use of the name resolves to the bound lvalue. GLSL
+//     substitutes the bound lvalue's text; MLIR records the bound node and
+//     routes reads/writes through the ordinary lvalue path.
+//
+// Exercises:
+//   - reference parameter mutating the caller's object
+//   - reference parameter read-only (const T&) — GLSL must drop the `const`
+//     (glslc rejects `const inout`)
+//   - reference local bound to a plain object
+//   - reference local bound to an array element
+//   - an alias of an alias (`int &s = r;`)
+//
+// Both backends PASS.
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__device__ void bump(int &r, int d) { r = r + d; }
+
+__device__ void scale(float &v, float k) { v = v * k; }
+
+__device__ int sum3(const int &r) { return r + 1; }
+
+__global__ void refs(int *out) {
+  // --- reference parameter: callee writes propagate back ---
+  int a = 5;
+  bump(a, 3);              // a = 8
+  out[0] = a;
+
+  // --- const reference parameter: read-only, must not disturb the caller ---
+  out[1] = sum3(a);        // 8 + 1 = 9
+  out[2] = a;              // still 8
+
+  // --- reference local bound to a plain object ---
+  int x = 10;
+  int &r = x;
+  r = r + 3;               // x = 13
+  out[3] = x;              // 13 (written through the alias)
+  out[4] = r;              // 13 (read through the alias)
+
+  // --- reference local bound to an array element ---
+  int b[4];
+  b[0] = 1;
+  b[1] = 2;
+  b[2] = 30;
+  b[3] = 4;
+  int &e = b[2];
+  e = e + 5;               // b[2] = 35
+  out[5] = b[2];           // 35
+
+  // --- alias of an alias, and a float reference ---
+  int &s = r;              // s aliases r, hence x
+  s = s * 2;               // x = 26
+  out[6] = x;              // 26
+
+  float f = 1.5f;
+  float &fr = f;
+  scale(fr, 4.0f);         // f = 6.0
+  out[7] = (int)f;         // 6
+  out[8] = (int)b[2];      // 35 (untouched by the above)
+  out[9] = (int)b[3];      // 4
+}
+
+int main() {
+  vcInit();
+  void *d = 0;
+  vcMalloc(&d, 10 * sizeof(int));
+  refs<<<1, 1>>>(d);
+  vcDeviceSynchronize();
+  int h[10] = {0};
+  vcMemcpy(h, d, sizeof(h), VCMemcpyKind::DeviceToHost);
+  const int want[10] = {8, 9, 8, 13, 13, 35, 26, 6, 35, 4};
+  int ok = 1;
+  for (int i = 0; i < 10; ++i)
+    if (h[i] != want[i]) ok = 0;
+  printf("refs: %s (", ok ? "PASS" : "FAIL");
+  for (int i = 0; i < 10; ++i)
+    printf("%d%s", h[i], i == 9 ? "" : " ");
+  printf(")\n");
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

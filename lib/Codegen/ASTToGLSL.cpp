@@ -101,6 +101,15 @@ class GLSLEmitter {
   struct PtrLocal { std::string base; std::string offset; };
   llvm::StringMap<PtrLocal> pointerLocals;
 
+  // Reference locals (`int &r = x;`) have no GLSL counterpart: there is no way
+  // to declare a second name for an existing variable. Since every use of `r`
+  // means the lvalue it was bound to, we record the bound lvalue's GLSL text
+  // and substitute it at each use — `r = r + 3` becomes `x = x + 3`. The
+  // initializer must be an lvalue expression (the parser accepts any
+  // expression, so a non-lvalue falls back to a plain by-value decl, which is
+  // what the previous behavior was). Cleared per function, like pointerLocals.
+  llvm::StringMap<std::string> refLocals;
+
 public:
   GLSLEmitter(raw_ostream &o) : os(&o) {}
 
@@ -634,6 +643,16 @@ private:
       if (n == r) return true;
     return false;
   }
+  // Is `t` a `T&` (possibly spelled through a typedef)? Reference parameters
+  // emit as GLSL `inout`.
+  static bool isReferenceType(const Type *t) {
+    while (t && t->getKind() == TypeKind::Typedef)
+      t = static_cast<const TypedefType *>(t)->decl
+              ? static_cast<const TypedefType *>(t)->decl->underlying
+              : nullptr;
+    return t && t->getKind() == TypeKind::Reference;
+  }
+
   // Return a GLSL-safe spelling of `name`, mangling reserved words.
   std::string glslName(llvm::StringRef name) const {
     if (isReservedGlslWord(name))
@@ -945,6 +964,7 @@ private:
     // different variable than the kernel's `a`).
     localTypes.clear();
     pointerLocals.clear();
+    refLocals.clear();
     localVarDecls.clear();
     // A helper's parameters are ordinary GLSL function parameters, NOT the
     // kernel's push-constant scalars. The kernel path (emitOneForKernel)
@@ -984,7 +1004,19 @@ private:
     for (unsigned i = 0; i < f->params.size(); ++i) {
       if (emittedParam) (*os) << ", ";
       emittedParam = true;
-      if (f->params[i]->isConst) (*os) << "const ";
+      // `T &r` is a CUDA reference parameter: calls must see the caller's
+      // object, and GLSL `inout` is the exact counterpart (passed by
+      // reference). Without the qualifier the parameter silently binds by
+      // value and the callee's writes are lost. `const T&` must drop the
+      // `const` here — GLSL rejects `const inout` ("too many storage
+      // qualifiers"), and `inout` already grants the write the callee is
+      // entitled to; the constness is a caller-side promise Sema already
+      // enforces.
+      if (isReferenceType(f->params[i]->type)) {
+        (*os) << "inout ";
+      } else if (f->params[i]->isConst) {
+        (*os) << "const ";
+      }
       (*os) << glslType(f->params[i]->type) << " " << glslName(f->params[i]->name);
     }
     (*os) << ") {\n";
@@ -1430,6 +1462,7 @@ private:
     // (each of which repopulated it) have been emitted.
     localTypes.clear();
     pointerLocals.clear();
+    refLocals.clear();
     localVarDecls.clear();
     for (const auto &p : kernel->params)
       if (p->type) localTypes[p->name] = p->type;
@@ -1524,13 +1557,16 @@ private:
       // of such locals, so we must skip the whole type/name emission when the
       // first declarator is registered.
       bool firstIsPtr = d && tryRegisterPointerLocal(d);
+      // Reference locals are elided too: a by-value copy would detach the alias.
+      bool firstIsRef = !firstIsPtr && d && tryRegisterRefLocal(d);
       if (d->isShared) break; // hoisted to a `shared` global
-      if (firstIsPtr) {
+      if (firstIsPtr || firstIsRef) {
         // First declarator is elided. Emit any additional (non-pointer) ones
         // as fresh declarations — they can't reuse the elided type prefix.
         for (unsigned i = 1; i < ds->decls.size(); ++i) {
           VarDecl *vd = ds->decls[i];
-          if (!vd || tryRegisterPointerLocal(vd)) continue;
+          if (!vd || tryRegisterPointerLocal(vd) || tryRegisterRefLocal(vd))
+            continue;
           pad(indent);
           if (vd->isConst) (*os) << "const ";
           (*os) << glslType(vd->type) << " " << glslName(vd->name);
@@ -1558,6 +1594,10 @@ private:
       // shared by the whole declaration, so it is not repeated either.
       for (unsigned i = 1; i < ds->decls.size(); ++i) {
         VarDecl *vd = ds->decls[i];
+        // A reference declarator in tail position (`int a = 1, &r = a;`) is
+        // elided like the leading case: it has no GLSL declaration of its own.
+        if (vd && tryRegisterPointerLocal(vd)) continue;
+        if (vd && tryRegisterRefLocal(vd)) continue;
         (*os) << ", " << glslName(vd->name);
         for (int64_t dim : vd->arrayDims)
           (*os) << "[" << dim << "]";
@@ -2068,6 +2108,44 @@ private:
     return false;
   }
 
+  // Try to register a reference local (`int &r = <lvalue>;`) into refLocals.
+  // Returns true if the local was registered (caller must then SKIP emitting any
+  // GLSL decl for it — a by-value copy would silently detach the alias). The
+  // rewrite target is the GLSL text of the bound lvalue (`x`, `out_[i]`, `a[0]`);
+  // anything else is not an lvalue and falls back to a by-value declaration.
+  bool tryRegisterRefLocal(const VarDecl *d) {
+    if (!d || !d->type || !isReferenceType(d->type) || !d->init) return false;
+    const ASTNode *init = d->init.get();
+    // Strip an explicitly written `&` (`int &r = &x;`) — same intent.
+    if (init->getNodeType() == ASTNode::NodeKind::UnaryExpr &&
+        static_cast<const UnaryExpr *>(init)->op == UnaryOp::AddrOf)
+      init = static_cast<const UnaryExpr *>(init)->operand.get();
+    switch (init->getNodeType()) {
+    case ASTNode::NodeKind::DeclRefExpr:
+    case ASTNode::NodeKind::IndexExpr:
+    case ASTNode::NodeKind::MemberAccessExpr:
+      break;
+    default:
+      // `int &r = a + b;` is not an lvalue binding; emit a by-value copy
+      // instead of a hard error rather than rejecting the program.
+      return false;
+    }
+    // Emit the bound lvalue's GLSL text into a buffer (the same redirect trick
+    // tryRegisterPointerLocal uses for its offsets). Since DeclRefExpr
+    // emission consults refLocals, a chained alias (`int &s = r;`) inherits
+    // the earlier substitution for free.
+    std::string text;
+    raw_string_ostream o(text);
+    raw_ostream *saved = os;
+    os = &o;
+    emitExpr(init);
+    os = saved;
+    o.flush();
+    if (text.empty()) return false;
+    refLocals[d->name] = text;
+    return true;
+  }
+
   // Emit the initializer part of a declarator (` = <expr>`), OR, for a multi-
   // dimensional array with an InitListExpr initializer, defer element-wise
   // assignments into `deferredArrInit` (flushed by the caller after the
@@ -2275,6 +2353,14 @@ private:
       // hardware; not a fixed 32 literal). gl_SubgroupSize is uint; wrap in
       // int() to match CUDA's int warpSize (and keep arithmetic on it int).
       if (name == "warpSize") { (*os) << "int(gl_SubgroupSize)"; break; }
+      // `int &r = x;` — substitute the lvalue `r` was bound to. Textual
+      // substitution is safe here because the bound expression is always an
+      // lvalue (a name or an index, never a call or a literal), and GLSL has no
+      // aliasing construct to express this any other way.
+      if (auto rl = refLocals.find(name); rl != refLocals.end()) {
+        (*os) << rl->second;
+        break;
+      }
       // Scalar params live in the push-constant block; qualify them.
       bool isScalar = false;
       for (StringRef s : scalarParams)

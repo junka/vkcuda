@@ -205,6 +205,10 @@ private:
   // Strip typedef aliases down to the underlying type for comparison and
   // arithmetic classification. A TypedefType is never directly comparable.
   static const Type *resolveTypedefs(const Type *t);
+  // Resolve typedefs, then peel `T&` down to `T`. Used wherever an expression's
+  // type is inspected (references are transparent to reads/arithmetic/assign);
+  // NOT used by sameType, which must keep `T&` and `T` distinct overloads.
+  static const Type *stripRef(const Type *t);
   // Two operands with the same TypeKind convert implicitly (builtin->builtin,
   // vector->vector, pointer->pointer); differing kinds only convert via an
   // explicit cast or for pointer+index Add/Sub.

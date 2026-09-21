@@ -872,10 +872,22 @@ bool Parser::evalConstInt(const ASTNode *e, int64_t &out) {
 
 VarDecl *Parser::parseVarDecl(Type *ty) {
   // Per-declarator leading pointer stars: in `int *a, *b;` each declarator
-  // may carry its own `*`s applied to the shared base type.
+  // may carry its own `*`s applied to the shared base type. A trailing `&`
+  // makes it a reference: `int &r = x;` — a declarator-only form (there is no
+  // `&` in a function's parameter *type* position, where parseParam handles it).
   Type *declTy = ty;
   while (consume(TokKind::star))
     declTy = new PointerType(declTy);
+  if (curTok.is(TokKind::amp)) {
+    // Only treat `&` as a declarator here when an identifier follows: the
+    // statement parser reaches parseVarDecl for anything starting with a type
+    // name, and `int & x` is unambiguous, but a stray `&` should still be a
+    // clean error rather than swallowing the name.
+    if (lexer.peek().is(TokKind::identifier)) {
+      advance();
+      declTy = new ReferenceType(declTy);
+    }
+  }
   Token nameTok = curTok;
   if (!expect(TokKind::identifier, "variable name"))
     return nullptr;

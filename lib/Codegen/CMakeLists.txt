@@ -41,5 +41,6 @@ target_link_libraries(VCCodegen PUBLIC
   MLIRMemRefToSPIRV
   MLIRControlFlowToSPIRV
   MLIRPass
+  MLIRReconcileUnrealizedCasts
   MLIRTransforms
 )
