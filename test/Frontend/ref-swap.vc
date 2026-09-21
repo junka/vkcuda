@@ -1,0 +1,36 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck --allow-empty %s
+//
+// Regression for the reference-parameter read-into-a-local pattern
+// (`int t = a;` where `a` is a `T&` param). This is the classic swap/rotate
+// temp-binding. The MLIR backend's struct-copy heuristic previously misfired
+// on the 0-rank memref behind a scalar ref param; this lit test guards the
+// parse/type-check side (the codegen regression is covered by ref_swap.vc).
+
+__device__ void swap(int &a, int &b) {
+  int t = a;   // init scalar local from a reference parameter
+  a = b;
+  b = t;
+}
+
+__device__ int pick(int &a, int &b) {
+  int x = a;   // init from ref param, then return
+  b = x;       // also write back through the ref param
+  return x;
+}
+
+__device__ void accum(int &acc, int v) {
+  int cur = acc;
+  acc = cur + v;
+}
+
+__global__ void kern(int *out) {
+  int a = 1, b = 2;
+  swap(a, b);
+  out[0] = pick(a, b);
+  int s = 0;
+  accum(s, 5);
+  out[1] = s;
+}
+
+// CHECK-NOT: error:
+// CHECK-NOT: warning:

@@ -1606,11 +1606,17 @@ private:
     // Struct-value copy: `v` is a local struct memref (e.g. the result of a
     // struct-returning call) and `mem` is the destination struct slot. Copy
     // element-by-element (both are flat i32 views of the same struct shape).
+    // A 0-rank memref is a scalar slot (a local `int t` or a `T&` reference
+    // parameter), NOT a struct — it must fall through to loadValue, which
+    // emits a 0-index load. Treating it as a 1-element struct copy would emit
+    // `memref.load(v, 0)` on a 0-rank memref, which the verifier rejects
+    // (expected 0 indices, got 1) — the regression behind `int t = a;` where
+    // `a` is a reference parameter.
     if (v.getType().isa<MemRefType>() && mem.getType().isa<MemRefType>() &&
         indices.empty()) {
       auto src = v.getType().cast<MemRefType>();
       auto dst = mem.getType().cast<MemRefType>();
-      if (src.getElementType() == dst.getElementType() &&
+      if (src.getRank() > 0 && src.getElementType() == dst.getElementType() &&
           src.hasStaticShape() && dst.hasStaticShape() &&
           src.getNumElements() == dst.getNumElements()) {
         int64_t n = src.getNumElements();

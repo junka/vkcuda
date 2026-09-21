@@ -1,0 +1,64 @@
+// ref_swap.vc — reference parameters with local-init-from-ref reads.
+//
+// A3 (commit d55bc58) added `T&` reference parameters, but the e2e demo
+// (references.vc) only covered the write-back path (`r = r + d`). The classic
+// read-into-a-local pattern — `int t = a; a = b; b = t;` (swap/rotate) — hit a
+// latent MLIR bug: storeTo's struct-value-copy heuristic misfired on a 0-rank
+// memref (the scalar slot behind a `T&` param or a scalar local), emitting
+// `memref.load(v, 0)` on a 0-rank memref, which the verifier rejects
+// ("expected 0 indices, got 1"). The fix gates the struct copy on rank > 0;
+// this demo is the regression.
+//
+// Covers:
+//   - `int t = a;` (init a scalar local from a reference parameter) — the fix
+//   - swap (two ref params, classic temp-swap)
+//   - rotate (three ref params, cyclic)
+//   - accumulator (`acc = acc + v` via a local)
+#include "vc/Runtime/VCRuntime.h"
+
+__device__ void swap(int &a, int &b) {
+  int t = a;
+  a = b;
+  b = t;
+}
+
+__device__ void rotate(int &a, int &b, int &c) {
+  int t = a;
+  a = b;
+  b = c;
+  c = t;
+}
+
+__device__ void addto(int &acc, int v) {
+  int cur = acc;
+  acc = cur + v;
+}
+
+__global__ void kern(int *out) {
+  int a = 1, b = 2, c = 3;
+  swap(a, b);          // a=2, b=1
+  rotate(a, b, c);     // a=1, b=3, c=2
+  int s = 0;
+  addto(s, 10);
+  addto(s, 20);        // s=30
+  out[0] = a;          // 1
+  out[1] = b;          // 3
+  out[2] = c;          // 2
+  out[3] = s;          // 30
+}
+
+int main() {
+  vcInit();
+  void *d = 0;
+  vcMalloc(&d, 4 * sizeof(int));
+  kern<<<1, 1>>>(d);
+  vcDeviceSynchronize();
+  int h[4] = {0};
+  vcMemcpy(h, d, 4 * sizeof(int), VCMemcpyKind::DeviceToHost);
+  printf("ref_swap: %d %d %d %d", h[0], h[1], h[2], h[3]);
+  bool ok = h[0] == 1 && h[1] == 3 && h[2] == 2 && h[3] == 30;
+  printf(" %s\n", ok ? "PASS" : "FAIL");
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}
