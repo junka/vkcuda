@@ -1,19 +1,30 @@
 // RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
 //
-// GLSL forbids recursion: a __device__/__global__ function that calls itself
-// directly must be rejected (otherwise the backend emits an illegal recursive
-// GLSL function). Indirect recursion is NOT yet detected.
+// Recursion in device code: SPIR-V forbids it, so it is not accepted as-is —
+// but a *bounded linear* self-recursion is rewritten to an iterative
+// accumulator loop by the AstTransforms pass (unrollDeviceRecursion) before
+// codegen, so Sema accepts it (it only marks the function `isRecursive`).
+// Shapes the pass cannot rewrite — here branching recursion (two self-calls) —
+// are rejected with a hard error, so unsupported recursion still fails loudly
+// instead of emitting illegal SPIR-V.
+//
+// Indirect recursion (f -> g -> f) is NOT yet detected.
 
-// A self-calling __device__ helper — direct recursion, must error.
+// Bounded linear self-recursion: accepted, rewritten to a loop by the pass.
+// No diagnostic for this function.
 __device__ int fact(int n) {
-  // CHECK: error: recursive function 'fact' is not allowed in GLSL
   if (n <= 1) return 1;
   return n * fact(n - 1);
 }
 
-// A __global__ kernel that calls itself via launch syntax is also recursion,
-// but kernel-to-kernel launch isn't a device-side call; only same-function
-// direct calls within device code are caught here.
+// Branching recursion: two self-calls in the return expression, which the
+// iterative rewrite cannot express.
+__device__ int fib(int n) {
+  // CHECK: error: cannot rewrite recursive function 'fib': branching recursion
+  if (n < 2) return n;
+  return fib(n - 1) + fib(n - 2);
+}
+
 __global__ void kern(int *out) {
-  out[0] = fact(3);
+  out[0] = fact(3) + fib(5);
 }
