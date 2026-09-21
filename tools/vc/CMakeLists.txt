@@ -30,13 +30,10 @@ target_link_libraries(vc PRIVATE
 # Bake the locations -emit=full needs to invoke g++ with the right -I / .a /
 # -l flags (mirrors tools/vcc/CMakeLists.txt). VCCodegen/VCFrontend already
 # bring in the headers; VCRuntime itself is linked by g++ at executable link
-# time, not by the vc binary.
-file(TO_CMAKE_PATH "${VC_INCLUDE_DIR}" VC_INCLUDE_DIR_ABS)
-set(VC_RUNTIME_LIB_PATH "$<TARGET_FILE:VCRuntime>")
-set(VC_VULKAN_LIB_FLAG "-lvulkan")
-
+# time, not by the vc binary. With -DVC_USE_INSTALL_PATHS=ON these are
+# install-relative so a packaged vc finds them under the install prefix.
 target_compile_definitions(vc PRIVATE
-  VC_INCLUDE_DIR="${VC_INCLUDE_DIR_ABS}"
-  VC_RUNTIME_LIB="${VC_RUNTIME_LIB_PATH}"
-  VC_VULKAN_LIBS="${VC_VULKAN_LIB_FLAG}"
+  VC_INCLUDE_DIR="${VC_DRIVER_INCLUDE_DIR}"
+  VC_RUNTIME_LIB="${VC_DRIVER_RUNTIME_LIB}"
+  VC_VULKAN_LIBS="${VC_DRIVER_VULKAN_LIBS}"
 )

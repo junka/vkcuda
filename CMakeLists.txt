@@ -83,10 +83,49 @@ endif()
 # Common include path for all VC targets.
 set(VC_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/include)
 
+include(GNUInstallDirs)  # sets CMAKE_INSTALL_{BINDIR,LIBDIR,INCLUDEDIR,...}
+
+# When ON, the compiler drivers (vcc, vc) bake install-relative paths into
+# their baked-in g++ invocation (VC_INCLUDE_DIR / VC_RUNTIME_LIB), so an
+# installed vcc can locate the public headers + libVCRuntime.a under the
+# install prefix without referencing the source/build tree. The source-tree
+# dev workflow (default OFF) keeps pointing at the build tree, so the e2e
+# harness and in-tree demos are unchanged.
+#
+# NOTE: $<INSTALL_PREFIX> is only valid inside install(EXPORT), not in
+# target_compile_definitions, so we expand against CMAKE_INSTALL_PREFIX here.
+# This means a packaged vcc is correct for the configured prefix (typically
+# /usr); it is not relocatable after install, but a .deb pins the path anyway.
+option(VC_USE_INSTALL_PATHS
+       "Bake install-prefix paths into vcc/vc (for packaging)" OFF)
+if(VC_USE_INSTALL_PATHS)
+  set(VC_DRIVER_INCLUDE_DIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_INCLUDEDIR}")
+  set(VC_DRIVER_RUNTIME_LIB "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/libVCRuntime.a")
+  message(STATUS "VC drivers: baking install paths "
+                 "(include=${VC_DRIVER_INCLUDE_DIR} "
+                 "runtime=${VC_DRIVER_RUNTIME_LIB})")
+else()
+  set(VC_DRIVER_INCLUDE_DIR "${VC_INCLUDE_DIR}")
+  set(VC_DRIVER_RUNTIME_LIB "$<TARGET_FILE:VCRuntime>")
+endif()
+set(VC_DRIVER_VULKAN_LIBS "-lvulkan")
+
 enable_testing()
 
+# The single-file demos under examples/ are compiled by the in-tree vcc at
+# build time, which assumes vcc points at the source-tree headers/runtime.
+# A packaging build (VC_USE_INSTALL_PATHS=ON) bakes install paths instead, so
+# the demos can't link there — disable them in that mode.
+option(VC_BUILD_EXAMPLES "Build the single-file vcc demos (in-tree vcc)" ON)
+if(VC_BUILD_EXAMPLES AND VC_USE_INSTALL_PATHS)
+  message(STATUS "VC_BUILD_EXAMPLES disabled (incompatible with VC_USE_INSTALL_PATHS)")
+  set(VC_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+endif()
+
 add_subdirectory(lib)
-add_subdirectory(examples)
+if(VC_BUILD_EXAMPLES)
+  add_subdirectory(examples)
+endif()
 add_subdirectory(tools/vc-dump-ast)
 add_subdirectory(tools/vc-glsl)
 add_subdirectory(tools/vcc)
@@ -209,3 +248,77 @@ if(VC_RUN_E2E_TESTS AND Python3_Interpreter_FOUND AND TARGET vcc)
 else()
   message(STATUS "vc-e2e-check disabled (set -DVC_RUN_E2E_TESTS=ON to enable)")
 endif()
+
+# ---------------------------------------------------------------------------
+# Install rules + packaging
+#
+# `cmake --install` lays out a FHS-style tree:
+#   bin/   vcc, vc, vc-dump-ast, vc-glsl   (vc only with MLIR)
+#   include/vc/  public headers (VCRuntime.h, AST, Frontend, ...)
+#   lib/   libVCRuntime.a, libVCFrontend.a, libVCCodegen.a, libVCDialect.a
+#
+# The drivers bake install-relative paths ONLY when -DVC_USE_INSTALL_PATHS=ON,
+# so a staged/installed vcc finds the headers + libVCRuntime.a under the
+# install prefix. CPack then turns the staged tree into a .deb.
+#
+# Static libs are installed as plain archives (no EXPORT set / find_package
+# config): the MLIR-backed libs (VCDialect/VCCodegen) drag in MLIR internals
+# that don't belong in a downstream config, and the package's purpose is the
+# driver binaries + the user-linkable VCRuntime.a.
+# ---------------------------------------------------------------------------
+
+# Driver binaries.
+set(_vc_install_tools vcc vc-dump-ast vc-glsl)
+if(VC_ENABLE_MLIR)
+  list(APPEND _vc_install_tools vc)
+endif()
+install(TARGETS ${_vc_install_tools}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Static libraries (plain archives, not exported).
+set(_vc_install_libs VCRuntime VCFrontend)
+if(VC_ENABLE_MLIR)
+  list(APPEND _vc_install_libs VCCodegen VCDialect)
+endif()
+install(TARGETS ${_vc_install_libs}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+# Public headers.
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/vc
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# ---------------------------------------------------------------------------
+# CPack — produce a Debian package.
+# ---------------------------------------------------------------------------
+set(CPACK_PACKAGE_NAME "vc")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+    "VC — a CUDA-like language targeting Vulkan via MLIR/SPIR-V")
+set(CPACK_PACKAGE_CONTACT "junka")
+set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/junka/gg")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "junka")
+set(CPACK_DEBIAN_PACKAGE_SECTION "devel")
+set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
+# Runtime + compile-time deps vcc/vc need on the target host:
+#   libllvm18 / libmlir-18 — the drivers link libLLVM.so (MLIR backend also
+#     pulls libMLIR.so transitively).
+#   libvulkan1 — runtime links Vulkan.
+#   glslc (shaderc) — vcc invokes it to compile GLSL→SPIR-V.
+#   spirv-tools / spirv-headers — SPIR-V validation/disassembly.
+#   libllvmspirvlib-18-dev — llvm-spirv translator (MLIR SPIR-V path).
+#   g++ + libc6-dev — vcc drives g++ to link user executables at use time.
+set(CPACK_DEBIAN_PACKAGE_DEPENDS
+    "libllvm18, libmlir-18, libvulkan1, glslc, spirv-tools, libllvmspirvlib-18-dev, g++, libc6-dev")
+# Keep debug symbols (RelWithDebInfo) — don't strip.
+set(CPACK_STRIP_FILES OFF)
+set(CPACK_DEBIAN_DEBUGINFO_PACKAGE ON)
+# Debian-conformant package filename: vc_<version>_<arch>.deb
+# (Debian uses "amd64" for x86_64; CPack's control field already says amd64,
+#  so match it in the filename too.)
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+  set(_vc_deb_arch "amd64")
+else()
+  set(_vc_deb_arch "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+set(CPACK_PACKAGE_FILE_NAME "vc_${PROJECT_VERSION}_${_vc_deb_arch}")
+include(CPack)

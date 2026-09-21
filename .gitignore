@@ -1,10 +1,13 @@
 /build/
 /build-mlir/
 /build-mlir3/
+/build-pkg/
 *.o
 *.a
 *.so
 *.spv
+*.deb
+*.ddeb
 .cache/
 compile_commands.json
 

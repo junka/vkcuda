@@ -27,12 +27,10 @@ target_link_libraries(vcc PRIVATE VCFrontend LLVM)
 #   VC_INCLUDE_DIR  - absolute path to the vc/ headers root
 #   VC_RUNTIME_LIB  - absolute path to libVCRuntime.a
 #   VC_VULKAN_LIBS  - linker flags to pull in Vulkan (VCRuntime needs it)
-file(TO_CMAKE_PATH "${VC_INCLUDE_DIR}" VC_INCLUDE_DIR_ABS)
-set(VC_RUNTIME_LIB_PATH "$<TARGET_FILE:VCRuntime>")
-set(VC_VULKAN_LIB_FLAG "-lvulkan")
-
+# With -DVC_USE_INSTALL_PATHS=ON these are install-relative ($<INSTALL_PREFIX>
+# based) so a packaged vcc finds the headers + .a under the install prefix.
 target_compile_definitions(vcc PRIVATE
-  VC_INCLUDE_DIR="${VC_INCLUDE_DIR_ABS}"
-  VC_RUNTIME_LIB="${VC_RUNTIME_LIB_PATH}"
-  VC_VULKAN_LIBS="${VC_VULKAN_LIB_FLAG}"
+  VC_INCLUDE_DIR="${VC_DRIVER_INCLUDE_DIR}"
+  VC_RUNTIME_LIB="${VC_DRIVER_RUNTIME_LIB}"
+  VC_VULKAN_LIBS="${VC_DRIVER_VULKAN_LIBS}"
 )
