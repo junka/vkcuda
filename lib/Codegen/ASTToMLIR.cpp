@@ -211,10 +211,14 @@ public:
     for (auto &d : tu.decls)
       preRegisterStructs(d.get(), StringRef());
     for (auto &d : tu.decls) {
-      // Pre-register __constant__ globals so device code can read them.
+      // Pre-register __constant__ globals (and file-scope C `const`/`constexpr`
+      // globals like `const int N = 4;`) so device code can read them. A
+      // constexpr/const file-scope integer used as an array dimension or loop
+      // bound lowers to the same module-scope SPIR-V global as __constant__.
       if (d->getNodeType() == ASTNode::NodeKind::VarDecl) {
         auto *v = static_cast<const VarDecl *>(d.get());
-        if (v->isConstant) constGlobals[v->name] = v;
+        if (v->isConstant || (v->isConst && v->init))
+          constGlobals[v->name] = v;
       }
       visitTopLevel(d.get());
     }

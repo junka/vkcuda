@@ -1,0 +1,41 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck --allow-empty %s
+//
+// CUDA/C++ keyword-compat: `__restrict__`/`__restrict`/C99 `restrict` in any
+// pointer-declarator position, `nullptr` as a null pointer literal, and
+// `constexpr` as a synonym for `const` (file-scope and local). All should
+// type-check with zero diagnostics beyond the benign int↔pointer mixing that
+// `nullptr`/`0` already produce (those are warnings, checked separately).
+
+// --- restrict: every position a pointer declarator allows. ---
+__global__ void k_restrict(int * __restrict__ a, int * restrict b,
+                           int *__restrict c) {
+  int * __restrict__ p = a;
+  *p = *b + *c;
+  a[0] = p[0];
+}
+
+// Forward decl with restrict on a prototype param.
+void fwd(int * __restrict__ o);
+
+// --- nullptr: null pointer literal, in init and in comparison. ---
+__global__ void k_nullptr(int *o) {
+  int *p = nullptr;
+  if (p == nullptr) {
+    o[0] = 1;
+  } else {
+    o[0] = 0;
+  }
+}
+
+// --- constexpr: file-scope constant (used as array dim) and local. ---
+constexpr int N = 4;
+
+__global__ void k_constexpr(int *o) {
+  constexpr int x = 5;
+  int arr[N];
+  arr[0] = x;
+  o[0] = arr[0];
+}
+
+// CHECK-NOT: error:
+// CHECK-NOT: warning:

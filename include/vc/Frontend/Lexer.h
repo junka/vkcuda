@@ -65,6 +65,10 @@ enum class TokKind {
   kw_const,
   kw_true, kw_false,
   kw_sizeof,
+  // C++11 `nullptr` (lexed as a keyword so it isn't an undeclared identifier;
+  // parsePrimary lowers it to IntegerLiteral(0), matching the existing
+  // `int *p = 0` path) and `constexpr` (treated as a synonym for `const`).
+  kw_nullptr, kw_constexpr,
   // C storage classes (recognized so `static`/`extern` don't lex as identifiers
   // and can be recorded on VarDecl/FunctionDecl for host passthrough).
   kw_static, kw_extern,
@@ -121,6 +125,8 @@ public:
   Token peek();
   /// Peek two tokens ahead without consuming.
   Token peek2();
+  /// Peek three tokens ahead without consuming.
+  Token peek3();
 
   /// Opaque save/restore of the lexer position, for speculative parsing
   /// (e.g. distinguishing a C-style cast `(T)x` from a grouping `(x)`).

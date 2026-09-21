@@ -335,10 +335,16 @@ private:
         // File-scope `static`/`extern` globals (storageClass) are also emitted
         // here with the storage class passed through verbatim — these are host
         // translation-unit globals, legal C++.
+        // File-scope C `const`/`constexpr` globals (`const int N = 4;`) are
+        // emitted as `const` C++ globals too: the host references the same
+        // compile-time constants the device does (array sizes, loop bounds).
+        // A const global without an initializer is a declaration only
+        // (`extern const int g;`) and skipped — there's no value to emit.
         auto *v = static_cast<const VarDecl *>(d.get());
-        bool isConstGlobal = v->isConstant;
+        bool isConstGlobal = v->isConstant || v->isConst;
         bool hasStorage = v->storageClass != StorageClass::None;
         if (!isConstGlobal && !hasStorage) continue;
+        if (v->isConst && !v->isConstant && !v->init) continue;
         if (v->storageClass == StorageClass::Static) os << pad << "static ";
         else if (v->storageClass == StorageClass::Extern) os << pad << "extern ";
         if (isConstGlobal) os << "const ";

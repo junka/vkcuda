@@ -105,6 +105,18 @@ bool Parser::parseTopLevelDecl() {
   // backend strips the storage class (no file-scope `static` in device code).
   if (curTok.is(TokKind::kw_static) || curTok.is(TokKind::kw_extern))
     return parseGlobalVarDecl();
+  // File-scope `const`/`constexpr` variable declarations
+  // (`const int N = 4;` / `constexpr int N = 4;`): CUDA code uses these for
+  // compile-time constants consumed as array dimensions. A `(` after the
+  // declarator name means a const-returning function prototype
+  // (`const int f();`) — rare in device code, and left to parseFunctionOrKernel.
+  // Otherwise route to parseGlobalVarDecl so the initializer/dims are handled.
+  if (curTok.is(TokKind::kw_const) || curTok.is(TokKind::kw_constexpr)) {
+    // curTok = const/constexpr, peek() = base type, peek2() = declarator name,
+    // peek3() = the token after the name (`(` → function; `=`/`;`/`[` → var).
+    if (!lexer.peek3().is(TokKind::l_paren))
+      return parseGlobalVarDecl();
+  }
   return parseFunctionOrKernel();
 }
 
@@ -875,9 +887,13 @@ VarDecl *Parser::parseVarDecl(Type *ty) {
   // may carry its own `*`s applied to the shared base type. A trailing `&`
   // makes it a reference: `int &r = x;` — a declarator-only form (there is no
   // `&` in a function's parameter *type* position, where parseParam handles it).
+  // A `restrict`/`__restrict__` may follow any star (CUDA `int * __restrict__ p`)
+  // and is dropped — VC models no aliasing.
   Type *declTy = ty;
-  while (consume(TokKind::star))
+  while (consume(TokKind::star)) {
+    while (consume(TokKind::kw_restrict)) { /* dropped */ }
     declTy = new PointerType(declTy);
+  }
   if (curTok.is(TokKind::amp)) {
     // Only treat `&` as a declarator here when an identifier follows: the
     // statement parser reaches parseVarDecl for anything starting with a type
@@ -1023,7 +1039,16 @@ Type *Parser::parseBaseType() {
   lastBaseWasConst = false;
   lastBaseStorage = StorageClass::None;
   while (true) {
-    if (curTok.is(TokKind::kw_const)) { lastBaseWasConst = true; advance(); continue; }
+    if (curTok.isOneOf(TokKind::kw_const, TokKind::kw_constexpr)) {
+      // `constexpr` is treated as a synonym for `const`: VC's type system has
+      // no constant-expression evaluation distinction, and a file-scope
+      // `constexpr int N = 4;` lowers through the same const-global path as
+      // `const int N = 4;` (used as an array dimension, it folds via the
+      // existing constInts map).
+      lastBaseWasConst = true;
+      advance();
+      continue;
+    }
     if (curTok.is(TokKind::kw_restrict)) { advance(); continue; }
     if (curTok.is(TokKind::kw_static)) {
       lastBaseStorage = StorageClass::Static; advance(); continue;
@@ -1194,10 +1219,14 @@ Type *Parser::parseBaseType() {
 Type *Parser::parseType() {
   Type *base = parseBaseType();
   if (!base) return nullptr;
-  // pointer levels: '*' '*'
+  // pointer levels: '*' '*'. A `restrict`/`__restrict__` may follow any star
+  // (C99 `int * restrict p`, CUDA `int * __restrict__ p`); it carries no
+  // semantics here and is silently dropped.
   Type *ty = base;
-  while (consume(TokKind::star))
+  while (consume(TokKind::star)) {
+    while (consume(TokKind::kw_restrict)) { /* alias qualifier, dropped */ }
     ty = new PointerType(ty);
+  }
   // reference levels: '&' (host-only, e.g. `const Point &p` in a helper).
   while (consume(TokKind::amp))
     ty = new ReferenceType(ty);
@@ -1207,7 +1236,8 @@ Type *Parser::parseType() {
 bool Parser::startsType(const Token &t) {
   switch (t.kind) {
   case TokKind::kw_const:
-    // `const` qualifies a following type; peek through it.
+  case TokKind::kw_constexpr:
+    // `const`/`constexpr` qualifies a following type; peek through it.
     return true;
   case TokKind::kw_static:
   case TokKind::kw_extern:
@@ -2026,6 +2056,18 @@ NodePtr Parser::parsePrimary() {
   case TokKind::kw_false:
     advance();
     return NodePtr(new BoolLiteral(toSourceLoc(t), false));
+  case TokKind::kw_nullptr:
+    // `nullptr` lowers to IntegerLiteral(0), reusing the existing `int *p = 0`
+    // and `p == 0` paths. The isNullPtr flag lets Sema treat it as a null-
+    // pointer literal (compatible with any pointer type, no int↔ptr warning),
+    // distinguishing it from a plain `0`. VC has no distinct null-pointer type;
+    // a pointer-typed context is what gives the literal its pointer meaning.
+    advance();
+    {
+      auto *il = new IntegerLiteral(toSourceLoc(t), 0);
+      il->isNullPtr = true;
+      return NodePtr(il);
+    }
   case TokKind::l_paren: {
     advance();
     auto e = parseExpression();

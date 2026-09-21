@@ -282,6 +282,14 @@ bool Sema::isCompatibleKinds(const Type *a, const Type *b) {
   return ra->getKind() == rb->getKind();
 }
 
+bool Sema::isNullPointerConstant(const ASTNode *e) {
+  if (!e)
+    return false;
+  if (e->getNodeType() != ASTNode::NodeKind::IntegerLiteral)
+    return false;
+  return static_cast<const IntegerLiteral *>(e)->isNullPtr;
+}
+
 bool Sema::isCompatibleForAssign(const Type *dst, const Type *src) {
   if (!dst || !src) return true; // unknown side: don't complain
   const Type *d = stripRef(dst);
@@ -1030,6 +1038,11 @@ void Sema::checkStmt(const ASTNode *n) {
                 decayOk = true;
             }
           }
+          // `nullptr` initializing a pointer is a null-pointer binding, not an
+          // int↔ptr mismatch.
+          if (!decayOk && v->type->getKind() == TypeKind::Pointer &&
+              isNullPointerConstant(v->init.get()))
+            decayOk = true;
           if (!decayOk)
             warn(v, "initializer of type " + typeName(initTy) +
                         " does not match declared type " + typeName(v->type));
@@ -1346,7 +1359,14 @@ Type *Sema::checkExpr(const ASTNode *n) {
                       rt && rt->getKind() == TypeKind::Builtin) ||
                      (lt && lt->getKind() == TypeKind::Builtin &&
                       rt && rt->getKind() == TypeKind::Pointer));
-    if (!logical && !ptrArith && !isCompatibleKinds(lt, rt))
+    // `ptr == nullptr` / `ptr != nullptr`: a null-pointer comparison is
+    // well-formed even though nullptr lowers to an integer literal.
+    bool nullCmp = (b->op == BinaryOp::Eq || b->op == BinaryOp::NEq) &&
+                   ((lt && lt->getKind() == TypeKind::Pointer &&
+                     isNullPointerConstant(b->rhs.get())) ||
+                    (rt && rt->getKind() == TypeKind::Pointer &&
+                     isNullPointerConstant(b->lhs.get())));
+    if (!logical && !ptrArith && !nullCmp && !isCompatibleKinds(lt, rt))
       warn(n, "operands of '" + std::string(opName(b->op)) +
                   "' have incompatible types (" + typeName(lt) + " and " +
                   typeName(rt) + ")");

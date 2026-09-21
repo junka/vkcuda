@@ -18,6 +18,17 @@ using namespace llvm;
 
 namespace {
 
+// True if `e` is the `nullptr` keyword, lowered by the parser to an
+// IntegerLiteral tagged isNullPtr. Used to fold pointer/nullptr comparisons
+// (a GLSL SSBO/pointer local is always bound, never null).
+static bool isNullPointerLiteral(const ASTNode *e) {
+  if (!e)
+    return false;
+  if (e->getNodeType() != ASTNode::NodeKind::IntegerLiteral)
+    return false;
+  return static_cast<const IntegerLiteral *>(e)->isNullPtr;
+}
+
 class GLSLEmitter {
   raw_ostream *os;
   // The kernel function being emitted.
@@ -939,7 +950,16 @@ private:
     for (auto *d : flat) {
       if (d->getNodeType() != ASTNode::NodeKind::VarDecl) continue;
       auto *v = static_cast<const VarDecl *>(d);
-      if (!v->isConstant) continue;
+      // CUDA `__constant__` globals (device-resident read-only) and file-scope
+      // C `const`/`constexpr` globals (`const int N = 4;`): both lower to a
+      // GLSL `const` global with a compile-time initializer. The latter is how
+      // CUDA code spells a compile-time constant used as an array dimension or
+      // loop bound; GLSL accepts a `const int` global for both.
+      if (!v->isConstant && !v->isConst) continue;
+      // A file-scope const without an initializer is a declaration (e.g.
+      // `extern const int g;`); skip it — there's no value to emit and a bare
+      // `const int g;` is ill-formed in GLSL.
+      if (!v->isConstant && !v->init) continue;
       (*os) << "const " << glslType(v->type) << " " << glslName(v->name);
       for (int64_t dim : v->arrayDims)
         (*os) << "[" << dim << "]";
@@ -2260,6 +2280,24 @@ private:
   // operand whose inferred type differs from the common type is wrapped in
   // `commonType(...)`. Assignment uses the LHS type as the target.
   void emitBinary(const BinaryExpr *b) {
+    // `ptr == nullptr` / `ptr != nullptr`: a GLSL SSBO or pointer local is a
+    // bound reference, never null, so the comparison folds to a constant
+    // (== → false, != → true). Emitting the raw `ptr == 0` would be ill-formed
+    // (no `==` between a buffer array and an int in GLSL).
+    if (b->op == BinaryOp::Eq || b->op == BinaryOp::NEq) {
+      bool lhsNull = isNullPointerLiteral(b->lhs.get());
+      bool rhsNull = isNullPointerLiteral(b->rhs.get());
+      if (lhsNull || rhsNull) {
+        const Type *other = exprType(lhsNull ? b->rhs.get() : b->lhs.get());
+        const Type *ro = resolveTypedef(other);
+        if (ro && ro->getKind() == TypeKind::Pointer) {
+          // == nullptr → false; != nullptr → true (the pointer is always bound).
+          bool isEq = (b->op == BinaryOp::Eq);
+          (*os) << (isEq ? "false" : "true");
+          return;
+        }
+      }
+    }
     (*os) << "(";
     if (b->op == BinaryOp::Assign) {
       // Coerce the RHS to the LHS type ONLY when the LHS is float16 and the RHS

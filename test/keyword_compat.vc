@@ -1,0 +1,58 @@
+// keyword_compat.vc — CUDA keyword compatibility: `__restrict__`/`restrict`,
+// `nullptr`, and `constexpr` (file-scope + local). These are pervasive in CUDA
+// C++ source and previously failed to parse or type-check.
+//
+// Regression for the keyword-compat gap. All three keywords are accepted by
+// the parser and lowered:
+//   - `__restrict__`/`__restrict`/C99 `restrict` may appear in any pointer-
+//     declarator position (before the base type, between `*` and the name, on
+//     a prototype). VC drops the qualifier (no aliasing model).
+//   - `nullptr` is a null-pointer literal, type-checked compatible with any
+//     pointer type in initialization and comparison.
+//   - `constexpr` is treated as a synonym for `const`; a file-scope
+//     `constexpr int N = 4;` folds as an array dimension.
+//
+// The runtime path here exercises `__restrict__` on a kernel SSBO param and
+// `constexpr` (file-scope + local) as a loop/bound constant. `nullptr` parsing
+// and type-checking is covered by test/Frontend/keyword-compat.vc; an
+// `int *p = nullptr` runtime store is gated on the MLIR backend's broader
+// pointer-local support, so this demo keeps nullptr in a position both
+// backends lower (a dead-comparison branch the optimizer drops).
+#include "vc/Runtime/VCRuntime.h"
+
+constexpr int N = 4;
+
+__global__ void kern(int * __restrict__ out) {
+  int tid = threadIdx.x;
+
+  // `constexpr` local: a compile-time constant in device code.
+  constexpr int step = 7;
+  if (tid < N) out[tid] = step;
+
+  // `nullptr` as a null pointer literal. The branch is dead (out is always
+  // bound), but it exercises the nullptr literal in a comparison context.
+  if (nullptr == nullptr) {
+    out[N] = step;
+  } else {
+    out[N] = 0;
+  }
+}
+
+int main() {
+  vcInit();
+  void *d = 0;
+  vcMalloc(&d, (N + 1) * sizeof(int));
+  kern<<<1, 32>>>(d);
+  vcDeviceSynchronize();
+  int h[N + 1] = {0};
+  vcMemcpy(h, d, (N + 1) * sizeof(int), VCMemcpyKind::DeviceToHost);
+
+  printf("kw:");
+  for (int i = 0; i < N + 1; ++i) printf(" %d", h[i]);
+  printf("\n");
+  bool ok = h[0] == 7 && h[1] == 7 && h[2] == 7 && h[3] == 7 && h[4] == 7;
+  printf("%s\n", ok ? "PASS" : "FAIL");
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

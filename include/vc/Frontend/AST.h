@@ -652,6 +652,12 @@ public:
   // re-attaches the `L` so a spilled launch arg deduces the right width,
   // matching a long device parameter.
   bool isLong = false;
+  // True if this literal was spelled `nullptr` (lowered to IntegerLiteral(0)
+  // by parsePrimary). Sema treats a null-pointer literal as compatible with
+  // any pointer type in initialization and comparison, mirroring C++ semantics
+  // — `int *p = nullptr;` and `p == nullptr` type-check without warnings,
+  // unlike the plain `0` spelling which keeps its benign int/pointer warning.
+  bool isNullPtr = false;
   IntegerLiteral(SourceLocation l, int64_t v) : ASTNode(l), value(v) {}
   NodeKind getNodeType() const override { return NodeKind::IntegerLiteral; }
 };

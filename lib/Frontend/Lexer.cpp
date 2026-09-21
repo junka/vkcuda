@@ -99,6 +99,8 @@ TokKind Lexer::classifyKeyword(StringRef ident) {
       .Case("case", TokKind::kw_case)
       .Case("default", TokKind::kw_default)
       .Case("const", TokKind::kw_const)
+      .Case("constexpr", TokKind::kw_constexpr)
+      .Case("nullptr", TokKind::kw_nullptr)
       .Case("true", TokKind::kw_true)
       .Case("false", TokKind::kw_false)
       .Case("sizeof", TokKind::kw_sizeof)
@@ -108,7 +110,14 @@ TokKind Lexer::classifyKeyword(StringRef ident) {
       .Case("__device__", TokKind::kw_device)
       .Case("__host__", TokKind::kw_host)
       .Case("__shared__", TokKind::kw_shared)
+      // `__restrict__`, `__restrict`, and C99 `restrict` all map to the same
+      // token: VC drops the qualifier (no aliasing model), but it must lex as a
+      // keyword so it can be silently consumed in any position a pointer
+      // declarator allows — before the base type, between `*` and the name
+      // (`int * __restrict__ p`), and in parameter/declarator suffixes.
       .Case("__restrict__", TokKind::kw_restrict)
+      .Case("__restrict", TokKind::kw_restrict)
+      .Case("restrict", TokKind::kw_restrict)
       // CUDA __constant__ variables: device-resident read-only globals. VC
       // lowers these to `const` GLSL/C++ globals with compile-time initializers
       // only (no cudaMemcpyToSymbol runtime path). Useful for lookup tables and
@@ -475,6 +484,27 @@ Token Lexer::peek2() {
   unsigned savedHashLine = hashLineLine, savedHashCol = hashLineCol;
   lex(); // skip current
   Token t = lex(); // the one after
+  pos = savedPos;
+  curLine = savedLine;
+  curCol = savedCol;
+  haveHashLine = savedHaveHash;
+  hashLineText = savedHashText;
+  hashLineLine = savedHashLine;
+  hashLineCol = savedHashCol;
+  return t;
+}
+
+Token Lexer::peek3() {
+  // Three-token lookahead: lex three tokens past the current, then restore.
+  unsigned savedPos = pos;
+  unsigned savedLine = curLine;
+  unsigned savedCol = curCol;
+  bool savedHaveHash = haveHashLine;
+  llvm::StringRef savedHashText = hashLineText;
+  unsigned savedHashLine = hashLineLine, savedHashCol = hashLineCol;
+  lex();      // skip current
+  lex();      // skip peek()
+  Token t = lex(); // the one after peek2()
   pos = savedPos;
   curLine = savedLine;
   curCol = savedCol;

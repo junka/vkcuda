@@ -214,6 +214,10 @@ private:
   // explicit cast or for pointer+index Add/Sub.
   static bool isCompatibleKinds(const Type *a, const Type *b);
   static bool isCompatibleForAssign(const Type *dst, const Type *src);
+  // True if `e` is a null-pointer literal: the `nullptr` keyword (lowered to
+  // IntegerLiteral(0) with the isNullPtr flag). Used to permit initialization
+  // and comparison of a pointer against nullptr without an int↔ptr warning.
+  static bool isNullPointerConstant(const ASTNode *e);
 };
 
 } // namespace vc
