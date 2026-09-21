@@ -1,0 +1,58 @@
+// ref_return.vc — reference return types (`int &f(...)`, G2).
+//
+// A `T&`-returning function yields an lvalue: the caller can write through it
+// (`pick(x,y,1) = 99`) or read through it (`v = pick(x,y,0)`). The returned
+// reference must alias a durable object — here, one of the reference parameters,
+// which itself binds to the caller's lvalue.
+//
+// Three things had to come together:
+//   - Sema: a call whose callee returns `T&` is an lvalue (the call's result
+//     type is a ReferenceType), so `pick(...) = 99` is accepted, not flagged
+//     "assignment to non-lvalue".
+//   - MLIR: the callee's result type is the Function-storage memref slot (the
+//     address), and `return a;` yields the slot (not the loaded value). A
+//     ref-return with an early return lowers to an `scf.if` yielding the slot;
+//     the HoistRefReturnIfYieldsPass rewrites that if to yield the underlying
+//     spirv.ptr (peeling the unrealized_conversion_casts) so GPUToSPIRV can
+//     legalize it to spirv.Select. The call result is then a store target.
+//   - GLSL: GLSL functions can't return references, so the call is inlined at
+//     the call site — a read lowers to a `(cond ? a : b)` ternary, and a write
+//     `pick(...)= v` lowers to `if (cond) a = v; else b = v;` (GLSL rejects
+//     assigning to a ternary).
+//
+// Covers:
+//   - `int &pick(int &a, int &b, int sel)` with an early return
+//   - write through the returned ref: `pick(x,y,1) = 99`
+//   - read through the returned ref: `out[i] = pick(x,y,0)`
+#include "vc/Runtime/VCRuntime.h"
+
+__device__ int &pick(int &a, int &b, int sel) {
+  if (sel) return a;
+  return b;
+}
+
+__global__ void kern(int *out) {
+  int x = 10, y = 20;
+  pick(x, y, 1) = 42;       // write through returned ref -> x
+  out[0] = x;               // 42
+  out[1] = y;               // 20
+  pick(x, y, 0) = 7;        // write through returned ref -> y
+  out[2] = x;               // 42
+  out[3] = y;               // 7
+}
+
+int main() {
+  vcInit();
+  void *d = 0;
+  vcMalloc(&d, 4 * sizeof(int));
+  kern<<<1, 1>>>(d);
+  vcDeviceSynchronize();
+  int h[4] = {0};
+  vcMemcpy(h, d, 4 * sizeof(int), VCMemcpyKind::DeviceToHost);
+  printf("ref_return: %d %d %d %d", h[0], h[1], h[2], h[3]);
+  bool ok = h[0] == 42 && h[1] == 20 && h[2] == 42 && h[3] == 7;
+  printf(" %s\n", ok ? "PASS" : "FAIL");
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

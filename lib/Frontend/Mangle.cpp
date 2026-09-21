@@ -94,13 +94,30 @@ std::string vc::deviceMangledName(const FunctionDecl *f) {
   // __device__ helpers get a parameter-type suffix so overloads emit distinct
   // symbols (f(int)->name_i, f(float)->name_f). An empty parameter list gets
   // _v (void) so f() and f(int) differ.
+  //
+  // `const T&` and `T&` are the same Type (const is modeled on ParamDecl, not
+  // in the Type itself — see ReferenceType), so mangleType alone can't tell them
+  // apart. A const-qualified reference parameter gets a `K` marker before the
+  // reference encoding so f(int&) -> _ri and f(const int&) -> _Kri emit distinct
+  // device symbols and can coexist in an overload set.
   name += "_";
   if (f->params.empty())
     name += "v";
   else {
     for (size_t i = 0; i < f->params.size(); ++i) {
       if (i) name += "_";
-      name += mangleType(f->params[i]->type);
+      ParamDecl *p = f->params[i];
+      // const on a reference parameter (const T&) must be part of the symbol so
+      // f(int&) and f(const int&) differ. const lives on ParamDecl, not in the
+      // Type, so resolve typedefs here to spot a reference behind an alias.
+      const Type *pt = p->type;
+      while (pt && pt->getKind() == TypeKind::Typedef) {
+        auto *td = static_cast<const TypedefType *>(pt);
+        pt = td->decl ? td->decl->underlying : nullptr;
+      }
+      if (p->isConst && pt && pt->getKind() == TypeKind::Reference)
+        name += "K";
+      name += mangleType(p->type);
     }
   }
   return name;

@@ -1,0 +1,40 @@
+// ref_elem.vc — passing an indexed SSBO element by reference (`f(out[i])`, G5).
+//
+// `bump(out[0])` passes an SSBO element to a `T&` parameter. The callee's slot
+// is Function-storage; the SSBO element is in StorageBuffer — a storage-class
+// mismatch, and an indexed element isn't a "plain named object" the call site
+// can hand a memref for directly. The fix materializes a Function-storage
+// temporary: copy the element's value in, pass the temp, and (for a non-const
+// `T&`) copy the callee's result back out to the original element after the
+// call. `const T&` skips the copy-out (read-only).
+//
+// Covers:
+//   - `f(out[i])` on a non-const `T&` (copy-in + copy-out: callee writes are
+//     visible in the SSBO)
+//   - two distinct elements mutated in one kernel
+#include "vc/Runtime/VCRuntime.h"
+
+__device__ void bump(int &x) { x = x + 100; }
+
+__global__ void kern(int *out) {
+  out[0] = 5;
+  out[1] = 7;
+  bump(out[0]);   // 105
+  bump(out[1]);   // 107
+}
+
+int main() {
+  vcInit();
+  void *d = 0;
+  vcMalloc(&d, 2 * sizeof(int));
+  kern<<<1, 1>>>(d);
+  vcDeviceSynchronize();
+  int h[2] = {0};
+  vcMemcpy(h, d, 2 * sizeof(int), VCMemcpyKind::DeviceToHost);
+  printf("ref_elem: %d %d", h[0], h[1]);
+  bool ok = h[0] == 105 && h[1] == 107;
+  printf(" %s\n", ok ? "PASS" : "FAIL");
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

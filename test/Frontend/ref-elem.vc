@@ -1,0 +1,19 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck --allow-empty %s
+//
+// Regression for passing an indexed SSBO element by reference (`f(out[i])`,
+// G5). The callee's `T&` parameter is a Function-storage slot; an SSBO element
+// is in StorageBuffer, so the MLIR backend materializes a temp (copy-in /
+// copy-out). The parse/type-check side is covered here; the codegen regression
+// is covered by ref_elem.vc.
+
+__device__ void bump(int &x) { x = x + 100; }
+
+__global__ void kern(int *out) {
+  out[0] = 5;
+  out[1] = 7;
+  bump(out[0]);
+  bump(out[1]);
+}
+
+// CHECK-NOT: error:
+// CHECK-NOT: warning:

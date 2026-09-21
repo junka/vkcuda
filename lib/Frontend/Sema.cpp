@@ -453,7 +453,65 @@ void Sema::checkCallArgs(const ASTNode *call, StringRef calleeName,
   }
 }
 
-// Structural type equality after stripping typedefs. Used by redefinition
+// True iff `p` is a const-qualified reference parameter (`const T&`). const
+// lives on ParamDecl::isConst, not in the Type, so the constness of a reference
+// parameter is observable only here. A plain `T&` or a non-reference const param
+// (`const int x`) returns false — the latter is a value parameter whose const
+// doesn't affect the signature.
+bool Sema::isConstRefParam(const ParamDecl *p) {
+  if (!p || !p->isConst || !p->type) return false;
+  const Type *t = resolveTypedefs(p->type);
+  return t && t->getKind() == TypeKind::Reference;
+}
+
+// Whether an argument expression is an lvalue (addressable): a named object,
+// a `.field` member access, a subscript `a[i]`, or a dereference `*p`. Used by
+// reference overload resolution — only lvalues can bind to a non-const `T&`,
+// and a non-const lvalue binding to `const T&` is a qualification conversion.
+bool Sema::argIsLvalue(const ASTNode *arg) {
+  if (!arg) return false;
+  switch (arg->getNodeType()) {
+  case ASTNode::NodeKind::DeclRefExpr:
+    return true;
+  case ASTNode::NodeKind::MemberAccessExpr:
+    return !static_cast<const MemberAccessExpr *>(arg)->isScope;
+  case ASTNode::NodeKind::IndexExpr:
+    return true;
+  case ASTNode::NodeKind::UnaryExpr:
+    return static_cast<const UnaryExpr *>(arg)->op == UnaryOp::Deref;
+  default:
+    return false;
+  }
+}
+
+// Whether an argument expression is a const-qualified lvalue: a DeclRefExpr to
+// a const VarDecl/ParamDecl, or a `.field` member access into a const object.
+// Rvalues (literals, arithmetic, calls returning by value) and non-const
+// lvalues return false. This is the input to const-aware reference overload
+// resolution: a const lvalue binds to `const T&` but not `T&`.
+bool Sema::argIsConstLvalue(const ASTNode *arg) {
+  if (!arg) return false;
+  if (arg->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+    auto *d = static_cast<const DeclRefExpr *>(arg);
+    ASTNode *decl = lookup(d->name);
+    if (!decl) return false;
+    if (decl->getNodeType() == ASTNode::NodeKind::VarDecl)
+      return static_cast<VarDecl *>(decl)->isConst;
+    if (decl->getNodeType() == ASTNode::NodeKind::ParamDecl)
+      return static_cast<ParamDecl *>(decl)->isConst;
+    return false;
+  }
+  // `.field` of an object: `obj.f` is const iff the base object is const. (A
+  // `::` scoped access is a namespace member, not an object field.)
+  if (arg->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+    auto *ma = static_cast<const MemberAccessExpr *>(arg);
+    if (ma->isScope) return false;
+    return argIsConstLvalue(ma->base.get());
+  }
+  return false;
+}
+
+
 // detection and overload-set dedup; not a full canonical Type (that's a later
 // milestone). Two types are equal iff their resolved kinds match and their
 // distinguishing sub-fields recurse equal: builtins compare their BuiltinTypeKind,
@@ -496,11 +554,21 @@ bool Sema::sameType(const Type *a, const Type *b) {
 // type is intentionally NOT compared: C++ allows overloads differing only in
 // return type to be a redefinition error (return type is not part of the
 // signature for overload resolution).
+//
+// `const` is not modeled in the Type itself (it lives on ParamDecl::isConst), so
+// sameType cannot tell `f(int&)` from `f(const int&)` — they would wrongly be
+// flagged as a redefinition. A const-qualified reference parameter is part of
+// the signature, so two params that are both references but differ in constness
+// are distinct signatures (matching C++).
 bool Sema::sameSignature(const FunctionDecl *a, const FunctionDecl *b) {
   if (a->params.size() != b->params.size()) return false;
-  for (size_t i = 0; i < a->params.size(); ++i)
+  for (size_t i = 0; i < a->params.size(); ++i) {
     if (!sameType(a->params[i]->type, b->params[i]->type))
       return false;
+    // Const-on-reference distinguishes f(int&) from f(const int&).
+    if (isConstRefParam(a->params[i]) != isConstRefParam(b->params[i]))
+      return false;
+  }
   return true;
 }
 
@@ -557,6 +625,49 @@ int Sema::conversionRank(const Type *param, const Type *arg) {
   return 4;
 }
 
+// Const-aware variant for the overload resolver. A reference parameter's
+// binding rank depends on the const-ness of BOTH sides, which the plain Type-
+// only conversionRank can't see (const is on ParamDecl, and the argument's
+// const-ness is a property of the expression, not its type). The rule mirrors
+// C++ [over.ics.rank]:
+//   - A non-const lvalue binds to `T&` exactly (rank 0) and to `const T&` via a
+//     qualification conversion (rank 1), so `T&` is preferred.
+//   - A const lvalue or an rvalue binds to `const T&` exactly (rank 0) and
+//     cannot bind to `T&` at all (rank 4), so `const T&` wins outright.
+// Non-reference parameters delegate to conversionRank (const on a value param
+// does not affect overload selection).
+int Sema::conversionRankFor(const ParamDecl *param, const ASTNode *arg,
+                            const Type *argTy) {
+  if (!param || !param->type) return conversionRank(nullptr, argTy);
+  const Type *pt = resolveTypedefs(param->type);
+  bool paramIsRef = pt && pt->getKind() == TypeKind::Reference;
+  if (!paramIsRef)
+    return conversionRank(param->type, argTy);
+
+  // Reference parameter. Compare the referred-to types first; a type mismatch is
+  // incompatible regardless of constness.
+  const Type *pointee = static_cast<const ReferenceType *>(pt)->pointee;
+  const Type *argPointee = stripRef(argTy);
+  if (!sameType(resolveTypedefs(pointee), resolveTypedefs(argPointee))) {
+    // Allow the usual arithmetic conversions on the pointee (e.g. int -> float
+    // binding to float&): defer to conversionRank on the stripped types.
+    return conversionRank(pointee, argPointee);
+  }
+
+  bool paramConst = isConstRefParam(param);
+  bool argConst = argIsConstLvalue(arg);
+  bool argLvalue = argIsLvalue(arg);
+  if (paramConst) {
+    // const T& binds a const lvalue or an rvalue exactly (rank 0). Binding a
+    // NON-const lvalue to const T& is a qualification conversion (rank 1) —
+    // worse than the exact `T&` binding, so a non-const lvalue prefers `T&`.
+    return (argConst || !argLvalue) ? 0 : 1;
+  }
+  // Non-const T&: exact only for a non-const lvalue. A const lvalue or an
+  // rvalue cannot bind to T& (C++ forbids binding a non-const ref to those).
+  return (!argConst && argLvalue) ? 0 : 4;
+}
+
 // Pick the best overload candidate for a call with the given argument types.
 // Each candidate is scored by the WORST conversion rank across its parameters
 // (after applying default arguments for omitted trailing params); the candidate
@@ -584,7 +695,7 @@ FunctionDecl *Sema::resolveOverload(const ASTNode *call, StringRef calleeName,
     int worst = 0;
     for (size_t i = 0; i < args.size(); ++i) {
       Type *argTy = checkExpr(args[i].get());
-      int r = conversionRank(f->params[i]->type, argTy);
+      int r = conversionRankFor(f->params[i], args[i].get(), argTy);
       if (r > worst) worst = r;
     }
     // rank 4 (incompatible) still counts as "viable-but-bad" so that a single
@@ -1300,7 +1411,17 @@ Type *Sema::checkExpr(const ASTNode *n) {
       if (k == ASTNode::NodeKind::UnaryExpr &&
           static_cast<const UnaryExpr *>(b->lhs.get())->op == UnaryOp::Deref)
         derefLvalue = true;
-      if (!derefLvalue &&
+      // A call to a `T&`-returning function is an lvalue: `pick(x,y,1) = 99`
+      // writes through the returned reference. The call's result type is a
+      // ReferenceType (set when checking the callee's return type), so a call
+      // returning by value stays a non-lvalue (rvalue).
+      bool refCallLvalue = false;
+      if (k == ASTNode::NodeKind::CallExpr) {
+        const Type *lt0 = checkExpr(b->lhs.get());
+        if (lt0 && resolveTypedefs(lt0)->getKind() == TypeKind::Reference)
+          refCallLvalue = true;
+      }
+      if (!derefLvalue && !refCallLvalue &&
           k != ASTNode::NodeKind::DeclRefExpr &&
           k != ASTNode::NodeKind::IndexExpr &&
           k != ASTNode::NodeKind::MemberAccessExpr)

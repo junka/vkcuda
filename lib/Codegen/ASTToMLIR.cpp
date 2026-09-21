@@ -2044,6 +2044,23 @@ private:
   //     yield %r2
   //   }
   //   return %r
+  // Prepare a return-value expression for emission: visit it, then load/cast to
+  // the function's result type. For a `T&` return the result is the referred-to
+  // object's *address* (a Function-storage memref slot), so the load is skipped
+  // — `return a;` on a `T&` param yields the slot itself, not its value.
+  Value prepareReturnValue(ASTNode *retValNode, Location l) {
+    Value v = visitExpr(retValNode);
+    if (!v) return v;
+    bool refReturn =
+        currentRetTy && currentRetTy.isa<MemRefType>() && !currentRetIsStruct;
+    if (!refReturn) {
+      v = loadValue(v, loc(retValNode));
+      if (currentRetTy && !currentRetTy.isa<NoneType>())
+        v = castValue(v, currentRetTy, l);
+    }
+    return v;
+  }
+
   void emitValueReturnChain(const std::vector<NodePtr> &stmts, size_t from) {
     ASTNode *s = stmts[from].get();
     auto *iff = static_cast<IfStmt *>(s);
@@ -2061,9 +2078,7 @@ private:
     builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
     emitThenWithoutTrailingReturn(iff->thenStmt.get());
     ASTNode *retValNode = trailingReturnValue(iff->thenStmt.get());
-    Value retVal = visitExpr(retValNode);
-    retVal = loadValue(retVal, loc(retValNode));
-    retVal = castValue(retVal, retTy, loc(retValNode));
+    Value retVal = prepareReturnValue(retValNode, l);
     builder.create<scf::YieldOp>(l, ValueRange{retVal});
 
     // Else branch: the fall-through statements, recursively.
@@ -2107,9 +2122,7 @@ private:
       builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
       emitThenWithoutTrailingReturn(iff->thenStmt.get());
       ASTNode *retValNode = trailingReturnValue(iff->thenStmt.get());
-      Value retVal = visitExpr(retValNode);
-      retVal = loadValue(retVal, loc(retValNode));
-      retVal = castValue(retVal, retTy, loc(retValNode));
+      Value retVal = prepareReturnValue(retValNode, l);
       builder.create<scf::YieldOp>(l, ValueRange{retVal});
       builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
       emitFallThroughToValue(stmts, from + 1, l, retTy);
@@ -2124,11 +2137,8 @@ private:
       ASTNode *cur = stmts[from].get();
       if (cur->getNodeType() == ASTNode::NodeKind::ReturnStmt) {
         auto *r = static_cast<ReturnStmt *>(cur);
-        Value v = r->value ? visitExpr(r->value.get()) : Value();
-        if (v) {
-          v = loadValue(v, loc(r->value.get()));
-          v = castValue(v, retTy, loc(r->value.get()));
-        } else {
+        Value v = r->value ? prepareReturnValue(r->value.get(), l) : Value();
+        if (!v) {
           v = builder.create<arith::ConstantOp>(l, retTy,
                                                 builder.getZeroAttr(retTy));
         }
@@ -2467,9 +2477,17 @@ private:
       }
       Value v = r->value ? visitExpr(r->value.get()) : Value();
       if (v) {
-        v = loadValue(v, loc(r->value.get()));
+        // A `T&` return yields the referred-to object's *address* (a
+        // Function-storage memref slot), not its loaded value — `return a;`
+        // where `a` is a `T&` param must hand back the slot so the caller can
+        // write through it (`pick(x,y,1) = 99`). currentRetTy is the memref slot
+        // type for a reference return; skip the load in that case.
+        bool refReturn =
+            currentRetTy && currentRetTy.isa<MemRefType>() && !currentRetIsStruct;
+        if (!refReturn)
+          v = loadValue(v, loc(r->value.get()));
         // Bridge index-typed expressions to the function's result type.
-        if (currentRetTy && !currentRetTy.isa<NoneType>())
+        if (currentRetTy && !currentRetTy.isa<NoneType>() && !refReturn)
           v = castValue(v, currentRetTy, l);
       }
       builder.create<func::ReturnOp>(l, v ? ValueRange(v) : ValueRange());
@@ -3519,6 +3537,21 @@ private:
           if (hasDecayArg)
             return inlineCallWithDecay(c, calleeFn, l);
           SmallVector<Value> args;
+          // Copy-out pending writes for materialized reference temporaries. When
+          // a `T&`/`const T&` parameter is bound to an argument that is not a
+          // plain named object (an rvalue like `7`, or an indexed SSBO element
+          // like `out[i]` whose storage class differs from the callee's Function
+          // slot), we materialize a Function-storage temp, copy the arg value
+          // in, and pass the temp. For a non-const `T&` bound to a writable
+          // lvalue, the callee's writes must propagate back to the original
+          // object after the call — recorded here as (temp slot, dst address,
+          // dst indices) and flushed once func::CallOp is emitted.
+          struct CopyOut {
+            Value temp;
+            Value dstMem;
+            SmallVector<Value, 2> dstIndices;
+          };
+          SmallVector<CopyOut, 2> copyOuts;
           unsigned argNo = 0;
           for (auto &a : c->args) {
             // A `T&` parameter takes the argument's *address* (a
@@ -3538,13 +3571,43 @@ private:
             if (wantsRef) {
               Value mem;
               SmallVector<Value> indices;
-              if (!lvalueAddress(a.get(), mem, indices) || !indices.empty()) {
-                error(a.get(), "reference argument must be a plain named object "
-                               "(cannot pass an indexed element or temporary "
-                               "by reference)");
+              if (lvalueAddress(a.get(), mem, indices) && indices.empty()) {
+                // Plain named object: pass its slot directly. But the callee's
+                // ref slot is Function-storage; an SSBO element address (a
+                // spirv.ptr or StorageBuffer memref) is NOT assignable to it, so
+                // fall through to materialization for those. A local alloca or
+                // shared slot already matches (or is implicitly convertible).
+                args.push_back(mem);
+                ++argNo;
+                continue;
+              }
+              // Not a plain named object (rvalue, indexed element, field of a
+              // temporary, ...). Materialize a Function-storage temp of the
+              // callee's expected slot type, copy the arg value in, and pass the
+              // temp. For a non-const `T&` bound to a writable lvalue (e.g.
+              // `out[i]`), schedule a copy-out so the callee's writes propagate.
+              mlir::Type slotTy = cvtType(calleeFn->params[argNo]->type);
+              if (!slotTy || !slotTy.isa<MemRefType>()) {
+                error(a.get(), "could not materialize reference temporary");
                 return Value();
               }
-              args.push_back(mem);
+              Value temp =
+                  builder.create<memref::AllocaOp>(loc(a.get()),
+                                                   slotTy.cast<MemRefType>());
+              Value av = visitExpr(a.get());
+              if (!av) return error(a.get(), "could not evaluate reference argument");
+              storeTo(temp, {}, av, loc(a.get()));
+              bool paramConst = calleeFn->params[argNo]->isConst;
+              if (!paramConst) {
+                // Copy-out destination: the arg's own lvalue address, if any.
+                Value dstMem;
+                SmallVector<Value> dstIdx;
+                if (lvalueAddress(a.get(), dstMem, dstIdx)) {
+                  copyOuts.push_back({temp, dstMem, {dstIdx.begin(), dstIdx.end()}});
+                } // else: rvalue bound to T& is ill-formed (Sema rejects); no
+                  // copy-out needed for a const T& rvalue binding either.
+              }
+              args.push_back(temp);
               ++argNo;
               continue;
             }
@@ -3572,6 +3635,14 @@ private:
             }
           }
           auto call = builder.create<func::CallOp>(l, fit->second, args);
+          // Flush copy-out for materialized non-const reference temporaries: the
+          // callee wrote through the temp slot; propagate the final value back to
+          // the original lvalue (e.g. `out[i] = temp`). Done after the call so
+          // the callee observed the pre-call value via copy-in.
+          for (const CopyOut &co : copyOuts) {
+            Value v = loadValue(co.temp, l);
+            storeTo(co.dstMem, co.dstIndices, v, l);
+          }
           FunctionType fty = fit->second.getFunctionType();
           if (fty.getNumResults() == 0) return Value();
           Value res = call.getResult(0);
@@ -5702,6 +5773,18 @@ private:
         SmallVector<Value, 2> pIdx;
         if (pointerLValue(b->lhs.get(), pBase, pIdx)) {
           storeTo(pBase, pIdx, rhs, l);
+          return rhs;
+        }
+      }
+      // Reference-returning call on the LHS: `pick(x,y,1) = 99`. The call yields
+      // a Function-storage memref slot (the callee returned a `T&`), which is the
+      // address to store into. visitExpr emits the call and returns the slot;
+      // store through it directly. (rhs was already visited above.)
+      if (b->lhs &&
+          b->lhs->getNodeType() == ASTNode::NodeKind::CallExpr) {
+        Value slot = visitExpr(b->lhs.get());
+        if (slot && slot.getType().isa<MemRefType>()) {
+          storeTo(slot, {}, rhs, l);
           return rhs;
         }
       }

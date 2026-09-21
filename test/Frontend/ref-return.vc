@@ -1,0 +1,20 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck --allow-empty %s
+//
+// Regression for reference return types (`int &f(...)`, G2). A `T&`-returning
+// call is an lvalue: it may be assigned through (`pick(x,y,1) = 99`) and read
+// through (`int v = pick(x,y,0)`). The parse/type-check side is covered here;
+// the MLIR + GLSL codegen regression is covered by ref_return.vc.
+
+__device__ int &pick(int &a, int &b, int sel) {
+  if (sel) return a;
+  return b;
+}
+
+__global__ void kern(int *out) {
+  int x = 10, y = 20;
+  pick(x, y, 1) = 99;     // write through returned ref -> x
+  out[0] = pick(x, y, 0); // read through returned ref -> y
+}
+
+// CHECK-NOT: error:
+// CHECK-NOT: warning:

@@ -1027,14 +1027,16 @@ private:
       // `T &r` is a CUDA reference parameter: calls must see the caller's
       // object, and GLSL `inout` is the exact counterpart (passed by
       // reference). Without the qualifier the parameter silently binds by
-      // value and the callee's writes are lost. `const T&` must drop the
-      // `const` here — GLSL rejects `const inout` ("too many storage
-      // qualifiers"), and `inout` already grants the write the callee is
-      // entitled to; the constness is a caller-side promise Sema already
-      // enforces.
-      if (isReferenceType(f->params[i]->type)) {
+      // value and the callee's writes are lost. `const T&` is different: the
+      // callee never writes through it, so it lowers to a plain `in` (by-value)
+      // parameter — GLSL `inout` would reject a const-qualified caller argument
+      // ("can't modify a const"), and `const inout` is itself illegal. By-value
+      // `in` matches the read-only contract and accepts any argument.
+      bool paramIsConstRef =
+          isReferenceType(f->params[i]->type) && f->params[i]->isConst;
+      if (isReferenceType(f->params[i]->type) && !paramIsConstRef) {
         (*os) << "inout ";
-      } else if (f->params[i]->isConst) {
+      } else if (f->params[i]->isConst && !paramIsConstRef) {
         (*os) << "const ";
       }
       (*os) << glslType(f->params[i]->type) << " " << glslName(f->params[i]->name);
@@ -1635,8 +1637,15 @@ private:
     }
     case ASTNode::NodeKind::ExprStmt: {
       pad(indent);
-      if (auto *e = static_cast<const ExprStmt *>(n)->expr.get())
+      if (auto *e = static_cast<const ExprStmt *>(n)->expr.get()) {
+        // A `pick(x,y,c) = v` statement (LHS is a T&-returning call): GLSL
+        // forbids assigning to a ternary, so lower to an if/else that assigns
+        // to each branch's target. Only the `if (C) return A; return B;` shape
+        // (cond + two lvalue targets) is supported; anything else falls through
+        // to the normal (glslc-rejected) expression form.
+        if (emitRefReturnAssign(e, indent)) break;
         emitExpr(e);
+      }
       (*os) << ";\n";
       break;
     }
@@ -1811,6 +1820,199 @@ private:
     const VarDecl *vd = resolveVar(ref->name);
     if (!vd || vd->arrayDims.empty()) return false;
     return dimsConsumed < vd->arrayDims.size();
+  }
+
+  // Inline a `T&`-returning __device__ helper as a GLSL expression (GLSL has no
+  // reference returns). Binds each parameter name to its argument's GLSL text
+  // via the refLocals substitution table, then emits the return-value expression
+  // — which then references the args in place of the params. Supported body
+  // shapes (the only realistic shapes for a ref-returning helper):
+  //   `return E;`                       ->  E
+  //   `return C ? A : B;`               ->  (C) ? A : B
+  //   `if (C) return A; return B;`      ->  (C) ? A : B
+  // Returns true if it emitted an inline expression; false if the body shape is
+  // not one of the above (caller falls back to a normal call, which glslc will
+  // reject for an lvalue use).
+  bool emitRefReturnInline(const FunctionDecl *calleeFn,
+                           const std::vector<NodePtr> &args) {
+    if (!calleeFn || !calleeFn->body) return false;
+    // Resolve the (cond, thenVal, elseVal) triple or the single-return value.
+    ASTNode *cond = nullptr;
+    ASTNode *thenVal = nullptr;
+    ASTNode *elseVal = nullptr;
+    ASTNode *singleVal = nullptr;
+    auto *cs = calleeFn->body->getNodeType() == ASTNode::NodeKind::CompoundStmt
+                   ? static_cast<CompoundStmt *>(calleeFn->body.get())
+                   : nullptr;
+    if (!cs) return false;
+    if (cs->statements.size() == 1 &&
+        cs->statements[0]->getNodeType() == ASTNode::NodeKind::ReturnStmt) {
+      singleVal =
+          static_cast<ReturnStmt *>(cs->statements[0].get())->value.get();
+    } else if (cs->statements.size() == 2 &&
+               cs->statements[0]->getNodeType() == ASTNode::NodeKind::IfStmt &&
+               cs->statements[1]->getNodeType() ==
+                   ASTNode::NodeKind::ReturnStmt) {
+      auto *iff = static_cast<IfStmt *>(cs->statements[0].get());
+      if (!iff->elseStmt) {
+        // thenStmt must be a bare `return A;` (or a CompoundStmt wrapping one).
+        ASTNode *t = iff->thenStmt.get();
+        if (t && t->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
+          auto *tcs = static_cast<CompoundStmt *>(t);
+          if (tcs->statements.size() == 1)
+            t = tcs->statements[0].get();
+        }
+        if (t && t->getNodeType() == ASTNode::NodeKind::ReturnStmt) {
+          cond = iff->cond.get();
+          thenVal = static_cast<ReturnStmt *>(t)->value.get();
+          elseVal =
+              static_cast<ReturnStmt *>(cs->statements[1].get())->value.get();
+        }
+      }
+    }
+    if (!singleVal && !cond) return false;
+    // Also accept `return C ? A : B;` as a single return whose value is a
+    // ConditionalExpr — handled by emitExpr directly, no special casing needed.
+
+    // Bind params to parenthesized arg text, saving any prior binding so nested
+    // inlines (a ref-returning call whose arg is itself a ref-returning call)
+    // restore correctly.
+    struct Saved { std::string name; std::string prev; bool had; };
+    SmallVector<Saved, 4> savedBindings;
+    unsigned n = std::min(args.size(), calleeFn->params.size());
+    for (unsigned i = 0; i < n; ++i) {
+      StringRef pname = calleeFn->params[i]->name;
+      std::string text;
+      raw_string_ostream o(text);
+      raw_ostream *savedOs = os;
+      os = &o;
+      emitExpr(args[i].get());
+      os = savedOs;
+      o.flush();
+      Saved s;
+      s.name = pname.str();
+      if (auto it = refLocals.find(pname); it != refLocals.end()) {
+        s.had = true;
+        s.prev = it->second;
+      }
+      savedBindings.push_back(s);
+      refLocals[pname] = "(" + text + ")";
+    }
+    // Restore on exit.
+    struct Restore {
+      llvm::StringMap<std::string> &m;
+      SmallVector<Saved, 4> &b;
+      ~Restore() {
+        for (auto it = b.rbegin(); it != b.rend(); ++it) {
+          if (it->had) m[it->name] = it->prev;
+          else m.erase(it->name);
+        }
+      }
+    } restore{refLocals, savedBindings};
+
+    if (singleVal) {
+      (*os) << "(";
+      emitExpr(singleVal);
+      (*os) << ")";
+    } else {
+      // GLSL's ?: requires a boolean condition (wrap non-bool via emitCondition)
+      // and yields an lvalue when both branches are lvalues of the same type,
+      // so `(c ? x : y) = v` assigns through the selected reference.
+      (*os) << "(";
+      emitCondition(cond);
+      (*os) << " ? (";
+      emitExpr(thenVal);
+      (*os) << ") : (";
+      emitExpr(elseVal);
+      (*os) << "))";
+    }
+    return true;
+  }
+
+  // Lower `pick(x,y,c) = v` (an Assign whose LHS is a T&-returning call) to an
+  // if/else statement, since GLSL rejects assigning to a ternary. Only the
+  // `if (C) return A; return B;` callee shape is supported (cond + two lvalue
+  // targets); returns false to let the caller fall through to a normal emit.
+  bool emitRefReturnAssign(const ASTNode *expr, unsigned indent) {
+    if (!expr || expr->getNodeType() != ASTNode::NodeKind::BinaryExpr)
+      return false;
+    auto *b = static_cast<const BinaryExpr *>(expr);
+    if (b->op != BinaryOp::Assign) return false;
+    if (!b->lhs ||
+        b->lhs->getNodeType() != ASTNode::NodeKind::CallExpr)
+      return false;
+    auto *call = static_cast<const CallExpr *>(b->lhs.get());
+    const FunctionDecl *calleeFn = call->resolvedCallee;
+    if (!calleeFn || !calleeFn->returnType ||
+        !isReferenceType(calleeFn->returnType) || !calleeFn->body)
+      return false;
+    auto *cs = calleeFn->body->getNodeType() == ASTNode::NodeKind::CompoundStmt
+                   ? static_cast<CompoundStmt *>(calleeFn->body.get())
+                   : nullptr;
+    if (!cs || cs->statements.size() != 2 ||
+        cs->statements[0]->getNodeType() != ASTNode::NodeKind::IfStmt ||
+        cs->statements[1]->getNodeType() != ASTNode::NodeKind::ReturnStmt)
+      return false;
+    auto *iff = static_cast<IfStmt *>(cs->statements[0].get());
+    if (iff->elseStmt) return false;
+    ASTNode *t = iff->thenStmt.get();
+    if (t && t->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
+      auto *tcs = static_cast<CompoundStmt *>(t);
+      if (tcs->statements.size() == 1) t = tcs->statements[0].get();
+    }
+    if (!t || t->getNodeType() != ASTNode::NodeKind::ReturnStmt) return false;
+    ASTNode *cond = iff->cond.get();
+    ASTNode *thenVal = static_cast<ReturnStmt *>(t)->value.get();
+    ASTNode *elseVal =
+        static_cast<ReturnStmt *>(cs->statements[1].get())->value.get();
+
+    // Bind params to parenthesized arg text (same substitution as the read
+    // case), restored on scope exit.
+    struct Saved { std::string name; std::string prev; bool had; };
+    SmallVector<Saved, 4> savedBindings;
+    unsigned n = std::min(call->args.size(), calleeFn->params.size());
+    for (unsigned i = 0; i < n; ++i) {
+      StringRef pname = calleeFn->params[i]->name;
+      std::string text;
+      raw_string_ostream o(text);
+      raw_ostream *savedOs = os;
+      os = &o;
+      emitExpr(call->args[i].get());
+      os = savedOs;
+      o.flush();
+      Saved s;
+      s.name = pname.str();
+      if (auto it = refLocals.find(pname); it != refLocals.end()) {
+        s.had = true;
+        s.prev = it->second;
+      }
+      savedBindings.push_back(s);
+      refLocals[pname] = "(" + text + ")";
+    }
+    struct Restore {
+      llvm::StringMap<std::string> &m;
+      SmallVector<Saved, 4> &bb;
+      ~Restore() {
+        for (auto it = bb.rbegin(); it != bb.rend(); ++it) {
+          if (it->had) m[it->name] = it->prev;
+          else m.erase(it->name);
+        }
+      }
+    } restore{refLocals, savedBindings};
+
+    // Emit `if (C) { A = v; } else { B = v; }`.
+    (*os) << "if (";
+    emitCondition(cond);
+    (*os) << ") { ";
+    emitExpr(thenVal);
+    (*os) << " = ";
+    emitExpr(b->rhs.get());
+    (*os) << "; } else { ";
+    emitExpr(elseVal);
+    (*os) << " = ";
+    emitExpr(b->rhs.get());
+    (*os) << "; }\n";
+    return true;
   }
 
   void emitCallArgsWithDefaults(StringRef mangledName,
@@ -2622,6 +2824,22 @@ private:
           callName = lowerBuiltinCall(ref->name);
           auto fit = funcDecls.find(ref->name);
           if (fit != funcDecls.end()) calleeFn = fit->second;
+        }
+        // A `T&`-returning call has no GLSL counterpart (GLSL functions can't
+        // return references), so inline the callee as an expression. The only
+        // shapes supported are the ones a reference-returning helper realistically
+        // takes: `return expr;`, `return cond ? a : b;`, or
+        // `if (cond) return a; return b;` — all lower to a (possibly ternary)
+        // expression with parameter names substituted by the parenthesized
+        // argument expressions. The result is an lvalue when the yielded exprs
+        // are lvalues, so `pick(x,y,1) = 99` becomes `(1 ? (x) : (y)) = 99`,
+        // which GLSL accepts.
+        if (calleeFn && calleeFn->returnType &&
+            isReferenceType(calleeFn->returnType)) {
+          if (emitRefReturnInline(calleeFn, c->args))
+            return;
+          // Fall through to a normal call if the body shape isn't inlineable;
+          // glslc will then reject the lvalue use with a clear diagnostic.
         }
         (*os) << callName << "(";
         for (unsigned i = 0; i < c->args.size(); ++i) {

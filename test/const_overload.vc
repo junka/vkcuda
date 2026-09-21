@@ -1,0 +1,45 @@
+// const_overload.vc — `const T&` overload resolution (G4).
+//
+// `f(int&)` and `f(const int&)` must coexist and dispatch by the argument's
+// value category: a non-const lvalue binds to `f(int&)` (exact), a const lvalue
+// or rvalue binds to `f(const int&)` (the non-const overload can't bind those).
+// Before this fix the two were the same mangled symbol (`_ri`) and Sema flagged
+// the second as a redefinition, then (once forced past it) every call was
+// ambiguous at rank 0. The fix: (1) const-on-a-reference-param is part of the
+// signature (sameSignature), (2) a `K` marker in the device symbol
+// (`which_Kri` vs `which_ri`), and (3) const-aware conversion rank in the
+// overload resolver.
+//
+// Covers:
+//   - `f(int&)` / `f(const int&)` coexisting (distinct symbols)
+//   - non-const lvalue -> `f(int&)`
+//   - const lvalue -> `f(const int&)`
+//   - rvalue (literal) -> `f(const int&)` (non-const ref can't bind)
+#include "vc/Runtime/VCRuntime.h"
+
+__device__ int which(int &x)       { return 1; }
+__device__ int which(const int &x) { return 2; }
+
+__global__ void kern(int *out) {
+  int a = 5;
+  out[0] = which(a);        // non-const lvalue -> which(int&): 1
+  const int c = 9;
+  out[1] = which(c);        // const lvalue -> which(const int&): 2
+  out[2] = which(7);        // rvalue -> which(const int&): 2
+}
+
+int main() {
+  vcInit();
+  void *d = 0;
+  vcMalloc(&d, 3 * sizeof(int));
+  kern<<<1, 1>>>(d);
+  vcDeviceSynchronize();
+  int h[3] = {0};
+  vcMemcpy(h, d, 3 * sizeof(int), VCMemcpyKind::DeviceToHost);
+  printf("const_overload: %d %d %d", h[0], h[1], h[2]);
+  bool ok = h[0] == 1 && h[1] == 2 && h[2] == 2;
+  printf(" %s\n", ok ? "PASS" : "FAIL");
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

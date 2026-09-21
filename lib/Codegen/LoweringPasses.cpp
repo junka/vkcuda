@@ -27,6 +27,7 @@
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVTypes.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
 #include "mlir/Dialect/SPIRV/Transforms/SPIRVConversion.h"
@@ -482,36 +483,162 @@ struct RewriteResidualIndexCastsPass
     });
   }
 };
+
+// A `T&`-returning __device__ helper with an early return (`if (sel) return a;
+// return b;`) lowers to an `scf.if` that yields a Function-storage memref (the
+// reference slot). ConvertFuncToSPIRV turns the helper's signature into
+// spirv.ptr, and ConvertMemRefToSPIRV lowers the body's memref ops — but the
+// `scf.if` result is still a Function-memref, with its yield operands and the
+// if-result all wrapped in `unrealized_conversion_cast ptr <-> memref`. The
+// scf.if -> spirv.if conversion cannot legalize a memref-typed result (it has
+// no SPIR-V type to lower to), so the residual cast around the if fails:
+// "failed to legalize operation 'builtin.unrealized_conversion_cast'".
+//
+// This pass peels the casts through the scf.if: rewrite the if to yield the
+// underlying spirv.ptr directly (each yield operand that is a `ptr -> memref`
+// cast donates its ptr input; a bare memref operand is wrapped `memref -> ptr`),
+// and re-wrap the if result back to memref for any downstream memref users. The
+// new if yields a spirv.ptr, which GPUToSPIRV lowers to spirv.Select, and the
+// residual casts reconcile away. Runs only in the reference-legalization stage.
+struct HoistRefReturnIfYieldsPass
+    : public PassWrapper<HoistRefReturnIfYieldsPass,
+                         OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(HoistRefReturnIfYieldsPass)
+
+  StringRef getArgument() const final {
+    return "vc-hoist-ref-return-if-yields";
+  }
+  StringRef getDescription() const final {
+    return "rewrite scf.if yielding a Function-memref to yield its spirv.ptr";
+  }
+
+  // Is `ty` a Function-storage memref (a reference slot)?
+  static bool isFunctionMemRef(Type ty) {
+    auto mt = ty.dyn_cast<MemRefType>();
+    if (!mt)
+      return false;
+    auto sc = mt.getMemorySpace()
+                  .dyn_cast_or_null<spirv::StorageClassAttr>();
+    return sc && sc.getValue() == spirv::StorageClass::Function;
+  }
+
+  // The spirv.ptr type a Function-memref converts to (the other side of the
+  // unrealized_conversion_cast ConvertFuncToSPIRV/MemRefToSPIRV emits). Find it
+  // by scanning the unrealized casts flowing into/out of memref-typed values.
+  static Type ptrForMemRef(Value memrefVal, IRRewriter &rw) {
+    // Look at users: a cast `ptr -> memref` whose result reaches this value, or
+    // a cast `memref -> ptr` whose operand is this value.
+    for (auto *user : memrefVal.getUsers()) {
+      auto cast = dyn_cast<UnrealizedConversionCastOp>(user);
+      if (!cast)
+        continue;
+      if (cast->getNumOperands() == 1 && cast.getOperand(0) == memrefVal &&
+          cast.getNumResults() == 1)
+        return cast.getResult(0).getType(); // memref -> ptr
+    }
+    // Look at the defining op: a cast `ptr -> memref`.
+    if (auto cast = memrefVal.getDefiningOp<UnrealizedConversionCastOp>()) {
+      if (cast->getNumOperands() == 1 && cast.getNumResults() == 1)
+        return cast.getOperand(0).getType();
+    }
+    return Type();
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    IRRewriter rw(&getContext());
+    // Collect first; rewriting mutates the use list.
+    SmallVector<scf::IfOp, 8> ifs;
+    module.walk([&](scf::IfOp op) {
+      if (op.getNumResults() == 1 && isFunctionMemRef(op.getResult(0).getType()))
+        ifs.push_back(op);
+    });
+    for (scf::IfOp op : ifs) {
+      Value oldRes = op.getResult(0);
+      Type ptrTy = ptrForMemRef(oldRes, rw);
+      if (!ptrTy)
+        continue;
+      rw.setInsertionPoint(op);
+      auto newIf = rw.create<scf::IfOp>(op.getLoc(), TypeRange{ptrTy},
+                                       op.getCondition(), /*withElse=*/true);
+      // Each new branch block starts with a default `scf.yield %undef`. Drop it
+      // and merge the old branch's body (sans its yield) in, then append a fresh
+      // yield of the ptr-form operand.
+      auto fillBranch = [&](Region &newRegion, Region &oldRegion) {
+        Block &oldB = oldRegion.front();
+        scf::YieldOp oldYield = cast<scf::YieldOp>(oldB.getTerminator());
+        Value v = oldYield.getOperand(0);
+        // Detach the old yield so the remaining ops can be moved whole.
+        oldYield->erase();
+        Block &newB = newRegion.front();
+        // Clear the new block's placeholder yield.
+        newB.getOperations().clear();
+        // Move the old body ops into the new block.
+        newB.getOperations().splice(newB.begin(), oldB.getOperations());
+        // Emit the ptr conversion inside this branch, then yield it.
+        rw.setInsertionPointToEnd(&newB);
+        Value pv = memRefToPtr(v, ptrTy, rw, op.getLoc());
+        rw.create<scf::YieldOp>(op.getLoc(), ValueRange{pv});
+      };
+      fillBranch(newIf.getThenRegion(), op.getThenRegion());
+      fillBranch(newIf.getElseRegion(), op.getElseRegion());
+      // Re-wrap the new if's ptr result back to memref for the old users.
+      rw.setInsertionPointAfter(newIf);
+      auto wrap = rw.create<UnrealizedConversionCastOp>(
+          op.getLoc(), oldRes.getType(), newIf.getResult(0));
+      rw.replaceOp(op, {wrap.getResult(0)});
+    }
+  }
+
+  // Convert a memref-typed value to the spirv.ptr form. If it is itself a
+  // `ptr -> memref` cast, return the ptr input directly; otherwise emit a
+  // `memref -> ptr` cast.
+  Value memRefToPtr(Value v, Type ptrTy, IRRewriter &rw, Location l) {
+    if (v.getType() == ptrTy)
+      return v;
+    if (auto cast = v.getDefiningOp<UnrealizedConversionCastOp>()) {
+      if (cast->getNumOperands() == 1 && cast.getNumResults() == 1 &&
+          cast.getOperand(0).getType() == ptrTy)
+        return cast.getOperand(0);
+    }
+    auto c = rw.create<UnrealizedConversionCastOp>(l, ptrTy, v);
+    return c.getResult(0);
+  }
+};
 } // namespace
 
-// Does any func.func in the module carry a Function-storage memref parameter?
-// That is the shape a reference parameter (`void f(int &r)`, emitted as a
-// Function-storage memref passed by value to func.call) has BEFORE
+// Does any func.func in the module carry a Function-storage memref parameter or
+// result? That is the shape a reference parameter (`void f(int &r)`, emitted as
+// a Function-storage memref passed by value to func.call) AND a reference return
+// (`int &f(...)`, emitted as a Function-storage memref result) have BEFORE
 // ConvertFuncToSPIRV runs (after which it becomes a
-// ptr<struct<array<1 x T>>, Function> spirv.func parameter). When none exists,
-// the reference-parameter legalization stage below is both unnecessary and
-// harmful: ConvertMemRefToSPIRV rebuilds a legality target that rejects a
+// ptr<struct<array<1 x T>>, Function> spirv.func parameter/result). When none
+// exists, the reference-parameter legalization stage below is both unnecessary
+// and harmful: ConvertMemRefToSPIRV rebuilds a legality target that rejects a
 // `spirv.ReturnValue : f16` left untouched in a pure f16-returning __device__
 // helper's body (no memref ops to convert there), so the stage must not run on
 // f16-device-helper-only modules like half.vc, which otherwise regressed here.
 static bool hasFunctionStorageRefParams(ModuleOp module) {
   bool found = false;
+  auto checkTy = [&](mlir::Type ty) {
+    if (found)
+      return;
+    auto memrefTy = ty.dyn_cast<mlir::MemRefType>();
+    if (!memrefTy)
+      return;
+    auto scAttr =
+        memrefTy.getMemorySpace()
+            .dyn_cast_or_null<spirv::StorageClassAttr>();
+    if (scAttr && scAttr.getValue() == spirv::StorageClass::Function)
+      found = true;
+  };
   module.walk([&](func::FuncOp fn) {
     if (found)
       return;
-    for (auto argTy : fn.getFunctionType().getInputs()) {
-      auto memrefTy = argTy.dyn_cast<mlir::MemRefType>();
-      if (!memrefTy)
-        continue;
-      auto scAttr =
-          memrefTy.getMemorySpace()
-              .dyn_cast_or_null<spirv::StorageClassAttr>();
-      if (scAttr &&
-          scAttr.getValue() == spirv::StorageClass::Function) {
-        found = true;
-        return;
-      }
-    }
+    for (auto argTy : fn.getFunctionType().getInputs())
+      checkTy(argTy);
+    for (auto resTy : fn.getFunctionType().getResults())
+      checkTy(resTy);
   });
   return found;
 }
@@ -589,6 +716,7 @@ void runLoweringPipeline(ModuleOp module) {
   // modules like half.vc, which otherwise regressed here.
   if (hasFunctionStorageRefParams(module)) {
     pm.addPass(createConvertMemRefToSPIRVPass());
+    pm.addPass(std::make_unique<HoistRefReturnIfYieldsPass>());
     pm.addPass(std::make_unique<RewriteResidualIndexCastsPass>());
     pm.addPass(createReconcileUnrealizedCastsPass());
   }

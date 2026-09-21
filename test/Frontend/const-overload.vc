@@ -1,0 +1,29 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// Regression for `const T&` overload resolution (G4). `f(int&)` and
+// `f(const int&)` must coexist (distinct signatures) and dispatch by the
+// argument's value category: non-const lvalue -> `f(int&)`, const lvalue or
+// rvalue -> `f(const int&)`. The e2e regression is covered by const_overload.vc.
+
+__device__ int which(int &x)       { return 1; }
+__device__ int which(const int &x) { return 2; }
+
+__global__ void kern(int *out) {
+  int a = 5;
+  out[0] = which(a);        // non-const lvalue -> which(int&)
+  const int c = 9;
+  out[1] = which(c);        // const lvalue -> which(const int&)
+  out[2] = which(7);        // rvalue -> which(const int&)
+}
+
+// The const-ref overload must NOT be a redefinition of the non-const one, and
+// the calls above must NOT be ambiguous. Before the fix both faults occurred.
+// CHECK-NOT: redefinition of 'which'
+// CHECK-NOT: call to 'which' is ambiguous
+
+// An identical signature to which(int&) (same constness) is still a
+// redefinition — the const distinction must not collapse *different* overloads
+// that happen to share constness.
+// CHECK: error: redefinition of 'dup'
+__device__ int dup(int &x)      { return 1; }
+__device__ int dup(int &x)      { return 2; }

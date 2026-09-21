@@ -139,6 +139,31 @@ private:
   //   0 exact, 1 promotion, 2 standard, 3 lossy, 4 incompatible.
   static int conversionRank(const Type *param, const Type *arg);
 
+  // Const-aware conversion rank for a reference parameter binding. `param` is
+  // the candidate's parameter decl (carries const), `arg` is the call-site
+  // argument expression (its const/lvalue-ness is resolved via the scope
+  // table), `argTy` is the already-inferred argument type (passed in to avoid
+  // re-running checkExpr). For non-reference params this delegates to
+  // conversionRank. For reference params it ranks:
+  //   non-const lvalue -> T&      rank 0 (exact), const T& rank 1 (qualification)
+  //   const lvalue/rvalue -> T&   rank 4 (can't bind), const T& rank 0 (exact)
+  // so f(int&) is preferred for mutable lvalues and f(const int&) for const
+  // lvalues and temporaries, mirroring C++ overload rules.
+  int conversionRankFor(const ParamDecl *param, const ASTNode *arg,
+                        const Type *argTy);
+
+  // True iff `p` is a reference parameter (`T&`) that is const-qualified
+  // (`const T&`). const is modeled on ParamDecl, not in the Type, so this is
+  // the single place that distinction is observable.
+  static bool isConstRefParam(const ParamDecl *p);
+  // Whether an argument expression is a const-qualified lvalue (a DeclRefExpr
+  // to a const VarDecl/ParamDecl, or a `.field` of a const object). Drives
+  // const-aware reference overload resolution.
+  bool argIsConstLvalue(const ASTNode *arg);
+  // Whether an argument expression is an lvalue (named object, `.field`,
+  // subscript, or `*p`). Only lvalues can bind to a non-const `T&`.
+  bool argIsLvalue(const ASTNode *arg);
+
   // Structural type equality (typedefs resolved). Used for redefinition
   // detection and overload-set dedup; not a full canonical Type.
   static bool sameType(const Type *a, const Type *b);
