@@ -3384,19 +3384,17 @@ private:
           SmallVector<Value> args;
           unsigned argNo = 0;
           for (auto &a : c->args) {
-            // A by-value struct argument is scalarized into N field scalars
-            // matching the callee's scalarized signature (see buildFunction).
-            if (expandStructArg(a.get(), args, loc(a.get()))) {
-              ++argNo;
-              continue;
-            }
             // A `T&` parameter takes the argument's *address* (a
             // Function-storage memref slot), not its value — that is what makes
             // the callee's writes visible to the caller. The callee's
             // signature already carries the slot type (see cvtType's
             // ReferenceType branch), so we must hand func.call the matching
             // lvalue address; loading the value here would produce an i32 where
-            // a memref is expected.
+            // a memref is expected. This MUST be checked before the by-value
+            // struct-arg expansion below: a `P&` parameter takes the struct's
+            // memref slot whole, whereas `expandStructArg` would scalarize it
+            // into N field scalars (the by-value call convention) — leaving the
+            // call site with N operands where the callee expects one memref.
             bool wantsRef = calleeFn && argNo < calleeFn->params.size() &&
                             calleeFn->params[argNo]->type &&
                             isa<ReferenceType>(calleeFn->params[argNo]->type);
@@ -3410,6 +3408,12 @@ private:
                 return Value();
               }
               args.push_back(mem);
+              ++argNo;
+              continue;
+            }
+            // A by-value struct argument is scalarized into N field scalars
+            // matching the callee's scalarized signature (see buildFunction).
+            if (expandStructArg(a.get(), args, loc(a.get()))) {
               ++argNo;
               continue;
             }

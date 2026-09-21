@@ -1,0 +1,57 @@
+// ref_struct.vc — reference parameters of struct type (`P& p`, `const P& p`).
+//
+// A3 added scalar `T&` reference parameters; struct references were left
+// broken by a call-site ordering bug: the by-value struct-arg expansion
+// (scalarize `P p` into N field scalars) fired *before* the `T&` check, so
+// `getx(p)` where the parameter is `P&` scalarized `p` into two i32 operands
+// while the callee expected one `memref<2xi32, Function>` slot — producing
+// "spirv.FunctionCall: expected 1 operand, but provided 2". The fix checks
+// `wantsRef` first; a `P&` parameter takes the struct's memref slot whole.
+//
+// Covers:
+//   - `P& p` (mutable struct reference: callee writes are visible to caller)
+//   - `const P& p` (read-only struct reference)
+//   - a struct reference used to read and write fields
+#include "vc/Runtime/VCRuntime.h"
+
+struct P {
+  int x;
+  int y;
+};
+
+// Mutable struct reference: offset both fields.
+__device__ void offset(P &p, int dx, int dy) {
+  p.x = p.x + dx;
+  p.y = p.y + dy;
+}
+
+// Read-only struct reference: sum the fields.
+__device__ int sumxy(const P &p) {
+  return p.x + p.y;
+}
+
+__global__ void kern(int *out) {
+  P p;
+  p.x = 10;
+  p.y = 20;
+  offset(p, 5, 15);       // x=15, y=35
+  out[0] = sumxy(p);      // 50
+  out[1] = p.x;           // 15
+  out[2] = p.y;           // 35
+}
+
+int main() {
+  vcInit();
+  void *d = 0;
+  vcMalloc(&d, 3 * sizeof(int));
+  kern<<<1, 1>>>(d);
+  vcDeviceSynchronize();
+  int h[3] = {0};
+  vcMemcpy(h, d, 3 * sizeof(int), VCMemcpyKind::DeviceToHost);
+  printf("ref_struct: %d %d %d", h[0], h[1], h[2]);
+  bool ok = h[0] == 50 && h[1] == 15 && h[2] == 35;
+  printf(" %s\n", ok ? "PASS" : "FAIL");
+  vcFree(d);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

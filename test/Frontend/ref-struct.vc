@@ -1,0 +1,34 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck --allow-empty %s
+//
+// Regression for reference parameters of struct type (`P& p`, `const P& p`).
+// The by-value struct-arg expansion previously fired before the `T&` check at
+// the call site, scalarizing the struct into N field operands where the callee
+// expected one memref slot. The parse/type-check side is covered here; the
+// MLIR codegen regression is covered by ref_struct.vc.
+
+struct P {
+  int x;
+  int y;
+};
+
+__device__ void offset(P &p, int dx, int dy) {
+  p.x = p.x + dx;
+  p.y = p.y + dy;
+}
+
+__device__ int sumxy(const P &p) {
+  return p.x + p.y;
+}
+
+__global__ void kern(int *out) {
+  P p;
+  p.x = 10;
+  p.y = 20;
+  offset(p, 5, 15);
+  out[0] = sumxy(p);
+  out[1] = p.x;
+  out[2] = p.y;
+}
+
+// CHECK-NOT: error:
+// CHECK-NOT: warning:
