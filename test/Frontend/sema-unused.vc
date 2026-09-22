@@ -21,9 +21,24 @@ __global__ void kern(float *out) {
   int w = 5;
   w = 6;
 
+  // A store-only variable: its only reference is the store, so it is unused.
+  // CHECK-DAG: warning: unused variable 'set_only'
+  float set_only = 0.0f;
+  set_only = out[3];
+
   if (x > 0) {
     // CHECK-DAG: warning: unused variable 'inner'
     float inner = 1.0f;
+  }
+
+  // Read at the top of each iteration, written at the bottom: the last
+  // statement naming it is a store, but the next iteration reads it, so it is
+  // used. Reported as unused before the store-clears-the-flag rule was dropped.
+  float cur = 1.0f;
+  for (int i = 0; i < 4; i = i + 1) {
+    float nxt = cur + 1.0f;
+    out[4] = nxt;
+    cur = nxt;
   }
 
   // Used variables do not warn.
@@ -37,3 +52,7 @@ __device__ void helper(float helper_param) {
   float helper_local = 1.0f;
   // Neither is used; both reported when helper's scope pops.
 }
+
+// `cur` must not be reported: a store at the end of the loop body does not make
+// a loop-carried variable unused. CHECK-NOT: unused variable 'cur'
+// CHECK-NOT: unused variable 'nxt'

@@ -1,0 +1,67 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck --allow-empty %s
+//
+// Two file-scope declaration forms that must round-trip through the parser:
+//
+//  1. A file-scope `static`/`extern` on a FUNCTION definition or prototype.
+//     `static`/`extern` start `parseTopLevelDecl`, which historically routed
+//     everything after a storage class into `parseGlobalVarDecl` — so
+//     `static void f() {}` was parsed as a variable declaration and died with
+//     "expected ';' after declaration". The disambiguation is the token after
+//     the declarator: a function has a `(` where a variable has `=`, `;`, `[`.
+//
+//  2. Multi-word builtin types: `unsigned int`, `unsigned long`,
+//     `unsigned long long`, `long int`, `long long`, `long long int`. The
+//     lexer folds each keyword separately, so the parser's `parseBaseType`
+//     must absorb the trailing word(s) into a single type or the declarator
+//     name is consumed as a type and the declaration fails.
+//
+// `static`/`extern` on host functions lower to C++ verbatim (see
+// sema-static.vc for the *device* rules, which are strict: no function-local
+// static/extern in device code).
+
+// --- storage class on a file-scope host function -------------------------
+static void helper(int *o) { o[0] = 1; }
+extern void proto_never_defined(int *o);   // prototype form of the same path
+static void second_helper(int *o) { o[0] = 2; }
+
+// --- storage class on a file-scope variable (the pre-existing path) ------
+static int g_counter = 0;
+extern int g_extern_counter;
+const int g_const = 7;
+
+// --- multi-word builtin types, as params and as locals -------------------
+__global__ void k_wide_types(unsigned int *a, unsigned long *b,
+                             unsigned long long *c, long int *d,
+                             long long *e, long long int *f) {
+  unsigned int u = 1u;
+  unsigned long ul = 2ul;
+  unsigned long long ull = 3ull;
+  long int li = 4l;
+  long long ll = 5ll;
+  long long int lli = 6ll;
+  a[0] = u;
+  b[0] = ul;
+  c[0] = ull;
+  d[0] = li;
+  e[0] = ll;
+  f[0] = lli;
+}
+
+// --- the const-folded dimension still works alongside a static helper ----
+__global__ void k_const_dim(int *o) {
+  int arr[g_const];
+  arr[0] = g_const;
+  o[0] = arr[0];
+}
+
+int main() {
+  int buf[4];
+  helper(buf);
+  second_helper(buf);
+  g_counter = g_counter + buf[0];
+  g_extern_counter = 1;
+  return 0;
+}
+
+// CHECK-NOT: error:
+// CHECK-NOT: warning:

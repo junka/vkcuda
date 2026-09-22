@@ -98,13 +98,26 @@ bool Parser::parseTopLevelDecl() {
     return parseConstantDecl();
   if (curTok.is(TokKind::kw_namespace))
     return parseNamespaceDecl();
-  // File-scope storage-class-qualified variable declarations: `static int x;`
-  // / `extern int g;`. These are not functions (no `(` after the declarator),
+  // File-scope storage-class-qualified declarations: `static int x;` /
+  // `extern int g;`. These are not functions (no `(` after the declarator),
   // and parseFunctionOrKernel would choke on the trailing `=`/`;`. Route them
   // to a dedicated path. The host backend emits them as C++ globals; the GLSL
   // backend strips the storage class (no file-scope `static` in device code).
-  if (curTok.is(TokKind::kw_static) || curTok.is(TokKind::kw_extern))
-    return parseGlobalVarDecl();
+  //
+  // A storage class can also prefix a *function* definition (`static void
+  // helper() {}` — parseBaseType consumes the `static` inside
+  // parseFunctionOrKernel), so disambiguate on the token after the declarator
+  // name exactly like the `const` case below: `(` → function, `=`/`;`/`[`/`,`
+  // → variable. Without this, every file-scope `static` function is misrouted
+  // here and fails with "expected ';' after declaration" at the function name.
+  // (Assumes a single-token base type: a pointer-returning `static float *f()`
+  // still lands in parseGlobalVarDecl, same as the pre-existing `const` path.)
+  if (curTok.is(TokKind::kw_static) || curTok.is(TokKind::kw_extern)) {
+    // curTok = static/extern, peek() = base type, peek2() = declarator name,
+    // peek3() = the token after the name.
+    if (!lexer.peek3().is(TokKind::l_paren))
+      return parseGlobalVarDecl();
+  }
   // File-scope `const`/`constexpr` variable declarations
   // (`const int N = 4;` / `constexpr int N = 4;`): CUDA code uses these for
   // compile-time constants consumed as array dimensions. A `(` after the
@@ -1063,8 +1076,31 @@ Type *Parser::parseBaseType() {
   case TokKind::kw_void: base = new BuiltinType(BuiltinTypeKind::Void); break;
   case TokKind::kw_bool: base = new BuiltinType(BuiltinTypeKind::Bool); break;
   case TokKind::kw_int: base = new BuiltinType(BuiltinTypeKind::Int32); break;
-  case TokKind::kw_uint: base = new BuiltinType(BuiltinTypeKind::UInt32); break;
-  case TokKind::kw_long: base = new BuiltinType(BuiltinTypeKind::Int64); break;
+  case TokKind::kw_uint:
+    // `unsigned` is lexed as one token; C also allows the two-token spellings
+    // `unsigned int` / `unsigned long` (and `unsigned long long`, folded to
+    // UInt64). Fold the trailing specifier here so the rest of the parser only
+    // ever sees a single canonical integer type.
+    if (lexer.peek().is(TokKind::kw_int)) {
+      advance(); // `unsigned int`
+    } else if (lexer.peek().is(TokKind::kw_long)) {
+      advance(); // `unsigned long [long]`
+      if (lexer.peek().is(TokKind::kw_long)) advance();
+      base = new BuiltinType(BuiltinTypeKind::UInt64);
+      break;
+    }
+    base = new BuiltinType(BuiltinTypeKind::UInt32);
+    break;
+  case TokKind::kw_long:
+    // `long int` / `long long` / `long long int` all fold to the same 64-bit
+    // type (VC models a single 64-bit integer width, matching SPIR-V's i64).
+    if (lexer.peek().is(TokKind::kw_int) || lexer.peek().is(TokKind::kw_long)) {
+      advance();
+      if (curTok.is(TokKind::kw_long) && lexer.peek().is(TokKind::kw_int))
+        advance();
+    }
+    base = new BuiltinType(BuiltinTypeKind::Int64);
+    break;
   case TokKind::kw_float: base = new BuiltinType(BuiltinTypeKind::Float32); break;
   case TokKind::kw_double: base = new BuiltinType(BuiltinTypeKind::Float64); break;
   case TokKind::kw_half: base = new BuiltinType(BuiltinTypeKind::Float16); break;

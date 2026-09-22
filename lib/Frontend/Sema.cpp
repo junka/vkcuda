@@ -1356,9 +1356,12 @@ Type *Sema::checkExpr(const ASTNode *n) {
       error(n, "use of undeclared identifier '" + std::string(d->name) + "'");
       return nullptr;
     }
-    // Any reference counts as a use for the unused-variable check.
-    if (sym->getNodeType() == ASTNode::NodeKind::VarDecl ||
-        sym->getNodeType() == ASTNode::NodeKind::ParamDecl)
+    // Any reference counts as a use for the unused-variable check, unless the
+    // reference is the target of a store: `x = 1` writes x, it does not read
+    // it (see the Assign case below).
+    if (!suppressReadMark &&
+        (sym->getNodeType() == ASTNode::NodeKind::VarDecl ||
+         sym->getNodeType() == ASTNode::NodeKind::ParamDecl))
       used[sym] = true;
     if (sym->getNodeType() == ASTNode::NodeKind::VarDecl)
       return static_cast<VarDecl *>(sym)->type;
@@ -1368,7 +1371,32 @@ Type *Sema::checkExpr(const ASTNode *n) {
   }
   case ASTNode::NodeKind::BinaryExpr: {
     auto *b = static_cast<const BinaryExpr *>(n);
+    // `x = 1` writes x; it does not read it, so a store-only variable stays
+    // unused (mirrors GCC's -Wunused-but-set-variable). Suppress the read
+    // marking while the target is checked, for a *bare* DeclRefExpr target
+    // only: `a[0] = x` and `s.f = x` still read their base, and an index
+    // expression like `a[i] = x` still reads `i`.
+    bool storeToName = false;
+    if (b->op == BinaryOp::Assign &&
+        b->lhs->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+      ASTNode *sym =
+          lookup(static_cast<const DeclRefExpr *>(b->lhs.get())->name);
+      // Writing *through a reference* (`void f(int &r) { r = 1; }`) is a use
+      // of the parameter, not a store-only variable: the assignment's effect
+      // is visible at the caller. Only plain locals and by-value parameters
+      // are store-only.
+      const Type *st =
+          sym && sym->getNodeType() == ASTNode::NodeKind::VarDecl
+              ? static_cast<VarDecl *>(sym)->type
+              : sym && sym->getNodeType() == ASTNode::NodeKind::ParamDecl
+                    ? static_cast<ParamDecl *>(sym)->type
+                    : nullptr;
+      storeToName = !(st && resolveTypedefs(st)->getKind() ==
+                               TypeKind::Reference);
+    }
+    if (storeToName) suppressReadMark = true;
     Type *lt = checkExpr(b->lhs.get());
+    if (storeToName) suppressReadMark = false;
     Type *rt = checkExpr(b->rhs.get());
     const Type *rl = resolveTypedefs(lt);
     const Type *rr = resolveTypedefs(rt);
@@ -1429,30 +1457,15 @@ Type *Sema::checkExpr(const ASTNode *n) {
       if (lt && rt && !isCompatibleForAssign(lt, rt))
         warn(n, "assigning " + typeName(rt) + " to variable of type " +
                     typeName(lt));
-      // Writing to a variable is not "using" it: checkExpr() above flagged the
-      // LHS DeclRefExpr as used, but a store-only variable is still unused
-      // (mirrors GCC's -Wunused-but-set-variable). A read through an index or
-      // member (`a[0] = x`, `s.f = x`) still counts as using the base.
+      // The store target's read marking was suppressed above, so nothing to
+      // undo here. Note this must not *clear* the flag: a variable is reported
+      // only when it is never read anywhere, and clearing on every store made
+      // that depend on statement order — a loop-carried running max that is
+      // read at the top of the next iteration but written last in the body
+      // (`alpha = exp2(m - mnew); ... m = mnew;`) was reported unused.
       if (k == ASTNode::NodeKind::DeclRefExpr) {
         ASTNode *sym =
             lookup(static_cast<const DeclRefExpr *>(b->lhs.get())->name);
-        // Writing *through a reference* (`void f(int &r) { r = 1; }`) is a use
-        // of the parameter, not a store-only variable: the assignment's effect
-        // is visible at the caller. Only plain locals/by-value params reset.
-        bool throughRef = false;
-        if (sym) {
-          const Type *st = resolveTypedefs(
-              sym->getNodeType() == ASTNode::NodeKind::VarDecl
-                  ? static_cast<VarDecl *>(sym)->type
-                  : sym->getNodeType() == ASTNode::NodeKind::ParamDecl
-                        ? static_cast<ParamDecl *>(sym)->type
-                        : nullptr);
-          throughRef = st && st->getKind() == TypeKind::Reference;
-        }
-        if (sym && !throughRef &&
-            (sym->getNodeType() == ASTNode::NodeKind::VarDecl ||
-             sym->getNodeType() == ASTNode::NodeKind::ParamDecl))
-          used[sym] = false;
         // Writing to a `const`-qualified variable is illegal.
         if (sym) {
           if (sym->getNodeType() == ASTNode::NodeKind::VarDecl &&

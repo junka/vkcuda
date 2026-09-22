@@ -8,6 +8,9 @@ name: release
 # Tag convention: v<MAJOR>.<MINOR>.<PATCH> — the version is taken from the
 # tag and must match PROJECT_VERSION in CMakeLists.txt (the workflow checks
 # this and fails otherwise).
+#
+# Runner: ubuntu-24.04 (noble) — see the note in ci.yml; LLVM 18 / MLIR 18
+# and glslc are not packaged for jammy (22.04).
 on:
   push:
     tags:
@@ -24,7 +27,7 @@ permissions:
 
 jobs:
   build-deb:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 

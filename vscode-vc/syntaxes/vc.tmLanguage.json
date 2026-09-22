@@ -291,6 +291,11 @@
           "match": "\\b(vcMemcpyAsync|vcPipelineProducerCommit|vcPipelineConsumerWait|vcPipelineConsumerCommit)\\b"
         },
         {
+          "comment": "Device printf (lowers to debugPrintfEXT on the GLSL backend)",
+          "name": "support.function.builtin.printf.vc",
+          "match": "\\bprintf\\b"
+        },
+        {
           "comment": "make_<vec> constructor family",
           "name": "support.function.builtin.make.vc",
           "match": "\\b(?i:make_(float|int|uint|double|bool|long|ulong|half|short|ushort|char|uchar)(2|3|4)?)\\b"

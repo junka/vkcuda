@@ -1,8 +1,9 @@
 # All demos are single-file `.vc` sources (kernel + host main + launch in one
 # file), compiled by the `vcc` driver at build time. There are no hand-written
-# host .cpp files anymore. Each demo lives under test/ (which doubles as the
-# single-file demo directory); vcc lowers the device subset to SPIR-V, the host
-# subset to C++ embedding it, and drives g++ to produce a self-contained exe.
+# host .cpp files anymore. The demos under test/ double as the test corpus; the
+# hand-written ones in this directory are the ones meant to be read. Either way
+# vcc lowers the device subset to SPIR-V, the host subset to C++ embedding it,
+# and drives g++ to produce a self-contained exe.
 #
 # `vcc` bakes the include dir / runtime lib / vulkan flags at its own link, so
 # each custom command only needs the input and output path.
@@ -22,15 +23,19 @@ foreach(demo ${VC_SINGLEFILE_DEMOS})
     DEPENDS ${CMAKE_BINARY_DIR}/${demo}_sf)
 endforeach()
 
-# The original canonical single-file example (kept as its own target for
-# documentation/reference alongside the test/ demos).
-add_custom_command(
-  OUTPUT ${CMAKE_BINARY_DIR}/singlefile
-  COMMAND vcc ${CMAKE_CURRENT_SOURCE_DIR}/singlefile.vc
-          -o ${CMAKE_BINARY_DIR}/singlefile
-  DEPENDS vcc ${CMAKE_CURRENT_SOURCE_DIR}/singlefile.vc
-  COMMENT "vcc compiling singlefile.vc (single-file CUDA-style)"
-  VERBATIM)
-add_custom_target(singlefile ALL
-  SOURCES singlefile.vc
-  DEPENDS ${CMAKE_BINARY_DIR}/singlefile)
+# The hand-written examples. These live here rather than under test/ because
+# they are written to be read: singlefile is the canonical minimal program,
+# flash_attn the worked FlashAttention-3-style kernel (also cross-checked
+# against PyTorch by compare_flash_attn.py in this directory).
+foreach(example singlefile flash_attn)
+  add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/${example}
+    COMMAND vcc ${CMAKE_CURRENT_SOURCE_DIR}/${example}.vc
+            -o ${CMAKE_BINARY_DIR}/${example}
+    DEPENDS vcc ${CMAKE_CURRENT_SOURCE_DIR}/${example}.vc
+    COMMENT "vcc compiling ${example}.vc (single-file CUDA-style)"
+    VERBATIM)
+  add_custom_target(${example} ALL
+    SOURCES ${example}.vc
+    DEPENDS ${CMAKE_BINARY_DIR}/${example})
+endforeach()

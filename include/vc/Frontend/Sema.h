@@ -71,9 +71,15 @@ class Sema {
   unsigned breakableDepth = 0;
 
   // Unused-variable tracking. declare() seeds a VarDecl/ParamDecl as unused;
-  // every DeclRefExpr to it flips the flag. When a scope pops, entries left
-  // unused are reported as warnings.
+  // every DeclRefExpr that *reads* it flips the flag. A variable is reported
+  // when a scope pops with the flag still clear, i.e. when it is never read —
+  // a store-only variable is unused. The flag is never cleared again, so the
+  // diagnostic does not depend on statement order.
   llvm::DenseMap<const ASTNode *, bool> used;
+
+  // Set while checking the target of an assignment, so the DeclRefExpr
+  // marking above records a write rather than a read.
+  bool suppressReadMark = false;
 
   // Per-switch case constants so `case 3:` twice — and a repeated `default` —
   // is caught. One entry per active switch, maintained by checkStmt.

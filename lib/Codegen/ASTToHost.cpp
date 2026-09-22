@@ -85,11 +85,26 @@ public:
     mainFn = findMain(tu.decls);
     if (!mainFn) return false;
 
-    // Find every kernel launched from main so we can preload handles.
+    // Find every kernel launch reachable from main so we can preload handles at
+    // the top of main. The scan is syntactic, not a call graph: we sweep every
+    // host function body, not just main's, because a launch may live in a host
+    // helper (`runCase(...)`) that main calls. Over-collecting is harmless — an
+    // unused `VCKernelHandle __vc_k_x = nullptr;` costs one pointer, and a
+    // launch site whose handle was never declared is a hard compile error.
     if (mainFn->body) scanLaunches(mainFn->body.get());
+    for (const auto &kv : hostFuncDecls)
+      if (kv.second != mainFn && kv.second->body)
+        scanLaunches(kv.second->body.get());
 
     emitPreamble(tu);
     emitSpirvEmbed();
+    // Kernel handles live at file scope, not inside main: a launch may sit in a
+    // host helper (`runCase(...)`) that main calls, and a helper cannot see a
+    // local of main. File scope is also correct for the lazy-load design — the
+    // declarations are just null pointers initialized at program start, and the
+    // vcLoadKernel guard still runs at the launch site, after the user's
+    // vcInit(). See emitKernelHandleDecls.
+    emitKernelHandleDecls();
 
     // Emit top-level struct/typedef/class/namespace declarations so host code
     // can name those types (e.g. `Point hPts[64]`). These are shared with the
@@ -98,7 +113,7 @@ public:
 
     // Emit host functions (Host/None), preserving namespace blocks. main is one
     // of them; its body gets the kernel-handle prologue prepended.
-    emitHostFunctions(tu.decls, /*indent=*/0, mainFn);
+    emitHostFunctions(tu.decls, /*indent=*/0);
     return true;
   }
 
@@ -358,16 +373,15 @@ private:
     if (indent == 0) os << "\n";
   }
 
-  // Emit host functions, preserving namespace blocks. `mainFn` (if non-null)
-  // gets the kernel-handle prologue prepended to its body.
-  void emitHostFunctions(const std::vector<NodePtr> &decls, int indent,
-                         const FunctionDecl *mainFn) {
+  // Emit host functions, preserving namespace blocks. Kernel handles are
+  // declared at file scope (see emitKernelHandleDecls), not here.
+  void emitHostFunctions(const std::vector<NodePtr> &decls, int indent) {
     std::string pad(indent * 2, ' ');
     for (auto &d : decls) {
       if (d->getNodeType() == ASTNode::NodeKind::NamespaceDecl) {
         auto *ns = static_cast<const NamespaceDecl *>(d.get());
         os << pad << "namespace " << ns->name << " {\n";
-        emitHostFunctions(ns->decls, indent + 1, mainFn);
+        emitHostFunctions(ns->decls, indent + 1);
         os << pad << "} // namespace " << ns->name << "\n";
         continue;
       }
@@ -377,7 +391,7 @@ private:
           f->deviceAttr == DeviceAttr::Device)
         continue;
       os << pad;
-      emitHostFunction(f, /*isMain=*/f == mainFn);
+      emitHostFunction(f);
     }
   }
 
@@ -546,7 +560,7 @@ private:
   // Function emission
   // --------------------------------------------------------------------- //
 
-  void emitHostFunction(const FunctionDecl *f, bool isMain) {
+  void emitHostFunction(const FunctionDecl *f) {
     // C storage class (`static`/`extern`) passes through verbatim to C++.
     // `static int helper()` is a legal translation-unit-local host function;
     // `extern` (prototype-only, no body) is also legal C++.
@@ -572,7 +586,6 @@ private:
       os << cppType(f->params[i]->type) << " " << f->params[i]->name;
     }
     os << ") {\n";
-    if (isMain) emitMainPrologue();
     if (f->body &&
         f->body->getNodeType() == ASTNode::NodeKind::CompoundStmt) {
       auto *cs = static_cast<const CompoundStmt *>(f->body.get());
@@ -582,18 +595,23 @@ private:
     os << "}\n\n";
   }
 
-  // Prepend kernel-handle declarations + loads to main. The user's own
-  // vcInit()/vcShutdown() calls are left in their body (passed through).
-  // The GLSL backend emits a single __global__ with SPIR-V entry "main", so
-  // every launched kernel's handle loads that same embedded module.
-  void emitMainPrologue() {
+  // File-scope kernel-handle declarations, emitted once just after the
+  // embedded SPIR-V. Every launched kernel gets one null handle; the actual
+  // vcLoadKernel call is deferred to a lazy guard at each launch site.
+  //
+  // Why file scope and not a local at the top of main: vcInit() may be called
+  // anywhere in the user's main(), so loading eagerly would run before it and
+  // silently fail (loadKernel checks init_). The lazy guard at the launch site
+  // necessarily runs after vcInit(), and it needs the handle to be reachable
+  // from wherever the launch textually sits — which may be a host helper that
+  // main calls, and a helper cannot see a local of main. File scope satisfies
+  // both. Zero-initialized statics cost nothing at startup.
+  void emitKernelHandleDecls() {
     if (launchedKernels.empty()) return;
-    // Declare kernel handles only — the actual vcLoadKernel call is deferred
-    // to a lazy guard at each launch site. vcInit() may be called anywhere in
-    // the user's main(); loading eagerly here would run before vcInit() and
-    // silently fail (loadKernel checks init_). The guard loads on first use.
+    os << "// Kernel handles: one per __global__ launched anywhere in this file.\n";
     for (const auto &kv : launchedKernels)
-      os << "  VCKernelHandle __vc_k_" << kv.getKey() << " = nullptr;\n";
+      os << "static VCKernelHandle __vc_k_" << kv.getKey() << " = nullptr;\n";
+    os << "\n";
   }
 
   void pad(unsigned n) { for (unsigned i = 0; i < n; ++i) os << "  "; }

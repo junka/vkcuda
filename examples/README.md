@@ -1,52 +1,80 @@
 # VC Examples
 
-Four end-to-end demos that compile a `.vc` kernel to SPIR-V (via the GLSL
-backend) and run it on Vulkan through the CUDA-style runtime API. Each is a
-self-contained host program: allocate buffers, launch the kernel, copy back,
-print `PASS`/`FAIL`. The first three are synchronous correctness demos; the
-fourth (`async_overlap`) exercises the async stream API.
+Single-file CUDA-style demos. Every `.vc` source holds **both** the
+`__global__` kernel and the host `int main()`, exactly like `nvcc`: the
+`vcc` driver lowers the device subset to SPIR-V, lowers the host subset to
+C++ embedding that SPIR-V, and drives g++ to produce a self-contained
+executable. There are no hand-written host `.cpp` files.
+
+Most demos live under [`test/`](../test/) (which doubles as the demo
+directory and the e2e test corpus). The hand-written examples kept here are
+[`singlefile.vc`](singlefile.vc) — the canonical minimal program — and
+[`flash_attn.vc`](flash_attn.vc) — a worked FlashAttention-2/3 kernel, with
+[`compare_flash_attn.py`](compare_flash_attn.py) cross-checking it against
+PyTorch.
 
 ## Prerequisites
 
 - A working build of the project (see the top-level [README](../README.md)):
   ```bash
-  cmake -B build -G Ninja -DVC_ENABLE_MLIR=OFF
+  cmake -B build -G Ninja -DVC_ENABLE_MLIR=OFF   # GLSL backend only
   cmake --build build
   ```
 - A Vulkan 1.2+ capable device with a compute queue.
-- `glslc` (shaderc) on `PATH` — the GLSL backend invokes it to assemble SPIR-V.
+- `glslc` (shaderc) on `PATH` — the GLSL backend invokes it.
 
-## Common flow
+## Build and run
 
-Every demo follows the same two steps:
+`vcc` compiles, links, and produces an executable in one step:
 
 ```bash
-# 1. Compile the .vc kernel -> SPIR-V (.spv)
-./build/tools/vc-glsl/vc-glsl test/<name>.vc -o build/<name>.spv
-
-# 2. Run the host program, passing the .spv path
-./build/examples/<binary> build/<name>.spv
+./build/tools/vcc/vcc test/vadd.vc -o build/vadd_sf
+./build/vadd_sf
+# vector_add: PASS
 ```
 
-The host program takes the `.spv` path as its first argument (defaults to
-`<name>.spv` in the cwd if omitted). Expected output on success:
-`<name>: PASS`.
+`cmake --build build` already does this for the demo set in
+[`CMakeLists.txt`](CMakeLists.txt) — `build/<demo>_sf` for the `test/` demos
+and `build/singlefile` / `build/flash_attn` for the two kept here. To inspect
+the intermediate stages instead of linking:
+
+```bash
+./build/tools/vc-dump-ast/vc-dump-ast test/vadd.vc   # pretty-print the AST
+./build/tools/vcc/vcc test/vadd.vc -emit=glsl        # dump the generated GLSL
+./build/tools/vcc/vcc test/vadd.vc -emit=spirv       # write a.out (raw SPIR-V)
+./build/tools/vcc/vcc test/vadd.vc -emit=full -o build/vadd_sf
+```
+
+`vcc -emit=` accepts `host`, `glsl`, `spirv`, `full` — not `ast`. The AST
+dump is a separate tool, `vc-dump-ast`.
+
+For the MLIR backend (`.vc` → MLIR → gpu → SPIR-V, no `glslc`), use the `vc`
+driver built in the MLIR configuration:
+
+```bash
+./build-mlir/tools/vc/vc test/vadd.vc -emit=mlir           # dump IR
+./build-mlir/tools/vc/vc test/vadd.vc -emit=full -o build/vadd_mlir
+./build/vadd_mlir
+```
+
+The full self-verifying suite runs every demo through **both** backends:
+
+```bash
+python3 test/run_e2e.py --vcc build/tools/vcc/vcc \
+                        --mlirc build-mlir/tools/vc/vc test/
+```
 
 ---
 
-## vector_add
+## vadd — element-wise add
 
-**Kernel:** [`test/vadd.vc`](../test/vadd.vc)
-**Host:** [`vector_add.cpp`](vector_add.cpp)
+**Source:** [`test/vadd.vc`](../test/vadd.vc)
 
-Element-wise `c[i] = a[i] + b[i]` over 64 floats. The simplest demo —
-exercises a 1D launch, a scalar argument passed by value (`int n`), and an
-`if` guard.
+`c[i] = a[i] + b[i]` over 64 floats. The simplest demo — a 1D launch, a
+scalar argument passed by value (`int n`), and an `if` guard.
 
 ```bash
-./build/tools/vc-glsl/vc-glsl test/vadd.vc -o build/vadd.spv
-./build/examples/vector_add build/vadd.spv
-# devices: 1
+./build/tools/vcc/vcc test/vadd.vc -o build/vadd_sf && ./build/vadd_sf
 # vector_add: PASS
 ```
 
@@ -54,24 +82,21 @@ exercises a 1D launch, a scalar argument passed by value (`int n`), and an
 |-------|-------|
 | N | 64 |
 | block | 32 |
-| grid | N (= 2 workgroups) |
+| grid | N (the runtime divides `gridDim` by `blockDim`) |
 | args | `a*`, `b*`, `c*`, `n` (scalar) |
 
 ---
 
-## block_reduce
+## reduce — block reduction
 
-**Kernel:** [`test/reduce.vc`](../test/reduce.vc)
-**Host:** [`block_reduce.cpp`](block_reduce.cpp)
+**Source:** [`test/reduce.vc`](../test/reduce.vc)
 
 Block-wise sum reduction. 128 elements are split into 4 blocks of 32 threads;
 each block tree-reduces its slice to one output element. Exercises a `for`
 loop, `__shared__` memory, and `__syncthreads()`.
 
 ```bash
-./build/tools/vc-glsl/vc-glsl test/reduce.vc -o build/reduce.spv
-./build/examples/block_reduce build/reduce.spv
-# devices: 1
+./build/tools/vcc/vcc test/reduce.vc -o build/reduce_sf && ./build/reduce_sf
 # block_reduce: PASS
 ```
 
@@ -79,7 +104,7 @@ loop, `__shared__` memory, and `__syncthreads()`.
 |-------|-------|
 | N | 128 |
 | block | 32 |
-| grid | N (= 4 workgroups) |
+| grid | N (4 workgroups) |
 | args | `inBuf*`, `outBuf*`, `N` (scalar) |
 
 The output buffer holds 4 partial sums (one per block); the host verifies
@@ -87,20 +112,17 @@ each against the corresponding slice of the input.
 
 ---
 
-## matmul
+## matmul — tiled matrix multiply
 
-**Kernel:** [`test/matmul.vc`](../test/matmul.vc)
-**Host:** [`matmul.cpp`](matmul.cpp)
+**Source:** [`test/matmul.vc`](../test/matmul.vc)
 
-Tiled matrix multiply `C = A * B` for a 32×32 matrix with 16×16 tiles. The
-only 2D demo — exercises a 2D launch (`vcLaunchKernel2D`), 2D thread indices
-(`threadIdx.y`, `blockIdx.x`, …), 2D `__shared__` arrays, `&&`, nested `for`
-loops, and two `__syncthreads()` per tile.
+Tiled `C = A * B` for a 32×32 matrix with 16×16 tiles. The only 2D demo —
+exercises a 2D launch, 2D thread indices (`threadIdx.y`, `blockIdx.x`, …), 2D
+`__shared__` arrays, `&&`, nested `for` loops, and two `__syncthreads()` per
+tile.
 
 ```bash
-./build/tools/vc-glsl/vc-glsl test/matmul.vc -o build/matmul.spv
-./build/examples/matmul build/matmul.spv
-# devices: 1
+./build/tools/vcc/vcc test/matmul.vc -o build/matmul_sf && ./build/matmul_sf
 # matmul: PASS
 ```
 
@@ -108,7 +130,7 @@ loops, and two `__syncthreads()` per tile.
 |-------|-------|
 | N | 32 |
 | tile/block | 16 × 16 |
-| grid | N × N (= 2 × 2 workgroups) |
+| grid | N × N (2 × 2 workgroups) |
 | args | `A*`, `B*`, `C*`, `N` (scalar) |
 
 The host feeds `A = I` (identity), so `C` should equal `B` exactly and the
@@ -118,29 +140,116 @@ check is a tolerance-free comparison.
 
 The GLSL backend emits the workgroup size as specialization constants
 (`local_size_x_id = 0[, local_size_y_id = 1[, local_size_z_id = 2]]`) based
-on which `.x`/`.y`/`.z` components the kernel reads. At launch,
-`vcLaunchKernel2D` specializes the compute pipeline to the given block
-dimensions, so the same `.spv` runs at any block shape without recompiling.
+on which `.x`/`.y`/`.z` components the kernel reads. At launch, a 2D launch
+specializes the compute pipeline to the given block dimensions, so the same
+`.spv` runs at any block shape without recompiling.
 
 ---
 
-## async_overlap
+## flash_attn — FlashAttention (online softmax)
 
-**Kernel:** [`test/vadd.vc`](../test/vadd.vc) (reused)
-**Host:** [`async_overlap.cpp`](async_overlap.cpp)
+**Source:** [`flash_attn.vc`](flash_attn.vc)
 
-Async stream overlap demo. Two independent `vector_add` workloads are
-dispatched back-to-back on **two separate streams** (`vcStreamCreate`), with no
-synchronization between them, then each stream is synchronized and verified
-independently. This exercises the stream API added by the runtime refactor:
+The most involved kernel demo: the core of FlashAttention-2/3 — tiled K/V
+traversal with a **running max and running sum**, so the full N×N score
+matrix is never materialized. One thread owns one query row; the kernel walks
+the key/value sequence in `BC`-wide tiles, staging each tile in `__shared__`
+memory, and rescales its accumulator whenever a new tile raises the running
+max.
+
+```bash
+./build/tools/vcc/vcc examples/flash_attn.vc -o build/flash_attn_sf
+./build/flash_attn_sf
+# flash_attn: PASS
+```
+
+| param | value |
+|-------|-------|
+| heads×seq×dim | 2 × 64 × 16 |
+| tile | 16 query rows × 16 keys |
+| grid | `NHEAD * SEQ` (element count → `NHEAD * SEQ / BR` workgroups) |
+| args | `Q*`, `K*`, `V*`, `O*`, `scale` (scalar), `causal` (scalar) |
+
+The demo runs both a full (non-causal) and a causal pass, and checks each
+against a straight O(N²) double-precision reference computed on the host.
+
+Two things about it are worth calling out, because they are what makes the
+flash-attention formulation behave:
+
+- **The base-2 domain.** The kernel computes `exp2` everywhere, never `exp`.
+  `log2(e)` is folded into the scale factor (`scale = log2(e) / sqrt(d)`), so
+  `exp2(x * scale) == exp(x / sqrt(d))` and the softmax stays exact while
+  needing only one transcendental instruction. The host reference must use
+  `std::exp2` on the same scores — using `std::exp` there computes a
+  different, steeper softmax and disagrees with the kernel by ~1e-2.
+- **`alpha = exp2(m_old - m_new)`.** When a new tile raises the running max,
+  the accumulator and denominator accumulated so far are scaled by that
+  factor — the classic online-softmax correction that lets one pass over K/V
+  produce the same result as a two-pass (max, then sum) softmax.
+
+### Cross-checking against PyTorch
+
+The host reference above is the demo's own, so it shares the kernel's author and
+its assumptions. For an independent check, the demo can dump its tensors and
+[`compare_flash_attn.py`](compare_flash_attn.py) hands them to
+PyTorch's own attention:
+
+```bash
+mkdir -p /tmp/fa_tensors
+./build/flash_attn_sf --dump /tmp/fa_tensors
+python3 examples/compare_flash_attn.py /tmp/fa_tensors -v   # needs torch
+```
+
+```text
+torch 2.10.0+cu128 — cuda_available=False
+  torch-vs-kernel    max_abs_err=2.384e-07  [ok]
+  torch-vs-hostref   max_abs_err=3.576e-07  [ok]
+  kernel-vs-hostref  max_abs_err=3.576e-07  [ok]
+  torch-vs-math      max_abs_err=3.322e-07  [ok]
+causal0.bin causal=0 (2x64x16): PASS
+compare_flash_attn: PASS
+```
+
+`torch-vs-kernel` is the claim under test; `torch-vs-math` is a sanity check on
+PyTorch rather than on VC. SDPA is pinned with
+`torch.nn.attention.sdpa_kernel`, and the two backends are genuinely different
+code — verified by profiling rather than assumed. On a CPU-only host
+`FLASH_ATTENTION` dispatches to `aten::_scaled_dot_product_flash_attention_for_cpu`
+(a real tiled CPU FlashAttention), while `MATH` materializes the N×N scores, so
+it is a ground truth that shares no algorithm with the kernel under test.
+
+The `~3e-7` floor is expected, not a defect: the VC kernel accumulates in
+float32 while both references accumulate in double. The script asserts `1e-5`,
+an order of magnitude above that floor and two below the demo's own `1e-4`.
+A GPU is not required, and `torch.cuda.is_available()` is printed so it is
+clear which PyTorch kernel ran.
+
+The dump is opt-in at **run time** (`--dump <dir>`), not compile time: VC has
+no conditional compilation, and a file-scope `#ifdef` would not enclose the
+host code it needs to guard. A run without the flag writes nothing.
+
+What this demo deliberately does *not* model: FA3's warp-specialized pingpong
+scheduling and FP8 paths. Those need warp-level producer/consumer stages,
+named barriers, and register-level pipelining that VC does not expose — the
+demo implements the FA3 *algorithm*, not its CUDA-kernel engineering.
+
+---
+
+## async_overlap — two streams
+
+**Source:** [`test/async_overlap.vc`](../test/async_overlap.vc)
+
+Two independent `vadd` workloads dispatched back-to-back on **two separate
+streams**, with no synchronization between them, then each stream is
+synchronized and verified independently. Exercises:
 
 - `vcStreamCreate` / `vcStreamDestroy` / `vcStreamSynchronize`
 - `vcLaunchKernelS(..., stream)` — explicit-stream 1D launch (`NULL` = default)
 - `vcMemcpyS(..., stream)` — explicit-stream memcpy
 
 ```bash
-./build/tools/vc-glsl/vc-glsl test/vadd.vc -o build/vadd.spv
-./build/examples/async_overlap build/vadd.spv
+./build/tools/vcc/vcc test/async_overlap.vc -o build/async_overlap_sf
+./build/async_overlap_sf
 # async_overlap: PASS
 ```
 
@@ -171,7 +280,7 @@ The runtime mirrors a subset of the CUDA Runtime API semantics:
   `vcLaunchKernel` / `vcLaunchKernel2D` / `vcMemcpy` are wrappers that pass
   `NULL` (default stream) — so existing programs work unchanged.
 - **D2H memcpy blocks** until the copy completes, matching `cudaMemcpy(D2H)`,
-  so the destination is readable on return. Truly async D2H is a future TODO.
+  so the destination is readable on return.
 - **Scalar kernel args** are passed via push constants (`pc.<name>` in the
   emitted GLSL), not staging buffers; pointer args get consecutive SSBO
   bindings. This is handled jointly by the GLSL backend and the runtime, and
@@ -179,17 +288,23 @@ The runtime mirrors a subset of the CUDA Runtime API semantics:
 
 ---
 
-## Run all four
-
+## Run everything
 
 ```bash
-for d in vadd:vector_add reduce:block_reduce matmul:matmul; do
-  k=${d%%:*}; b=${d##*:}
-  ./build/tools/vc-glsl/vc-glsl test/$k.vc -o build/$k.spv && \
-  ./build/examples/$b build/$k.spv
+# Demos from test/ (the VC_SINGLEFILE_DEMOS list in CMakeLists.txt):
+for d in vadd reduce matmul struct features features2 async_overlap atomics \
+         vectors sync warp enum half constant vote bool sizeof const_local \
+         comma default_arg define async_copy namespace class multi_kernel; do
+  ./build/${d}_sf
 done
-# async_overlap reuses the vadd kernel:
-./build/examples/async_overlap build/vadd.spv
+
+# The hand-written examples in this directory:
+./build/singlefile
+./build/flash_attn
+
+# Or both backends, all demos, with pass/fail checking (both directories):
+python3 test/run_e2e.py --vcc build/tools/vcc/vcc \
+                        --mlirc build-mlir/tools/vc/vc test/ examples/
 ```
 
 ## Troubleshooting
@@ -198,7 +313,8 @@ done
   equivalent), or ensure it is on `PATH`.
 - **`vcInit failed`** — no Vulkan instance/device. Check that a Vulkan loader
   and a compute-capable GPU are present (`vulkaninfo`).
-- **`could not load kernel`** — the `.spv` path argument is wrong or the
-  kernel wasn't compiled first.
-- **`FAIL`** — rerun the host binary; on failure the demos print the first few
+- **`FAIL`** — rerun the executable; on failure the demos print the first few
   mismatched elements for diagnosis.
+- **`no Vulkan device`** at configure time — `vc-e2e-check` is gated on a
+  working Vulkan device; leave `-DVC_RUN_E2E_TESTS=OFF` (the default) on
+  GPU-less machines.

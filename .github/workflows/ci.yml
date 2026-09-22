@@ -4,6 +4,10 @@ name: build-and-test
 # suites (vc-check frontend, mlir-check MLIR IR). GPU end-to-end demos are
 # NOT run here — GitHub-hosted runners have no Vulkan device. Use the
 # `release` workflow (tag-triggered) to produce a .deb.
+#
+# Runner: ubuntu-24.04 (noble). The LLVM 18 / MLIR 18 packages this build
+# needs (libmlir-18-dev, mlir-18-tools, llvm-spirv-18, glslc) are NOT in
+# jammy (22.04) — LLVM 18 was first packaged for noble.
 on:
   push:
     branches: [main, master]
@@ -13,7 +17,7 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 

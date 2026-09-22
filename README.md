@@ -52,7 +52,7 @@ cmake --build build
 
 ```bash
 # End-to-end via the GLSL backend (single-file CUDA-style driver):
-./build/tools/vcc/vcc test/vadd.vc -emit=ast     # dump AST
+./build/tools/vc-dump-ast/vc-dump-ast test/vadd.vc  # dump AST
 ./build/tools/vcc/vcc test/vadd.vc -emit=glsl    # dump GLSL source
 ./build/tools/vcc/vcc test/vadd.vc -o build/vadd.spv   # GLSL -> glslc -> .spv, link host exe, run
 
@@ -62,13 +62,14 @@ cmake --build build
 ./build-mlir/tools/vc/vc test/vadd.vc -emit=full -o build/vadd_mlir  # SPIR-V + linked host exe
 
 # Full self-checking demo suite, both backends at once:
-python3 test/run_e2e.py --vcc build/tools/vcc/vcc --mlirc build-mlir/tools/vc/vc test/
+python3 test/run_e2e.py --vcc build/tools/vcc/vcc \
+                        --mlirc build-mlir/tools/vc/vc test/ examples/
 ```
 
-The e2e harness builds and runs every `test/*.vc` demo through **both** backends
-and checks the `PASS`/`FAIL` the program prints. As of this commit: **131
-(backend, demo) pairs pass, 3 skipped** (constructs one backend can't lower are
-skip-listed rather than failing the suite).
+The e2e harness builds and runs every `test/*.vc` and `examples/*.vc` demo
+through **both** backends and checks the `PASS`/`FAIL` the program prints. As
+of this commit: **135 (backend, demo) pairs pass, 3 skipped** (constructs one
+backend can't lower are skip-listed rather than failing the suite).
 
 See [examples/README.md](examples/README.md) for per-demo details, the
 stream/memcpy semantics table, and the specialization-constant mechanism
@@ -188,10 +189,19 @@ The Vulkan runtime implements a CUDA-style host API over Vulkan compute:
 - `tools/vc-dump-ast/` — frontend-only AST dumper
 - `tools/vc-glsl/` — the `vc-glsl` GLSL-backend driver
 - `tools/vcc/` — single-file CUDA-style driver (host + GLSL backend)
-- `test/*.vc` — kernel sources (vadd, reduce, matmul, constant, …)
+- `test/*.vc` — kernel sources (vadd, reduce, matmul, constant, …); also the
+  end-to-end test corpus
 - `test/Frontend/`, `test/MLIR/` — FileCheck regression tests (targets
   `vc-check` / `mlir-check`)
+- `examples/` — the hand-written demos meant to be read: `singlefile.vc`, and
+  `flash_attn.vc` (FlashAttention-2/3) with `compare_flash_attn.py`
+  cross-checking it against PyTorch's SDPA kernels (needs torch; the demo
+  dumps tensors with `--dump`)
 - `docs/language-spec.md` — language design notes
+- `docs/plans/` — pre-implementation design plans (all shipped; kept for the
+  rationale and the rejected alternatives)
+- `examples/README.md` — how to build and run every demo
+- `vscode-vc/` — TextMate grammar for `.vc` (syntax highlighting only, no LSP)
 
 ## Implemented language surface
 
@@ -288,7 +298,13 @@ than silently miscompiling.
   (`int *row`, `sub_array_decay.vc`) covers the common case. Parser errors
   with "expected parameter name".
 - **3+ level nested init lists** (`int a[2][2][2] = {{{…}}}`). 2-level
-  nesting works (`multidim_init.vc`); deeper Sema gaps remain.
+  nesting works (`multidim_init.vc`); deeper nesting is a parse error
+  ("expected expression") — flatten the literal or use explicit assigns.
+- **`union`.** The parser does not accept the keyword at all ("expected '('"
+  — it is read as a function name). Model the storage explicitly with a
+  `struct` plus a cast, or keep separate typed buffers.
+- **`goto` / labels.** Rejected at parse time ("expected ';'" at the label).
+  Restructure with a loop plus `break`/`continue`, or a `for` with a flag.
 - **Function-like / conditional macros** (`#define F(x) …`, `#ifdef`). Only
   object-like single-literal `#define` is supported.
 - **General C++ templates / exceptions / RTTI.** Out of scope for a shader
@@ -318,3 +334,9 @@ intrinsics, WMMA/cooperative matrix, serialized SPIR-V (`vc -emit=spirv`),
 and host executable generation (`vc -emit=full`).
 
 Deferred: see **Long tail** above.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The `.deb` ships the same text as
+`/usr/share/doc/vc/copyright`.
+

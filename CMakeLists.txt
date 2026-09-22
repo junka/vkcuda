@@ -212,7 +212,8 @@ endif()
 # End-to-end demo tests (GPU-dependent)
 #
 # `cmake --build build --target vc-e2e-check` builds every self-verifying
-# demo under test/*.vc with BOTH backends (GLSL `vcc`, MLIR `vc -emit=full`),
+# demo under test/*.vc and examples/*.vc with BOTH backends (GLSL `vcc`, MLIR
+# `vc -emit=full`),
 # runs each built executable, and checks it prints PASS and exits 0. This is
 # the only automated coverage of the full .vc -> SPIR-V -> run path; the
 # vc-check / mlir-check targets above only exercise syntax/semantics and
@@ -238,8 +239,9 @@ if(VC_RUN_E2E_TESTS AND Python3_Interpreter_FOUND AND TARGET vcc)
             ${_vc_e2e_mlirc}
             --verbose
             ${CMAKE_SOURCE_DIR}/test
+            ${CMAKE_SOURCE_DIR}/examples
     DEPENDS vcc
-    COMMENT "Running end-to-end demo tests (test/*.vc, both backends)"
+    COMMENT "Running end-to-end demo tests (test/*.vc + examples/*.vc)"
     USES_TERMINAL)
   # Expose to ctest too, so `ctest -R e2e` finds it when the option is on.
   add_test(NAME vc-e2e-check
@@ -287,6 +289,13 @@ install(TARGETS ${_vc_install_libs}
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/vc
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
+# License text — installed under the Debian-mandated name
+# /usr/share/doc/vc/copyright (CPACK_RESOURCE_FILE_LICENSE alone does not
+# emit that file for the DEB generator).
+install(FILES ${CMAKE_SOURCE_DIR}/LICENSE
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/vc
+        RENAME copyright)
+
 # ---------------------------------------------------------------------------
 # CPack — produce a Debian package.
 # ---------------------------------------------------------------------------
@@ -299,16 +308,25 @@ set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/junka/gg")
 set(CPACK_DEBIAN_PACKAGE_MAINTAINER "junka")
 set(CPACK_DEBIAN_PACKAGE_SECTION "devel")
 set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
-# Runtime + compile-time deps vcc/vc need on the target host:
-#   libllvm18 / libmlir-18 — the drivers link libLLVM.so (MLIR backend also
-#     pulls libMLIR.so transitively).
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
+set(CPACK_DEBIAN_PACKAGE_LICENSE "MIT")
+# Runtime deps vcc/vc need on the target host. The drivers link libLLVM.so /
+# libMLIR.so by soversion, so libllvm18 + libmlir-18 are the right runtime
+# packages. No libllvmspirvlib is linked or dlopen'd — the MLIR SPIR-V path
+# goes through MLIR's own serializer — so a *-dev package is NOT an
+# install-time requirement of the shipped binaries.
+#   libllvm18 / libmlir-18 — libLLVM.so, libMLIR.so.
 #   libvulkan1 — runtime links Vulkan.
 #   glslc (shaderc) — vcc invokes it to compile GLSL→SPIR-V.
-#   spirv-tools / spirv-headers — SPIR-V validation/disassembly.
-#   libllvmspirvlib-18-dev — llvm-spirv translator (MLIR SPIR-V path).
-#   g++ + libc6-dev — vcc drives g++ to link user executables at use time.
+#   spirv-tools — SPIR-V validation/disassembly.
+#   g++ + libc6-dev — vcc drives g++ to link user executables at use time,
+#     so the package is only useful where a host toolchain is present.
 set(CPACK_DEBIAN_PACKAGE_DEPENDS
-    "libllvm18, libmlir-18, libvulkan1, glslc, spirv-tools, libllvmspirvlib-18-dev, g++, libc6-dev")
+    "libllvm18, libmlir-18, libvulkan1, glslc, spirv-tools, g++, libc6-dev")
+# What a downstream *build* against these headers/libs would additionally
+# need. Not an install-time need of the shipped binaries → Recommends.
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS
+    "libllvm-18-dev, libmlir-18-dev, spirv-headers")
 # Keep debug symbols (RelWithDebInfo) — don't strip.
 set(CPACK_STRIP_FILES OFF)
 set(CPACK_DEBIAN_DEBUGINFO_PACKAGE ON)

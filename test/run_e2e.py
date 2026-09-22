@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """End-to-end demo runner for the VC compiler.
 
-Runs every self-verifying demo under test/*.vc through BOTH backends:
+Runs every self-verifying demo under the given directories (test/*.vc plus
+examples/*.vc) through BOTH backends:
 
   * GLSL backend:  `vcc <demo>.vc -o <exe>`        -> run <exe>
   * MLIR backend:  `vc  <demo>.vc -emit=full -o <exe>` -> run <exe>

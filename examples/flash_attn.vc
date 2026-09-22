@@ -1,0 +1,297 @@
+// examples/flash_attn.vc — single-file FlashAttention (online-softmax attention).
+//
+// The algorithmic core of FlashAttention-2/3: tiled K/V traversal with a
+// running max and running sum, so the full N x N score matrix is never
+// materialized.  Instead of `exp`, it works entirely in the base-2 domain
+// (`exp2`), folding log2(e) into the scale factor — this is the numerical
+// trick FA2/FA3 rely on, and it maps to a single SPIR-V GLSL instruction.
+//
+//   S_ij = (Q_i . K_j) * scale
+//   m_i  = max_j S_ij          (running, per query row)
+//   l_i  = sum_j exp2(S_ij - m_i)
+//   O_i  = sum_j exp2(S_ij - m_i) * V_j / l_i
+//
+// "FA3" here means the *algorithm*; the warp-specialized pingpong scheduling
+// and FP8 paths of the CUDA FA3 kernel need warp-level producer/consumer
+// stages that VC does not model.  Everything below is portable device code.
+//
+// Layout: one thread owns one query row.  A block of BR threads covers BR
+// query rows; the kernel walks the key/value sequence in BC-wide tiles,
+// staging each tile in __shared__ memory.
+//
+//   vcc examples/flash_attn.vc -o build/flash_attn_sf && ./build/flash_attn_sf
+//
+// The demo checks itself against its own O(N^2) host reference. For an
+// independent check against a production implementation, ask it to dump the
+// tensors and hand them to PyTorch's FlashAttention kernels:
+//
+//   vcc examples/flash_attn.vc -o /tmp/fa
+//   /tmp/fa --dump /tmp/fa_tensors
+//   python3 examples/compare_flash_attn.py /tmp/fa_tensors   # needs torch
+//
+// The dump is opt-in at run time, not compile time: VC has no conditional
+// compilation (`#ifdef` is only meaningful at file scope, and a file-scope
+// guard would not enclose generated declarations), so a `-D`-guarded dump is
+// not expressible. An unrequested run writes nothing.
+
+#include <cstdio>
+#include <cmath>
+#include <cstring>
+#include "vc/Runtime/VCRuntime.h"
+
+// Object-like macros only: the minimal preprocessor captures a single literal
+// replacement token, so a trailing comment on the same line would make the
+// replacement multi-token and the macro would be silently ignored.
+//   SEQ   sequence length (query and key)
+//   HDIM  per-head feature dimension
+//   NHEAD number of (batch x head) slices
+//   BR    query rows per block  == blockDim.x
+//   BC    key/value columns per tile
+#define SEQ 64
+#define HDIM 16
+#define NHEAD 2
+#define BR 16
+#define BC 16
+
+__global__ void flashAttn(float *Q, float *K, float *V, float *O,
+                          float scale, int causal) {
+  // Grid is laid out as SEQ*NHEAD elements on x; the runtime divides by
+  // blockDim, so this yields SEQ/BR * NHEAD workgroups.
+  int head = blockIdx.x % NHEAD;
+  int qblk = blockIdx.x / NHEAD;
+  int q0 = qblk * BR + threadIdx.x;   // this thread's query row
+
+  // Per-thread register tile: the query row, the accumulator, and the
+  // running softmax state (m = max, l = sum).
+  float qr[HDIM];
+  float acc[HDIM];
+  float srow[BC];
+
+  int base = head * SEQ * HDIM;
+  for (int d = 0; d < HDIM; d = d + 1) {
+    qr[d] = Q[base + q0 * HDIM + d];
+    acc[d] = 0.0f;
+  }
+  float m = -100000000.0f;   // running max, in the exp2 domain
+  float l = 0.0f;            // running denominator
+
+  // Key/value tiles.
+  __shared__ float Ks[BC][HDIM];
+  __shared__ float Vs[BC][HDIM];
+
+  for (int k0 = 0; k0 < SEQ; k0 = k0 + BC) {
+    // Cooperative load of one K/V tile.  blockDim.x == HDIM, so each thread
+    // loads its own column of every row in the tile.
+    for (int r = 0; r < BC; r = r + 1) {
+      Ks[r][threadIdx.x] = K[base + (k0 + r) * HDIM + threadIdx.x];
+      Vs[r][threadIdx.x] = V[base + (k0 + r) * HDIM + threadIdx.x];
+    }
+    __syncthreads();
+
+    // --- scores for this tile: S_j = (q . k_j) * scale -------------------
+    float mnew = m;
+    for (int j = 0; j < BC; j = j + 1) {
+      float dot = 0.0f;
+      for (int d = 0; d < HDIM; d = d + 1) {
+        dot = dot + qr[d] * Ks[j][d];
+      }
+      float s = dot * scale;
+      // Causal mask: query i may only attend to key j <= i.
+      if (causal == 1 && k0 + j > q0) s = -100000000.0f;
+      srow[j] = s;
+      if (s > mnew) mnew = s;
+    }
+
+    // --- rescale the running state by exp2(m_old - m_new) ----------------
+    float alpha = exp2(m - mnew);
+    l = l * alpha;
+    for (int d = 0; d < HDIM; d = d + 1) acc[d] = acc[d] * alpha;
+
+    // --- accumulate this tile's contribution: P * V ----------------------
+    for (int j = 0; j < BC; j = j + 1) {
+      float p = exp2(srow[j] - mnew);
+      l = l + p;
+      for (int d = 0; d < HDIM; d = d + 1) {
+        acc[d] = acc[d] + p * Vs[j][d];
+      }
+    }
+    m = mnew;
+    __syncthreads();
+  }
+
+  // --- normalize and write out ------------------------------------------
+  for (int d = 0; d < HDIM; d = d + 1) {
+    O[base + q0 * HDIM + d] = acc[d] / l;
+  }
+}
+
+// Host reference: plain O(N^2) attention, no tiling, no online softmax.
+static void referenceAttn(const float *Q, const float *K, const float *V,
+                          float *O, float scale, int causal) {
+  for (int h = 0; h < NHEAD; h++) {
+    for (int i = 0; i < SEQ; i++) {
+      double m = -1.0e30;
+      for (int j = 0; j < SEQ; j++) {
+        if (causal && j > i) continue;
+        double s = 0.0;
+        for (int d = 0; d < HDIM; d++)
+          s += double(Q[h * SEQ * HDIM + i * HDIM + d]) *
+               double(K[h * SEQ * HDIM + j * HDIM + d]);
+        s *= double(scale);
+        if (s > m) m = s;
+      }
+      double l = 0.0;
+      double acc[HDIM];
+      for (int d = 0; d < HDIM; d++) acc[d] = 0.0;
+      for (int j = 0; j < SEQ; j++) {
+        if (causal && j > i) continue;
+        double s = 0.0;
+        for (int d = 0; d < HDIM; d++)
+          s += double(Q[h * SEQ * HDIM + i * HDIM + d]) *
+               double(K[h * SEQ * HDIM + j * HDIM + d]);
+        s *= double(scale);
+        // exp2, not exp: `scale` already folds in log2(e), so the scores above
+        // live in the base-2 domain. exp() here would compute a different,
+        // steeper softmax and disagree with the kernel by ~1e-2.
+        double p = std::exp2(s - m);
+        l += p;
+        for (int d = 0; d < HDIM; d++)
+          acc[d] += p * double(V[h * SEQ * HDIM + j * HDIM + d]);
+      }
+      for (int d = 0; d < HDIM; d++)
+        O[h * SEQ * HDIM + i * HDIM + d] = float(acc[d] / l);
+    }
+  }
+}
+
+// Host-side RNG: Gaussian (mean 0, variance 1) Q/K/V by Box-Muller on a
+// 32-bit LCG stream. Drawn in double and then quantized to float, so a
+// host-side reference computing the same expressions in double lands on
+// bit-identical float inputs (see examples/compare_flash_attn.py).
+//
+// Gaussian rather than uniform: uniform inputs make every query row nearly
+// orthogonal to every key (`q . k ~ 0`), which leaves the softmax almost flat
+// and hides an incorrect running max. Gaussian inputs give the scores real
+// spread and actually exercise the online-softmax rescale.
+//
+// One uniform in (0, 1) — the LCG top bits, never exactly 0, so log() is safe.
+static double runif(unsigned int *st) {
+  *st = *st * 1103515245u + 12345u;
+  return (double((*st >> 8) & 0xffffu) + 0.5) / 65536.0;
+}
+
+static float gaussian(unsigned int *st) {
+  double u1 = runif(st);
+  double u2 = runif(st);
+  return float(std::sqrt(-2.0 * std::log(u1)) *
+               std::cos(6.283185307179586 * u2));
+}
+
+// `dumpDir` is the `--dump <dir>` argument, or null when the flag is absent.
+// It is threaded through as a parameter rather than parked in a file-scope
+// global: a file-scope `const` is what the GLSL backend emits for CUDA
+// `__constant__`, so a host-only const global would leak into the shader
+// (and a `const char` global is not valid GLSL anyway).
+static int runCase(int causal, int verbose, const char *dumpDir) {
+  const int ELEMS = NHEAD * SEQ * HDIM;
+  float hQ[ELEMS], hK[ELEMS], hV[ELEMS], hO[ELEMS], hRef[ELEMS];
+
+  // Gaussian Q/K/V, so the scores have real spread — see gaussian() above for
+  // why, and examples/compare_flash_attn.py for the PyTorch cross-check that reads
+  // these exact values back out of the dump file.
+  unsigned int st = 12345u + (unsigned int)causal;
+  for (int i = 0; i < ELEMS; i++) {
+    hQ[i] = gaussian(&st);
+    hK[i] = gaussian(&st);
+    hV[i] = gaussian(&st);
+    hO[i] = 0.0f;
+  }
+  // scale folds 1/sqrt(HDIM) together with log2(e): the kernel's softmax runs
+  // in the base-2 domain, so exp2(x * scale) == exp(x / sqrt(HDIM)).
+  float scale = float(1.4426950408889634 / std::sqrt(double(HDIM)));
+
+  referenceAttn(hQ, hK, hV, hRef, scale, causal);
+
+  void *dQ = 0, *dK = 0, *dV = 0, *dO = 0;
+  int bytes = ELEMS * 4;
+  vcMalloc(&dQ, bytes);
+  vcMalloc(&dK, bytes);
+  vcMalloc(&dV, bytes);
+  vcMalloc(&dO, bytes);
+  vcMemcpy(dQ, hQ, bytes, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dK, hK, bytes, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dV, hV, bytes, VCMemcpyKind::HostToDevice);
+
+  // gridDim.x is an element count: NHEAD heads x SEQ query rows.
+  flashAttn<<<dim3(NHEAD * SEQ, 1), dim3(BR, 1)>>>(dQ, dK, dV, dO, scale, causal);
+  vcDeviceSynchronize();
+  vcMemcpy(hO, dO, bytes, VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  float worst = 0.0f;
+  for (int i = 0; i < ELEMS; i++) {
+    float diff = std::fabs(double(hO[i] - hRef[i]));
+    if (diff > worst) worst = diff;
+    if (diff > 1.0e-4f) ok = 0;
+  }
+  if (verbose || !ok)
+    printf("  causal=%d worst_abs_err=%.3e\n", causal, double(worst));
+
+  // Optional tensor dump for the external PyTorch cross-check. The format is
+  // deliberately dull — a four-byte magic, a four-float header, then five
+  // little-endian float32 blobs in row-major [NHEAD][SEQ][HDIM] order — so
+  // compare_flash_attn.py needs no .vc parser to read it. Blobs, in order:
+  // Q, K, V as generated, the kernel's O, the host reference's O.
+  if (dumpDir) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/causal%d.bin", dumpDir, causal);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+      float meta[4];
+      meta[0] = float(NHEAD);
+      meta[1] = float(SEQ);
+      meta[2] = float(HDIM);
+      meta[3] = float(causal);
+      fwrite("VCFA", 1, 4, f);
+      fwrite(meta, 4, sizeof(float), f);
+      fwrite(hQ, 4, ELEMS, f);
+      fwrite(hK, 4, ELEMS, f);
+      fwrite(hV, 4, ELEMS, f);
+      fwrite(hO, 4, ELEMS, f);
+      fwrite(hRef, 4, ELEMS, f);
+      fclose(f);
+      printf("  dumped %s\n", path);
+    } else {
+      printf("  dump failed: cannot open %s\n", path);
+    }
+  }
+
+  vcFree(dQ);
+  vcFree(dK);
+  vcFree(dV);
+  vcFree(dO);
+  return ok;
+}
+
+int main(int argc, char **argv) {
+  // `--dump <dir>` writes the tensors for the PyTorch cross-check; without
+  // the flag the demo behaves exactly as before and writes nothing.
+  const char *dumpDir = 0;
+  for (int i = 1; i + 1 < argc; i++) {
+    if (std::strcmp(argv[i], "--dump") == 0) dumpDir = argv[i + 1];
+  }
+
+  vcInit();
+
+  printf("flash_attn: heads=%d seq=%d dim=%d tile=%dx%d\n",
+         NHEAD, SEQ, HDIM, BR, BC);
+
+  int ok = 1;
+  if (!runCase(0, 1, dumpDir)) ok = 0;   // full (non-causal) attention
+  if (!runCase(1, 1, dumpDir)) ok = 0;   // causal attention
+
+  printf("flash_attn: %s\n", ok ? "PASS" : "FAIL");
+
+  vcShutdown();
+  return ok ? 0 : 1;
+}
