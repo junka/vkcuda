@@ -1,0 +1,53 @@
+name: build-and-test
+
+# Build the compiler (GLSL `vcc` + MLIR `vc`) and run the lit regression
+# suites (vc-check frontend, mlir-check MLIR IR). GPU end-to-end demos are
+# NOT run here — GitHub-hosted runners have no Vulkan device. Use the
+# `release` workflow (tag-triggered) to produce a .deb.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ \
+            libmlir-18-dev mlir-18-tools \
+            llvm-spirv-18 libllvmspirvlib-18-dev \
+            spirv-headers spirv-tools \
+            libvulkan-dev \
+            glslc \
+            python3
+          # FileCheck ships with the LLVM install; locate it for the lit suites.
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+
+      - name: Configure (MLIR backend, RelWithDebInfo)
+        run: |
+          cmake -B build -G Ninja \
+            -DVC_ENABLE_MLIR=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Frontend regression tests (vc-check)
+        run: cmake --build build --target vc-check
+
+      - name: MLIR IR regression tests (mlir-check)
+        run: cmake --build build --target mlir-check
+
+      # Smoke-test the compiler drivers actually run on the runner.
+      - name: Smoke test (vcc --help, vc --help)
+        run: |
+          ./build/tools/vcc/vcc --help | head -1
+          ./build/tools/vc/vc --help | head -1

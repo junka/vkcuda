@@ -1,0 +1,115 @@
+name: release
+
+# On a version tag (v0.1.0), build the Debian package and attach it to a
+# GitHub Release. The .deb bundles both backends (vcc GLSL + vc MLIR) and
+# the public headers + static runtime, built RelWithDebInfo with install
+# paths baked for /usr.
+#
+# Tag convention: v<MAJOR>.<MINOR>.<PATCH> — the version is taken from the
+# tag and must match PROJECT_VERSION in CMakeLists.txt (the workflow checks
+# this and fails otherwise).
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (vX.Y.Z) — must match CMakeLists PROJECT_VERSION'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write   # needed by softprops/action-gh-release to create the Release
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ \
+            libmlir-18-dev mlir-18-tools \
+            llvm-spirv-18 libllvmspirvlib-18-dev \
+            spirv-headers spirv-tools \
+            libvulkan-dev \
+            glslc \
+            python3 dpkg-dev
+
+      - name: Resolve version from tag
+        id: ver
+        run: |
+          # workflow_dispatch passes the tag via inputs; tag push via GITHUB_REF.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches CMake PROJECT_VERSION
+        run: |
+          PV=$(grep -m1 'project(vc' CMakeLists.txt | grep -oE 'VERSION [0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}')
+          TAGV="${{ steps.ver.outputs.version }}"
+          echo "CMake PROJECT_VERSION=$PV"
+          echo "tag version=$TAGV"
+          [ "$PV" = "$TAGV" ] || { echo "ERROR: tag version ($TAGV) != CMake PROJECT_VERSION ($PV)"; exit 1; }
+
+      - name: Configure (install paths baked, RelWithDebInfo)
+        run: |
+          cmake -B build-pkg -G Ninja \
+            -DVC_ENABLE_MLIR=ON \
+            -DVC_USE_INSTALL_PATHS=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INSTALL_PREFIX=/usr
+
+      - name: Build
+        run: cmake --build build-pkg -j"$(nproc)"
+
+      - name: Build .deb (CPack)
+        run: |
+          cd build-pkg
+          cpack -C RelWithDebInfo -G DEB
+          # List the artifacts for the log.
+          ls -la vc_*.deb vc_*.ddeb
+
+      - name: Stage install + smoke-test the packaged drivers
+        run: |
+          # Install into a throwaway prefix that matches what the .deb lays out,
+          # then run the staged vcc/vc to confirm the baked paths resolve and
+          # the binaries actually work (no Vulkan needed for -emit=mlir/--help).
+          cmake --install build-pkg --prefix /tmp/vc-stage
+          echo "=== baked paths in staged vcc ==="
+          strings /tmp/vc-stage/bin/vcc | grep -E -- '-I|libVCRuntime\.a$' | head
+          echo "=== vcc --help ==="
+          /tmp/vc-stage/bin/vcc --help | head -1
+          echo "=== vc --help ==="
+          /tmp/vc-stage/bin/vc --help | head -1
+          echo "=== vc -emit=mlir on test/vadd.vc ==="
+          /tmp/vc-stage/bin/vc test/vadd.vc -emit=mlir | grep -m1 'vc.kernel'
+
+      - name: Rename artifacts with arch suffix
+        id: artifacts
+        run: |
+          cd build-pkg
+          DEB=$(ls vc_*.deb | head -1)
+          DDEB=$(ls vc_*.ddeb 2>/dev/null | head -1)
+          cp "$DEB" "/tmp/$DEB"
+          [ -n "$DDEB" ] && cp "$DDEB" "/tmp/$DDEB"
+          echo "deb=/tmp/$DEB" >> "$GITHUB_OUTPUT"
+          echo "ddeb=/tmp/$DDEB" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release and upload artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.artifacts.outputs.deb }}
+            ${{ steps.artifacts.outputs.ddeb }}
