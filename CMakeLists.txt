@@ -176,6 +176,7 @@ if(Python3_Interpreter_FOUND AND VC_FILECHECK AND TARGET vcc)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/run_tests.py
             --vcc $<TARGET_FILE:vcc>
             --filecheck ${VC_FILECHECK}
+            --continue-on-error
             ${CMAKE_SOURCE_DIR}/test/Frontend
     DEPENDS vcc
     COMMENT "Running frontend regression tests (test/Frontend)"
@@ -199,6 +200,7 @@ if(VC_ENABLE_MLIR AND Python3_Interpreter_FOUND AND VC_FILECHECK
             --vcc $<TARGET_FILE:vcc>
             --mlirc $<TARGET_FILE:vc>
             --filecheck ${VC_FILECHECK}
+            --continue-on-error
             ${CMAKE_SOURCE_DIR}/test/MLIR
     DEPENDS vc
     COMMENT "Running MLIR backend regression tests (test/MLIR)"
