@@ -55,6 +55,15 @@ struct VulkanDevice {
   bool coopMatrix = false;       // VK_KHR_cooperative_matrix + shaderFloat16
   bool f16Storage = false;       // shaderFloat16 + shaderStorageBuffer16BitAccess
                                  // (scalar __half SSBO load/store)
+  // The individual features actually enabled on the logical device. A kernel's
+  // SPIR-V OpCapability list must be a subset of these or
+  // vkCreateShaderModule refuses the binary; checkSpirvCapabilities compares
+  // them and reports the missing feature by name.
+  bool shaderFloat16 = false;
+  bool shaderFloat64 = false;
+  bool shaderInt64 = false;
+  bool storageBuffer16BitAccess = false; // VkPhysicalDevice16BitStorageFeatures
+  bool storagePushConstant16 = false;    // VkPhysicalDevice16BitStorageFeatures
   // Per-device default stream. CUDA gives each device its own default stream;
   // vcSetDevice(i) makes resolveStream(NULL) return devices_[i]->defaultStream.
   // unique_ptr because VCStream is forward-declared at this point.

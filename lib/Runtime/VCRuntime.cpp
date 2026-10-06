@@ -328,8 +328,6 @@ bool Runtime::enumerateDevices(VkInstance instance) {
     if (!setupLogicalDevice(*owner, members)) continue;
     VkDevice sharedDevice = owner->device;
     VkQueue sharedQueue = owner->computeQueue;
-    bool timelineSemaphore = owner->timelineSemaphore;
-    bool coopMatrix = owner->coopMatrix;
 
     std::vector<std::unique_ptr<VulkanDevice>> groupDevices;
     groupDevices.push_back(std::move(owner));
@@ -344,8 +342,20 @@ bool Runtime::enumerateDevices(VkInstance instance) {
       vd->groupLocalIndex = i;
       vd->groupSize = static_cast<uint32_t>(members.size());
       vd->groupDeviceMask = 1u << i;
-      vd->timelineSemaphore = timelineSemaphore;
-      vd->coopMatrix = coopMatrix;
+      // One logical device is shared by the whole group, so every member has
+      // exactly the feature set the owner created it with. The per-kernel
+      // capability check reads these bits per device, so a member that lost one
+      // would reject a kernel the owner runs fine. Re-read the owner each
+      // iteration: push_back below can reallocate the vector.
+      const VulkanDevice &ownerDev = *groupDevices.front();
+      vd->timelineSemaphore = ownerDev.timelineSemaphore;
+      vd->coopMatrix = ownerDev.coopMatrix;
+      vd->f16Storage = ownerDev.f16Storage;
+      vd->shaderFloat16 = ownerDev.shaderFloat16;
+      vd->shaderFloat64 = ownerDev.shaderFloat64;
+      vd->shaderInt64 = ownerDev.shaderInt64;
+      vd->storageBuffer16BitAccess = ownerDev.storageBuffer16BitAccess;
+      vd->storagePushConstant16 = ownerDev.storagePushConstant16;
       groupDevices.push_back(std::move(vd));
     }
 
@@ -440,6 +450,30 @@ bool Runtime::setupLogicalDevice(
     f16StorageFeats.storagePushConstant16 = VK_TRUE;
     vd.f16Storage = true;
   }
+  // `double` (`double`, `double2`) and 64-bit integer (`long`, `long4`) kernels
+  // compile to SPIR-V that declares the Float64 / Int64 capabilities, which
+  // Vulkan gates behind the shaderFloat64 / shaderInt64 features. Those two are
+  // core Vulkan 1.0 bits — VkPhysicalDeviceVulkan12Features has no field for
+  // them — so they come from the VkPhysicalDeviceFeatures2 query above and are
+  // requested through their own features struct in the create chain. Enabled
+  // opportunistically, like the cases above: a pure f32/i32 kernel never
+  // declares these capabilities (the MLIR backend advertises only widths the
+  // source uses), so a device without hardware doubles still loads it.
+  VkPhysicalDeviceFeatures2 coreFeats2{};
+  coreFeats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  if (feats2.features.shaderFloat64) {
+    coreFeats2.features.shaderFloat64 = VK_TRUE;
+    vd.shaderFloat64 = true;
+  }
+  if (feats2.features.shaderInt64) {
+    coreFeats2.features.shaderInt64 = VK_TRUE;
+    vd.shaderInt64 = true;
+  }
+  // Mirror what really got enabled onto the device record: the per-kernel
+  // capability check reads these, not the locals above.
+  vd.shaderFloat16 = feats12.shaderFloat16;
+  vd.storageBuffer16BitAccess = f16StorageFeats.storageBuffer16BitAccess;
+  vd.storagePushConstant16 = f16StorageFeats.storagePushConstant16;
 
   VkDeviceGroupDeviceCreateInfo dgci{};
   bool useDeviceGroup = deviceGroupMembers.size() > 1;
@@ -474,26 +508,33 @@ bool Runtime::setupLogicalDevice(
   }
 
   // Thread the enabled feature structs through pNext. The chain order is
-  // feats12 -> coopFeats -> f16StorageFeats -> (dgci if device group). On the
-  // non-timeline path (no feats12 features enabled at all), fall back to a
-  // bare features struct.
-  if (vd.timelineSemaphore || vd.coopMatrix || vd.f16Storage) {
+  // coreFeats2 -> feats12 -> coopFeats -> f16StorageFeats -> (dgci if device
+  // group). VkPhysicalDeviceFeatures2 must be what carries the Vulkan 1.0
+  // features once the chain is used at all: pEnabledFeatures has to be NULL
+  // when a VkPhysicalDeviceFeatures2 is present, and the two must not disagree
+  // about the same bit. When nothing got enabled there is nothing to chain, so
+  // the plain pEnabledFeatures path (all features off) is used instead.
+  const bool anyVulkan12 =
+      vd.timelineSemaphore || vd.coopMatrix || vd.f16Storage || vd.shaderFloat16;
+  if (anyVulkan12 || vd.shaderFloat64 || vd.shaderInt64) {
     void *tail = useDeviceGroup ? static_cast<void *>(&dgci) : nullptr;
-    if (vd.f16Storage) {
-      f16StorageFeats.pNext = tail;
-      tail = &f16StorageFeats;
-    }
-    if (vd.coopMatrix) {
-      coopFeats.pNext = tail;
-      feats12.pNext = &coopFeats;
-    } else {
+    if (anyVulkan12) {
+      if (vd.f16Storage) {
+        f16StorageFeats.pNext = tail;
+        tail = &f16StorageFeats;
+      }
+      if (vd.coopMatrix) {
+        coopFeats.pNext = tail;
+        tail = &coopFeats;
+      }
       feats12.pNext = tail;
+      tail = &feats12;
     }
-    dci.pNext = &feats12; // replaces pEnabledFeatures chain
+    coreFeats2.pNext = tail;
+    dci.pNext = &coreFeats2;
   } else {
     if (useDeviceGroup) dci.pNext = &dgci;
-    VkPhysicalDeviceFeatures feats{};
-    dci.pEnabledFeatures = &feats;
+    dci.pEnabledFeatures = &coreFeats2.features; // every bit still FALSE
   }
 
   if (vkCreateDevice(vd.physical, &dci, nullptr, &vd.device) != VK_SUCCESS)
@@ -2128,6 +2169,7 @@ namespace {
 enum SpvOpcode : uint16_t {
   SpvOpName = 5,
   SpvOpMemberName = 6,
+  SpvOpCapability = 17,
   SpvOpDecorate = 71,
   SpvOpMemberDecorate = 72,
   SpvOpTypeInt = 21,
@@ -2152,6 +2194,17 @@ enum SpvStorageClass : uint32_t {
   SpvStorageUniform = 2,
   SpvStoragePushConstant = 9,
   SpvStorageStorageBuffer = 12,
+};
+
+// Capability ids VC's backend can emit (SPIR-V core registry,
+// SPV_KHR_16bit_storage, SPV_KHR_cooperative_matrix).
+enum SpvCapability : uint32_t {
+  SpvCapFloat16 = 9,
+  SpvCapFloat64 = 10,
+  SpvCapInt64 = 11,
+  SpvCapStorageBuffer16BitAccess = 4433,
+  SpvCapStoragePushConstant16 = 4435,
+  SpvCapCooperativeMatrixKHR = 6022,
 };
 
 struct SpirvTypeInfo {
@@ -2416,12 +2469,94 @@ static SpirvReflectionInfo reflectSpirvResources(const uint32_t *words,
   return out;
 }
 
+// True when `cap` depends on a device feature `vd` did not enable. On that
+// return, `*capability` names the SPIR-V capability and `*feature` the
+// VkPhysicalDeviceFeatures member it needs.
+static bool unsupportedCapability(uint32_t cap, const VulkanDevice &vd,
+                                  const char **capability,
+                                  const char **feature) {
+  struct Row {
+    uint32_t cap;
+    const char *name;
+    const char *feature;
+    bool enabled;
+  };
+  const Row rows[] = {
+      {SpvCapFloat16, "Float16", "shaderFloat16", vd.shaderFloat16},
+      {SpvCapFloat64, "Float64", "shaderFloat64", vd.shaderFloat64},
+      {SpvCapInt64, "Int64", "shaderInt64", vd.shaderInt64},
+      {SpvCapStorageBuffer16BitAccess, "StorageBuffer16BitAccess",
+       "VkPhysicalDevice16BitStorageFeatures::storageBuffer16BitAccess",
+       vd.storageBuffer16BitAccess},
+      {SpvCapStoragePushConstant16, "StoragePushConstant16",
+       "VkPhysicalDevice16BitStorageFeatures::storagePushConstant16",
+       vd.storagePushConstant16},
+      {SpvCapCooperativeMatrixKHR, "CooperativeMatrixKHR",
+       "VkPhysicalDeviceCooperativeMatrixFeaturesKHR::cooperativeMatrix",
+       vd.coopMatrix},
+  };
+  for (const Row &r : rows) {
+    if (r.cap != cap) continue;
+    if (r.enabled) return false;
+    *capability = r.name;
+    *feature = r.feature;
+    return true;
+  }
+  // Shader, Vector16, Int8/Int16, GroupNonUniform*, ...: core in Vulkan 1.x or
+  // gated by a limit rather than a feature flag — nothing to compare against.
+  return false;
+}
+
+// Vulkan requires every capability a module declares to be backed by an enabled
+// device feature, so a kernel that asks for Float64 on a device without
+// shaderFloat64 cannot be created. Report that here, naming the missing
+// feature, instead of letting vkCreateShaderModule fail into a null pointer that
+// the launch path flattens into a generic error. The compiler declares a width
+// capability only when the source uses that width, so a rejected kernel really
+// does need the feature.
+static bool checkSpirvCapabilities(const uint32_t *words, size_t wordCount,
+                                   const std::string &entry,
+                                   const VulkanDevice &vd) {
+  for (size_t offset = 5; offset < wordCount;) {
+    uint32_t inst = words[offset];
+    uint16_t op = static_cast<uint16_t>(inst & 0xffffu);
+    uint16_t wc = static_cast<uint16_t>(inst >> 16);
+    if (wc == 0 || offset + wc > wordCount) break;
+    if (op == SpvOpCapability && wc >= 2) {
+      const char *capability = nullptr;
+      const char *feature = nullptr;
+      if (unsupportedCapability(words[offset + 1], vd, &capability, &feature)) {
+        std::fprintf(stderr,
+                     "vc: kernel '%s' declares SPIR-V capability %s, which "
+                     "device '%s' does not provide (%s not enabled); "
+                     "vkCreateShaderModule would reject it\n",
+                     entry.c_str(), capability, vd.physProps.deviceName,
+                     feature);
+        std::fflush(stderr);
+        return false;
+      }
+    }
+    offset += wc;
+  }
+  return true;
+}
+
 } // namespace
 
 VCError Runtime::loadKernel(const uint32_t *words, size_t wordCount,
                             const char *entryPoint, VCKernel &out) {
   if (!init_) return VCError::InitializationError;
-  if (!words || wordCount == 0) return VCError::InvalidValue;
+  // Refuse a binary without the SPIR-V magic number up front. Silently loading
+  // one would leave resource reflection empty (no SSBO bindings, no push
+  // constants) and the launch would bind garbage.
+  if (!words || wordCount < 5 || words[0] != 0x07230203) {
+    std::fprintf(stderr,
+                 "vc: kernel '%s': input is not a SPIR-V binary (no 0x07230203 "
+                 "magic word)\n",
+                 entryPoint ? entryPoint : "?");
+    std::fflush(stderr);
+    return VCError::InvalidValue;
+  }
   // Store the device-independent SPIR-V; per-device shader modules / layouts /
   // pipelines are created lazily on first launch on each device.
   out.spirvWords.assign(words, words + wordCount);
@@ -2437,19 +2572,44 @@ VCError Runtime::loadKernel(const uint32_t *words, size_t wordCount,
 
 // Lazily create the per-device Vulkan state for `k` on `deviceIdx`: a shader
 // module built from the kernel's SPIR-V. Layout/pipelines are built later on
-// first dispatch. Returns nullptr on shader-module creation failure.
+// first dispatch. Returns nullptr, with the reason on stderr, when the kernel's
+// declared SPIR-V capabilities need a device feature this device did not enable
+// or when vkCreateShaderModule rejects the binary.
 VCKernelDeviceState *Runtime::getOrCreateKernelDeviceState(VCKernel &k,
                                                            int deviceIdx) {
   auto it = k.perDevice.find(deviceIdx);
-  if (it != k.perDevice.end()) return it->second.get();
+  if (it != k.perDevice.end())
+    // A cached state with no shader module is a recorded failure: report it once
+    // instead of re-running the checks and reprinting on every launch.
+    return it->second->shaderModule ? it->second.get() : nullptr;
   auto st = std::make_unique<VCKernelDeviceState>();
+  VulkanDevice &vd = *devices_[deviceIdx];
+  if (!checkSpirvCapabilities(k.spirvWords.data(), k.spirvWords.size(),
+                              k.entryPoint, vd)) {
+    // Cache the empty state: no Vulkan handles to track, and the null module
+    // marks it as failed so the message above prints once per kernel+device.
+    k.perDevice[deviceIdx] = std::move(st);
+    return nullptr;
+  }
   VkShaderModuleCreateInfo ci{};
   ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
   ci.codeSize = k.spirvWords.size() * sizeof(uint32_t);
   ci.pCode = k.spirvWords.data();
-  if (vkCreateShaderModule(devices_[deviceIdx]->device, &ci, nullptr,
-                           &st->shaderModule) != VK_SUCCESS)
+  VkResult result =
+      vkCreateShaderModule(vd.device, &ci, nullptr, &st->shaderModule);
+  if (result != VK_SUCCESS) {
+    std::fprintf(stderr,
+                 "vc: kernel '%s': vkCreateShaderModule failed with VkResult %d "
+                 "on device '%s'\n",
+                 k.entryPoint.c_str(), static_cast<int>(result),
+                 vd.physProps.deviceName);
+    std::fflush(stderr);
+    // Remember the failure (shaderModule stays null) and hand the unique_ptr to
+    // the cache so the teardown path can free the entry like any other.
+    k.perDevice[deviceIdx] = std::move(st);
+    trackKernel(&k);
     return nullptr;
+  }
   auto *raw = st.get();
   k.perDevice[deviceIdx] = std::move(st);
   // This kernel now owns Vulkan handles on a device. Register it so shutdown()

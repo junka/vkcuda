@@ -1,0 +1,24 @@
+// test/MLIR/target_env_f32.vc — the target env advertises only what the source
+// uses.
+//
+// A SPIR-V capability must be backed by the matching Vulkan device feature or
+// vkCreateShaderModule refuses the whole binary, so declaring Float64 / Int64 /
+// Float16 for a kernel that touches none of those widths makes an ordinary f32
+// kernel unloadable on a device without doubles. The capability list is
+// therefore derived from the module's types (VCToGPU.cpp scanWidthUses).
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+// RUN: mlirc -emit=spirv %s -o %t.spv && test -s %t.spv
+
+__global__ void scale(float *out, float *in, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  out[i] = in[i] * 2.0f;
+}
+
+// The gpu.module (and its spirv.target_env) is emitted before the vc.kernel
+// marker, so the CHECK-NOT window covers the capability list.
+// CHECK:      spirv.target_env
+// CHECK-NOT:  Float64
+// CHECK-NOT:  Int64
+// CHECK-NOT:  Float16
+// CHECK:      vc.kernel

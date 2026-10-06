@@ -45,6 +45,56 @@ gpu::Dimension toGpuDim(vc::Dim dim) {
   llvm_unreachable("unknown vc::Dim");
 }
 
+// The numeric widths a module's kernels actually use. Each non-f32/i32 width
+// needs its own SPIR-V capability (Float64/Int64/Float16) for GPUToSPIRV to
+// legalize the ops on it, and Vulkan gates the same widths behind device
+// features (shaderFloat64/shaderInt64/shaderFloat16). So a capability is both
+// required (by the IR) and optional (by the device): declaring one the source
+// never uses makes vkCreateShaderModule reject the binary on a device that
+// lacks the matching feature, which is why the list below is derived from the
+// IR instead of being advertised unconditionally.
+struct SPIRVWidthUse {
+  bool f64 = false;
+  bool i64 = false;
+  bool f16 = false;
+};
+
+// Records the width of `t`, peeling container types (memref/vector/…) down to
+// their element type and recursing through function signatures.
+void noteWidthUse(Type t, SPIRVWidthUse &use) {
+  while (auto shaped = t.dyn_cast<ShapedType>())
+    t = shaped.getElementType();
+  if (auto fn = t.dyn_cast<FunctionType>()) {
+    for (Type input : fn.getInputs())
+      noteWidthUse(input, use);
+    for (Type result : fn.getResults())
+      noteWidthUse(result, use);
+    return;
+  }
+  if (auto intTy = t.dyn_cast<IntegerType>()) {
+    if (intTy.getWidth() == 64) use.i64 = true;
+    return;
+  }
+  if (t.isF64()) use.f64 = true;
+  if (t.isF16()) use.f16 = true;
+}
+
+SPIRVWidthUse scanWidthUses(ModuleOp module) {
+  SPIRVWidthUse use;
+  module.walk([&](Operation *op) {
+    for (Type t : op->getResultTypes())
+      noteWidthUse(t, use);
+    for (Value v : op->getOperands())
+      noteWidthUse(v.getType(), use);
+    // Kernel parameters are block arguments, not op operands.
+    for (Region &region : op->getRegions())
+      for (Block &block : region.getBlocks())
+        for (BlockArgument arg : block.getArguments())
+          noteWidthUse(arg.getType(), use);
+  });
+  return use;
+}
+
 // The default target env only enables Shader without any extensions, while
 // the Vulkan interface variables we generate for kernel arguments live in the
 // StorageBuffer storage class, which SPIR-V 1.0 expresses via the
@@ -52,16 +102,18 @@ gpu::Dimension toGpuDim(vc::Dim dim) {
 // signature conversion cannot map the kernel arguments and memref.load/store
 // on them fails to legalize (<UNKNOWN SSA VALUE>).
 spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context, bool usesSubgroup,
-                                    bool usesCoopMatrix, bool usesF16Storage) {
-  // Int64/Float64/Float16 capabilities are advertised so 64-bit integer
-  // (`long`, `long4`) and double (`double`, `double2`) and half (`__half`)
-  // types legalize. Vulkan's core Shader capability already covers i32/f32;
-  // the wider/narrower widths need their own capabilities declared or the
-  // spirv.module's vce triple won't advertise them and GPUToSPIRV refuses to
+                                    bool usesCoopMatrix, bool usesF16Storage,
+                                    const SPIRVWidthUse &widths) {
+  // Float64/Int64/Float16 are advertised exactly when the kernels use a double
+  // (`double`, `double2`), 64-bit integer (`long`, `long4`) or half (`__half`)
+  // type — see scanWidthUses. Vulkan's core Shader capability already covers
+  // i32/f32; the wider/narrower widths need their own capabilities declared or
+  // the spirv.module's vce triple won't advertise them and GPUToSPIRV refuses to
   // legalize the ops (spirv.CompositeConstruct on vector<2xf64> fails with
-  // "explicitly marked illegal"). Runtime advertises these via the device's
-  // VkPhysicalDeviceFeatures (the runtime enables shaderFloat64/shaderInt64
-  // when the driver supports them; see VCRuntime device feature selection).
+  // "explicitly marked illegal"). The runtime enables the matching device
+  // features opportunistically and refuses a kernel whose declared capability
+  // the device did not enable (see VCRuntime device feature selection and
+  // checkSpirvCapabilities).
   //
   // CUDA warp intrinsics lower to spirv.GroupNonUniform* ops, which require
   // SPIR-V 1.3 (vulkan1.1) + the GroupNonUniform{Ballot,Shuffle,
@@ -75,9 +127,10 @@ spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context, bool usesSubgroup,
   // cooperative-matrix usage (vc.uses_coopmatrix), bump the target version
   // (1.6 supersedes 1.3) and advertise the capability/extension.
   spirv::Version version = spirv::Version::V_1_0;
-  SmallVector<spirv::Capability, 8> caps = {
-      spirv::Capability::Shader, spirv::Capability::Float64,
-      spirv::Capability::Int64, spirv::Capability::Float16};
+  SmallVector<spirv::Capability, 8> caps = {spirv::Capability::Shader};
+  if (widths.f64) caps.push_back(spirv::Capability::Float64);
+  if (widths.i64) caps.push_back(spirv::Capability::Int64);
+  if (widths.f16) caps.push_back(spirv::Capability::Float16);
   SmallVector<spirv::Extension, 2> exts = {
       spirv::Extension::SPV_KHR_storage_buffer_storage_class};
   if (usesSubgroup) {
@@ -402,6 +455,9 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
     return false;
   };
   bool usesF16Storage = kernelUsesF16VectorParam();
+  // Which numeric widths the kernels use, computed once over the module: the
+  // target env is one attribute on the single gpu.module every kernel lands in.
+  SPIRVWidthUse widths = scanWidthUses(module);
   for (vc::KernelOp k : kernels) {
     func::FuncOp fn = module.lookupSymbol<func::FuncOp>(k.getFunction());
     if (!fn) {
@@ -423,7 +479,7 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
     bool usesCoopMatrix = module->hasAttr("vc.uses_coopmatrix");
     gpuModule->setAttr(spirv::getTargetEnvAttrName(),
                        getVCTargetEnv(module.getContext(), usesSubgroup,
-                                      usesCoopMatrix, usesF16Storage));
+                                      usesCoopMatrix, usesF16Storage, widths));
 
     rw.setInsertionPointToStart(gpuModule.getBody());
     auto gpuFn = rw.create<gpu::GPUFuncOp>(k.getLoc(), fn.getName(),

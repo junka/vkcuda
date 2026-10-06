@@ -106,7 +106,10 @@ CUDA device surface; everything else lowers to `scf`/`arith`/`memref`/`func`.
 | `vc.block_dim` | `blockDim.{x,y,z}`  | `WorkgroupSize` builtin                     |
 | `vc.grid_dim`  | `gridDim.{x,y,z}`   | `NumWorkgroups` builtin                     |
 | `vc.barrier`   | `__syncthreads()`   | `OpControlBarrier(Workgroup)`               |
-| `vc.wmma.*`    | tensor-core ops     | `spirv.KHR.CooperativeMatrix`               |
+
+`wmma::` fragments never go through a VC op: the emitter lowers them straight
+to `gpu.subgroup_mma`, which MLIR's GPU→SPIR-V leg turns into
+`spirv.KHR.CooperativeMatrix` (see the WMMA row under Intrinsics / builtins).
 
 ### Lowering decisions
 
@@ -256,6 +259,7 @@ warnings to hard errors.
 | `__half` / `f16` | `half.vc`, `f16_ssbo.vc` | `float16_t`; f16 SSBO scalar load/store (rtarray widen + post-convert narrow) |
 | Vectors `float4`/`int3`/swizzle | `vectors.vc`, `vector_ptr.vc` | `make_float4`/`dot`/`cross`; vector-ptr swizzle write `(*p).x=v` |
 | By-value vector kernel args | `vec_arg.vc` | push-constant vector field |
+| Width capabilities `double`/`long`/`__half` | `target_env_f32.vc`, `target_env_widths.vc` | SPIR-V `Float64`/`Int64`/`Float16` is declared only for widths the source uses; the runtime enables `shaderFloat64`/`shaderInt64`/`shaderFloat16` opportunistically and refuses, by name, a kernel whose declared capability the device did not enable |
 
 ### Memory model
 

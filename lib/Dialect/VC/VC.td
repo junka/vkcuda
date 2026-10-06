@@ -1,7 +1,7 @@
 //===- VC.td - VC dialect definition --------------------------*- TableGen -*-===//
 //
-// The VC dialect models CUDA-like GPU programming semantics (kernels, thread
-// indexing, barriers, WMMA/tensor-core) so they can be lowered to SPIR-V /
+// The VC dialect models CUDA-like GPU programming semantics (kernel entries,
+// thread/block indexing, barriers) so they can be lowered to SPIR-V /
 // Vulkan. This is the device-side surface of the language.
 //
 //===----------------------------------------------------------------------===//
@@ -21,10 +21,12 @@ def VC_Dialect : Dialect {
   let name = "vc";
   let summary = "CUDA-like GPU dialect targeting Vulkan/SPIR-V";
   let description = [{
-    The `vc` dialect is the device-side IR for the VC language. It models
-    CUDA concepts (kernels, thread/block indices, shared memory, barriers,
-    WMMA fragments) and lowers through the GPU and SPIR-V dialects to a
-    Vulkan compute shader.
+    The `vc` dialect is the device-side IR for the VC language. It models the
+    CUDA constructs that have no MLIR counterpart (kernel entry markers,
+    thread/block indices, workgroup barriers) and lowers through the GPU and
+    SPIR-V dialects to a Vulkan compute shader. Everything else — shared
+    memory, WMMA fragments, atomics — is emitted straight onto the gpu/memref/
+    spirv dialects.
   }];
   let cppNamespace = "::vc";
 }
@@ -100,35 +102,6 @@ def GridDimOp : VC_Op<"grid_dim"> {
 def BarrierOp : VC_Op<"barrier"> {
   let summary = "workgroup synchronization barrier (CUDA __syncthreads)";
   let assemblyFormat = "attr-dict";
-}
-
-//===----------------------------------------------------------------------===//
-// WMMA / Tensor Core placeholders (lowering deferred — user will extend).
-// These map to spirv.KHR.CooperativeMatrix when implemented.
-//===----------------------------------------------------------------------===//
-
-def WMMALoadOp : VC_Op<"wmma.load"> {
-  let summary = "load a WMMA fragment (placeholder)";
-  let description = [{
-    Loads a matrix fragment into tensor-core registers. Placeholder op;
-    lowering to spirv.KHR.CooperativeMatrix is deferred.
-  }];
-  let arguments = (ins AnyMemRef:$memref);
-  let results = (outs AnyType:$fragment);
-  let assemblyFormat = "type($memref) $memref attr-dict type($fragment)";
-}
-
-def WMMAStoreOp : VC_Op<"wmma.store"> {
-  let summary = "store a WMMA fragment (placeholder)";
-  let arguments = (ins AnyType:$fragment, AnyMemRef:$memref);
-  let assemblyFormat = "$fragment `,` $memref attr-dict type($fragment) type($memref)";
-}
-
-def WMMAMmaOp : VC_Op<"wmma.mma"> {
-  let summary = "WMMA multiply-accumulate (placeholder)";
-  let arguments = (ins AnyType:$a, AnyType:$b, AnyType:$c);
-  let results = (outs AnyType:$result);
-  let assemblyFormat = "$a `,` $b `,` $c attr-dict type($a) type($b) type($c) type($result)";
 }
 
 #endif // VC_DIALECT

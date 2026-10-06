@@ -149,6 +149,15 @@ which Sema does not type-check). The fourth argument is the stream handle.
   fixups (f16 SSBO narrowing, entry-point interfaces, marked atomics) and an
   opportunistic runtime request for `coopMatrix` + `shaderFloat16`. The
   `wmma_gemm.vc` demo passes e2e on the MLIR backend.
+- **`double`, `long` and `__half` need device support, and VC says so out loud.**
+  Each of those widths lowers to a SPIR-V capability (`Float64` / `Int64` /
+  `Float16`) that Vulkan gates behind a device feature (`shaderFloat64` /
+  `shaderInt64` / `shaderFloat16`). The MLIR backend declares a width capability
+  only when the module actually uses that width, so a plain `float` kernel stays
+  loadable on a device without doubles; the runtime requests the features
+  opportunistically and, before `vkCreateShaderModule`, refuses a kernel whose
+  declared capability the device did not enable — naming the capability, the
+  device and the missing feature on stderr instead of failing silently.
 - **Kernel `printf`** works on the GLSL backend only, via `debugPrintfEXT` +
   `GL_EXT_debug_printf`, enabled at runtime with `vcEnableKernelPrintf()` (or
   `VC_KERNEL_PRINTF=1`) before `vcInit()`. The MLIR backend emits a

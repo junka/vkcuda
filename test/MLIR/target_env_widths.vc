@@ -1,0 +1,23 @@
+// test/MLIR/target_env_widths.vc — the widths a kernel uses get their
+// capabilities advertised.
+//
+// GPUToSPIRV refuses ops on f64/i64 unless the target env declares Float64 /
+// Int64, so `double` and `long` must flip exactly those two entries on. The
+// second RUN line serializes the module: it is the proof that the derived list
+// is complete, not merely present.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+// RUN: mlirc -emit=spirv %s -o %t.spv && test -s %t.spv
+
+__global__ void widen(double *out, long *counts, int n) {
+  int i = threadIdx.x;
+  double d = (double)n * 1.5;
+  long l = (long)n + 7L;
+  out[i] = d;
+  counts[i] = l;
+}
+
+// CHECK:      spirv.target_env
+// CHECK-SAME: Float64
+// CHECK-SAME: Int64
+// CHECK-NOT:  Float16
