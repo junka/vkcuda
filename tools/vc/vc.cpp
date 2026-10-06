@@ -31,6 +31,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Target/SPIRV/Serialization.h"
 #include "mlir/Target/SPIRV/Target.h"
@@ -440,6 +442,34 @@ int main(int argc, char **argv) {
                   mlir::memref::MemRefDialect, mlir::scf::SCFDialect,
                   mlir::gpu::GPUDialect, mlir::index::IndexDialect>();
   ctx.appendDialectRegistry(registry);
+
+  // MLIR's default diagnostic path prints Errors only: with no handler
+  // registered, DiagnosticEngineImpl::emit returns as soon as the severity is
+  // not Error (mlir/lib/IR/Diagnostics.cpp), so a warning emitted by codegen
+  // would vanish without a trace. Report the non-error severities here, in the
+  // same `location: severity: message` shape MLIR uses for errors — a notice
+  // the user cannot see is not a notice.
+  ctx.getDiagEngine().registerHandler([](mlir::Diagnostic &diag) {
+    if (diag.getSeverity() == mlir::DiagnosticSeverity::Error)
+      return mlir::failure(); // Leave errors to MLIR's own printer.
+    llvm::raw_ostream &os = llvm::errs();
+    if (!llvm::isa<mlir::UnknownLoc>(diag.getLocation()))
+      os << diag.getLocation() << ": ";
+    switch (diag.getSeverity()) {
+    case mlir::DiagnosticSeverity::Warning:
+      os << "warning: ";
+      break;
+    case mlir::DiagnosticSeverity::Remark:
+      os << "remark: ";
+      break;
+    default:
+      os << "note: ";
+      break;
+    }
+    os << diag.str() << '\n';
+    os.flush();
+    return mlir::success();
+  });
 
   auto module = codegen::translateASTToMLIR(tu, ctx, warningsAsErrors);
   if (!module) {

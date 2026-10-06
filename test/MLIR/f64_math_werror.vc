@@ -5,6 +5,10 @@
 // emitted. This is what makes the warning actionable in a build that refuses
 // silent precision loss.
 //
+// Every local here is used on purpose: -Werror also upgrades the frontend's
+// unused-variable warning, and an unused name would abort in Sema before
+// codegen ever ran, hiding the very diagnostic under test.
+//
 // RUN: mlirc -emit=mlir -Werror %s 2>&1 | FileCheck %s
 
 __global__ void k(float *out, int n) {
@@ -12,5 +16,8 @@ __global__ void k(float *out, int n) {
   double d = (double)n + 1.5;
   // CHECK: error: error (warning promoted by -Werror): sin on a double operand is computed in float precision
   double a = sin(d);
+  // CHECK: error: error (warning promoted by -Werror): pow on a double operand is computed in float precision
+  double b = pow(d, 2.0);
+  out[tid] = (float)(a * b);
   // CHECK: codegen failed
 }
