@@ -2958,9 +2958,12 @@ VCError Runtime::dispatch(VCKernel &k, unsigned wgX, unsigned wgY,
   VCError e = recordDispatchInto(cb, s.frames[s.frameIdx].descriptorPool, k,
                                   s.deviceIdx, wgX, wgY, wgZ, blockX, blockY,
                                   blockZ, args, argCount);
-  if (e != VCError::Success) return e;
+  // Submit even when recording failed: beginFrame already reset this frame's
+  // fence, and a fence nothing will ever signal makes the next beginFrame on
+  // the slot block in vkWaitForFences forever. A failed record leaves the
+  // command buffer empty (bindKernelForDispatch bails before any vkCmd*).
   endFrame(s);
-  return VCError::Success;
+  return e;
 }
 
 // Indirect dispatch on a stream: grid dims come from `indirectArgs` (written
@@ -2987,9 +2990,10 @@ VCError Runtime::dispatchIndirect(VCKernel &k, const VCBuffer &indirectArgs,
                                          k, s.deviceIdx, indirectArgs, offset,
                                          blockX, blockY, blockZ, args,
                                          argCount);
-  if (e != VCError::Success) return e;
+  // Submit even when recording failed, as in dispatch: the frame's fence was
+  // reset by beginFrame and only endFrame's submit can signal it.
   endFrame(s);
-  return VCError::Success;
+  return e;
 }
 
 //----------------------------------------------------------------------------
