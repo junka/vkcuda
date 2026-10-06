@@ -209,11 +209,17 @@ Both backends (GLSL and MLIR/SPIR-V) cover the device subset below unless a
 row notes otherwise. The e2e demo named in each row is the living spec — if
 the demo passes on a backend, that construct works there.
 
+A construct the compiler cannot honor is refused with a diagnostic, never
+silently dropped or mis-evaluated. Where the MLIR backend *can* lower something
+only at reduced fidelity (an f64 transcendental computed in f32), it says so as
+a warning; `-Werror` promotes both the frontend warnings and those codegen
+warnings to hard errors.
+
 ### Core C/CUDA
 
 | Construct | Demo | Notes |
 | --- | --- | --- |
-| `if`/`for`/`while`/`do`/`switch` | `cf_cond.vc`, `sync.vc` | `for`→`scf.while` (preserves C eval order); `switch`→`scf.if` chain |
+| `if`/`for`/`while`/`do`/`switch` | `cf_cond.vc`, `sync.vc` | `for`→`scf.while` (preserves C eval order); `switch`→`scf.if` chain. In MLIR every `case` must end with `break`/`return` — fallthrough and statements before the first label are rejected, not mis-lowered |
 | `break`/`continue` | `cf_cond.vc` | loop-carried i1 flag slots + `scf.if` guards (MLIR) |
 | Early returns (`if (cond) return;`) | `recursion.vc`, `ref_return.vc` | inverted into `scf.if(!cond){…}`; value-returning early returns via yield chains |
 | Scalars / arrays / `struct` / `class` | `struct.vc`, `class.vc`, `nested_struct.vc` | struct-as-value = flat memref; methods inlined at call site |
@@ -255,17 +261,17 @@ the demo passes on a backend, that construct works there.
 
 | Construct | Demo | Notes |
 | --- | --- | --- |
-| `__shared__` workgroup memory | `sync.vc` | `spirv.GlobalVariable`+`addressof`+`AccessChain` (not `memref.global`) |
-| Dynamic `extern __shared__ T s[]` | `dyn_shared.vc` | post-serialize SPIR-V binary patch (`__vc_dynshared_`→`OpTypeArray` length) |
+| `__shared__` workgroup memory | `sync.vc` | `spirv.GlobalVariable`+`addressof`+`AccessChain` (not `memref.global`). Globals are pooled by name module-wide, so two same-named `__shared__` arrays must agree in element type and shape — a conflict is rejected |
+| Dynamic `extern __shared__ T s[]` | `dyn_shared.vc` | sized from `blockDim.x`; post-serialize SPIR-V binary patch (`__vc_dynshared_`→`OpTypeArray` length). The `<<<g, b, nbytes>>>` byte count is **rejected by Sema** — no launch path carries it |
 | `__constant__` globals | `constant.vc`, `const_local.vc` | lazily materialized per-kernel; **no `cudaMemcpyToSymbol`** (compile-time init only) |
-| Atomics | `atomics.vc` | `spirv.Atomic*` / `memref.atomic_rmw`; SSBO `atomicExch` via ordinal-marker rewrite |
+| Atomics | `atomics.vc` | `spirv.Atomic*` / `memref.atomic_rmw`; SSBO `atomicExch` via ordinal-marker rewrite. **MLIR is i32-only** — a float/double/64-bit target or value is rejected (GLSL supports float atomics) |
 | `__threadfence()` | `sync.vc` | `spirv.MemoryBarrier` (no `barrier()`) |
 
 ### Intrinsics / builtins
 
 | Construct | Demo | Notes |
 | --- | --- | --- |
-| Math builtins (`sqrt`/`sin`/`pow`/…) | `math_builtins2/3.vc` | `spirv.GL.*` |
+| Math builtins (`sqrt`/`sin`/`pow`/…) | `math_builtins2/3.vc` | `spirv.GL.*`. SPIR-V has no f64 transcendental opcode, so in MLIR a `double` argument is computed at f32 precision — reported as a warning, and a hard error under `-Werror` |
 | Warp shuffles / ballot | `warp.vc` | `gpu.subgroup_size`+`GroupNonUniform*`; needs SPIR-V 1.3 (vulkan1.1) on demand |
 | Vote (`__syncthreads_count/and/or`) | `vote.vc` | shared-array reduction |
 | WMMA / cooperative matrix | `wmma_gemm.vc` | `gpu.subgroup_mma`→`spirv.KHR.CooperativeMatrix`; runtime opportunistic coopMatrix+shaderFloat16 |
@@ -305,6 +311,20 @@ than silently miscompiling.
   `struct` plus a cast, or keep separate typed buffers.
 - **`goto` / labels.** Rejected at parse time ("expected ';'" at the label).
   Restructure with a loop plus `break`/`continue`, or a `for` with a flag.
+- **Float / 64-bit atomics (MLIR backend only).** SPIR-V's atomic set here is
+  the integer one, and VC stores every scalar slot as an i32 (`double` spans
+  two slots), so `atomicAdd` on a `float`/`double`/`long` would add bit patterns
+  or touch half a value. The translator rejects it; the GLSL backend supports
+  float atomics. (`test/MLIR/atomic_reject.vc`)
+- **`switch` fallthrough (MLIR backend).** Each case lowers to its own `scf.if`,
+  so a case with no terminating `break`/`return` — or statements sitting before
+  the first label — is rejected instead of running the wrong statements.
+  (`test/MLIR/switch_reject.vc`)
+- **`<<<g, b, sharedMemBytes>>>`.** No launch path carries a dynamic shared-memory
+  byte count (both backends size `extern __shared__` from `blockDim.x`), so a
+  nonzero third argument is a Sema error rather than a silently dropped field.
+  Pass `0` (or the 2-argument form) to name a stream without asking for bytes.
+  (`test/Frontend/launch-shmem.vc`)
 - **Function-like / conditional macros** (`#define F(x) …`, `#ifdef`). Only
   object-like single-literal `#define` is supported.
 - **General C++ templates / exceptions / RTTI.** Out of scope for a shader

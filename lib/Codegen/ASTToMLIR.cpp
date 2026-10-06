@@ -40,6 +40,8 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
 
+#include "llvm/Support/raw_ostream.h"
+
 using namespace vc;
 using namespace mlir;
 
@@ -158,6 +160,16 @@ class ASTToMLIRImpl {
     uint32_t stride; // sizeof, rounded up to the struct's max field alignment
   };
   llvm::StringMap<StructLayout> recordLayouts;
+  // Struct name -> the fields `recordStructLayout` could not type. A dropped
+  // field shifts every later field's byte offset, so such a layout must never
+  // be addressed on device. Layouts are computed eagerly for every struct in
+  // the TU (including host-only ones), so the gap is reported at the struct's
+  // first *device* use instead of at layout time.
+  llvm::StringMap<std::vector<std::string>> layoutGaps;
+  llvm::StringMap<bool> layoutGapReported; // dedup: one report per struct
+  // Set while recordStructLayout sizes its fields (so cvtType calls made from
+  // there do not count as a device use of the struct).
+  bool computingLayout = false;
   // name -> StructDecl, so a method defined before its class body (class.vc's
   // `Accumulator::add` precedes `Class Accumulator { ... }`) can still force the
   // class layout before reading it. Populated as visitTopLevel walks tu.decls.
@@ -175,6 +187,9 @@ class ASTToMLIRImpl {
   const RecordType *currentRetRecord = nullptr;
   // Set when any diagnostic error is emitted, so the driver can fail.
   bool hadError = false;
+  // Under -Werror, a lowered-with-reduced-fidelity warning (see warnAt) is
+  // upgraded to an error so a precision compromise cannot slip through a build.
+  bool warningsAsErrors = false;
 
   //--- Loop break/continue state -----------------------------------------//
   // scf has no goto, so break/continue are modeled by threading two i1 flags
@@ -199,8 +214,8 @@ class ASTToMLIRImpl {
   unsigned structuredDepth = 0;
 
 public:
-  ASTToMLIRImpl(MLIRContext &c)
-      : ctx(c), builder(&c) {
+  ASTToMLIRImpl(MLIRContext &c, bool werror = false)
+      : ctx(c), builder(&c), warningsAsErrors(werror) {
     ctx.getOrLoadDialect<vc::VCDialect>();
     ctx.getOrLoadDialect<func::FuncDialect>();
     ctx.getOrLoadDialect<arith::ArithDialect>();
@@ -308,6 +323,35 @@ private:
     hadError = true;
     emitError(loc(n), msg);
     return Value();
+  }
+
+  // Same, for sites that only have a Location (module-scope helpers that are
+  // called before/after an AST node is in hand).
+  Value errorAt(Location l, const llvm::Twine &msg) {
+    hadError = true;
+    emitError(l, msg);
+    return Value();
+  }
+
+  // Render a type for a diagnostic. MLIR's type printing is verbose but
+  // unambiguous, which is what a conflict report needs.
+  std::string describeType(mlir::Type t) {
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    os << t;
+    return s;
+  }
+
+  // Report a construct the backend *can* lower, but only with reduced
+  // fidelity (e.g. an f64 transcendental computed at f32 precision). It is
+  // surfaced rather than left silent, and -Werror turns it into a hard failure.
+  void warnAt(Location l, const llvm::Twine &msg) {
+    if (warningsAsErrors) {
+      hadError = true;
+      emitError(l, Twine("error (warning promoted by -Werror): ") + msg);
+      return;
+    }
+    emitWarning(l, msg);
   }
 
   static const char *nodeKindName(ASTNode::NodeKind k) {
@@ -425,6 +469,10 @@ private:
     // by-value field terminates: a `struct Node { Node next; }` is ill-formed C++
     // anyway (infinite size), and we'd rather report a 0-stride than loop.
     recordLayouts[sd->name].stride = 0;
+    // cvtType() is called on the fields below; suppress gap reporting while it
+    // runs, since laying a struct out is not yet a device use of it.
+    bool savedComputingLayout = computingLayout;
+    computingLayout = true;
     StructLayout layout;
     uint32_t off = 0;
     uint32_t maxAlign = 1;
@@ -441,6 +489,10 @@ private:
         if (innerSd) recordStructLayout(innerSd);
         auto innerIt = recordLayouts.find(innerRec->decl->name);
         if (innerIt != recordLayouts.end() && innerIt->second.stride > 0) {
+          // A gap inside Inner shifts Inner's own fields, so Outer inherits the
+          // defect: record it against Outer's field name.
+          if (layoutGaps.count(innerRec->decl->name))
+            layoutGaps[sd->name].push_back(f->name.str());
           const StructLayout &innerLayout = innerIt->second;
           uint32_t align = fieldAlignmentStruct(innerLayout);
           uint32_t size = innerLayout.stride;
@@ -457,8 +509,11 @@ private:
       }
       mlir::Type fty = cvtType(f->type);
       if (!fty) {
-        // Unsupported field type: skip but keep the struct resolvable; field
-        // access to it will error at use site.
+        // Unsupported field type: skip but keep the struct resolvable. The
+        // fields after it are now at offsets that no longer match the host
+        // struct, so the gap is recorded and any device use of this layout
+        // fails (reportLayoutGap) instead of reading the wrong slots.
+        layoutGaps[sd->name].push_back(f->name.str());
         continue;
       }
       uint32_t align = fieldAlignment(fty);
@@ -471,6 +526,34 @@ private:
     layout.stride = (off + maxAlign - 1) & ~(maxAlign - 1);
     if (layout.stride == 0) layout.stride = maxAlign;
     recordLayouts[sd->name] = std::move(layout);
+    computingLayout = savedComputingLayout;
+  }
+
+  // Fail if `name`'s recorded layout dropped a field: the fields after the
+  // dropped one sit at offsets that no longer match the host struct, so any
+  // device access through it would read/write the wrong slots. Reported once per
+  // struct, at its first device use (see computingLayout).
+  bool reportLayoutGap(StringRef name) {
+    if (computingLayout) return false;
+    auto it = layoutGaps.find(name);
+    if (it == layoutGaps.end()) return false;
+    if (layoutGapReported.count(name)) return true;
+    layoutGapReported[name] = true;
+    std::string fields;
+    for (size_t i = 0; i < it->second.size(); ++i) {
+      if (i) fields += ", ";
+      fields += it->second[i];
+    }
+    errorAt(loc(lookupStructDecl(name)),
+            Twine("struct '") + name + "' has field(s) the MLIR backend cannot "
+                                       "lay out (" +
+                                       fields +
+                                       "), which shifts every field after them "
+                                       "to the wrong byte offset; this struct "
+                                       "cannot be used in device code — give the "
+                                       "field a supported type or keep it "
+                                       "host-only");
+    return true;
   }
 
   // Alignment of a whole struct under std430 = the max alignment of its fields.
@@ -556,6 +639,7 @@ private:
     // fields, so i32 granularity covers them directly with no lo/hi splitting.
     if (isa<RecordType>(t)) {
       auto *sd = cast<RecordType>(t)->decl;
+      if (reportLayoutGap(sd->name)) return mlir::Type();
       auto it = recordLayouts.find(sd->name);
       if (it == recordLayouts.end()) return mlir::Type();
       int64_t slots = ((int64_t)it->second.stride + 3) / 4; // i32 slots
@@ -638,6 +722,8 @@ private:
         // Struct pointer: use i32 as the granular element type (4-byte units).
         // recordLayouts holds byte offsets; access sites divide by 4 to get the
         // i32 slot index. i64/f64 fields span two slots and are split.
+        auto *rec = cast<RecordType>(pointeeTy);
+        if (reportLayoutGap(rec->decl->name)) return mlir::Type();
         pointee = builder.getI32Type();
       } else {
         pointee = cvtType(pointeeTy);
@@ -663,6 +749,7 @@ private:
   SmallVector<mlir::Type, 4> structFieldScalarTypes(const RecordType *rec) {
     SmallVector<mlir::Type, 4> out;
     if (!rec || !rec->decl) return out;
+    if (reportLayoutGap(rec->decl->name)) return out;
     auto it = recordLayouts.find(rec->decl->name);
     if (it == recordLayouts.end()) return out;
     for (const FieldLayout &f : it->second.fields) {
@@ -1746,9 +1833,13 @@ private:
   // way) so it survives Stage 1 cleanup and is carried into the spirv.module by
   // GPUToSPIRV.
   //
-  // The symbol is namespaced (`__vc_shared_<name>`) to avoid clashing with user
-  // symbols; the same global is reused across kernels that declare a __shared__
-  // var of the same name and shape.
+  // The symbol is namespaced (`__vc_shared_<name>`, or `__vc_internal_<name>`
+  // for scratch buffers the backend synthesizes itself) so it cannot collide
+  // with a plain user symbol. Because pooling is by name across the whole
+  // module, a same-named `__shared__` declaration in two kernels shares one
+  // buffer; `getOrCreateSharedGlobal` therefore verifies the existing global's
+  // type matches and errors out instead of aliasing silently.
+  //
   // Emit (or look up) a module-scope Workgroup-storage global for a
   // __shared__ decl. `shape` holds the array dims; any dim == 0 means
   // "extern __shared__ T s[]" — an unsized (runtime-sized) dimension. MLIR's
@@ -1762,9 +1853,11 @@ private:
   // backend sizes `extern __shared__` to `gl_WorkGroupSize.x`.
   Value getOrCreateSharedGlobal(llvm::StringRef name, ArrayRef<int64_t> shape,
                                 mlir::Type elemTy, Location l,
-                                bool dynamic = false) {
-    std::string sym = dynamic ? ("__vc_dynshared_") + name.str()
-                              : ("__vc_shared_") + name.str();
+                                bool dynamic = false,
+                                bool internal = false) {
+    std::string sym =
+        dynamic ? ("__vc_dynshared_") + name.str()
+                : (internal ? "__vc_internal_" : "__vc_shared_") + name.str();
     // The pointee type: the element for a scalar, or a spirv.array wrapping the
     // element for a (multi-dimensional) shared array. spirv.array is row-major
     // and nested for multi-dim (`float s[16][8]` -> array<16 x array<8 x f32>>).
@@ -1779,7 +1872,29 @@ private:
     spirv::PointerType ptrTy =
         spirv::PointerType::get(pointee, spirv::StorageClass::Workgroup);
 
-    if (!module.lookupSymbol(sym)) {
+    if (auto existing =
+            module.lookupSymbol<spirv::GlobalVariableOp>(sym)) {
+      // Globals are pooled by symbol name across the whole module, so an equal
+      // type here means the earlier declaration was identical in element type
+      // and shape. A mismatch would silently make two different `__shared__`
+      // arrays alias one buffer (or hand back a pointer of the wrong type,
+      // which then fails in an opaque verifier check), so refuse. The type is
+      // read off the `type` attribute the same way LoweringPasses rewrites it.
+      auto haveTy = existing->getAttrOfType<TypeAttr>("type");
+      if (haveTy && haveTy.getValue() != ptrTy) {
+        std::string have = describeType(haveTy.getValue());
+        std::string want = describeType(ptrTy);
+        errorAt(l, Twine("declaration of '") + name +
+                       "' conflicts with an earlier __shared__ declaration of "
+                       "the same name: shared-memory globals are pooled by "
+                       "name across the module, so both would address one "
+                       "buffer (earlier type " +
+                       have + ", this one " + want +
+                       "). Rename one of them, or give every same-named "
+                       "__shared__ array the same element type and shape.");
+        return Value();
+      }
+    } else {
       auto saved = builder.saveInsertionPoint();
       builder.setInsertionPointToStart(module.getBody());
       builder.create<spirv::GlobalVariableOp>(l, TypeAttr::get(ptrTy),
@@ -2161,25 +2276,51 @@ private:
   // chain simpler). C switch body is a flat statement list where Case/Default
   // are labels and Break ends a case's run — first group the body statements
   // into per-case buckets, then emit one scf.if per case (cond == val -> that
-  // bucket), with `default` as the final else tail. No fallthrough is modeled
-  // (every case in the demos ends with break or return); a case without an
-  // explicit terminator would fall through to the next bucket's statements,
-  // which this lowering does NOT do (recorded limitation).
+  // bucket), with `default` as the final else tail. Each bucket is its own
+  // region, so C fallthrough (a case with no `break`/`return`) has nowhere to
+  // run into: collectSwitchBuckets rejects it instead of emitting a chain that
+  // would silently skip the next label's statements.
 
   struct CaseBucket {
     Value val;            // empty => default
     bool isDefault = false;
     std::vector<ASTNode *> stmts;
+    // True once the case's own statement run ends in `break`/`return`. A case
+    // that does not terminate would fall through into the next label's
+    // statements, which this lowering does not model — so it is reported.
+    bool terminated = false;
+    ASTNode *label = nullptr; // the CaseStmt, for the fallthrough diagnostic
   };
+
+  // True when a case body provably ends its own run: `break`, `return`, or a
+  // braced block whose last statement does. Deliberately conservative — an
+  // `if`-terminated body (`case 1: if (c) return 1;`) can still fall through in
+  // C, so it reports false and the caller rejects it.
+  bool caseBodyTerminates(ASTNode *n) {
+    if (!n) return false;
+    switch (n->getNodeType()) {
+    case ASTNode::NodeKind::BreakStmt:
+    case ASTNode::NodeKind::ReturnStmt:
+      return true;
+    case ASTNode::NodeKind::CompoundStmt: {
+      auto &ss = static_cast<CompoundStmt *>(n)->statements;
+      return !ss.empty() && caseBodyTerminates(ss.back().get());
+    }
+    default:
+      return false;
+    }
+  }
 
   // Group a switch body's flat statement list into per-case buckets. A case's
   // body is its `CaseStmt::sub` (the statement following the label) plus any
-  // subsequent sibling statements up to the next Case/Default/Break (C
-  // fallthrough into the next label's statements is NOT modeled — every case
-  // in the demos ends with break or return). Returns the buckets in source
-  // order; sets `defOut` to the default bucket index (-1 if none). Statements
-  // before the first label are emitted inline into the current region (rare
-  // dead code).
+  // subsequent sibling statements up to the next Case/Default/Break. C
+  // fallthrough (a case with no `break`/`return` running into the next label)
+  // is NOT modeled: each bucket becomes its own `scf.if`, so a case that does
+  // not terminate is rejected with a diagnostic rather than silently skipping
+  // the next bucket's statements. Returns the buckets in source order; sets
+  // `defOut` to the default bucket index (-1 if none). Statements before the
+  // first label are dead code in C (control jumps straight to the matching
+  // label) and are rejected, since emitting them inline would run them.
   SmallVector<CaseBucket, 8>
   collectSwitchBuckets(const ASTNode *body, Location l, int &defOut) {
     defOut = -1;
@@ -2191,8 +2332,17 @@ private:
     if (bodyStmts) {
       for (const auto &s : *bodyStmts) {
         if (s->getNodeType() == ASTNode::NodeKind::CaseStmt) {
+          // A bucket still open here means the previous case had no
+          // `break`/`return` and has a successor label to fall into.
+          if (cur && !cur->terminated)
+            error(cur->label,
+                  "switch case without a terminating 'break' or 'return' falls "
+                  "through into the next label; the MLIR backend lowers each "
+                  "case to its own 'scf.if' and does not model switch "
+                  "fallthrough (add 'break;')");
           auto *cs = static_cast<CaseStmt *>(s.get());
           CaseBucket b;
+          b.label = s.get();
           if (!cs->value) { b.isDefault = true; }
           else b.val = loadValue(visitExpr(cs->value.get()), l);
           // The case body starts with the label's `sub`: a single statement or
@@ -2206,19 +2356,27 @@ private:
               b.stmts.push_back(cs->sub.get());
             }
           }
+          if (!b.stmts.empty() && caseBodyTerminates(b.stmts.back()))
+            b.terminated = true;
           buckets.push_back(std::move(b));
           cur = &buckets.back();
           if (cur->isDefault) defOut = buckets.size() - 1;
         } else if (s->getNodeType() == ASTNode::NodeKind::BreakStmt) {
           // Break ends the current case's statement run (no fallthrough).
+          if (cur) cur->terminated = true;
           cur = nullptr;
         } else {
           // A sibling statement belonging to the current case (after its `sub`).
-          // If no case is active (statement before the first label), emit it
-          // inline before the switch chain (rare; switch-in-C allows dead code
-          // before the first case).
+          // If no case is active, the source has statements before the first
+          // label: unreachable in C (control enters at the matched label), but
+          // this lowering would run them unconditionally — reject instead.
           if (cur) cur->stmts.push_back(s.get());
-          else visitStmt(s.get());
+          else
+            error(s.get(),
+                  "statements before the first 'case'/'default' label in a "
+                  "switch are not supported by the MLIR backend (they are dead "
+                  "code in C but would be emitted unconditionally); move them "
+                  "above the 'switch'");
         }
       }
     }
@@ -2575,6 +2733,8 @@ private:
         // Module-scope global in Workgroup storage, fetched per use.
         Value addr = getOrCreateSharedGlobal(d->name, shape, elemTy, l,
                                              /*dynamic=*/hasUnsizedDim);
+        if (!addr)
+          continue; // conflict already reported; leave the name unregistered.
         locals[d->name] = addr;
         localTypes[d->name] = d->type;
         // __shared__ decls may not have a non-constant initializer in CUDA
@@ -4395,7 +4555,7 @@ private:
       // Transcendentals (SPIRV_Float16or32): no f64 opcode. For f64, run in f32
       // and extend back; for f16/f32, emit directly.
       auto run = [&](std::function<Value(Value)> emit) {
-        return runTranscendental(std::move(emit), x, origTy, l);
+        return runTranscendental(std::move(emit), x, origTy, l, base);
       };
       if (base == "sin") return run([&](Value v) {
         return builder.create<spirv::GLSinOp>(l, v); });
@@ -4469,7 +4629,7 @@ private:
             [&](Value va) {
               Value vb = castValue(b, va.getType(), loc(args[1].get()));
               return builder.create<spirv::GLPowOp>(l, va, vb);
-            }, a, resTy, l);
+            }, a, resTy, l, base);
       }
       if (base == "fmin") return builder.create<spirv::GLFMinOp>(l, a, b);
       if (base == "fmax") return builder.create<spirv::GLFMaxOp>(l, a, b);
@@ -4609,10 +4769,22 @@ private:
   // truncate to f32, run the op, and extend back to f64. This matches what a
   // GLSL driver does for the f64-limited GLSLstd450 entries and preserves the
   // operand's storage width at the call site (the result is still f64, just
-  // computed with f32 transcendental precision — documented limitation).
+  // computed with f32 transcendental precision). The precision loss is reported
+  // (and is a hard error under -Werror) so a `double` result is never silently
+  // single-precision.
   Value runTranscendental(
-      std::function<Value(Value)> emit, Value x, mlir::Type origTy,
-      Location l) {
+      std::function<Value(Value)> emit, Value x, mlir::Type origTy, Location l,
+      llvm::StringRef fname = {}) {
+    if (origTy.isF64()) {
+      llvm::StringRef nm = fname.empty() ? llvm::StringRef("transcendental")
+                                         : fname;
+      warnAt(l, Twine(nm) +
+                    " on a double operand is computed in float precision by "
+                    "the MLIR backend (SPIR-V's GLSLstd450 has no f64 opcode) "
+                    "and extended back to double; ~29 bits of the mantissa are "
+                    "lost. Use the GLSL backend if double-precision "
+                    "transcendentals are required.");
+    }
     Value work = x;
     if (origTy.isF64())
       work = builder.create<arith::TruncFOp>(l, builder.getF32Type(), x);
@@ -4634,10 +4806,126 @@ private:
   // underlying pointer (the gpu.func arg lowers to a spirv.ptr under GPUToSPIRV,
   // but at this layer we emit spirv.AccessChain which GPUToSPIRV legalizes on
   // the memref-as-pointer). scope: Workgroup for __shared__, Device for SSBO.
+
+  // Resolve the language type an atomic operates on, for `&x`, `&arr[i]`,
+  // `&s.field` or a bare pointer param. Arrays and pointers yield their
+  // ELEMENT type (what the atomic reads/modifies); null when the shape isn't
+  // statically resolvable (callers then rely on the MLIR-side type check).
+  const vc::Type *unwrapTypedefType(const vc::Type *t) {
+    while (t && isa<vc::TypedefType>(t))
+      t = cast<vc::TypedefType>(t)->decl->underlying;
+    return t;
+  }
+
+  const vc::Type *atomicTargetLangType(ASTNode *arg) {
+    if (!arg) return nullptr;
+    switch (arg->getNodeType()) {
+    case ASTNode::NodeKind::UnaryExpr: {
+      auto *u = static_cast<UnaryExpr *>(arg);
+      if (u->op == UnaryOp::AddrOf)
+        return atomicTargetLangType(u->operand.get());
+      return nullptr;
+    }
+    case ASTNode::NodeKind::IndexExpr:
+      return atomicTargetLangType(
+          static_cast<IndexExpr *>(arg)->base.get());
+    case ASTNode::NodeKind::DeclRefExpr: {
+      auto *ref = static_cast<DeclRefExpr *>(arg);
+      auto it = localTypes.find(ref->name);
+      if (it == localTypes.end() || !it->second) return nullptr;
+      const vc::Type *t = unwrapTypedefType(it->second);
+      if (t && isa<PointerType>(t))
+        t = unwrapTypedefType(cast<PointerType>(t)->pointee);
+      if (t && isa<ReferenceType>(t))
+        t = unwrapTypedefType(cast<ReferenceType>(t)->pointee);
+      return t;
+    }
+    case ASTNode::NodeKind::MemberAccessExpr: {
+      auto *ma = static_cast<MemberAccessExpr *>(arg);
+      const vc::Type *baseTy = atomicTargetLangType(ma->base.get());
+      if (!baseTy || !isa<RecordType>(baseTy)) return nullptr;
+      auto *rec = cast<RecordType>(baseTy);
+      const StructDecl *sd = lookupStructDecl(rec->decl->name);
+      if (!sd) return nullptr;
+      for (const FieldDecl *f : sd->fields)
+        if (f->name == ma->member) return unwrapTypedefType(f->type);
+      return nullptr;
+    }
+    default:
+      return nullptr;
+    }
+  }
+
+  // A readable name for a rejected atomic operand type (kept local so the
+  // diagnostic does not depend on MLIR type printing).
+  static const char *atomicTypeName(mlir::Type t) {
+    if (t.isa<mlir::Float16Type>()) return "float16 (__half)";
+    if (t.isa<mlir::Float32Type>()) return "float";
+    if (t.isa<mlir::Float64Type>()) return "double";
+    // Checked before the integer-width query: index has no bit width to ask for.
+    if (t.isa<mlir::IndexType>()) return "index";
+    if (t.isInteger()) {
+      unsigned w = t.getIntOrFloatBitWidth();
+      if (w == 64) return "64-bit integer";
+      if (w != 32) return "integer narrower than 32 bits";
+    }
+    return "non-32-bit-integer";
+  }
+
+  static const char *atomicLangTypeName(BuiltinTypeKind k) {
+    switch (k) {
+    case BuiltinTypeKind::Float16: return "__half";
+    case BuiltinTypeKind::Float32: return "float";
+    case BuiltinTypeKind::Float64: return "double";
+    case BuiltinTypeKind::Int64: return "long";
+    case BuiltinTypeKind::UInt64: return "unsigned long";
+    default: return "non-32-bit-integer";
+    }
+  }
+
+  // SPIR-V's integer atomics are the only set this backend lowers, and VC's
+  // memory model stores every scalar slot as an i32 (bool/f16/f32 are bitcast
+  // into i32 slots). An atomic on a float/double/64-bit target would therefore
+  // add OR bit patterns — silently wrong — so reject it with a diagnostic.
+  bool rejectNonI32Atomic(llvm::StringRef op, llvm::StringRef what, mlir::Type t,
+                          const ASTNode *n) {
+    if (t.isInteger(32)) return false;
+    error(n, Twine(op) + " " + what +
+                 " must be a 32-bit integer in the MLIR backend (got " +
+                 atomicTypeName(t) + "); float/double/64-bit atomics are not "
+                 "lowered — use an i32 counter or the GLSL backend");
+    return true;
+  }
+
   Value emitAtomicBuiltin(llvm::StringRef name,
                           const std::vector<NodePtr> &args, Location l) {
     if (!isAtomicName(name)) return Value();
     if (args.size() < 1) return Value();
+
+    // Reject a float/double/64-bit target by its LANGUAGE type: a `double`
+    // struct field is stored as two i32 slots, so the MLIR-side element type
+    // alone looks like a legal i32 atomic.
+    if (const vc::Type *langTy = atomicTargetLangType(args[0].get())) {
+      if (auto *bt = dyn_cast_or_null<BuiltinType>(langTy)) {
+        switch (bt->builtin) {
+        case BuiltinTypeKind::Float16:
+        case BuiltinTypeKind::Float32:
+        case BuiltinTypeKind::Float64:
+        case BuiltinTypeKind::Int64:
+        case BuiltinTypeKind::UInt64:
+          error(args[0].get(),
+                Twine(name) +
+                    " target must be a 32-bit integer in the MLIR backend "
+                    "(got " +
+                    atomicLangTypeName(bt->builtin) +
+                    "); float/double/64-bit atomics are not lowered — use an "
+                    "i32 counter or the GLSL backend");
+          return Value();
+        default:
+          break;
+        }
+      }
+    }
 
     // atomicInc(a)/atomicDec(a) carry no explicit value; default to 1.
     bool isIncDec = (name == "atomicInc" || name == "atomicDec");
@@ -4652,6 +4940,8 @@ private:
                            "array element (__shared__ or SSBO/global)");
       return Value();
     }
+    if (rejectNonI32Atomic(name, "target", ptr.elemTy, args[0].get()))
+      return Value();
 
     // The value operand.
     Value val;
@@ -4662,6 +4952,11 @@ private:
       if (args.size() < 2) return Value();
       val = loadValue(visitExpr(args[1].get()), loc(args[1].get()));
       if (!val) return Value();
+      // Checked BEFORE the i32 coercion: toI32 truncates a 64-bit value and
+      // leaves a float alone, so coercing first would hide the mismatch.
+      if (rejectNonI32Atomic(name, "value operand", val.getType(),
+                             args[1].get()))
+        return Value();
       val = toI32(val, loc(args[1].get()));
     }
 
@@ -4763,13 +5058,20 @@ private:
                                                      semantics, val);
     if (name == "atomicCAS") {
       // atomicCAS(ptr, expected, desired) -> spirv.AtomicCompareExchange.
+      // `expected` (args[1]) was already type-checked as the value operand
+      // above; `desired` is the third arg and needs the same guard before its
+      // i32 coercion, which otherwise truncates a 64-bit value silently.
       if (args.size() < 3) return Value();
+      Value desiredRaw =
+          loadValue(visitExpr(args[2].get()), loc(args[2].get()));
+      if (!desiredRaw) return Value();
+      if (rejectNonI32Atomic(name, "'desired' operand", desiredRaw.getType(),
+                             args[2].get()))
+        return Value();
       Value expected = toI32(loadValue(visitExpr(args[1].get()),
                                        loc(args[1].get())),
                              loc(args[1].get()));
-      Value desired = toI32(loadValue(visitExpr(args[2].get()),
-                                      loc(args[2].get())),
-                            loc(args[2].get()));
+      Value desired = toI32(desiredRaw, loc(args[2].get()));
       return builder.create<spirv::AtomicCompareExchangeOp>(
           l, ptr.elemTy, ptr.spirvAddr, scope, semantics, semantics, desired,
           expected);
@@ -4915,11 +5217,18 @@ private:
     Value bdim = builder.create<arith::IndexCastOp>(l, builder.getI32Type(),
                                                     bdimIdx);
 
-    // __shared__ int voteArr[1024] (CUDA blockDim cap) and __shared__ int voteRes.
+    // Scratch shared pool for the reduction: int voteArr[1024] (CUDA blockDim
+    // cap) and int voteRes. `internal` puts them under `__vc_internal_` so a
+    // user's own __shared__ array of the same name cannot alias them.
     Value voteArr = getOrCreateSharedGlobal("voteArr", {1024},
-                                            builder.getI32Type(), l);
+                                            builder.getI32Type(), l,
+                                            /*dynamic=*/false,
+                                            /*internal=*/true);
     Value voteRes = getOrCreateSharedGlobal("voteResult", {},
-                                            builder.getI32Type(), l);
+                                            builder.getI32Type(), l,
+                                            /*dynamic=*/false,
+                                            /*internal=*/true);
+    if (!voteArr || !voteRes) return Value();
 
     // voteArr[tid] = predI32  (spirv.AccessChain over the shared array).
     spirv::PointerType arrPtrTy = voteArr.getType().cast<spirv::PointerType>();
@@ -5148,8 +5457,9 @@ private:
   //     src = device pointer expr, typically `in + offset` (BinOp::Add); split
   //           into base (memref<?xf32> kernel arg) + offset (i32). A bare
   //           indexable source uses offset 0.
-  //     n = nElems / blockDim.x;  base = threadIdx.x * n
-  //     scf.for i in 0..n: dst[base+i] = src[offset + base + i]
+  //     rem/count split over the workgroup (leading threads take one extra
+  //           element, so no tail element is dropped); base = start index
+  //     scf.for i in 0..count: dst[base+i] = src[offset + base + i]
   //     BarrierOp
   Value emitAsyncCopyBuiltin(llvm::StringRef name,
                              const std::vector<NodePtr> &args, Location l,
@@ -5231,17 +5541,34 @@ private:
     Value tid = builder.create<arith::IndexCastOp>(l, builder.getI32Type(),
                                                    tidIdx);
 
-    // n = nElems / blockDim.x ;  base = tid * n
-    Value n = builder.create<arith::DivSIOp>(l, nElems, bdim);
-    Value base = builder.create<arith::MulIOp>(l, tid, n);
-
-    // scf.for i = 0..n step 1: dst[base+i] = src[offset + base + i].
+    // Partition [0, nElems) across the workgroup. A plain
+    // `n = nElems / blockDim.x, base = tid * n` split silently DROPS the
+    // remainder (nElems % blockDim.x elements are never copied), so give the
+    // extra elements to the leading threads:
+    //   rem   = nElems % blockDim.x
+    //   start = tid * n + min(tid, rem)
+    //   count = n + (tid < rem ? 1 : 0)
+    // Every element in [0, nElems) is then copied exactly once for any
+    // (nElems, blockDim.x) shape, including nElems < blockDim.x.
     Value zero = builder.create<arith::ConstantOp>(l, builder.getI32Type(),
                                                    builder.getI32IntegerAttr(0));
+    Value one = builder.create<arith::ConstantOp>(
+        l, builder.getI32Type(), builder.getI32IntegerAttr(1));
+    Value n = builder.create<arith::DivSIOp>(l, nElems, bdim);
+    Value rem = builder.create<arith::RemSIOp>(l, nElems, bdim);
+    Value lead = builder.create<arith::MinSIOp>(l, tid, rem);
+    Value tidSpan = builder.create<arith::MulIOp>(l, tid, n);
+    Value base = builder.create<arith::AddIOp>(l, tidSpan, lead);
+    Value hasExtra = builder.create<arith::CmpIOp>(
+        l, arith::CmpIPredicate::slt, tid, rem);
+    Value extra = builder.create<arith::SelectOp>(l, hasExtra, one, zero);
+    Value count = builder.create<arith::AddIOp>(l, n, extra);
+
+    // scf.for i = 0..count step 1: dst[base+i] = src[offset + base + i].
     Value lb = builder.create<arith::ConstantOp>(l, builder.getIndexType(),
                                                  builder.getIndexAttr(0));
     Value ubIdx = builder.create<arith::IndexCastOp>(l, builder.getIndexType(),
-                                                     n);
+                                                     count);
     Value step = builder.create<arith::ConstantOp>(l, builder.getIndexType(),
                                                    builder.getIndexAttr(1));
     auto saved = builder.saveInsertionPoint();
@@ -5920,13 +6247,15 @@ private:
 
 } // namespace
 
-OwningOpRef<ModuleOp> vc::codegen::translateASTToMLIR(const TranslationUnit &tu,
-                                                      MLIRContext &ctx) {
-  ASTToMLIRImpl impl(ctx);
+OwningOpRef<ModuleOp>
+vc::codegen::translateASTToMLIR(const TranslationUnit &tu, MLIRContext &ctx,
+                                bool warningsAsErrors) {
+  ASTToMLIRImpl impl(ctx, warningsAsErrors);
   ModuleOp module = impl.translate(tu);
   if (impl.failed()) {
-    // A diagnostic was emitted for an unsupported construct; signal failure
-    // so the driver does not report success on a partial shader.
+    // A diagnostic was emitted for an unsupported construct (or a
+    // reduced-fidelity lowering under -Werror); signal failure so the driver
+    // does not report success on a partial shader.
     module.erase();
     return OwningOpRef<ModuleOp>();
   }

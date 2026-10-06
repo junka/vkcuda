@@ -47,8 +47,9 @@ __global__ void k(int *out, int *counter, int n) {
 
   // Vote -> shared-array reduction. Two barriers bracket a thread-0 fold:
   //   AccessChain voteArr[tid]; store; barrier; if(tid==0){scf.while fold};
-  //   barrier; load voteResult.
-  // CHECK: spirv.AccessChain {{.*}}__vc_shared_voteArr
+  //   barrier; load voteResult. The scratch globals live under
+  //   `__vc_internal_` so a user __shared__ of the same name can't alias them.
+  // CHECK: spirv.AccessChain {{.*}}__vc_internal_voteArr
   // CHECK: vc.barrier
   // CHECK: scf.while
   // CHECK: vc.barrier

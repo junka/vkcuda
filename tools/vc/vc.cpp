@@ -441,7 +441,7 @@ int main(int argc, char **argv) {
                   mlir::gpu::GPUDialect, mlir::index::IndexDialect>();
   ctx.appendDialectRegistry(registry);
 
-  auto module = codegen::translateASTToMLIR(tu, ctx);
+  auto module = codegen::translateASTToMLIR(tu, ctx, warningsAsErrors);
   if (!module) {
     llvm::errs() << "codegen failed\n";
     return 1;

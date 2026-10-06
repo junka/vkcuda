@@ -20,8 +20,12 @@ class TranslationUnit;
 namespace codegen {
 
 /// Translate an AST translation unit into a VC-dialect MLIR module.
+/// `warningsAsErrors` upgrades the reduced-fidelity warnings the translator
+/// emits (e.g. an f64 transcendental computed at f32 precision) to hard
+/// errors, matching the driver's -Werror contract for the frontend.
 ::mlir::OwningOpRef<::mlir::ModuleOp>
-translateASTToMLIR(const TranslationUnit &tu, ::mlir::MLIRContext &ctx);
+translateASTToMLIR(const TranslationUnit &tu, ::mlir::MLIRContext &ctx,
+                   bool warningsAsErrors = false);
 
 /// Stage 1 of the lowering pipeline: lower the VC dialect to the GPU dialect
 /// (vc.kernel -> gpu.module/gpu.func; thread/block/barrier ops -> gpu.*).

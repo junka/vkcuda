@@ -756,12 +756,19 @@ public:
   NodePtr gridDimY;        // grid size Y (null = 1D)
   NodePtr blockDimY;       // block size Y (null = 1D)
   NodePtr stream;          // optional stream handle (null = default stream)
+  // The `<<<g, b, nbytes>>>` dynamic shared-memory request. Kept so Sema can
+  // reject a nonzero value rather than dropping the field silently: both
+  // backends size `extern __shared__` from the block's x extent, so a requested
+  // byte count cannot be honored. Null when the source used the 2-arg form.
+  NodePtr sharedMemBytes;
   std::vector<NodePtr> args;
   LaunchExpr(SourceLocation l, NodePtr c, NodePtr g, NodePtr b,
-             NodePtr gy = nullptr, NodePtr by = nullptr, NodePtr s = nullptr)
+             NodePtr gy = nullptr, NodePtr by = nullptr, NodePtr s = nullptr,
+             NodePtr shm = nullptr)
       : ASTNode(l), callee(std::move(c)), gridDim(std::move(g)),
         blockDim(std::move(b)), gridDimY(std::move(gy)),
-        blockDimY(std::move(by)), stream(std::move(s)) {}
+        blockDimY(std::move(by)), stream(std::move(s)),
+        sharedMemBytes(std::move(shm)) {}
   NodeKind getNodeType() const override { return NodeKind::LaunchExpr; }
 };
 

@@ -1966,11 +1966,15 @@ NodePtr Parser::tryParseLaunch(NodePtr &callee) {
   expect(TokKind::comma, "','");
   auto block = parseAssignment();
   // Optional extra launch arguments: <<<g, b, sharedMem, stream>>>. The 3rd
-  // (dynamic shared memory) is unused by the VC runtime and dropped; the 4th
-  // (stream handle) is captured so the host backend can emit vcLaunchKernelS.
+  // (dynamic shared memory) is captured, not dropped: the VC runtime sizes
+  // `extern __shared__` from the block's x extent and cannot honor a byte
+  // request, so Sema rejects a nonzero value instead of letting it vanish. The
+  // 4th (stream handle) is captured so the host backend can emit
+  // vcLaunchKernelS.
   NodePtr stream;
+  NodePtr sharedMem;
   if (consume(TokKind::comma)) {
-    parseAssignment(); // shared-mem size — ignored
+    sharedMem = parseAssignment(); // dynamic shared-mem bytes
     if (consume(TokKind::comma))
       stream = parseAssignment(); // stream handle
   }
@@ -1995,7 +1999,8 @@ NodePtr Parser::tryParseLaunch(NodePtr &callee) {
 
   auto *launch = new LaunchExpr(toSourceLoc(openLt), std::move(callee),
                                 std::move(gx), std::move(bx),
-                                std::move(gy), std::move(by), std::move(stream));
+                                std::move(gy), std::move(by), std::move(stream),
+                                std::move(sharedMem));
   if (!curTok.is(TokKind::r_paren)) {
     while (true) {
       // parseAssignment: comma is the launch-arg separator, not the operator.

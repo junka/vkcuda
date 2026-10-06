@@ -1,0 +1,35 @@
+// RUN: vcc -fsyntax-only %s 2>&1 | FileCheck %s
+//
+// The third argument of `<<<grid, block, sharedMemBytes, stream>>>` asks for a
+// runtime-sized (extern) shared-memory allocation. Neither backend honors it:
+// `extern __shared__` arrays are sized from the block's x extent, and the launch
+// API has no byte-count parameter to carry the request. It used to be parsed and
+// dropped, so a kernel written against a CUDA byte-count layout silently ran with
+// a differently-sized buffer. A nonzero request is now rejected; `0` (and the
+// two-argument form) stay legal because they ask for nothing.
+
+__global__ void dyn(float *out) {
+  extern __shared__ float buf[];
+  out[threadIdx.x] = buf[threadIdx.x];
+}
+
+__global__ void fixed(float *out) {
+  __shared__ float s[64];
+  s[threadIdx.x] = 1.0f;
+  __syncthreads();
+  out[threadIdx.x] = s[0];
+}
+
+int main() {
+  float *d = nullptr;
+  // CHECK: error: the <<<grid, block, sharedMemBytes>>> dynamic shared-memory argument is not supported
+  dyn<<<1, 64, 256>>>(d);
+  // Same through the 4-argument (stream) form.
+  // CHECK: error: the <<<grid, block, sharedMemBytes>>> dynamic shared-memory argument is not supported
+  dyn<<<1, 64, 64, 0>>>(d);
+  // Legal: nothing extra requested.
+  dyn<<<1, 64>>>(d);
+  dyn<<<1, 64, 0>>>(d);
+  fixed<<<1, 64>>>(d);
+  return 0;
+}

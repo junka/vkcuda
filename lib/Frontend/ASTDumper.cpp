@@ -258,6 +258,7 @@ public:
       if (l->gridDimY) { pad(); os << "gridY:\n"; ++indent; dumpNode(l->gridDimY.get()); --indent; }
       pad(); os << "block:\n"; ++indent; dumpNode(l->blockDim.get()); --indent;
       if (l->blockDimY) { pad(); os << "blockY:\n"; ++indent; dumpNode(l->blockDimY.get()); --indent; }
+      if (l->sharedMemBytes) { pad(); os << "sharedMem:\n"; ++indent; dumpNode(l->sharedMemBytes.get()); --indent; }
       if (l->stream) { pad(); os << "stream:\n"; ++indent; dumpNode(l->stream.get()); --indent; }
       for (auto &a : l->args) dumpNode(a.get());
       --indent;

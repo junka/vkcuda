@@ -1,0 +1,30 @@
+// test/MLIR/switch_reject.vc — switch shapes the lowering can't express refuse.
+//
+// Each `case` becomes its own `scf.if`; there is no switch op in the IR and no
+// fallthrough chain. Two constructs would therefore produce a result that
+// differs from C semantics while still compiling:
+//   1. a case body without a terminating `break`/`return` — its statements run,
+//      then the next label's body runs too (double-executed);
+//   2. statements before the first `case`/`default` label — dead code in C, but
+//      emitted unconditionally here.
+// Both are reported instead of mis-lowered.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+
+__global__ void k(int *out, int n) {
+  int i = threadIdx.x;
+  int sw = 0;
+  switch (i & 3) {
+    // CHECK: error: switch case without a terminating 'break' or 'return' falls through
+    case 0: sw = 1;
+    case 1: sw = 2; break;
+    default: sw = 3; break;
+  }
+  int y = 0;
+  switch (i) {
+    // CHECK: error: statements before the first 'case'/'default' label in a switch are not supported
+    y = 1;
+    case 2: y = 3; break;
+  }
+  out[i] = sw + y;
+}

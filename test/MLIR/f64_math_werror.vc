@@ -1,0 +1,16 @@
+// test/MLIR/f64_math_werror.vc — -Werror promotes the reduced-fidelity warning.
+//
+// Same source as f64_math_warn.vc, compiled with -Werror: the f64 transcendental
+// notice becomes a hard error, the translation is aborted, and no module is
+// emitted. This is what makes the warning actionable in a build that refuses
+// silent precision loss.
+//
+// RUN: mlirc -emit=mlir -Werror %s 2>&1 | FileCheck %s
+
+__global__ void k(float *out, int n) {
+  int tid = threadIdx.x;
+  double d = (double)n + 1.5;
+  // CHECK: error: error (warning promoted by -Werror): sin on a double operand is computed in float precision
+  double a = sin(d);
+  // CHECK: codegen failed
+}

@@ -1861,6 +1861,22 @@ Type *Sema::checkExpr(const ASTNode *n) {
     checkExpr(l->gridDimY.get());
     checkExpr(l->blockDimY.get());
     checkExpr(l->stream.get());
+    if (l->sharedMemBytes) {
+      checkExpr(l->sharedMemBytes.get());
+      // `<<<g, b, 0, stream>>>` is the usual spelling for naming a stream
+      // without requesting dynamic shared memory, so a literal 0 is accepted.
+      // A nonzero byte count cannot be honored: both backends size
+      // `extern __shared__` from the block's x extent, so dropping it silently
+      // would allocate a different amount than the kernel asked for.
+      bool zeroLiteral =
+          l->sharedMemBytes->getNodeType() == ASTNode::NodeKind::IntegerLiteral &&
+          static_cast<const IntegerLiteral *>(l->sharedMemBytes.get())->value == 0;
+      if (!zeroLiteral)
+        error(n, "the <<<grid, block, sharedMemBytes>>> dynamic shared-memory "
+                 "argument is not supported; extern __shared__ arrays are sized "
+                 "to blockDim.x (use __shared__ T s[N] for fixed sizes, or pass "
+                 "0)");
+    }
     return nullptr;
   }
   default:

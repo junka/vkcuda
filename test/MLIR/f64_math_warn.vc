@@ -1,0 +1,20 @@
+// test/MLIR/f64_math_warn.vc — double transcendentals lose precision loudly.
+//
+// SPIR-V's GLSLstd450 transcendental ops are Float16or32 only, so a `sin(double)`
+// is computed by truncating to f32, running the op, and extending back to f64.
+// The result keeps its storage width but only ~29 bits of mantissa survive.
+// That reduction in fidelity is reported as a warning (and `-Werror`, see
+// f64_math_werror.vc, turns it into a hard failure) rather than being presented
+// as a full-precision double result.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+
+__global__ void k(float *out, int n) {
+  int tid = threadIdx.x;
+  double d = (double)n + 1.5;
+  // CHECK: warning: sin on a double operand is computed in float precision by the MLIR backend
+  double a = sin(d);
+  // CHECK: warning: pow on a double operand is computed in float precision by the MLIR backend
+  double b = pow(d, 2.0);
+  out[tid] = (float)(a * b);
+}

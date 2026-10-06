@@ -122,18 +122,28 @@ per backend.
 ## Launch syntax
 ```
 kernel<<<grid, block>>>(args...)
+kernel<<<grid, block, 0, stream>>>(args...)
 ```
 maps to `vkCmdDispatch` with workgroup count = `ceil(grid/block)` — i.e. `grid`
 is an **element count**, not a block count, and the runtime divides by
 `blockDim`. `vcLaunchKernelIndirect` takes a device buffer holding a
 `VkDispatchIndirectCommand` (`{x,y,z}` in *workgroups*, not elements).
 
+The third argument (CUDA's dynamic shared-memory byte count) must be the
+literal `0` when present: no launch path carries a byte count, and both
+backends size `extern __shared__` from `blockDim.x`, so a nonzero request is a
+Sema error rather than a dropped field. The fourth argument is the stream
+handle.
+
 ## Hardware features
 
 - **Atomics, warp shuffle/vote, and block-wide vote intrinsics** are
   implemented (both backends): `spirv.Atomic*` / `memref.atomic_rmw` /
   `GroupNonUniform*`, vote via shared-array reduction. Warp ops need SPIR-V 1.3
-  (vulkan1.1), enabled on demand.
+  (vulkan1.1), enabled on demand. The MLIR backend lowers **32-bit integer**
+  atomics only — a float/double/64-bit target or value is rejected (VC stores a
+  `double` as two i32 slots, so such an atomic would add bit patterns or half a
+  value); the GLSL backend supports float atomics.
 - **`wmma::*` / cooperative matrix** is implemented:
   `gpu.subgroup_mma` → `spirv.KHR.CooperativeMatrix`, with post-conversion
   fixups (f16 SSBO narrowing, entry-point interfaces, marked atomics) and an

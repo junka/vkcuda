@@ -1,0 +1,23 @@
+// test/MLIR/atomic_reject.vc — atomics on non-32-bit-integer targets refuse.
+//
+// VC stores every scalar slot as an i32 (a `float` is a bitcast i32 slot, a
+// `double` is a *pair* of i32 slots), and the MLIR backend only lowers SPIR-V's
+// integer atomic set. An atomicAdd on a float or double target would therefore
+// add bit patterns, or bump only the low half of a two-slot value — a wrong
+// number, silently. The language-level target check catches that even though the
+// MLIR-side element type looks like a legal i32; the value operand is checked
+// before toI32(), which would otherwise truncate it.
+//
+// The GLSL backend does support float atomics, so the diagnostic names it.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+
+__global__ void k(float *out, double *acc, int *cnt) {
+  int tid = threadIdx.x;
+  // CHECK: error: atomicAdd target must be a 32-bit integer in the MLIR backend (got float)
+  atomicAdd(&out[tid], 1.0f);
+  // CHECK: error: atomicAdd target must be a 32-bit integer in the MLIR backend (got double)
+  atomicAdd(&acc[tid], 1.0);
+  // CHECK: error: atomicAdd value operand must be a 32-bit integer in the MLIR backend (got float)
+  atomicAdd(&cnt[tid], 1.0f);
+}

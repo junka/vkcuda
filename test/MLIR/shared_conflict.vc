@@ -1,0 +1,28 @@
+// test/MLIR/shared_conflict.vc — same-named __shared__ arrays may not disagree.
+//
+// Workgroup globals are pooled by symbol name across the whole module (one
+// `@__vc_shared_<name>` per name), because a shared buffer must be a module-
+// scope spirv.GlobalVariable, not a per-function allocation. Two kernels that
+// declare the same name therefore address the SAME buffer. Reusing it is
+// intended and fine as long as both declarations agree; when they don't, the
+// second use either aliases a buffer of the wrong type or leaves a mismatched
+// spirv.mlir.addressof for the verifier to trip over. Report it at the
+// declaration instead.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+
+__global__ void ka(int *out) {
+  __shared__ int s[8];
+  s[threadIdx.x] = threadIdx.x;
+  __syncthreads();
+  out[threadIdx.x] = s[0];
+}
+
+__global__ void kb(float *out) {
+  // CHECK: error: declaration of 's' conflicts with an earlier __shared__ declaration of the same name
+  // CHECK-SAME: Rename one of them
+  __shared__ float s[8];
+  s[threadIdx.x] = 1.0f;
+  __syncthreads();
+  out[threadIdx.x] = s[0];
+}
