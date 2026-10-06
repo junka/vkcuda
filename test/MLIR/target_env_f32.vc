@@ -7,18 +7,21 @@
 // kernel unloadable on a device without doubles. The capability list is
 // therefore derived from the module's types (VCToGPU.cpp scanWidthUses).
 //
-// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
-// RUN: mlirc -emit=spirv %s -o %t.spv && test -s %t.spv
+// The list is only observable in the serialized module — -emit=mlir dumps the
+// VC-dialect IR, which predates the gpu.module and its spirv.target_env — so
+// this test decodes the OpCapability records out of the binary.
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && python3 "$(dirname "%s")/spirv_capabilities.py" %t.spv | FileCheck %s
 
 __global__ void scale(float *out, float *in, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  out[i] = in[i] * 2.0f;
+  if (i < n)
+    out[i] = in[i] * 2.0f;
 }
 
-// The gpu.module (and its spirv.target_env) is emitted before the vc.kernel
-// marker, so the CHECK-NOT window covers the capability list.
-// CHECK:      spirv.target_env
+// Shader is the first capability the emitter pushes, so the CHECK-NOT window
+// that follows it spans the rest of the list.
+// CHECK:      capability Shader
 // CHECK-NOT:  Float64
 // CHECK-NOT:  Int64
 // CHECK-NOT:  Float16
-// CHECK:      vc.kernel

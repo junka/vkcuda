@@ -2,12 +2,12 @@
 // capabilities advertised.
 //
 // GPUToSPIRV refuses ops on f64/i64 unless the target env declares Float64 /
-// Int64, so `double` and `long` must flip exactly those two entries on. The
-// second RUN line serializes the module: it is the proof that the derived list
-// is complete, not merely present.
+// Int64, so `double` and `long` must flip exactly those two entries on — and
+// nothing else. The second half of that contract (no Float16 for a module that
+// never mentions half) is what keeps the binary loadable on a device without
+// shaderFloat16; see target_env_f32.vc for the f32-only case.
 //
-// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
-// RUN: mlirc -emit=spirv %s -o %t.spv && test -s %t.spv
+// RUN: mlirc -emit=spirv %s -o %t.spv && python3 "$(dirname "%s")/spirv_capabilities.py" %t.spv | FileCheck %s
 
 __global__ void widen(double *out, long *counts, int n) {
   int i = threadIdx.x;
@@ -17,7 +17,9 @@ __global__ void widen(double *out, long *counts, int n) {
   counts[i] = l;
 }
 
-// CHECK:      spirv.target_env
-// CHECK-SAME: Float64
-// CHECK-SAME: Int64
+// The emitter pushes Shader, then Float64, Int64 and Float16 in that order, so
+// matching the first two proves the derived list has no gaps.
+// CHECK:      capability Shader
+// CHECK:      Float64
+// CHECK:      Int64
 // CHECK-NOT:  Float16
