@@ -4864,7 +4864,7 @@ private:
     if (t.isa<mlir::Float64Type>()) return "double";
     // Checked before the integer-width query: index has no bit width to ask for.
     if (t.isa<mlir::IndexType>()) return "index";
-    if (t.isInteger()) {
+    if (t.isa<mlir::IntegerType>()) {
       unsigned w = t.getIntOrFloatBitWidth();
       if (w == 64) return "64-bit integer";
       if (w != 32) return "integer narrower than 32 bits";
