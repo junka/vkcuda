@@ -262,7 +262,7 @@ warnings to hard errors.
 | Construct | Demo | Notes |
 | --- | --- | --- |
 | `__shared__` workgroup memory | `sync.vc` | `spirv.GlobalVariable`+`addressof`+`AccessChain` (not `memref.global`). Globals are pooled by name module-wide, so two same-named `__shared__` arrays must agree in element type and shape — a conflict is rejected |
-| Dynamic `extern __shared__ T s[]` | `dyn_shared.vc` | sized from `blockDim.x`; post-serialize SPIR-V binary patch (`__vc_dynshared_`→`OpTypeArray` length). The `<<<g, b, nbytes>>>` byte count is **rejected by Sema** — no launch path carries it |
+| Dynamic `extern __shared__ T s[]` | `dyn_shared.vc` | sized from `blockDim.x`; post-serialize SPIR-V binary patch (`__vc_dynshared_`→`OpTypeArray` length). The `<<<g, b, nbytes>>>` byte count is **rejected at parse time** — no launch path carries it |
 | `__constant__` globals | `constant.vc`, `const_local.vc` | lazily materialized per-kernel; **no `cudaMemcpyToSymbol`** (compile-time init only) |
 | Atomics | `atomics.vc` | `spirv.Atomic*` / `memref.atomic_rmw`; SSBO `atomicExch` via ordinal-marker rewrite. **MLIR is i32-only** — a float/double/64-bit target or value is rejected (GLSL supports float atomics) |
 | `__threadfence()` | `sync.vc` | `spirv.MemoryBarrier` (no `barrier()`) |
@@ -322,7 +322,9 @@ than silently miscompiling.
   (`test/MLIR/switch_reject.vc`)
 - **`<<<g, b, sharedMemBytes>>>`.** No launch path carries a dynamic shared-memory
   byte count (both backends size `extern __shared__` from `blockDim.x`), so a
-  nonzero third argument is a Sema error rather than a silently dropped field.
+  nonzero third argument is a parse error rather than a silently dropped
+  field (rejected by the parser, not Sema: launches live in host bodies,
+  which Sema deliberately does not type-check).
   Pass `0` (or the 2-argument form) to name a stream without asking for bytes.
   (`test/Frontend/launch-shmem.vc`)
 - **Function-like / conditional macros** (`#define F(x) …`, `#ifdef`). Only

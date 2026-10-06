@@ -132,8 +132,8 @@ is an **element count**, not a block count, and the runtime divides by
 The third argument (CUDA's dynamic shared-memory byte count) must be the
 literal `0` when present: no launch path carries a byte count, and both
 backends size `extern __shared__` from `blockDim.x`, so a nonzero request is a
-Sema error rather than a dropped field. The fourth argument is the stream
-handle.
+parse error rather than a dropped field (launches live in host function bodies,
+which Sema does not type-check). The fourth argument is the stream handle.
 
 ## Hardware features
 

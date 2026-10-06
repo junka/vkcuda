@@ -1968,13 +1968,29 @@ NodePtr Parser::tryParseLaunch(NodePtr &callee) {
   // Optional extra launch arguments: <<<g, b, sharedMem, stream>>>. The 3rd
   // (dynamic shared memory) is captured, not dropped: the VC runtime sizes
   // `extern __shared__` from the block's x extent and cannot honor a byte
-  // request, so Sema rejects a nonzero value instead of letting it vanish. The
-  // 4th (stream handle) is captured so the host backend can emit
-  // vcLaunchKernelS.
+  // request, so a nonzero value is rejected right here. The 4th (stream handle)
+  // is captured so the host backend can emit vcLaunchKernelS.
   NodePtr stream;
   NodePtr sharedMem;
   if (consume(TokKind::comma)) {
+    Token shmAt = curTok;
     sharedMem = parseAssignment(); // dynamic shared-mem bytes
+    // Reject a nonzero request instead of dropping it: neither backend has a
+    // byte-count launch parameter (`extern __shared__` is sized from the
+    // block's x extent), so a silently-ignored request would run the kernel
+    // against a differently-sized buffer than it expects. `0` stays legal
+    // because it asks for nothing. This is a parse-time check, not Sema,
+    // precisely because launches live in host bodies, which Sema deliberately
+    // does not type-check.
+    bool zeroLiteral =
+        sharedMem &&
+        sharedMem->getNodeType() == ASTNode::NodeKind::IntegerLiteral &&
+        static_cast<IntegerLiteral *>(sharedMem.get())->value == 0;
+    if (!zeroLiteral)
+      error(shmAt, "the <<<grid, block, sharedMemBytes>>> dynamic shared-memory "
+                   "argument is not supported; extern __shared__ arrays are "
+                   "sized to blockDim.x (use __shared__ T s[N] for fixed "
+                   "sizes, or pass 0)");
     if (consume(TokKind::comma))
       stream = parseAssignment(); // stream handle
   }

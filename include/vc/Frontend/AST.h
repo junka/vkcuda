@@ -756,10 +756,11 @@ public:
   NodePtr gridDimY;        // grid size Y (null = 1D)
   NodePtr blockDimY;       // block size Y (null = 1D)
   NodePtr stream;          // optional stream handle (null = default stream)
-  // The `<<<g, b, nbytes>>>` dynamic shared-memory request. Kept so Sema can
-  // reject a nonzero value rather than dropping the field silently: both
-  // backends size `extern __shared__` from the block's x extent, so a requested
-  // byte count cannot be honored. Null when the source used the 2-arg form.
+  // The `<<<g, b, nbytes>>>` dynamic shared-memory request. Captured at parse
+  // time and rejected there unless it is a literal 0: both backends size
+  // `extern __shared__` from the block's x extent, so a requested byte count
+  // cannot be honored and must not vanish silently. Null when the source used
+  // the 2-arg form.
   NodePtr sharedMemBytes;
   std::vector<NodePtr> args;
   LaunchExpr(SourceLocation l, NodePtr c, NodePtr g, NodePtr b,

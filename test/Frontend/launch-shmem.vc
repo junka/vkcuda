@@ -5,7 +5,9 @@
 // `extern __shared__` arrays are sized from the block's x extent, and the launch
 // API has no byte-count parameter to carry the request. It used to be parsed and
 // dropped, so a kernel written against a CUDA byte-count layout silently ran with
-// a differently-sized buffer. A nonzero request is now rejected; `0` (and the
+// a differently-sized buffer. A nonzero request is now rejected at parse
+// time -- not in Sema, because launches only ever appear in host function
+// bodies, which Sema deliberately does not type-check. `0` (and the
 // two-argument form) stay legal because they ask for nothing.
 
 __global__ void dyn(float *out) {
