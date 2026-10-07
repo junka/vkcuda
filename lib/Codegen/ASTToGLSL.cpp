@@ -54,12 +54,12 @@ class GLSLEmitter {
   // and the driver bumps the glslc target to vulkan1.1 when this is set.
   bool usesSubgroup = false;
   // Whether the kernel references any `double`/`doubleN` type. GLSL's
-  // GL_EXT_shader_explicit_arithmetic_types (enabled unconditionally) gives us
-  // the double *type* and the any-width builtins (sqrt/floor/fabs/min/max work
-  // on double without extra extensions), but the transcendental overloads
-  // (sin/cos/tan/asin/.../pow/exp/log on a double arg) require the separate
-  // _float64 extension. Set during emitBindings/emitSharedDecls by checking
-  // each param's and shared var's glslType for `double`/`dvec`.
+  // GL_EXT_shader_explicit_arithmetic_types (enabled unconditionally) gives the
+  // double *type*; the separate _float64 extension adds its builtins — the
+  // any-width set (sqrt/floor/abs/min/max/clamp/...). No extension provides a
+  // double transcendental, so `sin`/`cos`/`pow`/... on a double are rejected in
+  // codegen (see isF64NoDoubleBuiltin). Set during emitBindings/emitSharedDecls
+  // by checking each param's and shared var's glslType for `double`/`dvec`.
   bool usesDouble = false;
   // Name -> FunctionDecl index of all top-level functions (kernels + __device__
   // helpers). Used to look up default-argument expressions when completing call
@@ -79,6 +79,14 @@ class GLSLEmitter {
   // backend (no pointer type). emitHeader emits a `#error` so glslc fails with
   // a clear message instead of an opaque parse error from the broken body.
   bool hasSubArrayDecayCall = false;
+  // Names of the `double`-argument transcendental calls found while emitting
+  // this unit, comma-separated. Reported by the driver (GLSLModule's
+  // unsupportedF64Math) and backed by a token-safe `#error` line, because
+  // glslang's own message is just "no matching overloaded function found".
+  std::string rejectedF64Math;
+  // -fallow-f64-math-f32: lower a `double` transcendental to its f32 form
+  // (`double(sin(float(x)))`) instead of rejecting it.
+  bool allowF64MathF32 = false;
   // Hoisted statements to emit before the current enclosing statement. The
   // vote intrinsics push their reduction prologue here; emitStmt flushes and
   // clears this before emitting each statement node.
@@ -122,7 +130,8 @@ class GLSLEmitter {
   llvm::StringMap<std::string> refLocals;
 
 public:
-  GLSLEmitter(raw_ostream &o) : os(&o) {}
+  GLSLEmitter(raw_ostream &o, bool f64MathF32 = false)
+      : os(&o), allowF64MathF32(f64MathF32) {}
 
   bool emit(const TranslationUnit &tu) {
     // Flatten the translation unit: namespaces are transparent on the device
@@ -174,6 +183,7 @@ public:
     usesDouble = false;
     usesPrintf = false;
     hasSubArrayDecayCall = false;
+    rejectedF64Math.clear();
     preStmts.clear();
     emittingVoteRef = false;
     if (k->body) scanDims(k->body.get());
@@ -195,6 +205,14 @@ public:
     emitVoteDecls();
     emitDeviceFunctions(flat);
     emitBody();
+    if (!rejectedF64Math.empty()) {
+      // The driver turns this into a readable error before invoking glslc; the
+      // `#error` is the backstop for someone compiling the emitted .comp by
+      // hand. Its text is identifiers only: glslang re-prints the directive as
+      // tokens, so punctuation would come out mangled.
+      (*os) << "#error vcc_f64_math_no_double_overload " << rejectedF64Math
+            << "\n";
+    }
   }
 
   // Emit a complete unit for every __global__ in `tu`, each into its own
@@ -220,7 +238,7 @@ public:
       emitOneForKernel(f, flat);
       os = saved;
       buf.flush();
-      out.push_back({deviceMangledName(f), std::move(src)});
+      out.push_back({deviceMangledName(f), std::move(src), rejectedF64Math});
     }
     return out;
   }
@@ -241,10 +259,8 @@ public:
 private:
   // Detect any `double`/`doubleN` usage in the kernel's params or body so
   // emitHeader can enable GL_EXT_shader_explicit_arithmetic_types_float64 (the
-  // transcendental overloads sin/cos/.../pow on a double arg need it; the base
-  // explicit-arithmetic extension only provides the double *type* and the
-  // any-width builtins). Checks params, shared decls, and walks the body for
-  // VarDecls whose glslType comes out `double`/`dvecN`.
+  // double overloads of the any-width builtins). Walks params, shared decls and
+  // body VarDecls whose glslType comes out `double`/`dvecN`.
   void scanDoubleUsage(const FunctionDecl *k) {
     auto mark = [&](const char *ty) {
       if (ty && (StringRef(ty).starts_with("double") ||
@@ -754,10 +770,13 @@ private:
                "GLSL backend (use the MLIR backend, or pass a flat pointer)\n";
     }
     if (usesDouble) {
-      // The base extension gives us the double *type* and any-width builtins
-      // (sqrt/floor/fabs/min/max on a double), but the transcendental overloads
-      // (sin/cos/tan/asin/.../pow/exp/log on a double arg) require this
-      // separate float64 extension. Runtime advertises shaderFloat64.
+      // The base explicit-arithmetic extension only gives the double *type*;
+      // this one adds the double overloads of the any-width builtins
+      // (sqrt/inversesqrt/floor/ceil/round/trunc/fract and the generic
+      // abs/min/max/clamp/mix/smoothstep/mod) — and of abs/min/max/clamp, which
+      // is why fabs/fmin/fmax lower onto them. It does NOT provide double
+      // transcendentals: sin/cos/tan/exp/log/pow on a double are rejected in
+      // codegen (see isF64NoDoubleBuiltin). Runtime advertises shaderFloat64.
       (*os) << "#extension GL_EXT_shader_explicit_arithmetic_types_float64 : enable\n";
     }
     (*os) << "// generated by vc (GLSL backend)\n";
@@ -1094,14 +1113,45 @@ private:
     }
     // CUDA double-precision math names (no f suffix) that have no direct GLSL
     // spelling: fabs/fmin/fmax -> abs/min/max. GLSL's abs/min/max are generic
-    // over float/double under GL_EXT_shader_explicit_arithmetic_types, so these
-    // work on double without needing the _float64 extension (unlike sin/pow,
-    // which DO need it — handled below).
+    // over float/double under GL_EXT_shader_explicit_arithmetic_types_float64,
+    // so these work on a double. The transcendentals (sin/cos/.../pow) have no
+    // double form at all — see isF64NoDoubleBuiltin.
     if (name == "fabs") return "abs";
     if (name == "fmin") return "min";
     if (name == "fmax") return "max";
     // CUDA fabsf/fminf/fmaxf already handled above by f-strip or builtin pass.
     return name;
+  }
+
+  // The GLSL math builtins with NO `double` overload: glslc rejects them on a
+  // double argument even with GL_EXT_shader_explicit_arithmetic_types_float64
+  // enabled ("'sin' : no matching overloaded function found"), because SPIR-V's
+  // GLSLstd450 transcendental entries are f16/f32-only. The any-width set
+  // (sqrt/inversesqrt/floor/ceil/round/trunc/fract/abs/min/max/clamp/mix/
+  // smoothstep/mod) does have a double form, so it isn't listed here — the same
+  // split the MLIR backend draws between SPIRV_Float and SPIRV_Float16or32.
+  static bool isF64NoDoubleBuiltin(llvm::StringRef name) {
+    return name == "sin" || name == "cos" || name == "tan" ||
+           name == "asin" || name == "acos" || name == "atan" ||
+           name == "exp" || name == "log" || name == "exp2" ||
+           name == "log2" || name == "pow";
+  }
+
+  // True if any argument is a double (or a double vector). `exprType` is
+  // conservative and returns null for shapes it cannot classify; an unknown
+  // argument is treated as not-double and the call is emitted as written, which
+  // leaves glslc to reject it — a loud failure, never a silent narrowing.
+  bool hasDoubleArg(const std::vector<NodePtr> &args) const {
+    for (const auto &a : args) {
+      const Type *t = resolveTypedef(exprType(a.get()));
+      if (t && t->getKind() == TypeKind::Vector)
+        t = resolveTypedef(static_cast<const VectorType *>(t)->elem);
+      if (t && t->getKind() == TypeKind::Builtin &&
+          static_cast<const BuiltinType *>(t)->builtin ==
+              BuiltinTypeKind::Float64)
+        return true;
+    }
+    return false;
   }
 
   // If `name` is a CUDA-style vector name (float4, int3, ...), return the
@@ -2841,6 +2891,29 @@ private:
           // Fall through to a normal call if the body shape isn't inlineable;
           // glslc will then reject the lvalue use with a clear diagnostic.
         }
+        // A double-argument transcendental has no GLSL spelling (see
+        // isF64NoDoubleBuiltin). By default the kernel is rejected with that
+        // reason; -fallow-f64-math-f32 opts into computing it in float and
+        // widening the result back, so the expression keeps its double storage.
+        if (!calleeFn && isF64NoDoubleBuiltin(callName) &&
+            hasDoubleArg(c->args)) {
+          if (!allowF64MathF32) {
+            if (rejectedF64Math.find(callName) == std::string::npos) {
+              if (!rejectedF64Math.empty()) rejectedF64Math += ", ";
+              rejectedF64Math += callName;
+            }
+          } else {
+            (*os) << "double(" << callName << "(";
+            for (unsigned i = 0; i < c->args.size(); ++i) {
+              if (i) (*os) << ", ";
+              (*os) << "float(";
+              emitExpr(c->args[i].get());
+              (*os) << ")";
+            }
+            (*os) << "))";
+            return;
+          }
+        }
         (*os) << callName << "(";
         for (unsigned i = 0; i < c->args.size(); ++i) {
           if (i) (*os) << ", ";
@@ -2962,13 +3035,15 @@ private:
 
 } // namespace
 
-std::vector<glsl::GLSLModule> vc::glsl::translateASTToGLSLSources(const TranslationUnit &tu) {
-  return GLSLEmitter(nulls()).emitAll(tu);
+std::vector<glsl::GLSLModule>
+vc::glsl::translateASTToGLSLSources(const TranslationUnit &tu,
+                                   bool allowF64MathF32) {
+  return GLSLEmitter(nulls(), allowF64MathF32).emitAll(tu);
 }
 
 bool vc::glsl::translateASTToGLSL(const TranslationUnit &tu,
-                                  raw_ostream &os) {
-  auto mods = translateASTToGLSLSources(tu);
+                                  raw_ostream &os, bool allowF64MathF32) {
+  auto mods = translateASTToGLSLSources(tu, allowF64MathF32);
   if (mods.empty()) {
     os << "// no __global__ kernel found\n";
     return false;

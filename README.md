@@ -147,11 +147,25 @@ to `gpu.subgroup_mma`, which MLIR's GPU→SPIR-V leg turns into
 
 ### Testing
 
-`cmake --build build --target mlir-check` runs `test/MLIR/*.vc` through the
-`vc` driver and FileCheck-validates the emitted IR: kernel structure and
-indexing ops, `__constant__` array/scalar materialization, local arrays,
-early-return guards, structured control flow, and an end-to-end `-emit=spirv`
-smoke test. `vc-check` covers the frontend diagnostics.
+Three automated suites, none of which need a GPU:
+
+- `cmake --build build-mlir --target mlir-check` runs `test/MLIR/*.vc` through
+  the `vc` driver and FileCheck-validates the emitted IR: kernel structure and
+  indexing ops, `__constant__` array/scalar materialization, local arrays,
+  early-return guards, structured control flow, and an end-to-end `-emit=spirv`
+  smoke test.
+- `vc-check` covers the frontend diagnostics.
+- `spirv-val-check` compiles every `test/*.vc` and `examples/*.vc` with **both**
+  backends (`vc -emit=spirv`, `vcc -emit=spirv`, which writes one module per
+  kernel) and runs `spirv-val` over each binary. Loading a shader is otherwise
+  only exercised by the GPU end-to-end suite, and CI has no device, so this is
+  the check that a lowering emits SPIR-V any driver will take.
+  `test/check_spirv_val.py` holds the small, documented list of modules known to
+  be invalid; anything outside it fails, and an entry that has started to
+  validate fails too.
+
+`vc-e2e-check` / `python3 test/run_e2e.py` (see below) are the GPU-dependent
+half: they build and run the self-verifying demos.
 
 ### Deferred
 
@@ -213,10 +227,12 @@ row notes otherwise. The e2e demo named in each row is the living spec — if
 the demo passes on a backend, that construct works there.
 
 A construct the compiler cannot honor is refused with a diagnostic, never
-silently dropped or mis-evaluated. Where the MLIR backend *can* lower something
-only at reduced fidelity (an f64 transcendental computed in f32), it says so as
-a warning; `-Werror` promotes both the frontend warnings and those codegen
-warnings to hard errors.
+silently dropped or mis-evaluated. The one construct that *could* be lowered at
+reduced fidelity — a `double` transcendental, which SPIR-V and Vulkan GLSL alike
+encode only in f32 — is a hard error by default on both backends;
+`-fallow-f64-math-f32` accepts the f32-computed, double-stored result and keeps
+the warning. `-Werror` promotes the frontend warnings and that warning to hard
+errors.
 
 ### Core C/CUDA
 
@@ -247,7 +263,7 @@ warnings to hard errors.
 | Pointer arithmetic | `pointer_arith.vc` | derived pointers (base+offset), `&x`/`*p` |
 | Reference params `T&` / locals | `references.vc`, `ref_swap.vc` | Function-storage memref by-value to `func.call`→`spirv.ptr<struct<array<1×T>>,Function>`; GLSL `inout` |
 | `const T&` overload | `const_overload.vc` | `K` mangle marker; const-aware conversion rank; GLSL→`in` (by-value) |
-| Reference return `int &f()` | `ref_return.vc` | lvalue call (`pick(x,y,1)=v`); `HoistRefReturnIfYieldsPass` rewrites `scf.if`-yielding-memref to yield `spirv.ptr`; GLSL inlines to ternary/if-else |
+| Reference return `int &f()` | `ref_return.vc` | lvalue call (`pick(x,y,1)=v`); MLIR lowers the helper to a position-returning selector and expands the read/write over the caller's candidates; GLSL inlines to ternary/if-else |
 | Ref-from-element `f(out[i])` | `ref_elem.vc` | Function-storage temp + copy-in/copy-out for non-const `T&` |
 | Struct references `P&`/`const P&` | `ref_struct.vc` | |
 
@@ -275,7 +291,7 @@ warnings to hard errors.
 
 | Construct | Demo | Notes |
 | --- | --- | --- |
-| Math builtins (`sqrt`/`sin`/`pow`/…) | `math_builtins2/3.vc` | `spirv.GL.*`. SPIR-V has no f64 transcendental opcode, so in MLIR a `double` argument is computed at f32 precision — reported as a warning, and a hard error under `-Werror` |
+| Math builtins (`sqrt`/`sin`/`pow`/…) | `math_builtins2/3.vc`, `f64_math_error.vc` | `spirv.GL.*`. Any-width ops keep the operand's width, so a `double` stays true f64. No f64 transcendental exists — `GLSLstd450` is `SPIRV_Float16or32` and `glslc` rejects `sin(double)` too — so both backends reject a `double` `sin`/`pow`/… and point at the float spelling; `-fallow-f64-math-f32` opts into computing it in f32 and storing it as f64 (still warns) |
 | Warp shuffles / ballot | `warp.vc` | `gpu.subgroup_size`+`GroupNonUniform*`; needs SPIR-V 1.3 (vulkan1.1) on demand |
 | Vote (`__syncthreads_count/and/or`) | `vote.vc` | shared-array reduction |
 | WMMA / cooperative matrix | `wmma_gemm.vc`, `wmma.vc` | `gpu.subgroup_mma`→`spirv.KHR.CooperativeMatrix`; SPIR-V 1.6 + `VulkanMemoryModel` (patched onto the module), runtime opportunistic coopMatrix+shaderFloat16+vulkanMemoryModel |

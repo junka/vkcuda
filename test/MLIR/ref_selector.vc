@@ -1,0 +1,45 @@
+// test/MLIR/ref_selector.vc — a `T&`-returning __device__ helper is a
+// position-returning selector, and the caller expands the selection.
+//
+// Logical addressing forbids a Function-storage variable that holds a pointer
+// and forbids a function returning one, so no reference can cross the helper's
+// `if (sel) return a; return b;`. Instead the helper's result type is i32 and
+// each `return a;` yields `a`'s parameter position; the caller then expands that
+// position against the lvalues it passed, so either only a loaded scalar crosses
+// an scf.if (a read) or nothing does (a store). That is the shape spirv-val
+// accepts — the pointer-valued form this replaced emitted a module MoltenVK ran
+// and no conforming driver may load.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+
+__device__ int &pick(int &a, int &b, int sel) {
+  if (sel) return a;
+  return b;
+}
+
+// The helper returns a position: i32 result, constants 0 and 1 yielded from the
+// early-return chain, and no load or store of its reference parameters.
+// CHECK-LABEL: func.func @pick_ri_ri_i
+// CHECK-SAME: -> i32
+// CHECK: scf.if
+// CHECK: arith.constant 0 : i32
+// CHECK: arith.constant 1 : i32
+// CHECK-NOT: memref.load
+// CHECK-LABEL: func.func @kern
+
+__global__ void kern(int *out, int n) {
+  int x = 10, y = 20;
+  // Write through the selection: compare the returned position with each
+  // candidate and store only in the branch that matches.
+  pick(x, y, 1) = 42;
+  // CHECK: call @pick_ri_ri_i
+  // CHECK: arith.cmpi eq
+  // CHECK: scf.if
+  // CHECK-NEXT: memref.store
+  // read through the selection: the scf.if yields the selected value.
+  out[0] = pick(x, y, n);
+  // CHECK: call @pick_ri_ri_i
+  // CHECK: arith.cmpi eq
+  // CHECK: scf.if {{.*}} -> (i32)
+  // CHECK: memref.load
+}

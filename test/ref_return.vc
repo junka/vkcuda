@@ -9,12 +9,13 @@
 //   - Sema: a call whose callee returns `T&` is an lvalue (the call's result
 //     type is a ReferenceType), so `pick(...) = 99` is accepted, not flagged
 //     "assignment to non-lvalue".
-//   - MLIR: the callee's result type is the Function-storage memref slot (the
-//     address), and `return a;` yields the slot (not the loaded value). A
-//     ref-return with an early return lowers to an `scf.if` yielding the slot;
-//     the HoistRefReturnIfYieldsPass rewrites that if to yield the underlying
-//     spirv.ptr (peeling the unrealized_conversion_casts) so GPUToSPIRV can
-//     legalize it to spirv.Select. The call result is then a store target.
+//   - MLIR: a `T&`-returning helper compiles as a *selector*. Logical addressing
+//     forbids a Function-storage variable holding a pointer and a function
+//     returning one, so no pointer can cross `if (sel) return a; return b;`: the
+//     helper's result type becomes i32 and each `return a;` yields the position
+//     of `a` among its parameters. The caller then expands that position — an
+//     `scf.if` per candidate, carrying only the loaded value (a read) or only
+//     the store (a write).
 //   - GLSL: GLSL functions can't return references, so the call is inlined at
 //     the call site — a read lowers to a `(cond ? a : b)` ternary, and a write
 //     `pick(...)= v` lowers to `if (cond) a = v; else b = v;` (GLSL rejects
@@ -24,6 +25,8 @@
 //   - `int &pick(int &a, int &b, int sel)` with an early return
 //   - write through the returned ref: `pick(x,y,1) = 99`
 //   - read through the returned ref: `out[i] = pick(x,y,0)`
+//   - a selector that is a runtime value, not a literal
+//   - an SSBO element as a candidate: `pick(out[i], x, s) = v`
 #include "vc/Runtime/VCRuntime.h"
 
 __device__ int &pick(int &a, int &b, int sel) {
@@ -31,7 +34,7 @@ __device__ int &pick(int &a, int &b, int sel) {
   return b;
 }
 
-__global__ void kern(int *out) {
+__global__ void kern(int *out, int sel) {
   int x = 10, y = 20;
   pick(x, y, 1) = 42;       // write through returned ref -> x
   out[0] = x;               // 42
@@ -39,18 +42,27 @@ __global__ void kern(int *out) {
   pick(x, y, 0) = 7;        // write through returned ref -> y
   out[2] = x;               // 42
   out[3] = y;               // 7
+  // Read through the selection with a runtime selector (sel == 1 -> a == x).
+  out[4] = pick(x, y, sel); // 42
+  // A buffer element as a candidate: the store lands on out[5] itself.
+  out[5] = 1;
+  pick(out[5], x, sel) = 33; // sel truthy -> a == out[5]
+  out[6] = out[5];           // 33
+  out[7] = pick(out[6], x, sel - 1); // sel - 1 falsy -> b == x
 }
 
 int main() {
   vcInit();
   void *d = 0;
-  vcMalloc(&d, 4 * sizeof(int));
-  kern<<<1, 1>>>(d);
+  vcMalloc(&d, 8 * sizeof(int));
+  kern<<<1, 1>>>(d, 1);
   vcDeviceSynchronize();
-  int h[4] = {0};
-  vcMemcpy(h, d, 4 * sizeof(int), VCMemcpyKind::DeviceToHost);
-  printf("ref_return: %d %d %d %d", h[0], h[1], h[2], h[3]);
-  bool ok = h[0] == 42 && h[1] == 20 && h[2] == 42 && h[3] == 7;
+  int h[8] = {0};
+  vcMemcpy(h, d, 8 * sizeof(int), VCMemcpyKind::DeviceToHost);
+  printf("ref_return: %d %d %d %d %d %d %d %d", h[0], h[1], h[2], h[3], h[4],
+         h[5], h[6], h[7]);
+  bool ok = h[0] == 42 && h[1] == 20 && h[2] == 42 && h[3] == 7 && h[4] == 42 &&
+            h[5] == 33 && h[6] == 33 && h[7] == 42;
   printf(" %s\n", ok ? "PASS" : "FAIL");
   vcFree(d);
   vcShutdown();

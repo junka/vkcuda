@@ -1,0 +1,58 @@
+// test/MLIR/ref_selector_reject.vc — shapes the reference-selector lowering
+// cannot express.
+//
+// A `T&`-returning helper hands the caller a *position*, and the caller expands
+// the read or the write on whichever lvalue that position names. So anything
+// without a durable caller-side address, or without a single scalar value to
+// carry across the `scf.if`, is refused instead of silently given a different
+// meaning.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+
+struct S {
+  int a;
+  int b;
+};
+
+// The candidates are expanded into one scf.if, which needs a single value type:
+// a struct has none.
+// CHECK: error: a reference-returning device function can only refer to a scalar
+__device__ S &sel_struct(S &x, S &y, int s) {
+  if (s) return x;
+  return y;
+}
+
+// Every candidate must load and store the same type the returned reference has.
+// CHECK: error: a reference parameter of a reference-returning function must refer to the same type
+__device__ int &sel_mismatch(int &a, float &b, int s) {
+  if (s) return a;
+  return b;
+}
+
+// Only a parameter has an address the caller could expand against; a local dies
+// with the callee.
+__device__ int &sel_local(int &a, int b) {
+  int t = a;
+  // CHECK: error: a reference-returning device function can only return one of its own reference parameters
+  if (b) return t;
+  return a;
+}
+
+__device__ int &pick(int &a, int &b, int s) {
+  if (s) return a;
+  return b;
+}
+
+__device__ void bump(int &r) { r = r + 1; }
+
+__global__ void kern(int *out, int n) {
+  int x = 1, y = 2;
+  // A candidate of a selecting call must itself be an address. A nested
+  // reference-returning call only has a position, not an address.
+  // CHECK: error: a reference argument of a reference-returning call must be an lvalue
+  out[0] = pick(pick(x, y, n), y, n);
+  // And a plain reference argument cannot be one either: the callee's writes
+  // would land on the materialized temporary and be dropped.
+  // CHECK: error: a non-const reference argument cannot be a reference-returning call
+  bump(pick(x, y, n));
+}

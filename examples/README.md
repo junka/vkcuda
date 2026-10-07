@@ -41,7 +41,7 @@ the intermediate stages instead of linking:
 ```bash
 ./build/tools/vc-dump-ast/vc-dump-ast test/vadd.vc   # pretty-print the AST
 ./build/tools/vcc/vcc test/vadd.vc -emit=glsl        # dump the generated GLSL
-./build/tools/vcc/vcc test/vadd.vc -emit=spirv       # write a.out (raw SPIR-V)
+./build/tools/vcc/vcc test/vadd.vc -emit=spirv -o v.spv   # raw SPIR-V, one file per kernel (v.spv, v.2.spv…)
 ./build/tools/vcc/vcc test/vadd.vc -emit=full -o build/vadd_sf
 ```
 

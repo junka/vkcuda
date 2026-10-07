@@ -1,0 +1,26 @@
+// test/Frontend/f64_math_glsl.vc — the GLSL backend holds the same f64 contract.
+//
+// Vulkan GLSL has no double overload for the transcendental builtins, so
+// `sin(double)` never reaches SPIR-V: glslc answers "no matching overloaded
+// function found", which blames the shader rather than the source. The backend
+// now detects the shape itself (isF64NoDoubleBuiltin) and the driver reports it
+// before invoking glslc — the same diagnosis, the same opt-in, the same
+// reasoning as the MLIR backend's f64_math_error.vc.
+//
+// With -fallow-f64-math-f32 the call lowers to the float form widened back for
+// storage: double(sin(float(d))).
+//
+// RUN: vcc -emit=glsl %s 2>&1 | FileCheck %s
+// RUN: vcc -emit=glsl -fallow-f64-math-f32 %s 2>&1 | FileCheck %s --check-prefix=ALLOW
+
+__global__ void k(float *out, int n) {
+  int tid = threadIdx.x;
+  double d = (double)n + 1.5;
+  // CHECK: error: no double-precision form of sin, pow in kernel 'k'
+  // CHECK-NOT: void main()
+  double a = sin(d);
+  double b = pow(d, 2.0);
+  // ALLOW: double(sin(float(d)))
+  // ALLOW: double(pow(float(d), float(2
+  out[tid] = (float)(a * b);
+}

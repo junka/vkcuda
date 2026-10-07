@@ -80,7 +80,9 @@ VC is a CUDA-like language whose kernels compile to Vulkan SPIR-V.
 - `#define NAME <literal>` — an object-like macro over a single literal, folded
   at parse time. No function-like macros, no `#ifdef`.
 - CUDA/math builtins lower to GLSL: `__sinf`→`sin`, `sinf`→`sin`, `sqrtf`→`sqrt`,
-  `__syncthreads`→`barrier()`, etc.
+  `__syncthreads`→`barrier()`, etc. A `double` operand keeps its width for the
+  any-width set; the transcendentals have no `double` form at all — see
+  "Math on `double`" below.
 
 ## Functions
 
@@ -162,6 +164,24 @@ which Sema does not type-check). The fourth argument is the stream handle.
   opportunistically and, before `vkCreateShaderModule`, refuses a kernel whose
   declared capability the device did not enable — naming the capability, the
   device and the missing feature on stderr instead of failing silently.
+- **Math on `double` is exact where SPIR-V is, and rejected where it isn't.**
+  The any-width ops (`sqrt` `inversesqrt` `floor` `ceil` `round` `trunc` `fract`
+  `fabs`/`abs` `fmin`/`fmax` `min`/`max` `clamp` `mix` `fma` `smoothstep` `mod`
+  `isnan` `isinf`, plus `+ - * /` and comparisons) run in the operand's own
+  width, so a `double` stays a true f64. The transcendental set —
+  `sin cos tan asin acos atan exp log exp2 log2 pow` — has no f64 encoding
+  anywhere in this stack: SPIR-V's `GLSLstd450` declares them
+  `SPIRV_Float16or32`, and `glslc` rejects `sin(double)` even with
+  `GL_EXT_shader_explicit_arithmetic_types_float64` enabled
+  (`'sin' : no matching overloaded function found`). There is no backend that
+  can do better, so both backends reject the call by default and point at the
+  float spelling (`float r = sin((float)x);`, i.e. CUDA's `sinf`).
+  `-fallow-f64-math-f32` opts into the compromise explicitly — compute in f32,
+  store as f64 — and still warns about the ~29 lost mantissa bits, which
+  `-Werror` promotes. `test/MLIR/f64_math_error.vc`,
+  `test/MLIR/f64_math_allow_f32.vc` and `test/Frontend/f64_math_glsl.vc` pin
+  the three behaviours; `test/math_width.vc` is the passing demo that writes
+  the casts itself.
 - **Kernel `printf`** works on the GLSL backend only, via `debugPrintfEXT` +
   `GL_EXT_debug_printf`, enabled at runtime with `vcEnableKernelPrintf()` (or
   `VC_KERNEL_PRINTF=1`) before `vcInit()`. The MLIR backend emits a
@@ -185,17 +205,23 @@ silently miscompiled:
 - `__constant__` is compile-time-initialized only — there is no
   `cudaMemcpyToSymbol` runtime path.
 
-One construct compiles and runs but is **not valid SPIR-V**, so a stricter
-driver can refuse it at `vkCreateShaderModule`:
+References returned from a `__device__` function (`int &pick(int &a, int &b,
+int sel)`) are lvalues the caller may read *or* write through, and both backends
+lower them by inlining the selection into the caller: SPIR-V's logical
+addressing model forbids a Function-storage variable holding a pointer and a
+function returning one, so a pointer-valued reference can never cross the
+callee's `if (sel) return a; return b;`. The MLIR backend compiles such a helper
+as a *selector* that returns the designated parameter's position as an `i32`,
+and the caller expands the read or the store under an `scf.if` over the
+candidates it passed. Two consequences are checked at compile time rather than
+silently mis-compiled:
 
-- A `__device__` function that returns a reference (`int &pick(int &a, int &b,
-  int sel)`) has to hand the caller a pointer value. SPIR-V's logical addressing
-  model forbids both a Function-storage variable holding a pointer and a function
-  returning one, so the emitted module fails `spirv-val`; MoltenVK compiles it
-  and the `ref_return.vc` demo passes. `test/check_spirv_val.py` keeps the file
-  on a documented exception list so the rest of the sweep stays strict. The legal
-  lowering is the one the GLSL backend already uses for this source: inline the
-  call and let each branch carry the store.
+- the referred-to type must be a **scalar** (a struct or array has no single
+  value for the `scf.if` to yield), and every reference parameter of the helper
+  must refer to that **same type**;
+- `return` may only designate one of the helper's own reference parameters — a
+  local, an expression, or a nested reference-returning call has no address the
+  caller could be given, and is rejected.
 
 Two behaviours that earlier revisions of this document listed as limitations
 are in fact **fixed** and should not be worked around:

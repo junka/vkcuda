@@ -143,6 +143,24 @@ Runtime::~Runtime() {
   devices_.clear();
 }
 
+// True when the loader knows the named instance layer. Layer presence is a
+// property of the machine, not of the program: a missing or mis-pointed-at
+// vulkan-validation-layers has to be reported as that, not as an unexplained
+// instance-creation failure.
+static bool instanceLayerAvailable(const char *name) {
+  uint32_t count = 0;
+  if (vkEnumerateInstanceLayerProperties(&count, nullptr) != VK_SUCCESS)
+    return false;
+  std::vector<VkLayerProperties> layers(count);
+  if (count == 0) return false;
+  if (vkEnumerateInstanceLayerProperties(&count, layers.data()) != VK_SUCCESS)
+    return false;
+  for (const VkLayerProperties &p : layers) {
+    if (std::string(p.layerName) == name) return true;
+  }
+  return false;
+}
+
 VCError Runtime::init() {
   if (init_) return VCError::Success;
 
@@ -188,6 +206,25 @@ VCError Runtime::init() {
   valFeats.enabledValidationFeatureCount = 1;
   valFeats.pEnabledValidationFeatures = &printfEnable;
   bool wantPrintf = g_kernelPrintfEnabled;
+  // Only ask for a layer the loader can actually find: naming a layer that is not
+  // installed does not downgrade anything — vkCreateInstance fails outright, which
+  // took the whole runtime down with an error no demo could attribute (printf.vc
+  // reported it as `FAIL (malloc)`). Request it when present, otherwise say on
+  // stderr that printf() will produce no output.
+  if (wantPrintf && !instanceLayerAvailable(layer)) {
+    std::fprintf(stderr,
+                 "vc: kernel printf requested (vcEnableKernelPrintf/VC_KERNEL_PRINTF=1) "
+                 "but instance layer '%s' is not installed; continuing without it, so "
+                 "printf() inside kernels will produce no output, and a kernel that "
+                 "uses it will fail to compile (install vulkan-validation-layers)\n",
+                 layer);
+    // Not just the messenger: VK_KHR_shader_non_semantic_info, the device
+    // extension that carries NonSemantic.DebugPrintf, is the layer's, so leaving
+    // the flag set would have setupLogicalDevice request an extension that is not
+    // present and fail vkCreateDevice for every device on the machine.
+    g_kernelPrintfEnabled = false;
+    wantPrintf = false;
+  }
   if (wantPrintf) {
     ici.enabledLayerCount = 1;
     ici.ppEnabledLayerNames = &layer;
@@ -206,7 +243,15 @@ VCError Runtime::init() {
     ici.enabledExtensionCount = 1;
     ici.ppEnabledExtensionNames = &exts[1];
     r = vkCreateInstance(&ici, nullptr, &instDev->instance);
-    if (r != VK_SUCCESS) return VCError::InitializationError;
+    if (r != VK_SUCCESS) {
+      std::fprintf(stderr,
+                   "vc: vkCreateInstance failed with VkResult %d (requested "
+                   "Vulkan 1.2, extension '%s'%s) — no Vulkan driver reachable; "
+                   "check that an ICD is installed and VK_ICD_FILENAMES / "
+                   "VK_LAYER_PATH point at one\n",
+                   int(r), exts[1], wantPrintf ? ", with the validation layer" : "");
+      return VCError::InitializationError;
+    }
   }
   VkInstance instance = instDev->instance;
 
@@ -245,6 +290,10 @@ VCError Runtime::init() {
       debugMessenger_ = VK_NULL_HANDLE;
     }
     vkDestroyInstance(instance, nullptr);
+    std::fprintf(stderr,
+                 "vc: vkCreateInstance succeeded but the loader enumerated no "
+                 "physical device with a compute queue — no Vulkan driver (ICD) "
+                 "reachable; check VK_ICD_FILENAMES / VK_DRIVER_FILES\n");
     return VCError::InvalidDevice;
   }
   instDev.reset(); // devices_ entries each carry `instance` (shared)
@@ -551,8 +600,23 @@ bool Runtime::setupLogicalDevice(
     dci.pEnabledFeatures = &coreFeats2.features; // every bit still FALSE
   }
 
-  if (vkCreateDevice(vd.physical, &dci, nullptr, &vd.device) != VK_SUCCESS)
+  VkResult dr = vkCreateDevice(vd.physical, &dci, nullptr, &vd.device);
+  if (dr != VK_SUCCESS) {
+    // The usual cause is one of the conditionally requested extensions not being
+    // present for this device, and VkDeviceCreateInfo has no way of saying which —
+    // name what was asked for so the failure is attributable.
+    std::string asked;
+    for (uint32_t i = 0; i < devExtCount; ++i) {
+      asked += devExts[i];
+      if (i + 1 < devExtCount) asked += ", ";
+    }
+    std::fprintf(stderr,
+                 "vc: vkCreateDevice failed for '%s' with VkResult %d "
+                 "(requested extensions: %s)\n",
+                 vd.physProps.deviceName, int(dr),
+                 asked.empty() ? "none" : asked.c_str());
     return false;
+  }
   vkGetDeviceQueue(vd.device, vd.computeQueueFamily, 0, &vd.computeQueue);
   return true;
 }
@@ -2798,6 +2862,40 @@ VkPipeline Runtime::getPipeline(VCKernel &k, int deviceIdx, unsigned blockX,
   if (!st) return VK_NULL_HANDLE;
   if (!st->layoutBuilt && !buildLayout(k, deviceIdx, args, argCount))
     return VK_NULL_HANDLE;
+
+  // The block dims become the pipeline's OpLocalSize through the specialization
+  // constants below, and Vulkan holds a compute pipeline to two device limits: no
+  // dimension over maxComputeWorkGroupSize, and no invocation count over
+  // maxComputeWorkGroupInvocations. vkCreateComputePipelines answers either with a
+  // bare VkResult (VK_ERROR_INITIALIZATION_FAILED on MoltenVK) that names neither,
+  // so check them here and say which one the launch has to come down to.
+  const VkPhysicalDeviceLimits &lim =
+      devices_[deviceIdx]->physProps.limits;
+  const unsigned dims[3] = {blockX ? blockX : 1, blockY ? blockY : 1,
+                            blockZ ? blockZ : 1};
+  for (int i = 0; i < 3; ++i) {
+    if (dims[i] <= lim.maxComputeWorkGroupSize[i]) continue;
+    std::fprintf(stderr,
+                 "vc: kernel '%s': block dimension %d is %u, device '%s' allows "
+                 "at most %u (maxComputeWorkGroupSize[%d])\n",
+                 k.entryPoint.c_str(), i + 1, dims[i],
+                 devices_[deviceIdx]->physProps.deviceName,
+                 lim.maxComputeWorkGroupSize[i], i);
+    return VK_NULL_HANDLE;
+  }
+  const uint64_t invocations =
+      uint64_t(dims[0]) * dims[1] * dims[2];
+  if (invocations > lim.maxComputeWorkGroupInvocations) {
+    std::fprintf(stderr,
+                 "vc: kernel '%s': block %ux%ux%u is %llu invocations, device "
+                 "'%s' allows at most %u per workgroup "
+                 "(maxComputeWorkGroupInvocations)\n",
+                 k.entryPoint.c_str(), dims[0], dims[1], dims[2],
+                 (unsigned long long)invocations,
+                 devices_[deviceIdx]->physProps.deviceName,
+                 lim.maxComputeWorkGroupInvocations);
+    return VK_NULL_HANDLE;
+  }
 
   // Key: pack block dims into 64 bits (16 bits each + reserved).
   uint64_t key = (uint64_t(blockX) << 32) | (uint64_t(blockY) << 16) | blockZ;

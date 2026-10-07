@@ -1,0 +1,36 @@
+// test/MLIR/f64_math_error.vc — a double transcendental is rejected, not
+// silently narrowed.
+//
+// SPIR-V's GLSLstd450 transcendental set is Float16or32 only: there is no f64
+// sin/cos/exp/log/pow opcode, and the GLSL path is no better — glslc rejects
+// `sin(double)` even with GL_EXT_shader_explicit_arithmetic_types_float64
+// enabled ("'sin' : no matching overloaded function found"). So no backend can
+// produce a double-precision transcendental; the only lowering available
+// computes it in float and extends the result back, which leaves a `double`
+// holding ~29 fewer mantissa bits than its type claims.
+//
+// That is a wrong answer dressed as a double, so the default is a hard error
+// that names the fix (compute in float, as CUDA's `sinf`) and the opt-in
+// (`-fallow-f64-math-f32`, see f64_math_allow_f32.vc). The GLSL backend reports
+// the same contract; test/Frontend/f64_math_glsl.vc checks it.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+
+__global__ void k(float *out, int n) {
+  int tid = threadIdx.x;
+  double d = (double)n + 1.5;
+  // CHECK: error: no double-precision form of sin: SPIR-V's GLSLstd450 transcendentals are f16/f32-only
+  // CHECK-SAME: or pass -fallow-f64-math-f32
+  double a = sin(d);
+  // CHECK: error: no double-precision form of pow:
+  double b = pow(d, 2.0);
+  // The guard is scoped to the GLSLstd450 transcendental set. Widen it by
+  // mistake — send an any-width op through the same path — and a third
+  // "no double-precision form of" line appears, which must land between the
+  // pow error above and `codegen failed` (every diagnostic precedes that line).
+  // CHECK-NOT: no double-precision form of
+  // CHECK: codegen failed
+  out[tid] = (float)(a * b + fract(d) + degrees(d) + radians(d) + trunc(d) +
+                    sqrt(d) + floor(d) + fabs(d) + fmin(d, 1.0) +
+                    clamp(d, 0.0, 1.0) + fmod(d, 1.0));
+}

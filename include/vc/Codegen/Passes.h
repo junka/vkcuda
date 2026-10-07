@@ -22,11 +22,17 @@ namespace codegen {
 
 /// Translate an AST translation unit into a VC-dialect MLIR module.
 /// `warningsAsErrors` upgrades the reduced-fidelity warnings the translator
-/// emits (e.g. an f64 transcendental computed at f32 precision) to hard
-/// errors, matching the driver's -Werror contract for the frontend.
+/// emits to hard errors, matching the driver's -Werror contract for the
+/// frontend.
+///
+/// `allowF64MathF32` opts into computing a `double` transcendental (`sin(d)`,
+/// `pow(d, e)`, ...) at f32 precision and extending the result back to f64.
+/// Without it the translator rejects the call: SPIR-V's GLSLstd450
+/// transcendental set is f16/f32-only, so a f64-accurate form does not exist.
 ::mlir::OwningOpRef<::mlir::ModuleOp>
 translateASTToMLIR(const TranslationUnit &tu, ::mlir::MLIRContext &ctx,
-                   bool warningsAsErrors = false);
+                   bool warningsAsErrors = false,
+                   bool allowF64MathF32 = false);
 
 /// Stage 1 of the lowering pipeline: lower the VC dialect to the GPU dialect
 /// (vc.kernel -> gpu.module/gpu.func; thread/block/barrier ops -> gpu.*).

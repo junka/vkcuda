@@ -5,10 +5,11 @@
 //   double x = sqrt(d)   ->  computed sqrt in f32, lost 29 bits of precision
 //   __half x = sqrt(h)   ->  computed sqrt in f32, then truncated back to f16
 // The fix (toNativeFloat) preserves the operand's native float width for ops
-// that accept it (SPIRV_Float: sqrt/fabs/floor/ceil/round/fmin/fmax/clamp/...),
-// and routes the f64 transcendental set (sin/cos/exp/log/pow, which are
-// SPIRV_Float16or32 — no f64 opcode) through runTranscendental: truncate to
-// f32, run, extend back to f64 (f32 transcendental precision, f64 storage).
+// that accept it (SPIRV_Float: sqrt/fabs/floor/ceil/round/fmin/fmax/clamp/...).
+// The transcendental set (sin/cos/exp/log/pow) is SPIRV_Float16or32 — no f64
+// opcode exists, and glslc rejects sin(double) too — so a double operand there
+// is a hard error unless -fallow-f64-math-f32 opts into f32 (see
+// test/MLIR/f64_math_error.vc).
 //
 // The kernel reads a `double*` SSBO and a `float*` SSBO (host allocates 8-byte
 // doubles and 4-byte floats), does arithmetic in the native width, and stores
@@ -25,9 +26,9 @@
 // f64 math: sqrt, floor, fabs, fmin, fmax, clamp (any-width: native f64), plus
 // transcendentals via explicit float cast (GLSL has no sin(double)/pow(double)
 // overloads even with the float64 extension; CUDA code likewise uses sinf or
-// casts). The MLIR backend's runTranscendental does this trunc→f32→extend
-// automatically for bare sin(double); here we cast explicitly so the test runs
-// identically on both backends.
+// casts). Both backends reject a bare sin(double) for that reason, so the cast
+// is written here instead of implied — and the test then runs identically on
+// both.
 __global__ void dmath(double *in, double *out, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;

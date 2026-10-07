@@ -30,16 +30,28 @@ namespace glsl {
 struct GLSLModule {
   std::string entryName;
   std::string source;
+  // Comma-separated names of the `double`-argument transcendental calls this
+  // unit contains (empty when there are none). Vulkan GLSL has no double
+  // overload for them, so the driver reports them and stops rather than letting
+  // glslc emit an opaque "no matching overloaded function found".
+  std::string unsupportedF64Math;
 };
 
 /// Lower every `__global__` in `tu` to its own GLSL compute unit. Returns one
 /// `GLSLModule` per kernel (empty if there are no kernels). The order matches
 /// source order of the `__global__` declarations.
-std::vector<GLSLModule> translateASTToGLSLSources(const TranslationUnit &tu);
+///
+/// `allowF64MathF32` (-fallow-f64-math-f32) lowers a `double` transcendental
+/// (`sin(d)`, `pow(d, e)`, ...) to its f32 form, `double(sin(float(d)))`.
+/// Vulkan GLSL has no double overload for those builtins, so without the flag
+/// the kernel carries a `#error` saying so instead of glslc's opaque one.
+std::vector<GLSLModule> translateASTToGLSLSources(const TranslationUnit &tu,
+                                                  bool allowF64MathF32 = false);
 
 /// Convenience wrapper: emit the first `__global__` kernel to `os`. Returns
 /// true on success. Kept for single-kernel / `-emit=glsl` debug use.
-bool translateASTToGLSL(const TranslationUnit &tu, llvm::raw_ostream &os);
+bool translateASTToGLSL(const TranslationUnit &tu, llvm::raw_ostream &os,
+                        bool allowF64MathF32 = false);
 
 } // namespace glsl
 } // namespace vc

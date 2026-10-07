@@ -186,11 +186,44 @@ class ASTToMLIRImpl {
   // fields and the call site can CompositeExtract them.
   bool currentRetIsStruct = false;
   const RecordType *currentRetRecord = nullptr;
+  //--- Reference-return state ---------------------------------------------//
+  // A `T&`-returning __device__ helper is compiled as a *selector*: the function
+  // returns the parameter position of the object it designates (an i32), and the
+  // caller performs the read or the write on that candidate under an scf.if. The
+  // reference itself can never be a value here — SPIR-V's logical addressing
+  // forbids a variable that holds a pointer, and MLIR carries a value across an
+  // scf.if in exactly such a variable, so only the *choice* of candidate can
+  // cross the control flow. See expandRefRead/expandRefWrite.
+  bool currentRetIsRefSelection = false;
+  // The function whose body is being emitted, so a `return a;` can map the name
+  // back to its parameter position.
+  const FunctionDecl *currentFnDecl = nullptr;
+  // One pending caller-side expansion, keyed by the i32 the selector call
+  // returned. A reference-returning call in an assignment LHS position registers
+  // one here and returns the raw position, so emitBinary can expand the store
+  // (expandRefWrite); every other use resolves into a read (expandRefRead) at
+  // the call site and never lands in the map.
+  struct RefSelection {
+    mlir::Type pointeeTy; // the referred-to scalar type
+    // Parameter position -> the caller's lvalue the callee designates there.
+    SmallVector<std::pair<unsigned, std::pair<Value, SmallVector<Value, 2>>>, 4>
+        candidates;
+  };
+  llvm::DenseMap<Value, RefSelection> pendingRefSelections;
+  // Set while an assignment's LHS is emitted, so a reference-returning call in
+  // that position stays a pending selection for the store instead of resolving
+  // into a read.
+  bool emittingAssignLHS = false;
+
   // Set when any diagnostic error is emitted, so the driver can fail.
   bool hadError = false;
   // Under -Werror, a lowered-with-reduced-fidelity warning (see warnAt) is
   // upgraded to an error so a precision compromise cannot slip through a build.
   bool warningsAsErrors = false;
+  // -fallow-f64-math-f32: accept a `double` transcendental being computed at
+  // f32 precision. Off by default, which makes such a call a hard error —
+  // a `double` result backed by f32 digits is a wrong answer, not a warning.
+  bool allowF64MathF32 = false;
 
   //--- Loop break/continue state -----------------------------------------//
   // scf has no goto, so break/continue are modeled by threading two i1 flags
@@ -215,8 +248,9 @@ class ASTToMLIRImpl {
   unsigned structuredDepth = 0;
 
 public:
-  ASTToMLIRImpl(MLIRContext &c, bool werror = false)
-      : ctx(c), builder(&c), warningsAsErrors(werror) {
+  ASTToMLIRImpl(MLIRContext &c, bool werror = false, bool f64MathF32 = false)
+      : ctx(c), builder(&c), warningsAsErrors(werror),
+        allowF64MathF32(f64MathF32) {
     ctx.getOrLoadDialect<vc::VCDialect>();
     ctx.getOrLoadDialect<func::FuncDialect>();
     ctx.getOrLoadDialect<arith::ArithDialect>();
@@ -935,6 +969,35 @@ private:
     } else {
       retTy = cvtType(fn->returnType);
     }
+    // A `T&`-returning helper is compiled as a selector, so its MLIR result is the
+    // position it chose (an i32) rather than the address of what it chose — an
+    // address could only reach the caller through a pointer-valued variable, which
+    // logical addressing forbids. Only a scalar pointee is supported: the caller
+    // expands a read into an scf.if yielding that value, and a struct or array has
+    // no single value to yield.
+    currentRetIsRefSelection = false;
+    if (!retRec && fn->returnType && isa<ReferenceType>(fn->returnType)) {
+      const vc::Type *pointee = cast<ReferenceType>(fn->returnType)->pointee;
+      mlir::Type pty = cvtType(pointee);
+      if (!pty || !pty.isIntOrIndexOrFloat()) {
+        error(fn, "a reference-returning device function can only refer to a "
+                  "scalar; lower the caller to select the lvalue itself");
+        return;
+      }
+      // The caller's expansion yields one type from an scf.if, so every
+      // candidate must load as the returned reference's type.
+      for (auto *p : fn->params) {
+        if (!p->type || !isa<ReferenceType>(p->type)) continue;
+        if (cvtType(cast<ReferenceType>(p->type)->pointee) != pty) {
+          error(p, "a reference parameter of a reference-returning function "
+                   "must refer to the same type as the returned reference");
+          return;
+        }
+      }
+      currentRetIsRefSelection = true;
+      retTy = builder.getI32Type();
+    }
+    currentFnDecl = fn;
     currentRetTy = retTy;
     currentRetIsStruct = (bool)retRec;
     currentRetRecord = retRec;
@@ -967,6 +1030,7 @@ private:
     localTypes.clear();
     refLocalBinds.clear();
     pointerLocalsML.clear();
+    pendingRefSelections.clear();
 
     // Bind the synthesized `_this` (methods): the leading block arg is the
     // caller's memref<Nxi32> slot for the object; register it as a bare
@@ -2175,6 +2239,142 @@ private:
     }
   }
 
+  // For a `T&`-returning selector, `return a;` yields the *position* of `a` among
+  // the callee's parameters, which is what the caller expands on. Only a
+  // reference parameter can be designated: anything else (a local, an expression)
+  // has an address the caller cannot be given under logical addressing.
+  Value refSelectionIndex(ASTNode *retValNode, Location l) {
+    auto *dr = retValNode && retValNode->getNodeType() ==
+                                      ASTNode::NodeKind::DeclRefExpr
+                   ? static_cast<DeclRefExpr *>(retValNode)
+                   : nullptr;
+    if (dr && currentFnDecl) {
+      for (unsigned pos = 0; pos < currentFnDecl->params.size(); ++pos) {
+        auto *p = currentFnDecl->params[pos];
+        if (!p || p->name != dr->name.str()) continue;
+        if (!p->type || !isa<ReferenceType>(p->type)) break;
+        return builder.create<arith::ConstantOp>(l, builder.getI32Type(),
+                                                 builder.getI32IntegerAttr((int32_t)pos));
+      }
+    }
+    error(retValNode,
+          "a reference-returning device function can only return one of its own "
+          "reference parameters (`return a;`), which the caller expands into the "
+          "selected lvalue");
+    // Keep the IR well-formed so the rest of the function (and the diagnostic
+    // for every other early return) still lowers; the driver fails on the error.
+    return builder.create<arith::ConstantOp>(l, builder.getI32Type(),
+                                             builder.getI32IntegerAttr(0));
+  }
+
+  // Load through an already-resolved (address, indices) pair — the tail of
+  // loadLValue for a candidate whose lvalue was resolved at the call site.
+  Value loadFromAddress(Value mem, ArrayRef<Value> indices, Location l) {
+    if (auto ptr = mem.getType().dyn_cast<spirv::PointerType>())
+      return builder.create<spirv::LoadOp>(l, ptr.getPointeeType(), mem,
+                                           /*memory_access=*/spirv::MemoryAccessAttr(),
+                                           /*alignment=*/IntegerAttr());
+    return builder.create<memref::LoadOp>(l, mem, indices);
+  }
+
+  //===--------------------------------------------------------------------//
+  // Reference-selection expansion (caller side)
+  //===--------------------------------------------------------------------//
+
+  // A reference-returning call gave back the *position* of the parameter it
+  // designates; read the object that position names. The chain runs from the
+  // last candidate backwards so each `scf.if`'s else branch already holds the
+  // rest of the chain, and only a scalar value crosses the control flow —
+  // which is exactly what makes this legal SPIR-V where handing the caller a
+  // pointer value is not. An index matching no candidate (unreachable: the
+  // callee returns one of these positions) yields zero.
+  Value expandRefRead(const RefSelection &sel, Value idx, Location l) {
+    mlir::Type ty = sel.pointeeTy;
+    Value acc = builder.create<arith::ConstantOp>(l, ty,
+                                                 builder.getZeroAttr(ty));
+    auto saved = builder.saveInsertionPoint();
+    for (size_t i = sel.candidates.size(); i-- > 0;) {
+      unsigned pos = sel.candidates[i].first;
+      Value mem = sel.candidates[i].second.first;
+      ArrayRef<Value> indices = sel.candidates[i].second.second;
+      Value at = builder.create<arith::ConstantOp>(
+          l, builder.getI32Type(), builder.getI32IntegerAttr((int32_t)pos));
+      Value cmp = builder.create<arith::CmpIOp>(l, arith::CmpIPredicate::eq,
+                                                idx, at);
+      auto ifOp = builder.create<scf::IfOp>(l, TypeRange{ty}, cmp,
+                                            /*withElse=*/true);
+      ++structuredDepth;
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      Value v = castValue(loadFromAddress(mem, indices, l), ty, l);
+      builder.create<scf::YieldOp>(l, ValueRange{v});
+      builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+      builder.create<scf::YieldOp>(l, ValueRange{acc});
+      --structuredDepth;
+      builder.restoreInsertionPoint(saved);
+      acc = ifOp.getResult(0);
+    }
+    return acc;
+  }
+
+  // Write through a reference selection: `pick(x, y, 1) = 99`. Same chain as
+  // the read, but each region carries only a store, so nothing at all crosses
+  // the control flow. No candidate matches => no store (the callee always names
+  // one of them).
+  void expandRefWrite(const RefSelection &sel, Value idx, Value rhs,
+                      Location l) {
+    auto saved = builder.saveInsertionPoint();
+    for (size_t i = 0; i < sel.candidates.size(); ++i) {
+      bool last = (i + 1 == sel.candidates.size());
+      Value at = builder.create<arith::ConstantOp>(
+          l, builder.getI32Type(), builder.getI32IntegerAttr((int32_t)sel.candidates[i].first));
+      Value cmp = builder.create<arith::CmpIOp>(l, arith::CmpIPredicate::eq,
+                                                idx, at);
+      auto ifOp = builder.create<scf::IfOp>(l, TypeRange{}, cmp, /*withElse=*/!last);
+      ++structuredDepth;
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      storeTo(sel.candidates[i].second.first, sel.candidates[i].second.second,
+              rhs, l);
+      if (last) break;
+      builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+    }
+    --structuredDepth;
+    builder.restoreInsertionPoint(saved);
+  }
+
+  // The callee of `n` if `n` is a call to a reference-returning function,
+  // else null. Such a call designates an lvalue rather than producing a value,
+  // which the caller can only expand where it has a durable address to expand
+  // against.
+  const FunctionDecl *refReturningCallee(const ASTNode *n) const {
+    if (!n || n->getNodeType() != ASTNode::NodeKind::CallExpr) return nullptr;
+    const FunctionDecl *fn = static_cast<const CallExpr *>(n)->resolvedCallee;
+    return fn && fn->returnType && isa<ReferenceType>(fn->returnType) ? fn
+                                                                      : nullptr;
+  }
+
+  // Take the pending selection for a reference-returning call result, if any.
+  // Resolving consumes it: a result is either read or written, never both.
+  bool takeRefSelection(Value result, RefSelection &out) {
+    auto it = pendingRefSelections.find(result);
+    if (it == pendingRefSelections.end()) return false;
+    out = it->second;
+    pendingRefSelections.erase(it);
+    return true;
+  }
+
+  // Prepare a return-value expression for emission: visit it, then load/cast to
+  // the function's result type. A `T&`-returning selector never loads — it yields
+  // the parameter position the caller has to expand on (refSelectionIndex).
+  Value prepareReturnValue(ASTNode *retValNode, Location l) {
+    if (currentRetIsRefSelection) return refSelectionIndex(retValNode, l);
+    Value v = visitExpr(retValNode);
+    if (!v) return v;
+    v = loadValue(v, loc(retValNode));
+    if (currentRetTy && !currentRetTy.isa<NoneType>())
+      v = castValue(v, currentRetTy, l);
+    return v;
+  }
+
   // Lower a run of statements starting at a value-returning early-return if
   // (`if (c) ... return v; [more...] return w;`) into a single scf.if that
   // yields the function's result: the then branch yields the early return's
@@ -2188,23 +2388,6 @@ private:
   //     yield %r2
   //   }
   //   return %r
-  // Prepare a return-value expression for emission: visit it, then load/cast to
-  // the function's result type. For a `T&` return the result is the referred-to
-  // object's *address* (a Function-storage memref slot), so the load is skipped
-  // — `return a;` on a `T&` param yields the slot itself, not its value.
-  Value prepareReturnValue(ASTNode *retValNode, Location l) {
-    Value v = visitExpr(retValNode);
-    if (!v) return v;
-    bool refReturn =
-        currentRetTy && currentRetTy.isa<MemRefType>() && !currentRetIsStruct;
-    if (!refReturn) {
-      v = loadValue(v, loc(retValNode));
-      if (currentRetTy && !currentRetTy.isa<NoneType>())
-        v = castValue(v, currentRetTy, l);
-    }
-    return v;
-  }
-
   void emitValueReturnChain(const std::vector<NodePtr> &stmts, size_t from) {
     ASTNode *s = stmts[from].get();
     auto *iff = static_cast<IfStmt *>(s);
@@ -2662,19 +2845,19 @@ private:
         }
         // Fall through to emit a clear error below.
       }
+      // A `T&`-returning selector hands back the parameter position it names;
+      // the caller does the read or write (see expandRefRead/expandRefWrite).
+      if (currentRetIsRefSelection) {
+        Value idx =
+            r->value ? refSelectionIndex(r->value.get(), l) : Value();
+        builder.create<func::ReturnOp>(l, idx ? ValueRange(idx) : ValueRange());
+        break;
+      }
       Value v = r->value ? visitExpr(r->value.get()) : Value();
       if (v) {
-        // A `T&` return yields the referred-to object's *address* (a
-        // Function-storage memref slot), not its loaded value — `return a;`
-        // where `a` is a `T&` param must hand back the slot so the caller can
-        // write through it (`pick(x,y,1) = 99`). currentRetTy is the memref slot
-        // type for a reference return; skip the load in that case.
-        bool refReturn =
-            currentRetTy && currentRetTy.isa<MemRefType>() && !currentRetIsStruct;
-        if (!refReturn)
-          v = loadValue(v, loc(r->value.get()));
+        v = loadValue(v, loc(r->value.get()));
         // Bridge index-typed expressions to the function's result type.
-        if (currentRetTy && !currentRetTy.isa<NoneType>() && !refReturn)
+        if (currentRetTy && !currentRetTy.isa<NoneType>())
           v = castValue(v, currentRetTy, l);
       }
       builder.create<func::ReturnOp>(l, v ? ValueRange(v) : ValueRange());
@@ -3741,6 +3924,19 @@ private:
             SmallVector<Value, 2> dstIndices;
           };
           SmallVector<CopyOut, 2> copyOuts;
+          // A reference-returning callee is a selector: it gives back a
+          // parameter position, and the caller reads or writes whichever
+          // candidate it names. Record each reference argument's lvalue, keyed
+          // by the callee's parameter position.
+          bool calleeSelectsRef =
+              calleeFn && calleeFn->returnType &&
+              isa<ReferenceType>(calleeFn->returnType);
+          mlir::Type refPointeeTy;
+          if (calleeSelectsRef)
+            refPointeeTy = cvtType(
+                cast<ReferenceType>(calleeFn->returnType)->pointee);
+          SmallVector<std::pair<unsigned, std::pair<Value, SmallVector<Value, 2>>>,
+                      4> refCandidates;
           unsigned argNo = 0;
           for (auto &a : c->args) {
             // A `T&` parameter takes the argument's *address* (a
@@ -3760,7 +3956,27 @@ private:
             if (wantsRef) {
               Value mem;
               SmallVector<Value> indices;
-              if (lvalueAddress(a.get(), mem, indices) && indices.empty()) {
+              bool addressable =
+                  lvalueAddress(a.get(), mem, indices) && mem &&
+                  (mem.getType().isa<MemRefType>() ||
+                   mem.getType().isa<spirv::PointerType>());
+              if (calleeSelectsRef) {
+                // The caller expands the selection against these lvalues, so
+                // each must be addressable. A nested reference-returning call
+                // is not: its own selection would have to be resolved before
+                // this one, which needs a durable alias the language cannot
+                // give here.
+                if (!addressable || !refPointeeTy)
+                  return error(
+                      a.get(),
+                      "a reference argument of a reference-returning call must "
+                      "be an lvalue the caller can read and write (not a "
+                      "temporary or a nested reference-returning call)");
+                refCandidates.push_back(
+                    {argNo, {mem, SmallVector<Value, 2>(indices.begin(),
+                                                        indices.end())}});
+              }
+              if (addressable && indices.empty()) {
                 // Plain named object: pass its slot directly. But the callee's
                 // ref slot is Function-storage; an SSBO element address (a
                 // spirv.ptr or StorageBuffer memref) is NOT assignable to it, so
@@ -3789,12 +4005,18 @@ private:
               bool paramConst = calleeFn->params[argNo]->isConst;
               if (!paramConst) {
                 // Copy-out destination: the arg's own lvalue address, if any.
-                Value dstMem;
-                SmallVector<Value> dstIdx;
-                if (lvalueAddress(a.get(), dstMem, dstIdx)) {
-                  copyOuts.push_back({temp, dstMem, {dstIdx.begin(), dstIdx.end()}});
-                } // else: rvalue bound to T& is ill-formed (Sema rejects); no
-                  // copy-out needed for a const T& rvalue binding either.
+                if (addressable)
+                  copyOuts.push_back({temp, mem,
+                                      {indices.begin(), indices.end()}});
+                // A non-const `T&` bound to something with no address at all
+                // (a reference-returning call, an expression) would write into
+                // the temp and drop it. Fail closed rather than compute wrong.
+                else if (refReturningCallee(a.get()))
+                  return error(a.get(),
+                               "a non-const reference argument cannot be a "
+                               "reference-returning call: the callee's writes "
+                               "would land on a temporary, not the selected "
+                               "lvalue");
               }
               args.push_back(temp);
               ++argNo;
@@ -3817,6 +4039,14 @@ private:
           if (calleeFn) {
             for (unsigned i = c->args.size(); i < calleeFn->params.size(); ++i) {
               if (!calleeFn->params[i]->defaultVal) break;
+              // A selecting call expands over the lvalues it was given, so a
+              // reference parameter it omits would have no candidate: the
+              // selection could name a position nothing was recorded for.
+              if (calleeSelectsRef && calleeFn->params[i]->type &&
+                  isa<ReferenceType>(calleeFn->params[i]->type))
+                return error(calleeFn->params[i]->defaultVal.get(),
+                             "a reference-returning call cannot omit a "
+                             "reference parameter the selection may name");
               Value dv = visitExpr(calleeFn->params[i]->defaultVal.get());
               if (!dv) return error(calleeFn->params[i]->defaultVal.get(),
                                    "could not evaluate default argument");
@@ -3835,6 +4065,18 @@ private:
           FunctionType fty = fit->second.getFunctionType();
           if (fty.getNumResults() == 0) return Value();
           Value res = call.getResult(0);
+          // A reference-returning callee handed back the position it designates;
+          // expand it against the candidates recorded above. As an assignment
+          // LHS the store belongs to the caller, so leave the selection pending
+          // for expandRefWrite; every other use is a read.
+          if (calleeSelectsRef) {
+            RefSelection sel{refPointeeTy, std::move(refCandidates)};
+            if (emittingAssignLHS) {
+              pendingRefSelections[res] = sel;
+              return res;
+            }
+            return expandRefRead(sel, res, l);
+          }
           // A struct-returning callee yields a spirv::StructType SSA value.
           // Spill it into a fresh local struct memref so the caller can bind
           // it like any other local struct (field reads reuse the slot path).
@@ -4538,8 +4780,9 @@ private:
     // (toNativeFloat preserves f16/f64; only int/index promotes to f32) so a
     // `double`/`__half` arg is lowered in its own precision. Sqrt/InverseSqrt/
     // FAbs/FSign/Floor/Ceil/Round accept any float width (SPIRV_Float); the
-    // transcendental set below is f16/f32-only (SPIRV_Float16or32) so a double
-    // operand is run through runTranscendental (truncate→f32 op→extend).
+    // transcendental set below is f16/f32-only (SPIRV_Float16or32), so a double
+    // operand goes to runTranscendental — which rejects it unless
+    // -fallow-f64-math-f32 asks for the truncate→f32 op→extend form.
     struct UnaryMath { const char *name; };
     static constexpr llvm::StringRef unaryMath[] = {
         "sin", "cos", "tan", "asin", "acos", "atan",
@@ -4621,20 +4864,25 @@ private:
         Value ln2 = builder.create<arith::ConstantOp>(l, workTy,
             builder.getFloatAttr(workTy, 0.6931471805599453));
         return builder.create<arith::DivFOp>(l, ln, ln2); });
-      // fract(x) = x - floor(x). No GLFract opcode; any float width via
-      // GLFloorOp. (GLSL fract returns the fractional part in [0,1).)
-      if (base == "fract") return run([&](Value v) {
-        Value fl = builder.create<spirv::GLFloorOp>(l, v);
-        return builder.create<arith::SubFOp>(l, v, fl); });
-      // degrees(x) = x * (180/pi); radians(x) = x * (pi/180). No GL opcode.
-      if (base == "degrees") return run([&](Value v) {
+      // fract(x) = x - floor(x); degrees/radians scale by a constant. These are
+      // made of any-width ops (GLFloorOp, arith mul/sub), so they keep the
+      // operand's native width — no f32 fallback and no rejection, unlike the
+      // true transcendentals above. (GLSL agrees: fract/abs/min/max have double
+      // overloads, sin/pow do not.)
+      if (base == "fract") {
+        Value fl = builder.create<spirv::GLFloorOp>(l, x);
+        return builder.create<arith::SubFOp>(l, x, fl);
+      }
+      if (base == "degrees") {
         Value k = builder.create<arith::ConstantOp>(l, workTy,
             builder.getFloatAttr(workTy, 57.29577951308232));
-        return builder.create<arith::MulFOp>(l, v, k); });
-      if (base == "radians") return run([&](Value v) {
+        return builder.create<arith::MulFOp>(l, x, k);
+      }
+      if (base == "radians") {
         Value k = builder.create<arith::ConstantOp>(l, workTy,
             builder.getFloatAttr(workTy, 0.017453292519943295));
-        return builder.create<arith::MulFOp>(l, v, k); });
+        return builder.create<arith::MulFOp>(l, x, k);
+      }
     }
     // Binary float math: pow (f16/f32 only) and fmin/fmax/fmod (any width).
     // Operands coerce to the SAME width — the operand's native float width if
@@ -4794,25 +5042,40 @@ private:
 
   // The GLSLstd450 transcendental set (sin/cos/tan/asin/acos/atan/sinh/cosh/
   // tanh/exp/log/pow) is constrained to SPIRV_Float16or32 in the spirv dialect
-  // — no f64 opcode exists. For a double operand we have no native f64 path, so
-  // truncate to f32, run the op, and extend back to f64. This matches what a
-  // GLSL driver does for the f64-limited GLSLstd450 entries and preserves the
-  // operand's storage width at the call site (the result is still f64, just
-  // computed with f32 transcendental precision). The precision loss is reported
-  // (and is a hard error under -Werror) so a `double` result is never silently
-  // single-precision.
+  // — no f64 opcode exists, and glslc rejects the same call on the GLSL backend
+  // (`'sin' : no matching overloaded function found`, even with
+  // GL_EXT_shader_explicit_arithmetic_types_float64). So there is no path that
+  // yields a double-precision transcendental, only one that yields a double
+  // *storage* holding f32 digits.
+  //
+  // That is a wrong answer, not a rounded one, so by default the call is a hard
+  // error telling the source to say what it means (`sin((float)x)` — CUDA's own
+  // `sinf`). `-fallow-f64-math-f32` opts into the trunc→f32→extend lowering,
+  // which still warns (and -Werror can promote that).
   Value runTranscendental(
       std::function<Value(Value)> emit, Value x, mlir::Type origTy, Location l,
       llvm::StringRef fname = {}) {
     if (origTy.isF64()) {
       llvm::StringRef nm = fname.empty() ? llvm::StringRef("transcendental")
                                          : fname;
-      warnAt(l, Twine(nm) +
-                    " on a double operand is computed in float precision by "
-                    "the MLIR backend (SPIR-V's GLSLstd450 has no f64 opcode) "
-                    "and extended back to double; ~29 bits of the mantissa are "
-                    "lost. Use the GLSL backend if double-precision "
-                    "transcendentals are required.");
+      if (!allowF64MathF32) {
+        errorAt(l, Twine("no double-precision form of ") + nm +
+                        ": SPIR-V's GLSLstd450 transcendentals are f16/f32-only "
+                        "and Vulkan GLSL has no double overload either, so a "
+                        "double operand can only be computed in float (losing "
+                        "~29 mantissa bits). Compute it in float explicitly, "
+                        "e.g. `float r = " +
+                        nm +
+                        "((float)x);` (CUDA's `" + nm + "f`), or pass "
+                        "-fallow-f64-math-f32 to accept the f32-computed, "
+                        "double-stored result.");
+      } else {
+        warnAt(l, Twine(nm) +
+                       " on a double operand is computed in float precision by "
+                       "the MLIR backend (SPIR-V's GLSLstd450 has no f64 opcode) "
+                       "and extended back to double; ~29 bits of the mantissa "
+                       "are lost.");
+      }
     }
     Value work = x;
     if (origTy.isF64())
@@ -6132,13 +6395,21 @@ private:
           return rhs;
         }
       }
-      // Reference-returning call on the LHS: `pick(x,y,1) = 99`. The call yields
-      // a Function-storage memref slot (the callee returned a `T&`), which is the
-      // address to store into. visitExpr emits the call and returns the slot;
-      // store through it directly. (rhs was already visited above.)
+      // Reference-returning call on the LHS: `pick(x,y,1) = 99`. The callee
+      // returned the position of the parameter it designates; store through
+      // whichever candidate that position names.
       if (b->lhs &&
           b->lhs->getNodeType() == ASTNode::NodeKind::CallExpr) {
+        emittingAssignLHS = true;
         Value slot = visitExpr(b->lhs.get());
+        emittingAssignLHS = false;
+        RefSelection sel;
+        if (slot && takeRefSelection(slot, sel)) {
+          expandRefWrite(sel, slot, rhs, l);
+          return rhs;
+        }
+        // A reference local (`int &r = ...`) can still hand back its target's
+        // slot; store through it directly.
         if (slot && slot.getType().isa<MemRefType>()) {
           storeTo(slot, {}, rhs, l);
           return rhs;
@@ -6278,8 +6549,8 @@ private:
 
 OwningOpRef<ModuleOp>
 vc::codegen::translateASTToMLIR(const TranslationUnit &tu, MLIRContext &ctx,
-                                bool warningsAsErrors) {
-  ASTToMLIRImpl impl(ctx, warningsAsErrors);
+                                bool warningsAsErrors, bool allowF64MathF32) {
+  ASTToMLIRImpl impl(ctx, warningsAsErrors, allowF64MathF32);
   ModuleOp module = impl.translate(tu);
   if (impl.failed()) {
     // A diagnostic was emitted for an unsupported construct (or a

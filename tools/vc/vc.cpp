@@ -388,6 +388,10 @@ int main(int argc, char **argv) {
       llvm::cl::desc("treat warnings as errors"));
   llvm::cl::opt<bool> syntaxOnly("fsyntax-only",
       llvm::cl::desc("lex, parse and type-check only; emit no output"));
+  llvm::cl::opt<bool> allowF64MathF32(
+      "fallow-f64-math-f32",
+      llvm::cl::desc("compute double transcendentals (sin/pow/...) in float "
+                     "instead of rejecting them"));
   llvm::cl::ParseCommandLineOptions(argc, argv, "VC compiler\n");
 
   EmitKind kind = EmitKind::MLIR;
@@ -471,7 +475,8 @@ int main(int argc, char **argv) {
     return mlir::success();
   });
 
-  auto module = codegen::translateASTToMLIR(tu, ctx, warningsAsErrors);
+  auto module = codegen::translateASTToMLIR(tu, ctx, warningsAsErrors,
+                                            allowF64MathF32);
   if (!module) {
     llvm::errs() << "codegen failed\n";
     return 1;

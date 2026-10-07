@@ -1,0 +1,47 @@
+// test/MLIR/f64_math_any_width.vc — the any-width builtins keep f64.
+//
+// The complement of f64_math_error.vc: everything outside the GLSLstd450
+// transcendental set runs in the operand's own precision, so a `double` result
+// really is double. That covers the SPIRV_Float ops (Sqrt/Floor/FAbs/FMin/FMax/
+// FClamp, which the spirv dialect accepts at any float width) and the ones VC
+// spells out of any-width ops because no opcode exists — `fract` is
+// x - floor(x), `degrees`/`radians` multiply by a constant, `fmod` divides and
+// floors. None of them may go through the f32 fallback, so the whole kernel
+// must lower with no truncf/extf pair and no diagnostic at all.
+//
+// A float argument stays float: `sin((float)d)` is the CUDA `sinf` shape the
+// rejection in f64_math_error.vc points at, and it emits GLSin on an f32 value.
+//
+// RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+
+__global__ void k(double *out, const double *in) {
+  int i = threadIdx.x;
+  double d = in[i];
+  double s = sqrt(d);
+  // CHECK-LABEL: func.func @k
+  // CHECK: spirv.GL.Sqrt %{{.*}} : f64
+  double fl = floor(d);
+  // CHECK: spirv.GL.Floor %{{.*}} : f64
+  double ab = fabs(d);
+  // CHECK: spirv.GL.FAbs %{{.*}} : f64
+  double mn = fmin(d, 1.0);
+  // CHECK: spirv.GL.FMin %{{.*}} : f64
+  double cl = clamp(d, 0.0, 1.0);
+  // CHECK: spirv.GL.FClamp %{{.*}} : f64
+  double tr = trunc(d);
+  // CHECK: spirv.GL.Floor %{{.*}} : f64
+  // CHECK: spirv.GL.Ceil %{{.*}} : f64
+  double fr = fract(d);
+  // CHECK: spirv.GL.Floor %{{.*}} : f64
+  double dg = degrees(d);
+  // CHECK: arith.mulf %{{.*}} : f64
+  double rd = radians(d);
+  // CHECK: arith.mulf %{{.*}} : f64
+  double fm = fmod(d, 1.0);
+  // CHECK: arith.divf %{{.*}} : f64
+  double sn = sin((float)d);
+  // CHECK: spirv.GL.Sin %{{.*}} : f32
+  // The f32 fallback (truncf→op→extf) belongs to the opt-in path only.
+  // CHECK-NOT: arith.truncf
+  out[i] = s + fl + ab + mn + cl + tr + fr + dg + rd + fm + sn;
+}

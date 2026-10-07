@@ -64,6 +64,10 @@ int main(int argc, char **argv) {
       cl::desc("treat warnings as errors"));
   cl::opt<bool> syntaxOnly("fsyntax-only",
       cl::desc("lex, parse and type-check only; emit no output"));
+  cl::opt<bool> allowF64MathF32(
+      "fallow-f64-math-f32",
+      cl::desc("compute double transcendentals (sin/pow/...) in float "
+               "instead of rejecting them"));
   cl::ParseCommandLineOptions(argc, argv, "VC compiler (GLSL backend)\n");
 
   EmitKind kind = EmitKind::SPIRV;
@@ -105,9 +109,21 @@ int main(int argc, char **argv) {
   }
 
   // 2. AST -> one GLSL compute unit per __global__ kernel.
-  auto glslModules = glsl::translateASTToGLSLSources(tu);
+  auto glslModules = glsl::translateASTToGLSLSources(tu, allowF64MathF32);
   if (glslModules.empty()) {
     errs() << "no kernel to emit\n";
+    return 1;
+  }
+
+  for (const auto &m : glslModules) {
+    if (m.unsupportedF64Math.empty()) continue;
+    errs() << "error: no double-precision form of " << m.unsupportedF64Math
+           << " in kernel '" << m.entryName
+           << "': SPIR-V's GLSLstd450 transcendentals are f16/f32-only and "
+              "Vulkan GLSL has no double overload either. Compute it in float, "
+              "e.g. `float r = sin((float)x);` (CUDA's `sinf`), or pass "
+              "-fallow-f64-math-f32 to compute it in float and store the "
+              "result as double\n";
     return 1;
   }
 

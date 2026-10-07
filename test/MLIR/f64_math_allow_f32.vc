@@ -1,0 +1,25 @@
+// test/MLIR/f64_math_allow_f32.vc — the opt-in f64 transcendental lowering.
+//
+// -fallow-f64-math-f32 says "I know": compute the transcendental in float and
+// extend the result back to double, so the storage width at the call site is
+// preserved while the digits are f32's. The lowering is a truncf into the
+// GLSLstd450 op and an extf back out — and it still warns, which -Werror can
+// promote (second RUN line), so the compromise cannot become invisible even
+// after opting in.
+//
+// RUN: mlirc -emit=mlir -fallow-f64-math-f32 %s 2>&1 | FileCheck %s
+// RUN: mlirc -emit=mlir -fallow-f64-math-f32 -Werror %s 2>&1 | FileCheck %s --check-prefix=WERROR
+
+__global__ void k(float *out, int n) {
+  int tid = threadIdx.x;
+  double d = (double)n + 1.5;
+  // CHECK: warning: sin on a double operand is computed in float precision by the MLIR backend
+  // CHECK: arith.truncf {{.*}} : f64 to f32
+  // CHECK: spirv.GL.Sin
+  // CHECK: arith.extf {{.*}} : f32 to f64
+  double a = sin(d);
+  // WERROR: error (warning promoted by -Werror): pow on a double operand is computed in float precision
+  // WERROR: codegen failed
+  double b = pow(d, 2.0);
+  out[tid] = (float)(a * b);
+}
