@@ -147,8 +147,12 @@ which Sema does not type-check). The fourth argument is the stream handle.
 - **`wmma::*` / cooperative matrix** is implemented:
   `gpu.subgroup_mma` → `spirv.KHR.CooperativeMatrix`, with post-conversion
   fixups (f16 SSBO narrowing, entry-point interfaces, marked atomics) and an
-  opportunistic runtime request for `coopMatrix` + `shaderFloat16`. The
-  `wmma_gemm.vc` demo passes e2e on the MLIR backend.
+  opportunistic runtime request for `coopMatrix` + `shaderFloat16` +
+  `vulkanMemoryModel`. SPV_KHR_cooperative_matrix requires a module that
+  declares `Shader` + `CooperativeMatrixKHR` to declare `VulkanMemoryModel` too
+  and to use it as its `OpMemoryModel`; MLIR's GPU→SPIR-V conversion still
+  writes `GLSL450`, so the lowering patches both on the `spirv.module`
+  afterwards. The `wmma_gemm.vc` demo passes e2e on the MLIR backend.
 - **`double`, `long` and `__half` need device support, and VC says so out loud.**
   Each of those widths lowers to a SPIR-V capability (`Float64` / `Int64` /
   `Float16`) that Vulkan gates behind a device feature (`shaderFloat64` /
@@ -180,6 +184,18 @@ silently miscompiled:
 - No string type beyond `printf` format strings.
 - `__constant__` is compile-time-initialized only — there is no
   `cudaMemcpyToSymbol` runtime path.
+
+One construct compiles and runs but is **not valid SPIR-V**, so a stricter
+driver can refuse it at `vkCreateShaderModule`:
+
+- A `__device__` function that returns a reference (`int &pick(int &a, int &b,
+  int sel)`) has to hand the caller a pointer value. SPIR-V's logical addressing
+  model forbids both a Function-storage variable holding a pointer and a function
+  returning one, so the emitted module fails `spirv-val`; MoltenVK compiles it
+  and the `ref_return.vc` demo passes. `test/check_spirv_val.py` keeps the file
+  on a documented exception list so the rest of the sweep stays strict. The legal
+  lowering is the one the GLSL backend already uses for this source: inline the
+  call and let each branch carry the store.
 
 Two behaviours that earlier revisions of this document listed as limitations
 are in fact **fixed** and should not be worked around:

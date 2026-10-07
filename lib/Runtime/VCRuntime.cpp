@@ -350,6 +350,7 @@ bool Runtime::enumerateDevices(VkInstance instance) {
       const VulkanDevice &ownerDev = *groupDevices.front();
       vd->timelineSemaphore = ownerDev.timelineSemaphore;
       vd->coopMatrix = ownerDev.coopMatrix;
+      vd->vulkanMemoryModel = ownerDev.vulkanMemoryModel;
       vd->f16Storage = ownerDev.f16Storage;
       vd->shaderFloat16 = ownerDev.shaderFloat16;
       vd->shaderFloat64 = ownerDev.shaderFloat64;
@@ -427,6 +428,18 @@ bool Runtime::setupLogicalDevice(
     feats12.shaderFloat16 = VK_TRUE;
     coopFeats.cooperativeMatrix = VK_TRUE;
     vd.coopMatrix = true;
+  }
+  // A cooperative-matrix module additionally declares the VulkanMemoryModel
+  // capability and its OpMemoryModel reads `Logical VulkanMemoryModel`
+  // (SPV_KHR_cooperative_matrix: Shader + CooperativeMatrixKHR require it — see
+  // useVulkanMemoryModelForCooperativeMatrix in LoweringPasses.cpp). Vulkan only
+  // accepts that memory model when the device was created with the
+  // vulkanMemoryModel feature, which Vulkan 1.2 core carries in
+  // VkPhysicalDeviceVulkan12Features above. Enabled opportunistically: a GLSL450
+  // shader doesn't reference the bit, so kernels without wmma are unaffected.
+  if (supported12.vulkanMemoryModel) {
+    feats12.vulkanMemoryModel = VK_TRUE;
+    vd.vulkanMemoryModel = true;
   }
   // Scalar __half SSBO load/store needs shaderFloat16 (f16 arithmetic) AND
   // storageBuffer16BitAccess (16-bit values in SSBOs). Enable both when the
@@ -515,7 +528,8 @@ bool Runtime::setupLogicalDevice(
   // about the same bit. When nothing got enabled there is nothing to chain, so
   // the plain pEnabledFeatures path (all features off) is used instead.
   const bool anyVulkan12 =
-      vd.timelineSemaphore || vd.coopMatrix || vd.f16Storage || vd.shaderFloat16;
+      vd.timelineSemaphore || vd.coopMatrix || vd.f16Storage ||
+      vd.shaderFloat16 || vd.vulkanMemoryModel;
   if (anyVulkan12 || vd.shaderFloat64 || vd.shaderInt64) {
     void *tail = useDeviceGroup ? static_cast<void *>(&dgci) : nullptr;
     if (anyVulkan12) {
@@ -2197,13 +2211,15 @@ enum SpvStorageClass : uint32_t {
 };
 
 // Capability ids VC's backend can emit (SPIR-V core registry,
-// SPV_KHR_16bit_storage, SPV_KHR_cooperative_matrix).
+// SPV_KHR_16bit_storage, SPV_KHR_vulkan_memory_model,
+// SPV_KHR_cooperative_matrix).
 enum SpvCapability : uint32_t {
   SpvCapFloat16 = 9,
   SpvCapFloat64 = 10,
   SpvCapInt64 = 11,
   SpvCapStorageBuffer16BitAccess = 4433,
   SpvCapStoragePushConstant16 = 4435,
+  SpvCapVulkanMemoryModel = 5345,
   SpvCapCooperativeMatrixKHR = 6022,
 };
 
@@ -2499,6 +2515,12 @@ static bool unsupportedCapability(uint32_t cap, const VulkanDevice &vd,
       {SpvCapFloat16, "Float16", "shaderFloat16", vd.shaderFloat16},
       {SpvCapFloat64, "Float64", "shaderFloat64", vd.shaderFloat64},
       {SpvCapInt64, "Int64", "shaderInt64", vd.shaderInt64},
+      // Declared by a cooperative-matrix module, whose OpMemoryModel is then
+      // `Logical VulkanMemoryModel` (SPV_KHR_cooperative_matrix requires both).
+      // Vulkan validates the model against the enabled feature at
+      // vkCreateShaderModule, so name it here rather than let that fail opaque.
+      {SpvCapVulkanMemoryModel, "VulkanMemoryModel", "vulkanMemoryModel",
+       vd.vulkanMemoryModel},
       {SpvCapStorageBuffer16BitAccess, "StorageBuffer16BitAccess",
        "VkPhysicalDevice16BitStorageFeatures::storageBuffer16BitAccess",
        vd.storageBuffer16BitAccess},
@@ -2709,6 +2731,22 @@ bool Runtime::buildLayout(VCKernel &k, int deviceIdx,
         pcSize += sz;
       ++scalarOrdinal;
     }
+  }
+
+  // A push-constant range has to fit the device's maxPushConstantsSize, and
+  // vkCreatePipelineLayout answers an oversized one with a bare VkResult that
+  // names neither the size nor the limit. Check it here, before creating
+  // anything, so the message says what to change.
+  const uint32_t maxPc =
+      devices_[deviceIdx]->physProps.limits.maxPushConstantsSize;
+  if (pcSize > maxPc) {
+    std::fprintf(stderr,
+                 "vc: kernel '%s': %u bytes of scalar kernel arguments exceed "
+                 "device '%s' maxPushConstantsSize (%u); move the payload into "
+                 "a buffer argument\n",
+                 k.entryPoint.c_str(), pcSize,
+                 devices_[deviceIdx]->physProps.deviceName, maxPc);
+    return false;
   }
 
   VkDescriptorSetLayoutCreateInfo dci{};

@@ -278,7 +278,7 @@ warnings to hard errors.
 | Math builtins (`sqrt`/`sin`/`pow`/…) | `math_builtins2/3.vc` | `spirv.GL.*`. SPIR-V has no f64 transcendental opcode, so in MLIR a `double` argument is computed at f32 precision — reported as a warning, and a hard error under `-Werror` |
 | Warp shuffles / ballot | `warp.vc` | `gpu.subgroup_size`+`GroupNonUniform*`; needs SPIR-V 1.3 (vulkan1.1) on demand |
 | Vote (`__syncthreads_count/and/or`) | `vote.vc` | shared-array reduction |
-| WMMA / cooperative matrix | `wmma_gemm.vc` | `gpu.subgroup_mma`→`spirv.KHR.CooperativeMatrix`; runtime opportunistic coopMatrix+shaderFloat16 |
+| WMMA / cooperative matrix | `wmma_gemm.vc`, `wmma.vc` | `gpu.subgroup_mma`→`spirv.KHR.CooperativeMatrix`; SPIR-V 1.6 + `VulkanMemoryModel` (patched onto the module), runtime opportunistic coopMatrix+shaderFloat16+vulkanMemoryModel |
 | Kernel `printf` | `printf.vc` | `debugPrintfEXT` (GLSL only; MLIR skip-listed) |
 
 ### Host runtime API

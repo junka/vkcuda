@@ -146,6 +146,16 @@ spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context, bool usesSubgroup,
     version = spirv::Version::V_1_6; // supersedes 1.3
     caps.push_back(spirv::Capability::CooperativeMatrixKHR);
     exts.push_back(spirv::Extension::SPV_KHR_cooperative_matrix);
+    // SPV_KHR_cooperative_matrix additionally requires the VulkanMemoryModel
+    // capability ("If the Shader and CooperativeMatrixKHR capabilities are
+    // declared, the VulkanMemoryModel capability must also be declared" --
+    // spirv-val), so the target advertises it. This attr alone is not what
+    // reaches the binary: ConvertGPUToSPIRV still writes the module's memory
+    // model as `Logical GLSL450` and SPIRVUpdateVCEPass rebuilds the emitted
+    // capability list from the ops present, which drops it.
+    // useVulkanMemoryModelForCooperativeMatrix in LoweringPasses.cpp repairs
+    // both on the spirv.module after legalization.
+    caps.push_back(spirv::Capability::VulkanMemoryModel);
   }
   // A by-value f16 vector kernel arg (`__half2 v`, `half4 v`) is pushed through
   // a PushConstant struct member `vector<Nxf16>` (lowerScalarArgsToPushConstant).

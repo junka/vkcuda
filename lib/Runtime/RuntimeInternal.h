@@ -64,6 +64,8 @@ struct VulkanDevice {
   bool shaderInt64 = false;
   bool storageBuffer16BitAccess = false; // VkPhysicalDevice16BitStorageFeatures
   bool storagePushConstant16 = false;    // VkPhysicalDevice16BitStorageFeatures
+  bool vulkanMemoryModel = false;        // VkPhysicalDeviceVulkan12Features,
+                                         // required by coop-matrix shaders
   // Per-device default stream. CUDA gives each device its own default stream;
   // vcSetDevice(i) makes resolveStream(NULL) return devices_[i]->defaultStream.
   // unique_ptr because VCStream is forward-declared at this point.

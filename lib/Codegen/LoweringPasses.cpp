@@ -377,6 +377,52 @@ static void fixupF16StorageBuffers(ModuleOp module) {
 }
 
 
+// SPV_KHR_cooperative_matrix additionally requires `OpMemoryModel Logical
+// VulkanMemoryModel` ("If the Shader and CooperativeMatrixKHR capabilities are
+// declared, the VulkanMemoryModel capability must also be declared" --
+// spirv-val), and a module that declares the capability must use that model.
+// Neither of the two places MLIR derives the serialized header from honors it:
+// ConvertGPUToSPIRV hardcodes the GLSL450 model into the spirv.module's own
+// `memory_model` attribute, and SPIRVUpdateVCEPass rebuilds `vce_triple` (the
+// list the serializer emits as OpCapability) from the ops it finds, so a
+// capability the target env advertises but no op demands is dropped. Coop-matrix
+// shaders therefore came out as `Logical GLSL450` + CooperativeMatrixKHR, which
+// spirv-val rejects and vkCreateShaderModule would refuse on a device that
+// actually has the feature. Rewrite both attributes here, after the re-run
+// legalization has produced the vce_triple, and only for a module that requires
+// the capability: other kernels keep GLSL450, since switching the model makes
+// the shader need the device's `vulkanMemoryModel` feature (see
+// checkSpirvCapabilities in VCRuntime.cpp).
+static void useVulkanMemoryModelForCooperativeMatrix(ModuleOp module) {
+  module.walk([&](spirv::ModuleOp spvModule) {
+    std::optional<spirv::VerCapExtAttr> triple = spvModule.getVceTriple();
+    if (!triple)
+      return;
+    SmallVector<spirv::Capability, 8> caps(triple->getCapabilities().begin(),
+                                           triple->getCapabilities().end());
+    if (!llvm::is_contained(caps, spirv::Capability::CooperativeMatrixKHR))
+      return;
+    if (spvModule.getMemoryModel() == spirv::MemoryModel::Vulkan)
+      return;
+
+    auto version = triple->getVersion();
+    if (!llvm::is_contained(caps, spirv::Capability::VulkanMemoryModel))
+      caps.push_back(spirv::Capability::VulkanMemoryModel);
+    SmallVector<spirv::Extension, 4> exts(triple->getExtensions().begin(),
+                                          triple->getExtensions().end());
+    // Core SPIR-V 1.5+; below that only the SPV_KHR_vulkan_memory_model
+    // extension makes the model legal. The cooperative-matrix target is 1.6.
+    if (version < spirv::Version::V_1_5 &&
+        !llvm::is_contained(exts,
+                            spirv::Extension::SPV_KHR_vulkan_memory_model))
+      exts.push_back(spirv::Extension::SPV_KHR_vulkan_memory_model);
+
+    spvModule.setMemoryModel(spirv::MemoryModel::Vulkan);
+    spvModule.setVceTripleAttr(
+        spirv::VerCapExtAttr::get(version, caps, exts, spvModule->getContext()));
+  });
+}
+
 // When the MemRef→SPIRV conversion widens an f16 SSBO to f32 (see
 // fixupF16StorageBuffers), the scalar `memref.store` pattern emits a
 // `spirv.Store ptr<f32>, %val:f16` — a type mismatch that fails spirv
@@ -419,6 +465,69 @@ static LogicalResult rejectPointerBitcasts(ModuleOp module) {
                  "interface variable's type disagrees with the kernel "
                  "argument it reaches");
     found = true;
+  });
+  return failure(found);
+}
+
+// MLIR's MemRef→SPIRV converter widens an SSBO of halfs to 4-byte elements and
+// fixupF16StorageBuffers narrows the ones an f16 access reaches back down.
+// Where that narrowing misses something, the result is not a type error the
+// verifier catches but a layout error: a cooperative-matrix f16 tile read
+// through `ptr<f32, StorageBuffer>` takes two halfs out of every float, an f16
+// store through one lands at the wrong offset, and an `f32 <-> f16`
+// `unrealized_conversion_cast` inside the spirv.module is the bridge between an
+// access of one width and a value of the other. A device that accepts such a
+// binary computes the wrong numbers without complaining, so stop the build
+// instead of shipping it (same reasoning as rejectPointerBitcasts).
+static LogicalResult rejectResidualF16Widening(ModuleOp module) {
+  bool found = false;
+  auto isF32StorageBuffer = [](Value ptr) {
+    auto ptrTy = dyn_cast<spirv::PointerType>(ptr.getType());
+    return ptrTy &&
+           ptrTy.getStorageClass() == spirv::StorageClass::StorageBuffer &&
+           ptrTy.getPointeeType().isF32();
+  };
+
+  module.walk([&](spirv::KHRCooperativeMatrixLoadOp op) {
+    auto matrixTy =
+        cast<spirv::CooperativeMatrixType>(op.getResult().getType());
+    if (matrixTy.getElementType().isF16() && isF32StorageBuffer(op.getPointer())) {
+      op.emitError("f16 cooperative-matrix load reaches a StorageBuffer whose "
+                   "elements are still f32; the f16 narrowing did not cover "
+                   "this interface variable");
+      found = true;
+    }
+  });
+  module.walk([&](spirv::KHRCooperativeMatrixStoreOp op) {
+    auto matrixTy =
+        cast<spirv::CooperativeMatrixType>(op.getObject().getType());
+    if (matrixTy.getElementType().isF16() && isF32StorageBuffer(op.getPointer())) {
+      op.emitError("f16 cooperative-matrix store reaches a StorageBuffer whose "
+                   "elements are still f32; the f16 narrowing did not cover "
+                   "this interface variable");
+      found = true;
+    }
+  });
+  module.walk([&](spirv::StoreOp op) {
+    if (op.getValue().getType().isF16() && isF32StorageBuffer(op.getPtr())) {
+      op.emitError("f16 value stored through a StorageBuffer pointer to f32; "
+                   "the interface variable and the access disagree on the "
+                   "element width");
+      found = true;
+    }
+  });
+  module.walk([&](spirv::ModuleOp spvModule) {
+    spvModule.walk([&](UnrealizedConversionCastOp op) {
+      if (op->getNumResults() != 1 || op->getNumOperands() != 1) return;
+      mlir::Type from = op.getOperand(0).getType();
+      mlir::Type to = op.getResult(0).getType();
+      if (!((from.isF16() && to.isF32()) || (from.isF32() && to.isF16())))
+        return;
+      op.emitError("lowering left an f16<->f32 conversion bridge inside the "
+                   "spirv.module: the access and the value it feeds still "
+                   "disagree on the element width");
+      found = true;
+    });
   });
   return failure(found);
 }
@@ -688,6 +797,32 @@ static bool hasFunctionStorageRefParams(ModuleOp module) {
   return found;
 }
 
+// True when the device code reads or writes an f16 StorageBuffer (`__half*`
+// kernel arg, or a wmma tile over one). This is the only input shape whose
+// known MemRef→SPIRV residue aborts pm.run below — f16 values stored through
+// the converter's 4-byte-widened pointer — and therefore the only case where
+// runLoweringPipeline filters that diagnostic.
+static bool hasF16StorageBufferAccess(ModuleOp module) {
+  bool found = false;
+  auto isF16SSBO = [&](mlir::Type ty) {
+    auto memrefTy = ty.dyn_cast<mlir::MemRefType>();
+    if (!memrefTy || !memrefTy.getElementType().isF16())
+      return;
+    auto scAttr =
+        memrefTy.getMemorySpace()
+            .dyn_cast_or_null<spirv::StorageClassAttr>();
+    if (scAttr && scAttr.getValue() == spirv::StorageClass::StorageBuffer)
+      found = true;
+  };
+  module.walk([&](Operation *op) {
+    if (found)
+      return;
+    for (Value operand : op->getOperands())
+      isF16SSBO(operand.getType());
+  });
+  return found;
+}
+
 LogicalResult runLoweringPipeline(ModuleOp module) {
   MLIRContext &ctx = *module.getContext();
   ctx.getOrLoadDialect<mlir::spirv::SPIRVDialect>();
@@ -787,25 +922,32 @@ LogicalResult runLoweringPipeline(ModuleOp module) {
   // repairs it). That single stderr line is spurious — the build succeeds and
   // spirv-val passes — so install a scoped handler around pm.run that swallows
   // exactly that known mismatch and forwards everything else. The handler is
-  // RAII-scoped to this pm.run, so it cannot mask errors elsewhere or later.
+  // RAII-scoped to this pm.run, so it cannot mask errors elsewhere or later, and
+  // it is only installed for a module that has an f16 StorageBuffer access at
+  // all: that residue is the only thing that mismatch can come from, so every
+  // other module's pm.run errors print. Whether the repair actually covered
+  // everything is checked afterwards (rejectResidualF16Widening), not assumed.
   {
-    ScopedDiagnosticHandler diagHandler(&ctx, [](Diagnostic &diag) {
-      if (diag.getSeverity() == DiagnosticSeverity::Error) {
-        std::string msg = diag.str();
-        // The residue the f16-SSBO converter leaves, repaired post-run by
-        // fixupF16StorageBuffers. Match on the verifier's wording so unrelated
-        // spirv.Store/Load errors still surface.
-        if (msg.find("spirv.Store") != std::string::npos &&
-            msg.find("mismatch in result type and pointer type") !=
-                std::string::npos)
-          return success();
-        if (msg.find("spirv.Load") != std::string::npos &&
-            msg.find("mismatch in result type and pointer type") !=
-                std::string::npos)
-          return success();
-      }
-      return failure();
-    });
+    const bool maySwallowF16Residue = hasF16StorageBufferAccess(module);
+    std::optional<ScopedDiagnosticHandler> diagHandler;
+    if (maySwallowF16Residue)
+      diagHandler.emplace(&ctx, [](Diagnostic &diag) {
+        if (diag.getSeverity() == DiagnosticSeverity::Error) {
+          std::string msg = diag.str();
+          // The residue the f16-SSBO converter leaves, repaired post-run by
+          // fixupF16StorageBuffers. Match on the verifier's wording so unrelated
+          // spirv.Store/Load errors still surface.
+          if (msg.find("spirv.Store") != std::string::npos &&
+              msg.find("mismatch in result type and pointer type") !=
+                  std::string::npos)
+            return success();
+          if (msg.find("spirv.Load") != std::string::npos &&
+              msg.find("mismatch in result type and pointer type") !=
+                  std::string::npos)
+            return success();
+        }
+        return failure();
+      });
     (void)failed(pm.run(module));
   }
 
@@ -829,6 +971,10 @@ LogicalResult runLoweringPipeline(ModuleOp module) {
   // PassManager so the EntryPoint + vce_triple the serializer needs exist.
   rerunAbortedSPIRVLegality(module);
 
+  // Cooperative-matrix modules need OpMemoryModel VulkanMemoryModel, which
+  // neither the conversion nor the re-run UpdateVCE pass above produces.
+  useVulkanMemoryModelForCooperativeMatrix(module);
+
   // SPIR-V 1.4+ requires every statically-used interface variable (including
   // StorageBuffer/Uniform descriptor variables) to be listed in the entry
   // point's interface list. The KHR cooperative-matrix target is bumped to
@@ -840,7 +986,22 @@ LogicalResult runLoweringPipeline(ModuleOp module) {
   // (No-op below SPIR-V 1.4, where listing StorageBuffer vars is illegal.)
   populateEntryPointInterfaces(module);
 
+  // The state the serializer sees, after the f16 narrowing and the re-run
+  // legalization: the only place where the SSBO element widths, the interface
+  // variables and the kernel signature can still disagree is here.
+  if (std::getenv("VC_SPIRV_DEBUG")) {
+    llvm::errs() << "=== after lowering + f16 fixup ===\n";
+    module->print(llvm::errs(), OpPrintingFlags().assumeVerified());
+    llvm::errs() << "\n";
+  }
+
   if (failed(rejectPointerBitcasts(module)))
+    return failure();
+
+  // Same residue class, one level down: an f16 access still reaching an f32
+  // interface variable would serialize into a shader that reads the wrong
+  // offsets instead of one the device refuses.
+  if (failed(rejectResidualF16Widening(module)))
     return failure();
 
   // Keep only the spirv.module: erase the original gpu.module (clone source)

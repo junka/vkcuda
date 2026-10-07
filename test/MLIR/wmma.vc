@@ -6,6 +6,7 @@
 // fp16-input/fp32-accumulate shape is used (the dev GPU's supported shape).
 //
 // RUN: mlirc -emit=mlir %s 2>&1 | FileCheck %s
+// RUN: mlirc -emit=spirv %s -o %t.spv && python3 "$(dirname "%s")/spirv_capabilities.py" %t.spv | FileCheck %s --check-prefix=BIN && python3 "$(dirname "%s")/spirv_storage_buffers.py" %t.spv | FileCheck %s --check-prefix=BUF
 //
 // Fragment decls produce no storage; the matrix value is register-resident
 // and flows as SSA through load -> compute -> store.
@@ -20,10 +21,24 @@
 // CHECK-SAME: !gpu.mma_matrix<8x8xf32, "COp">
 // CHECK: gpu.subgroup_mma_store_matrix
 //
-// The GPUToSPIRV pass lowers these to spirv.KHR.CooperativeMatrix* and the
-// serialized binary advertises SPV_KHR_cooperative_matrix (verified by the
-// e2e demo test/wmma_gemm.vc, not here — -emit=spirv yields a binary that
-// FileCheck cannot match as text).
+// The serialized module is what the device validates, and the cooperative
+// matrix shapes two things the IR-level checks above can't see: the tiles must
+// be contiguous halfs (MLIR's MemRef->SPIRV converter widens them to stride 4,
+// which fixupF16StorageBuffers narrows again — see f16_ssbo_layout.vc for the
+// scalar path), and the module must both declare VulkanMemoryModel and use it
+// for its memory model. SPV_KHR_cooperative_matrix requires the capability
+// alongside Shader + CooperativeMatrixKHR, and Vulkan rejects the model at
+// vkCreateShaderModule unless the device enabled vulkanMemoryModel.
+
+// BIN:      memory-model Logical Vulkan
+// BIN-NEXT: capability Shader
+// BIN:      capability CooperativeMatrixKHR
+// BIN:      capability VulkanMemoryModel
+
+// BUF:      storage-buffer kern_arg_0 binding=0 stride=2 element=half
+// BUF-NEXT: storage-buffer kern_arg_1 binding=1 stride=2 element=half
+// BUF-NEXT: storage-buffer kern_arg_2 binding=2 stride=4 element=float
+// BUF-NEXT: pointer-bitcasts 0
 
 __global__ void kern(half *A, half *B, float *C) {
   wmma::fragment<wmma::matrix_a, 8, 8, 16, half, wmma::row_major> a_frag;

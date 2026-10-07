@@ -211,6 +211,30 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# SPIR-V validity sweep
+#
+# `cmake --build build --target spirv-val-check` compiles every .vc under test/
+# and examples/ with the MLIR backend and runs spirv-val over each binary. The
+# GPU e2e suite is the only thing that ever loads them, and it needs a device CI
+# does not have, so this is the device-free check that the lowering emits
+# loadable SPIR-V at all. test/check_spirv_val.py carries the (small,
+# documented) list of modules known to be invalid; anything outside it fails.
+# ---------------------------------------------------------------------------
+find_program(VC_SPIRV_VAL NAMES spirv-val NO_CACHE)
+if(VC_ENABLE_MLIR AND Python3_Interpreter_FOUND AND VC_SPIRV_VAL AND TARGET vc)
+  add_custom_target(spirv-val-check
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/check_spirv_val.py
+            --mlirc $<TARGET_FILE:vc>
+            --spirv-val ${VC_SPIRV_VAL}
+            ${CMAKE_SOURCE_DIR}/test ${CMAKE_SOURCE_DIR}/examples
+    DEPENDS vc
+    COMMENT "Validating every emitted SPIR-V module with spirv-val"
+    USES_TERMINAL)
+else()
+  message(STATUS "spirv-val-check disabled (needs VC_ENABLE_MLIR, vc, spirv-val)")
+endif()
+
+# ---------------------------------------------------------------------------
 # End-to-end demo tests (GPU-dependent)
 #
 # `cmake --build build --target vc-e2e-check` builds every self-verifying

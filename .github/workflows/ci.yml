@@ -1,7 +1,8 @@
 name: build-and-test
 
 # Build the compiler (GLSL `vcc` + MLIR `vc`) and run the lit regression
-# suites (vc-check frontend, mlir-check MLIR IR). GPU end-to-end demos are
+# suites (vc-check frontend, mlir-check MLIR IR) plus the device-free SPIR-V
+# validity sweep (spirv-val-check). GPU end-to-end demos are
 # NOT run here — GitHub-hosted runners have no Vulkan device. Use the
 # `release` workflow (tag-triggered) to produce a .deb.
 #
@@ -49,6 +50,12 @@ jobs:
 
       - name: MLIR IR regression tests (mlir-check)
         run: cmake --build build --target mlir-check
+
+      # Device-free half of the "is the output loadable" question: the e2e suite
+      # needs a GPU, so spirv-val over every emitted module is what catches a
+      # lowering that writes SPIR-V no driver will take.
+      - name: SPIR-V validity sweep (spirv-val-check)
+        run: cmake --build build --target spirv-val-check
 
       # Smoke-test the compiler drivers actually run on the runner.
       - name: Smoke test (vcc --help, vc --help)
