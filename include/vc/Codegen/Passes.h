@@ -8,6 +8,7 @@
 #define VC_CODEGEN_PASSES_H
 
 #include "mlir/IR/OwningOpRef.h"
+#include "mlir/Support/LogicalResult.h"
 
 namespace mlir {
 class MLIRContext;
@@ -34,7 +35,11 @@ void lowerVCToGPU(::mlir::ModuleOp module);
 /// Run the full lowering pipeline: VC -> (standard/gpu) -> SPIR-V.
 /// Stage 1 is `lowerVCToGPU`; the gpu->spirv stage reuses MLIR's built-in
 /// conversion passes.
-void runLoweringPipeline(::mlir::ModuleOp module);
+///
+/// Fails when the lowering leaves the module in a shape that would serialize
+/// into an unloadable — or, worse, silently wrong — SPIR-V binary, so the
+/// driver does not emit a binary it knows to be bad.
+::mlir::LogicalResult runLoweringPipeline(::mlir::ModuleOp module);
 
 } // namespace codegen
 } // namespace vc

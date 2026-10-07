@@ -218,10 +218,13 @@ static void fixupF16StorageBuffers(ModuleOp module) {
     // Pass 2: for each f16 base, narrow its type and rebuild every AccessChain
     // on it to yield ptr<f16>. The base is either a func arg (mutate its type
     // in place) or an addressof (rebuild, then rebuild its AccessChains).
+    DenseSet<spirv::FuncOp> narrowedFuncs;
     for (Value base : f16Bases) {
       if (auto blkArg = dyn_cast<BlockArgument>(base)) {
         // SSBO kernel arg, pre-lower-abi-attrs: mutate the arg type directly.
         blkArg.setType(ptrTy);
+        if (auto fn = dyn_cast<spirv::FuncOp>(blkArg.getOwner()->getParentOp()))
+          narrowedFuncs.insert(fn);
         // Rebuild AccessChains using this arg as base.
         SmallVector<spirv::AccessChainOp> chains;
         for (auto *u : blkArg.getUsers())
@@ -256,6 +259,25 @@ static void fixupF16StorageBuffers(ModuleOp module) {
         addr.replaceAllUsesWith(newAddr.getResult());
         addr.erase();
       }
+    }
+
+    // A spirv.func signature is a `function_type` attribute, separate from the
+    // entry block's argument types that setType above just narrowed. Leaving the
+    // two disagreeing is not cosmetic: the fixup runs after the in-pipeline
+    // conversion aborted, so spirv-lower-abi-attrs only runs later (via
+    // rerunAbortedSPIRVLegality) and builds each SSBO interface global from the
+    // *signature* — still the widened `struct<(rtarray<f32, stride=4>)>`. It then
+    // bridges global -> narrowed argument with a spirv.bitcast, which SPIR-V
+    // forbids for logical pointers ("Instruction may not have a logical pointer
+    // operand"), and the global keeps ArrayStride 4 while the access math assumes
+    // stride 2 — silently wrong offsets even on a driver that skipped
+    // validation. Sync the signature with the region.
+    for (spirv::FuncOp fn : narrowedFuncs) {
+      SmallVector<mlir::Type> inputs;
+      for (Value arg : fn.getRegion().front().getArguments())
+        inputs.push_back(arg.getType());
+      fn.setFunctionType(FunctionType::get(fn.getContext(), inputs,
+                                           fn.getFunctionType().getResults()));
     }
 
     // Pass 3: after narrowing, scalar spirv.Load on an f16 SSBO still yields
@@ -376,6 +398,29 @@ static void rerunAbortedSPIRVLegality(ModuleOp module) {
   pm.addNestedPass<spirv::ModuleOp>(spirv::createSPIRVUpdateVCEPass());
   if (failed(pm.run(module)))
     module.emitError("post-fixup spirv.module legalization failed");
+}
+
+// spirv-lower-abi-attrs derives an SSBO interface global's type from the
+// spirv.func signature and, when a block argument's type disagrees with it,
+// bridges the two with a spirv.bitcast. OpBitcast may not take or yield a
+// logical pointer, so the residue makes the module fail spirv-val ("Instruction
+// may not have a logical pointer operand") and vkCreateComputePipelines with
+// VK_ERROR_INITIALIZATION_FAILED — and because the global keeps the widened
+// layout while the accesses compute for the narrowed one, it would be silently
+// wrong even where nothing validates the binary. Nothing in this emitter wants
+// a pointer bitcast, so stop the build instead of shipping the module.
+static LogicalResult rejectPointerBitcasts(ModuleOp module) {
+  bool found = false;
+  module.walk([&](spirv::BitcastOp op) {
+    if (!op.getOperand().getType().isa<spirv::PointerType>() ||
+        !op.getResult().getType().isa<spirv::PointerType>())
+      return;
+    op.emitError("lowering left a pointer-to-pointer spirv.bitcast: the "
+                 "interface variable's type disagrees with the kernel "
+                 "argument it reaches");
+    found = true;
+  });
+  return failure(found);
 }
 
 // SPIR-V 1.4+ requires every statically-used interface variable to be listed
@@ -643,7 +688,7 @@ static bool hasFunctionStorageRefParams(ModuleOp module) {
   return found;
 }
 
-void runLoweringPipeline(ModuleOp module) {
+LogicalResult runLoweringPipeline(ModuleOp module) {
   MLIRContext &ctx = *module.getContext();
   ctx.getOrLoadDialect<mlir::spirv::SPIRVDialect>();
 
@@ -795,6 +840,9 @@ void runLoweringPipeline(ModuleOp module) {
   // (No-op below SPIR-V 1.4, where listing StorageBuffer vars is illegal.)
   populateEntryPointInterfaces(module);
 
+  if (failed(rejectPointerBitcasts(module)))
+    return failure();
+
   // Keep only the spirv.module: erase the original gpu.module (clone source)
   // and anything else left at module scope.
   SmallVector<Operation *> nonSpirv;
@@ -805,6 +853,8 @@ void runLoweringPipeline(ModuleOp module) {
   });
   for (Operation *op : nonSpirv)
     op->erase();
+
+  return success();
 }
 
 } // namespace vc::codegen

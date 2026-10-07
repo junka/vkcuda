@@ -483,7 +483,8 @@ int main(int argc, char **argv) {
   }
 
   // SPIRV: run lowering then translate to binary.
-  codegen::runLoweringPipeline(*module);
+  if (failed(codegen::runLoweringPipeline(*module)))
+    return 1;
 
   // Serialize the spirv.module to a SPIR-V binary.
   SmallVector<uint32_t, 0> binary;

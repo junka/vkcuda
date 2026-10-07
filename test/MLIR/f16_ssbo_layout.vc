@@ -1,0 +1,32 @@
+// test/MLIR/f16_ssbo_layout.vc — an f16 SSBO reaches the device packed.
+//
+// MLIR's MemRef->SPIRV converter widens StorageBuffer elements smaller than
+// 4 bytes to 4 bytes (`memref<?xf16, StorageBuffer>` becomes
+// `ptr<struct<(rtarray<f32, stride=4>)>>`), but the host allocates a __half
+// array at 2 bytes per element, so element i would live at 4*i on the device
+// and 2*i in memory the host passed in. LoweringPasses.cpp's
+// fixupF16StorageBuffers narrows the interface variable back to
+// rtarray<f16, stride=2> — and has to narrow the spirv.func signature as well
+// as the entry block argument, because spirv-lower-abi-attrs derives the
+// interface variable from the signature. If the two disagree it bridges them
+// with an OpBitcast, which SPIR-V forbids for logical pointers, while the
+// variable keeps the widened ArrayStride.
+//
+// Neither is visible in -emit=mlir (that dump predates the conversion), so
+// this test reads the stride and the pointer-bitcast count out of the
+// serialized binary.
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && python3 "$(dirname "%s")/spirv_storage_buffers.py" %t.spv | FileCheck %s
+
+__global__ void narrow(__half *out, __half *in, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n)
+    out[i] = in[i];
+}
+
+// The binding order follows the parameter order, and both arrays are packed
+// halfs. CHECK-NOT on the bitcast count is the fail-closed half: a nonzero
+// count means the signature and the argument disagreed again.
+// CHECK:      storage-buffer narrow_arg_0 binding=0 stride=2 element=half
+// CHECK-NEXT: storage-buffer narrow_arg_1 binding=1 stride=2 element=half
+// CHECK-NEXT: pointer-bitcasts 0
