@@ -15,8 +15,13 @@
 
 __global__ void scale(float *out, float *in, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
+  // `0.0` is a double literal by C rules, but the value only ever lives in a
+  // float. The emitter folds such an immediate to the target width instead of
+  // keeping an f64 constant and its truncf — either one in the IR would make
+  // this f32 kernel declare Float64.
+  float acc = 0.0;
   if (i < n)
-    out[i] = in[i] * 2.0f;
+    out[i] = in[i] * 2.0f + acc;
 }
 
 // Shader is the first capability the emitter pushes, so the CHECK-NOT window

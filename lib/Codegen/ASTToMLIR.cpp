@@ -40,6 +40,7 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
 
+#include "llvm/ADT/APFloat.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace vc;
@@ -1757,7 +1758,7 @@ private:
     // struct fields, not array elements).
     if (v.getType() != elem && elem.isInteger(32)) {
       if (v.getType().isF64())
-        v = builder.create<arith::TruncFOp>(l, builder.getF32Type(), v);
+        v = convertFloatWidth(v, builder.getF32Type().cast<mlir::FloatType>(), l);
       if (v.getType().isF32() || v.getType().isF16())
         v = builder.create<arith::BitcastOp>(l, elem, v);
     }
@@ -1980,6 +1981,34 @@ private:
     return {l, r};
   }
 
+  // Float <-> float width change. An immediate is re-materialized at the
+  // target width instead of running ExtF/TruncF on it: `float acc = 0.0;` is a
+  // float value in the source, and leaving the f64 constant plus its truncf in
+  // the IR makes scanWidthUses (VCToGPU) declare the Float64 capability, which
+  // then gets the whole kernel refused on any device without shaderFloat64.
+  // rmNearestTiesToEven is the conversion TruncFOp would do at run time, so the
+  // value is unchanged.
+  Value convertFloatWidth(Value v, mlir::FloatType to, Location l) {
+    if (v.getType() == to) return v;
+    auto fold = [&](const llvm::APFloat &src) {
+      llvm::APFloat val = src;
+      bool losesInfo = false;
+      val.convert(to.getFloatSemantics(), llvm::APFloat::rmNearestTiesToEven,
+                  &losesInfo);
+      if (v.use_empty()) v.getDefiningOp()->erase();
+      return builder.create<arith::ConstantFloatOp>(l, val, to);
+    };
+    if (auto cf = v.getDefiningOp<arith::ConstantFloatOp>())
+      if (auto fa = cf.getValue().dyn_cast<mlir::FloatAttr>())
+        return fold(fa.getValue());
+    if (auto co = v.getDefiningOp<arith::ConstantOp>())
+      if (auto fa = co.getValue().dyn_cast<mlir::FloatAttr>())
+        return fold(fa.getValue());
+    if (v.getType().getIntOrFloatBitWidth() < to.getIntOrFloatBitWidth())
+      return builder.create<arith::ExtFOp>(l, to, v);
+    return builder.create<arith::TruncFOp>(l, to, v);
+  }
+
   Value castValue(Value v, mlir::Type to, Location lc) {
     v = loadValue(v, lc);
     mlir::Type from = v.getType();
@@ -2008,18 +2037,18 @@ private:
     if (from.isF16() && to.isSignlessInteger())
       return builder.create<arith::FPToSIOp>(lc, to, v);
     if (from.isF32() && to.isF64())
-      return builder.create<arith::ExtFOp>(lc, to, v);
+      return convertFloatWidth(v, builder.getF64Type().cast<mlir::FloatType>(), lc);
     if (from.isF64() && to.isF32())
-      return builder.create<arith::TruncFOp>(lc, to, v);
-    // f16 ↔ wider floats: widen with ExtFOp, narrow with TruncFOp.
+      return convertFloatWidth(v, builder.getF32Type().cast<mlir::FloatType>(), lc);
+    // f16 <-> wider floats: widen with ExtFOp, narrow with TruncFOp.
     if (from.isF16() && to.isF32())
-      return builder.create<arith::ExtFOp>(lc, to, v);
+      return convertFloatWidth(v, builder.getF32Type().cast<mlir::FloatType>(), lc);
     if (from.isF16() && to.isF64())
-      return builder.create<arith::ExtFOp>(lc, to, v);
+      return convertFloatWidth(v, builder.getF64Type().cast<mlir::FloatType>(), lc);
     if (from.isF32() && to.isF16())
-      return builder.create<arith::TruncFOp>(lc, to, v);
+      return convertFloatWidth(v, builder.getF16Type().cast<mlir::FloatType>(), lc);
     if (from.isF64() && to.isF16())
-      return builder.create<arith::TruncFOp>(lc, to, v);
+      return convertFloatWidth(v, builder.getF16Type().cast<mlir::FloatType>(), lc);
     return v;
   }
 

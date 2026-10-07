@@ -2420,16 +2420,30 @@ static SpirvReflectionInfo reflectSpirvResources(const uint32_t *words,
   std::vector<Binding> buffers;
   std::vector<Binding> entryNamedBuffers;
   std::string entryArgPrefix = entryPoint + "_arg_";
+  // The MLIR backend serializes every kernel of a .vc file into ONE module and
+  // names each interface variable `<kernel>_arg_<i>` and each push-constant
+  // struct `__vc_pc_<kernel>`, so a multi-kernel binary holds every kernel's
+  // variables at once. An entry point must ignore the ones that follow the
+  // convention but belong to another kernel: taking them all hands it the union
+  // of every kernel's bindings and member offsets, in unordered_map iteration
+  // order, so scalars land in another argument's slot and the kernel silently
+  // computes on garbage. A module from another producer (the GLSL backend, a
+  // hand-written .spv) carries no such names and keeps the take-all path.
+  const std::string entryPcVar = "__vc_pc_" + entryPoint;
   for (const auto &kv : vars) {
     const SpirvVariableInfo &v = kv.second;
+    const bool otherKernelArg =
+        v.name.find("_arg_") != std::string::npos &&
+        v.name.rfind(entryArgPrefix, 0) != 0;
     if ((v.storageClass == SpvStorageUniform ||
          v.storageClass == SpvStorageStorageBuffer) &&
-        v.binding != std::numeric_limits<uint32_t>::max()) {
+        v.binding != std::numeric_limits<uint32_t>::max() && !otherKernelArg) {
       buffers.push_back({v.descriptorSet, v.binding, kv.first});
       if (!entryArgPrefix.empty() && v.name.rfind(entryArgPrefix, 0) == 0)
         entryNamedBuffers.push_back({v.descriptorSet, v.binding, kv.first});
     }
     if (v.storageClass == SpvStoragePushConstant) {
+      if (v.name.rfind("__vc_pc_", 0) == 0 && v.name != entryPcVar) continue;
       auto typeIt = types.find(v.resultType);
       if (typeIt == types.end() || typeIt->second.kind != SpirvTypeInfo::Pointer)
         continue;
@@ -2701,9 +2715,15 @@ bool Runtime::buildLayout(VCKernel &k, int deviceIdx,
   dci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
   dci.bindingCount = static_cast<uint32_t>(bindings.size());
   dci.pBindings = bindings.data();
-  if (vkCreateDescriptorSetLayout(dev, &dci, nullptr,
-                                  &st->descriptorSetLayout) != VK_SUCCESS)
+  VkResult lr =
+      vkCreateDescriptorSetLayout(dev, &dci, nullptr, &st->descriptorSetLayout);
+  if (lr != VK_SUCCESS) {
+    std::fprintf(stderr,
+                 "vc: kernel '%s': vkCreateDescriptorSetLayout failed with "
+                 "VkResult %d (%zu SSBO bindings)\n",
+                 k.entryPoint.c_str(), int(lr), bindings.size());
     return false;
+  }
 
   VkPipelineLayoutCreateInfo plci{};
   plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -2717,9 +2737,15 @@ bool Runtime::buildLayout(VCKernel &k, int deviceIdx,
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges = &pcr;
   }
-  if (vkCreatePipelineLayout(dev, &plci, nullptr,
-                             &st->pipelineLayout) != VK_SUCCESS)
+  VkResult pr = vkCreatePipelineLayout(dev, &plci, nullptr,
+                                       &st->pipelineLayout);
+  if (pr != VK_SUCCESS) {
+    std::fprintf(stderr,
+                 "vc: kernel '%s': vkCreatePipelineLayout failed with VkResult "
+                 "%d (push-constant size %u)\n",
+                 k.entryPoint.c_str(), int(pr), pcSize);
     return false;
+  }
   k.pcSize = pcSize;
   st->layoutBuilt = true;
   return true;
@@ -2764,10 +2790,16 @@ VkPipeline Runtime::getPipeline(VCKernel &k, int deviceIdx, unsigned blockX,
   pci.stage.pSpecializationInfo = &spec;
   pci.layout = st->pipelineLayout;
   VkPipeline pipeline = VK_NULL_HANDLE;
-  if (vkCreateComputePipelines(devices_[deviceIdx]->device,
-                               devices_[deviceIdx]->pipelineCache, 1,
-                               &pci, nullptr, &pipeline) != VK_SUCCESS)
+  VkResult pr = vkCreateComputePipelines(devices_[deviceIdx]->device,
+                                         devices_[deviceIdx]->pipelineCache, 1,
+                                         &pci, nullptr, &pipeline);
+  if (pr != VK_SUCCESS) {
+    std::fprintf(stderr,
+                 "vc: kernel '%s': vkCreateComputePipelines failed with "
+                 "VkResult %d (block %u,%u,%u)\n",
+                 k.entryPoint.c_str(), int(pr), blockX, blockY, blockZ);
     return VK_NULL_HANDLE;
+  }
   st->pipelines[key] = pipeline;
   return pipeline;
 }
@@ -2788,13 +2820,19 @@ VkPipeline Runtime::bindKernelForDispatch(VkCommandBuffer cb,
                                           unsigned blockZ,
                                           const VCKernelArg *args,
                                           int argCount) {
-  if (k.spirvWords.empty()) return VK_NULL_HANDLE;
+  if (k.spirvWords.empty()) {
+    std::fprintf(stderr,
+                 "vc: kernel '%s': launched with no SPIR-V embedded — the "
+                 "compiler emitted no device module for it\n",
+                 k.entryPoint.c_str());
+    return VK_NULL_HANDLE;
+  }
   VCKernelDeviceState *st = getOrCreateKernelDeviceState(k, deviceIdx);
-  if (!st) return VK_NULL_HANDLE;
+  if (!st) return VK_NULL_HANDLE; // getOrCreate... already reported the cause
   VkDevice dev = devices_[deviceIdx]->device;
   VkPipeline pipeline = getPipeline(k, deviceIdx, blockX, blockY, blockZ,
                                     args, argCount);
-  if (!pipeline) return VK_NULL_HANDLE;
+  if (!pipeline) return VK_NULL_HANDLE; // getPipeline already reported
 
   VkDescriptorSet set = VK_NULL_HANDLE;
   // Only allocate a set if there are pointer args (SSBO bindings).
@@ -2807,7 +2845,12 @@ VkPipeline Runtime::bindKernelForDispatch(VkCommandBuffer cb,
     ai.descriptorPool = dpool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &st->descriptorSetLayout;
-    vkAllocateDescriptorSets(dev, &ai, &set);
+    VkResult ar = vkAllocateDescriptorSets(dev, &ai, &set);
+    if (ar != VK_SUCCESS)
+      std::fprintf(stderr,
+                   "vc: kernel '%s': vkAllocateDescriptorSets failed with "
+                   "VkResult %d\n",
+                   k.entryPoint.c_str(), int(ar));
   }
   if (hasPointer && !set) return VK_NULL_HANDLE;
 
