@@ -1,12 +1,21 @@
 // test/image_stencil.vc — storage image (texture memory) demo.
 //
 // Exercises Vulkan **storage images** (the compute analogue of CUDA texture
-// memory, minus sampler-based filtering) end-to-end through the GLSL backend:
-//   - `texture2D<float>` kernel parameter -> GLSL `layout(binding=N, r32f)
-//     uniform image2D` (a STORAGE_IMAGE descriptor, not an SSBO).
-//   - `imageRead(tex, x, y)` -> `imageLoad(tex, ivec2(x,y))` returns a vec4
-//     (storage images are always 4-channel on the device side).
-//   - `imageWrite(tex, x, y, v)` -> `imageStore(tex, ivec2(x,y), v)`.
+// memory, minus sampler-based filtering) end-to-end on BOTH backends:
+//   - `texture2D<float>` kernel parameter:
+//     * GLSL: `layout(binding=N, r32f) uniform image2D` (a STORAGE_IMAGE
+//       descriptor, not an SSBO).
+//     * MLIR: a `spirv.GlobalVariable @__vc_img_<param>` of type
+//       `!spirv.image<f32, Dim2D, ..., NoSampler, Rgba32f>` (STORAGE_IMAGE
+//       descriptor, serializes natively).
+//   - `imageRead(tex, x, y)`:
+//     * GLSL: `imageLoad(tex, ivec2(x,y))` returns a vec4 (storage images are
+//       always 4-channel on the device side).
+//     * MLIR: a carrier stub rewritten by the post-serialize `patchImageOps`
+//       pass into `OpImageRead` (MLIR 18's spirv dialect has no ImageRead op).
+//   - `imageWrite(tex, x, y, v)`:
+//     * GLSL: `imageStore(tex, ivec2(x,y), v)`.
+//     * MLIR: carrier stub -> `OpImageWrite` via `patchImageOps`.
 //   - Host: `vcCreateImage2D` / `vcMemcpyToImage` / `vcMemcpyFromImage` /
 //     `vcDestroyImage`, and passing a `VCImage*` as a kernel arg (the runtime
 //     binds it as a STORAGE_IMAGE descriptor at launch).
@@ -15,12 +24,8 @@
 // texel coordinates (no normalized coords, no filtering) — the read/write
 // pattern is the point, not a performance win at this size.
 //
-// MLIR backend: storage image read/write needs spirv.ImageRead/ImageWrite,
-// which MLIR's spirv dialect only gained in release/21.x (this tree builds
-// against MLIR 18). So this demo is GLSL-only — the MLIR backend rejects it
-// with a diagnostic and the e2e harness skip-lists it (see run_e2e.py).
-//
 //   vcc test/image_stencil.vc -o build/image_stencil_sf && ./build/image_stencil_sf
+//   vc  test/image_stencil.vc -emit=full -o build/image_stencil_mlir && ./build/image_stencil_mlir
 
 #include <cstdio>
 #include <cmath>

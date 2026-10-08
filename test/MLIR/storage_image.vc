@@ -1,0 +1,32 @@
+// test/MLIR/storage_image.vc — storage image (texture2D<T>) lowering (MLIR).
+//
+// texture2D<T> / imageRead / imageWrite lower to a spirv.GlobalVariable of
+// type !spirv.image<f32, Dim2D, ..., NoSampler, Rgba32f> (a STORAGE_IMAGE
+// descriptor, Sampled=2), and imageRead/imageWrite lower to carrier stubs
+// that the post-serialize patchImageOps pass rewrites into OpImageRead /
+// OpImageWrite. MLIR 18's spirv dialect has no ImageRead/Write ops and its
+// spirv.Load verifier rejects storage-image result types, so neither can
+// appear in the IR — they are produced only in the final binary.
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && spirv-dis %t.spv | FileCheck %s
+//
+// The image variable is a module-scope !spirv.image global bound to a
+// descriptor (Sampled=2 / Rgba32f => storage image). Decorates precede the
+// type definitions in the serialized module.
+// CHECK: OpDecorate {{%[a-zA-Z0-9_]+}} Binding 0
+// CHECK: OpDecorate {{%[a-zA-Z0-9_]+}} DescriptorSet 0
+// CHECK: OpTypeImage %float 2D 0 0 0 2 Rgba32f
+//
+// The carriers are rewritten into real image ops:
+// CHECK: OpImageRead %v4float
+// CHECK: OpImageWrite
+
+__global__ void copy(texture2D<float> src, texture2D<float> dst, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  float4 v = imageRead(src, x, y);
+  imageWrite(dst, x, y, v);
+}
+
+int main() { return 0; }

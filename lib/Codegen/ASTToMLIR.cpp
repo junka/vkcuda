@@ -624,17 +624,21 @@ private:
 
   mlir::Type cvtType(const vc::Type *t) {
     if (!t) return mlir::Type();
-    // Storage images (texture2D<T>) are GLSL-only: MLIR's spirv dialect gained
-    // spirv.ImageRead/ImageWrite only in release/21.x, and this tree builds
-    // against MLIR 18. Reject up front with a diagnostic so the demo is
-    // skip-listed (see run_e2e.py MLIR_UNSUPPORTED) rather than silently
-    // producing a null type that crashes later codegen.
+    // Storage image (texture2D<T>): a 2D storage image of f32 texels. Sampled=2
+    // (NoSampler) marks it as a storage image (no sampler, integer texel
+    // coords); format Rgba32f matches the GLSL backend's r32f->R32G32B32A32
+    // mapping (4xf32 texel) and avoids the StorageImageReadWithoutFormat cap.
+    // The ImageRead/Write ops don't exist in MLIR 18's spirv dialect, so calls
+    // are lowered via a post-serialize binary patch (see patchImageOps in
+    // tools/vc/vc.cpp); the type/variable/descriptor plumbing here is native.
     if (isa<vc::ImageType>(t)) {
-      emitError(mlir::UnknownLoc::get(&ctx),
-                "storage images (texture2D<T>) are not supported by the MLIR "
-                "backend (requires spirv.ImageRead/Write, MLIR 21+); use the "
-                "GLSL backend");
-      return mlir::Type();
+      return mlir::spirv::ImageType::get(
+          builder.getF32Type(), mlir::spirv::Dim::Dim2D,
+          mlir::spirv::ImageDepthInfo::NoDepth,
+          mlir::spirv::ImageArrayedInfo::NonArrayed,
+          mlir::spirv::ImageSamplingInfo::SingleSampled,
+          mlir::spirv::ImageSamplerUseInfo::NoSampler,
+          mlir::spirv::ImageFormat::Rgba32f);
     }
     // typedef alias: resolve to the underlying type recursively. Sema keeps the
     // TypedefType on params/locals (e.g. `weight_t wgt`); without this, buildFunction
@@ -942,7 +946,17 @@ private:
     if (isMethod && thisTy)
       argTypes.push_back(thisTy);
     structParams.clear();
+    // PROBE: image params are NOT function args — they become module-scope
+    // spirv.GlobalVariable (bind(set,binding)) + AddressOf + Load in the body.
+    // spirv-lower-abi-attrs crashes on a spirv.image interface var
+    // (VulkanLayoutUtils::decorateType assumes SSBO struct layout), so an
+    // image cannot ride the gpu.func signature / interface_var_abi path.
+    SmallVector<const ParamDecl *> imageParams;
     for (auto *p : fn->params) {
+      if (p->type && isa<vc::ImageType>(p->type)) {
+        imageParams.push_back(p);
+        continue;
+      }
       if (p->type && isa<RecordType>(p->type)) {
         auto scalars = structFieldScalarTypes(cast<RecordType>(p->type));
         if (!scalars.empty()) {
@@ -1062,6 +1076,11 @@ private:
     // The body then treats `v` exactly like a local `Vec4 v;` decl.
     for (unsigned i = 0; i < fn->params.size(); ++i) {
       const ParamDecl *p = fn->params[i];
+      // Image params are NOT in the gpu.func signature (they materialize as
+      // module-scope globals below); skip them here so argIdx tracks only the
+      // block arguments that actually exist.
+      if (p->type && isa<vc::ImageType>(p->type))
+        continue;
       auto spit = structParams.find(p->name);
       if (spit != structParams.end()) {
         const StructParamSlots &sp = spit->second;
@@ -1117,6 +1136,44 @@ private:
                                 ? cast<ReferenceType>(p->type)->pointee
                                 : p->type;
       ++argIdx;
+    }
+
+    // PROBE: materialize each image param as a module-scope storage-image
+    // global + AddressOf + Load, bound to its descriptor slot. The binding
+    // index is the param's position among ALL pointer/image args (SSBOs get
+    // bindings from VCToGPU in source order; images interleave by position).
+    // For the probe we just assign bindings in image-param order starting
+    // after the SSBO count — exact binding assignment is finalized once the
+    // carrier design is validated.
+    unsigned imgBindBase = 0; // bumped per image param
+    for (const ParamDecl *p : imageParams) {
+      mlir::Type imgTy = cvtType(p->type);
+      if (!imgTy) continue;
+      auto ptrTy = spirv::PointerType::get(
+          imgTy, spirv::StorageClass::UniformConstant);
+      std::string sym = "__vc_img_" + p->name.str();
+      unsigned binding = imgBindBase++;
+      auto saved = builder.saveInsertionPoint();
+      builder.setInsertionPointToStart(module.getBody());
+      auto gvar = builder.create<spirv::GlobalVariableOp>(
+          loc(p), TypeAttr::get(ptrTy), builder.getStringAttr(sym),
+          /*initializer=*/FlatSymbolRefAttr());
+      gvar->setAttr("binding",
+                    builder.getI32IntegerAttr((int)binding));
+      gvar->setAttr("descriptor_set",
+                    builder.getI32IntegerAttr(0));
+      builder.restoreInsertionPoint(saved);
+      Value addr = builder.create<spirv::AddressOfOp>(loc(p), ptrTy, sym);
+      // PROBE: spirv.Load MLIR op rejects a storage-image result type (its
+      // verifier only allows sampled images), so the image VALUE cannot be
+      // materialized at the IR level. The OpLoad+OpImageRead/Write are both
+      // produced by the post-serialize binary patch (legal in the SPIR-V
+      // binary, just not in MLIR 18's spirv.Load verifier). We stash the
+      // AddressOf result in locals so the param name resolves to the variable
+      // if referenced; imageRead/imageWrite find the image VARIABLE by name
+      // (via declRefName + the `__vc_img_<param>` OpName), not via this value.
+      locals[p->name] = addr;
+      localTypes[p->name] = p->type;
     }
 
     // Route the body through emitStatements so trailing bare-return guards
@@ -4526,6 +4583,15 @@ private:
     if (auto v = emitAtomicBuiltin(name, args, l)) return v;
     if (emitFenceBuiltin(name, l)) return Value();
     if (auto v = emitVoteBuiltin(name, args, l)) return v;
+    // Storage image read/write: emit a carrier that survives serialization and
+    // lets the post-serialize patcher (patchImageOps in tools/vc/vc.cpp) find
+    // the operand ids and rewrite it into OpLoad+OpImageRead / OpImageWrite.
+    // MLIR 18's spirv dialect has no spirv.ImageRead/Write op AND its
+    // spirv.Load verifier rejects a storage-image result type, so both the
+    // image-value load and the read/write are produced in the binary patch.
+    if (name == "imageRead" || name == "imageWrite") {
+      return emitImageBuiltin(name, args, l);
+    }
     // emitWarpBuiltin handles void __syncwarp (returns null with warpMatched
     // set), so dispatch it before the matched=false fallback.
     bool warpMatched = false;
@@ -5096,6 +5162,99 @@ private:
     if (origTy.isF64())
       r = builder.create<arith::ExtFOp>(l, origTy, r);
     return r;
+  }
+
+  // CUDA atomic builtins -> spirv.Atomic*. Returns null if `name` is not an
+  // atomic builtin.
+  //
+  // PROBE (storage image): imageRead/imageWrite emit a carrier that survives
+  // serialization and carries the operand ids the post-serialize patcher needs.
+  // The carrier is a `spirv.Store` of the coord/texel vector into a per-call
+  // dummy Private-storage global, stamped with an OpName marker naming the
+  // image param + call id. patchImageOps walks OpName records, locates the
+  // carrier, reads back the coord/texel operand id, finds the image VARIABLE
+  // by its `__vc_img_<param>` OpName, and rewrites the carrier into
+  // OpLoad(image value) + OpImageRead / OpImageWrite. The image variable
+  // pointer itself need NOT be kept alive as an SSA value: the patch finds
+  // the variable directly by name (it has its own OpVariable + OpName).
+  //
+  // For imageRead's RESULT: a per-call dummy Private global `__vc_imgresult_`
+  // <id> of type ptr<v4float> is emitted, and a `spirv.Load` from it stands in
+  // for the read result. We can't use spirv.Undef here — Undef is Pure and CSE
+  // folds all same-typed Undefs into one, so multiple imageRead calls would
+  // share a single result id. The Load is side-effect-free but reads a
+  // distinct pointer per call, so it is NOT CSE'd. patchImageOps finds each
+  // result Load by its pointer variable's OpName and rewrites the Load into
+  // OpImageRead (reusing the Load's result id so existing uses resolve to the
+  // real read).
+  Value emitImageBuiltin(llvm::StringRef name,
+                         const std::vector<NodePtr> &args, Location l) {
+    static unsigned counter = 0;
+    unsigned id = counter++;
+    bool isRead = name == "imageRead";
+    // coord = vec2(x, y) as i32 vector (OpImageRead/Write want integer coords).
+    Value cx = visitExpr(args[1].get());
+    Value cy = visitExpr(args[2].get());
+    cx = loadValue(cx, loc(args[1].get()));
+    cy = loadValue(cy, loc(args[2].get()));
+    cx = castValue(cx, builder.getI32Type(), l);
+    cy = castValue(cy, builder.getI32Type(), l);
+    Value coord = builder.create<spirv::CompositeConstructOp>(
+        l, mlir::VectorType::get({2}, builder.getI32Type()),
+        ValueRange{cx, cy});
+    std::string imgName = declRefName(args[0].get());
+
+    if (isRead) {
+      emitImageCarrier(l, "__vc_imgread_" + imgName, id, coord);
+      // Per-call result placeholder: a Private global + Load. The Load's result
+      // id is what the patcher rewrites into OpImageRead.
+      auto resTy = mlir::VectorType::get({4}, builder.getF32Type());
+      auto resPtrTy =
+          spirv::PointerType::get(resTy, spirv::StorageClass::Private);
+      std::string resSym = "__vc_imgresult_" + imgName + "_" + Twine(id).str();
+      auto saved = builder.saveInsertionPoint();
+      builder.setInsertionPointToStart(module.getBody());
+      builder.create<spirv::GlobalVariableOp>(
+          l, TypeAttr::get(resPtrTy), builder.getStringAttr(resSym),
+          /*initializer=*/FlatSymbolRefAttr());
+      builder.restoreInsertionPoint(saved);
+      Value resAddr = builder.create<spirv::AddressOfOp>(l, resPtrTy, resSym);
+      return builder.create<spirv::LoadOp>(l, resAddr);
+    }
+    // imageWrite(tex, x, y, v): carrier keeps coord + texel alive.
+    Value texel = visitExpr(args[3].get());
+    texel = loadValue(texel, loc(args[3].get()));
+    emitImageCarrier(l, "__vc_imgwrite_coord_" + imgName, id, coord);
+    emitImageCarrier(l, "__vc_imgwrite_texel_" + imgName, id, texel);
+    return Value();
+  }
+
+  // Extract the param name from a DeclRefExpr arg (the image variable name).
+  std::string declRefName(const ASTNode *n) {
+    if (n && n->getNodeType() == ASTNode::NodeKind::DeclRefExpr)
+      return static_cast<const DeclRefExpr *>(n)->name.str();
+    return "img";
+  }
+
+  // Create a dummy Private-storage global named `sym_<id>` whose pointee type
+  // matches `val`'s type, and Store `val` into it. The Store is side-effecting
+  // so it survives DCE; the stored value's id is thus pinned in the binary for
+  // the patcher to reference directly as OpImageRead/Write's coord/texel
+  // operand. Storing the ORIGINAL vector (not an extracted element) means the
+  // patcher can read the vector id straight from the Store's operand — no
+  // need to walk back through CompositeConstruct/Load definitions.
+  void emitImageCarrier(Location l, std::string sym, unsigned id, Value val) {
+    std::string fullSym = sym + "_" + Twine(id).str();
+    auto ptrTy =
+        spirv::PointerType::get(val.getType(), spirv::StorageClass::Private);
+    auto saved = builder.saveInsertionPoint();
+    builder.setInsertionPointToStart(module.getBody());
+    builder.create<spirv::GlobalVariableOp>(
+        l, TypeAttr::get(ptrTy), builder.getStringAttr(fullSym),
+        /*initializer=*/FlatSymbolRefAttr());
+    builder.restoreInsertionPoint(saved);
+    Value addr = builder.create<spirv::AddressOfOp>(l, ptrTy, fullSym);
+    builder.create<spirv::StoreOp>(l, addr, val);
   }
 
   // CUDA atomic builtins -> spirv.Atomic*. Returns null if `name` is not an

@@ -233,9 +233,19 @@ static void lowerScalarArgsToPushConstant(gpu::GPUFuncOp gpuFn,
   SmallVector<unsigned> pointerArgIdxs;
   TypeRange inputTys = gpuFn.getFunctionType().getInputs();
   for (auto [i, ty] : llvm::enumerate(inputTys)) {
-    if (isa<MemRefType>(ty))
+    if (isa<MemRefType>(ty)) {
       pointerArgIdxs.push_back(i);
-    else {
+    } else if (isa<mlir::spirv::ImageType>(ty)) {
+      // Storage image param (texture2D<T>): ASTToMLIR strips image params from
+      // the gpu.func signature and materializes them as module-scope
+      // spirv.GlobalVariable + AddressOf (spirv-lower-abi-attrs crashes on a
+      // spirv.image interface var — VulkanLayoutUtils::decorateType assumes
+      // SSBO struct layout). This branch is therefore never taken in practice,
+      // but classifies defensively: if an image ever does reach the signature,
+      // it must NOT enter the push-constant struct (spirv.image can't be a
+      // struct member or be Load'd as a scalar).
+      pointerArgIdxs.push_back(i);
+    } else {
       scalarArgIdxs.push_back(i);
       scalarTys.push_back(ty);
     }
