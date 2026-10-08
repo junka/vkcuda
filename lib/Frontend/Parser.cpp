@@ -1200,7 +1200,25 @@ Type *Parser::parseBaseType() {
     // A user-named type (struct/typedef) or a vector name like float4.
     if (auto *vec = makeVectorType(curTok.text))
       base = vec;
-    else {
+    else if (curTok.text == "texture2D") {
+      // texture2D<T> — a Vulkan storage image (GLSL image2D). T must be a
+      // scalar builtin (float/half/int). Parse the `<T>` and build an
+      // ImageType. Only 2D is supported.
+      advance(); // consume `texture2D`
+      if (!expect(TokKind::lt, "'<'"))
+        return nullptr;
+      Type *elem = parseBaseType();
+      if (!elem) {
+        error(curTok, "expected element type in texture2D<T>");
+        return nullptr;
+      }
+      if (!expect(TokKind::gt, "'>'"))
+        return nullptr;
+      base = new ImageType(elem);
+      // texture2D<T> is fully consumed here (up to and including `>`); skip
+      // the shared advance() below.
+      return base;
+    } else {
       auto it = typeNames.find(curTok.text);
       if (it != typeNames.end())
         base = it->second;

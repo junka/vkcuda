@@ -56,6 +56,15 @@ class HostEmitter {
   // Name -> FunctionDecl for all top-level host functions. Used to complete
   // call sites that omit trailing defaulted parameters (default arguments).
   llvm::StringMap<const FunctionDecl *> hostFuncDecls;
+  // Name -> FunctionDecl for every __global__ kernel. A launch arg's
+  // classification (Pointer vs Image vs Scalar) must follow the kernel's
+  // declared parameter type, not the host variable's type: the host declares a
+  // storage-image arg as `VCImage *src` (an opaque RecordType — VCImage is an
+  // unknown type name on the host side), so hostVarTypes cannot distinguish it
+  // from a pointer. The ImageType lives on the kernel parameter
+  // (`texture2D<float> src`). emitLaunch resolves the kernel decl via this map
+  // and reads params[idx] to classify each arg by its real device type.
+  llvm::StringMap<const FunctionDecl *> kernelDecls;
 
 public:
   HostEmitter(raw_ostream &o, const std::vector<host::HostSpirvModule> *mods)
@@ -128,8 +137,15 @@ public:
       }
       if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
       auto *f = static_cast<const FunctionDecl *>(d.get());
-      if (f->deviceAttr == DeviceAttr::Global ||
-          f->deviceAttr == DeviceAttr::Device)
+      if (f->deviceAttr == DeviceAttr::Global) {
+        // Record kernel decls by bare name so emitLaunch can resolve parameter
+        // types for launch-arg classification (see kernelDecls). Scoped kernels
+        // (ns::k) are rare and handled at launch via launchHandleName's scope
+        // mangling; the bare-name key covers the common case.
+        kernelDecls[f->name.str()] = f;
+        continue;
+      }
+      if (f->deviceAttr == DeviceAttr::Device)
         continue;
       hostFuncDecls[hostFuncKey(f)] = f;
       for (ParamDecl *p : f->params)
@@ -1057,6 +1073,14 @@ private:
     // and the kernel symbol name for the MLIR backend (one binary, one
     // OpEntryPoint per kernel so named) — resolved via entryPointForKernel.
     std::string kname = launchHandleName(l->callee.get());
+    // Resolve the kernel FunctionDecl so each launch arg is classified by its
+    // declared device parameter type, not by the host variable's type. A
+    // storage-image param (`texture2D<float>`) is an ImageType on the kernel
+    // side but an opaque RecordType (`VCImage*`) on the host side, so the host
+    // var type alone cannot tell Pointer from Image.
+    const FunctionDecl *kernelFunc = nullptr;
+    auto kfit = kernelDecls.find(kname);
+    if (kfit != kernelDecls.end()) kernelFunc = kfit->second;
     std::string spirvVar;
     if (spirvVarForKernel.count(kname))
       spirvVar = spirvVarForKernel[kname];
@@ -1081,7 +1105,8 @@ private:
     // long/...) so sizeof matches what the device ABI expects. Pointer args
     // (vcMalloc handles) are passed by value and need no spill.
     for (unsigned i = 0; i < l->args.size(); ++i) {
-      if (!isPointerArg(l->args[i].get())) {
+      if (!isPointerArg(l->args[i].get(), kernelFunc, i) &&
+          !isImageArg(l->args[i].get(), kernelFunc, i)) {
         pad(indent + 1);
         os << "auto __vc_a" << i << " = (";
         emitHostExpr(l->args[i].get());
@@ -1091,7 +1116,7 @@ private:
     os << "VCKernelArg __args[" << l->args.size() << "] = {";
     for (unsigned i = 0; i < l->args.size(); ++i) {
       if (i) os << ", ";
-      emitLaunchArg(l->args[i].get(), i, indent + 1);
+      emitLaunchArg(l->args[i].get(), i, kernelFunc, indent + 1);
     }
     os << "};\n";
 
@@ -1132,7 +1157,17 @@ private:
 
   // True if `arg` is a pointer-typed DeclRefExpr (a vcMalloc device handle):
   // such args are passed by value, not by address, and need no spill.
-  bool isPointerArg(const ASTNode *arg) {
+  // `kernelFunc`/`idx` let us exclude image params: a `texture2D<T>` kernel
+  // param is backed on the host by a `VCImage*` (a PointerType wrapping an
+  // opaque RecordType), which would otherwise look exactly like a buffer
+  // pointer. If the kernel declares an Image param at `idx`, this is an image,
+  // not a buffer pointer.
+  bool isPointerArg(const ASTNode *arg, const FunctionDecl *kernelFunc,
+                    unsigned idx) {
+    if (kernelFunc && idx < kernelFunc->params.size()) {
+      const Type *pt = kernelFunc->params[idx]->type;
+      if (pt && pt->getKind() == TypeKind::Image) return false;
+    }
     if (!arg || arg->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
       return false;
     auto *d = static_cast<const DeclRefExpr *>(arg);
@@ -1141,13 +1176,52 @@ private:
            it->second->getKind() == TypeKind::Pointer;
   }
 
+  // A storage-image launch arg: the host variable is a VCImage* declared from
+  // vcCreateImage2D. Like pointer args it is passed by handle value (no spill
+  // local), but the runtime binds it as a STORAGE_IMAGE descriptor, not an
+  // SSBO, so it needs its own VCKernelArg kind.
+  //
+  // The host variable is an opaque RecordType (VCImage is unknown on the host),
+  // so we cannot tell it from a pointer by the var type alone. The decisive
+  // signal is the kernel's declared parameter type at `idx` — if the kernel
+  // declares a `texture2D<T>` param there, this arg is an Image regardless of
+  // the host spelling. `kernelFunc` is null only when the kernel couldn't be
+  // resolved (e.g. a scoped name we didn't index); we then fall back to the
+  // host var type, which still works for any arg explicitly typed VCImage*
+  // when the frontend happens to record it as ImageType.
+  bool isImageArg(const ASTNode *arg, const FunctionDecl *kernelFunc,
+                  unsigned idx) {
+    if (kernelFunc && idx < kernelFunc->params.size()) {
+      const Type *pt = kernelFunc->params[idx]->type;
+      if (pt && pt->getKind() == TypeKind::Image) return true;
+    }
+    if (!arg || arg->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+      return false;
+    auto *d = static_cast<const DeclRefExpr *>(arg);
+    auto it = hostVarTypes.find(d->name);
+    return it != hostVarTypes.end() && it->second &&
+           it->second->getKind() == TypeKind::Image;
+  }
+
   // Classify one launch arg and emit its VCKernelArg initializer. `idx` is the
   // arg's position; scalar args were already spilled to `__vc_a<idx>` by
   // emitLaunch, so we take that local's address (always an lvalue).
-  void emitLaunchArg(const ASTNode *arg, unsigned idx, unsigned /*indent*/) {
+  // `kernelFunc` (may be null) lets us classify image args by the kernel's
+  // declared parameter type rather than the host var's opaque type.
+  void emitLaunchArg(const ASTNode *arg, unsigned idx,
+                     const FunctionDecl *kernelFunc, unsigned /*indent*/) {
     // Pointer arg: pass the handle value directly (no spill local exists).
-    if (isPointerArg(arg)) {
+    if (isPointerArg(arg, kernelFunc, idx)) {
       os << "{VCKernelArg::Pointer, ";
+      emitHostExpr(arg);
+      os << ", 0}";
+      return;
+    }
+    // Image arg: pass the VCImage* handle directly (no spill local). The
+    // runtime reads the VkImageView from the VCImage and binds a
+    // STORAGE_IMAGE descriptor.
+    if (isImageArg(arg, kernelFunc, idx)) {
+      os << "{VCKernelArg::Image, ";
       emitHostExpr(arg);
       os << ", 0}";
       return;
@@ -1196,6 +1270,11 @@ private:
       // C++ lvalue reference `T&` (host-only, e.g. helper `const Point &p`).
       return cppType(static_cast<const ReferenceType *>(t)->pointee) + "&";
     }
+    // texture2D<T> on the host is a VCImage* handle (created by vcCreateImage2D,
+    // destroyed by vcDestroyImage). The element type only matters on the
+    // device; the host carries an opaque image handle.
+    if (t->getKind() == TypeKind::Image)
+      return "VCImage*";
     if (t->getKind() == TypeKind::Vector) {
       // float4 etc. are real host types now (see emitPreamble): a struct with
       // x/y/z/w members and sizeof matching the device's packed layout. Used

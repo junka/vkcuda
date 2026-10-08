@@ -81,6 +81,10 @@ BuiltinClass vc::builtinClass(llvm::StringRef name) {
   if (name == "printf")
     return BuiltinClass::Other;
 
+  // Storage image texel access (texture2D<T>).
+  if (name == "imageRead" || name == "imageWrite")
+    return BuiltinClass::Image;
+
   // Vector constructors (float4, make_float4, ...).
   if (isVectorCtorName(name))
     return BuiltinClass::VectorCtor;

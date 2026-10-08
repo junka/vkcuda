@@ -715,14 +715,16 @@ static bool initStream(VulkanDevice &dev, VCStream &s,
   fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   fci.flags = VK_FENCE_CREATE_SIGNALED_BIT; // start signaled so first beginFrame doesn't wait
 
-  VkDescriptorPoolSize ps{};
-  ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  ps.descriptorCount = 64;
+  VkDescriptorPoolSize ps[2]{};
+  ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  ps[0].descriptorCount = 64;
+  ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  ps[1].descriptorCount = 16;
   VkDescriptorPoolCreateInfo dpci{};
   dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   dpci.maxSets = 32;
-  dpci.poolSizeCount = 1;
-  dpci.pPoolSizes = &ps;
+  dpci.poolSizeCount = 2;
+  dpci.pPoolSizes = ps;
 
   for (auto &f : s.frames) {
     if (vkAllocateCommandBuffers(dev.device, &ai, &f.cb) != VK_SUCCESS)
@@ -1247,6 +1249,263 @@ VCError Runtime::freeBuffer(VCBuffer &buf) {
   return VCError::Success;
 }
 
+// Map a VC pixel format to the Vulkan VkFormat the image is created with.
+// These must match the GLSL layout format qualifier emitted by the GLSL
+// backend (imageFormatQualifier): float->r32f, half->r16f, int->r32i.
+static VkFormat pixelFormatToVk(VCPixelFormat f) {
+  switch (f) {
+  case VCPixelFormat::R32G32B32A32Float: return VK_FORMAT_R32G32B32A32_SFLOAT;
+  case VCPixelFormat::R16G16B16A16Float: return VK_FORMAT_R16G16B16A16_SFLOAT;
+  case VCPixelFormat::R32G32B32A32Sint:  return VK_FORMAT_R32G32B32A32_SINT;
+  }
+  return VK_FORMAT_UNDEFINED;
+}
+
+// Bytes per texel for a pixel format (4 channels × channel width).
+static uint32_t pixelFormatTexelSize(VCPixelFormat f) {
+  switch (f) {
+  case VCPixelFormat::R32G32B32A32Float:
+  case VCPixelFormat::R32G32B32A32Sint:  return 16;
+  case VCPixelFormat::R16G16B16A16Float: return 8;
+  }
+  return 16;
+}
+
+// Create a 2D storage image in the GENERAL layout (compute shaders read/write
+// directly, no sampler). The VkImageView is the handle bound as a
+// STORAGE_IMAGE descriptor at launch. Image memory is device-local (falls back
+// to host-visible on integrated GPUs, matching mallocBuffer's policy).
+VCError Runtime::createImage2D(uint32_t w, uint32_t h, VCPixelFormat fmt,
+                               VCImage &out) {
+  if (!init_) return VCError::InitializationError;
+  if (w == 0 || h == 0) return VCError::InvalidValue;
+  VulkanDevice &vd = *devices_[currentDeviceIdx_];
+  VkFormat vkfmt = pixelFormatToVk(fmt);
+  if (vkfmt == VK_FORMAT_UNDEFINED) return VCError::InvalidValue;
+
+  VkImageCreateInfo ici{};
+  ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  ici.imageType = VK_IMAGE_TYPE_2D;
+  ici.format = vkfmt;
+  ici.extent = {w, h, 1};
+  ici.mipLevels = 1;
+  ici.arrayLayers = 1;
+  ici.samples = VK_SAMPLE_COUNT_1_BIT;
+  ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ici.usage = VK_IMAGE_USAGE_STORAGE_BIT |    // imageLoad/imageStore
+              VK_IMAGE_USAGE_TRANSFER_DST_BIT | // vcMemcpyToImage
+              VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // vcMemcpyFromImage
+  ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (vkCreateImage(vd.device, &ici, nullptr, &out.image) != VK_SUCCESS)
+    return VCError::OutOfMemory;
+
+  VkMemoryRequirements reqs;
+  vkGetImageMemoryRequirements(vd.device, out.image, &reqs);
+  uint32_t typeIdx = findMemoryTypeOn(
+      vd, reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (typeIdx == UINT32_MAX)
+    typeIdx = findMemoryTypeOn(vd, reqs.memoryTypeBits,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (typeIdx == UINT32_MAX) {
+    vkDestroyImage(vd.device, out.image, nullptr);
+    out.image = VK_NULL_HANDLE;
+    return VCError::OutOfMemory;
+  }
+  VkMemoryAllocateInfo mai{};
+  mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  mai.allocationSize = reqs.size;
+  mai.memoryTypeIndex = typeIdx;
+  if (vkAllocateMemory(vd.device, &mai, nullptr, &out.memory) != VK_SUCCESS) {
+    vkDestroyImage(vd.device, out.image, nullptr);
+    out.image = VK_NULL_HANDLE;
+    return VCError::OutOfMemory;
+  }
+  vkBindImageMemory(vd.device, out.image, out.memory, 0);
+
+  VkImageViewCreateInfo vci{};
+  vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  vci.image = out.image;
+  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.format = vkfmt;
+  vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  vci.subresourceRange.baseMipLevel = 0;
+  vci.subresourceRange.levelCount = 1;
+  vci.subresourceRange.baseArrayLayer = 0;
+  vci.subresourceRange.layerCount = 1;
+  if (vkCreateImageView(vd.device, &vci, nullptr, &out.view) != VK_SUCCESS) {
+    vkDestroyImage(vd.device, out.image, nullptr);
+    vkFreeMemory(vd.device, out.memory, nullptr);
+    out.image = VK_NULL_HANDLE;
+    out.memory = VK_NULL_HANDLE;
+    return VCError::OutOfMemory;
+  }
+
+  // Transition the image to GENERAL layout (the layout storage images are
+  // accessed in). The image was created UNDEFINED, so this is the first
+  // transition. Use a one-time command buffer on the default stream.
+  out.width = w;
+  out.height = h;
+  out.format = vkfmt;
+  out.deviceIdx = currentDeviceIdx_;
+  VCStream &s = *vd.defaultStream;
+  VkCommandBuffer cb = beginFrame(s);
+  VkImageMemoryBarrier b{};
+  b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  b.srcAccessMask = 0;
+  b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+  b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  b.image = out.image;
+  b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &b);
+  endFrame(s);
+  return streamSynchronize(s);
+}
+
+VCError Runtime::destroyImage(VCImage &img) {
+  if (!init_) return VCError::InitializationError;
+  if (!img.image) return VCError::Success;
+  VkDevice dev = devices_[img.deviceIdx]->device;
+  if (img.view) vkDestroyImageView(dev, img.view, nullptr);
+  if (img.image) vkDestroyImage(dev, img.image, nullptr);
+  if (img.memory) vkFreeMemory(dev, img.memory, nullptr);
+  img = VCImage{};
+  return VCError::Success;
+}
+
+// Upload packed host pixel data (row-major, tightly packed) into the image.
+// Stages through a host-visible buffer, then vkCmdCopyBufferToImage into the
+// GENERAL layout. The buffer-to-image copy requires the image in
+// TRANSFER_DST_OPTIMAL, so we transition GENERAL->TRANSFER_DST_OPTIMAL,
+// copy, then transition back to GENERAL for shader access. Syncs on return.
+VCError Runtime::copyToImage(VCImage &img, const void *hostData) {
+  if (!init_ || !img.image) return VCError::InitializationError;
+  VulkanDevice &vd = *devices_[img.deviceIdx];
+  uint32_t texelSize = pixelFormatTexelSize(
+      img.format == VK_FORMAT_R32G32B32A32_SFLOAT ? VCPixelFormat::R32G32B32A32Float
+      : img.format == VK_FORMAT_R16G16B16A16_SFLOAT ? VCPixelFormat::R16G16B16A16Float
+      : VCPixelFormat::R32G32B32A32Sint);
+  VkDeviceSize total = (VkDeviceSize)texelSize * img.width * img.height;
+
+  VCBuffer staging{};
+  if (mallocHostBufferOn(img.deviceIdx, total, staging) != VCError::Success)
+    return VCError::OutOfMemory;
+  std::memcpy(staging.mapped, hostData, total);
+
+  VCStream &s = *vd.defaultStream;
+  VkCommandBuffer cb = beginFrame(s);
+  VkImageMemoryBarrier toTransfer{};
+  toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  toTransfer.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  toTransfer.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+  toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  toTransfer.image = img.image;
+  toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &toTransfer);
+
+  VkBufferImageCopy region{};
+  region.bufferOffset = 0;
+  region.bufferRowLength = 0; // tightly packed
+  region.bufferImageHeight = 0;
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageOffset = {0, 0, 0};
+  region.imageExtent = {img.width, img.height, 1};
+  vkCmdCopyBufferToImage(cb, staging.buffer, img.image,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+  VkImageMemoryBarrier toGeneral{};
+  toGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+  toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  toGeneral.image = img.image;
+  toGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &toGeneral);
+  endFrame(s);
+  VCError e = streamSynchronize(s);
+  freeBuffer(staging);
+  return e;
+}
+
+// Download the image to packed host pixel data. vkCmdCopyImageToBuffer requires
+// the image in TRANSFER_SRC_OPTIMAL, so transition GENERAL->TRANSFER_SRC_OPTIMAL,
+// copy, transition back, then read the staging buffer.
+VCError Runtime::copyFromImage(void *hostData, const VCImage &img) {
+  if (!init_ || !img.image) return VCError::InitializationError;
+  VulkanDevice &vd = *devices_[img.deviceIdx];
+  uint32_t texelSize = pixelFormatTexelSize(
+      img.format == VK_FORMAT_R32G32B32A32_SFLOAT ? VCPixelFormat::R32G32B32A32Float
+      : img.format == VK_FORMAT_R16G16B16A16_SFLOAT ? VCPixelFormat::R16G16B16A16Float
+      : VCPixelFormat::R32G32B32A32Sint);
+  VkDeviceSize total = (VkDeviceSize)texelSize * img.width * img.height;
+
+  VCBuffer staging{};
+  if (mallocHostBufferOn(img.deviceIdx, total, staging) != VCError::Success)
+    return VCError::OutOfMemory;
+
+  VCStream &s = *vd.defaultStream;
+  VkCommandBuffer cb = beginFrame(s);
+  VkImageMemoryBarrier toTransfer{};
+  toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  toTransfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  toTransfer.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+  toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  toTransfer.image = img.image;
+  toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &toTransfer);
+
+  VkBufferImageCopy region{};
+  region.bufferOffset = 0;
+  region.bufferRowLength = 0;
+  region.bufferImageHeight = 0;
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageOffset = {0, 0, 0};
+  region.imageExtent = {img.width, img.height, 1};
+  vkCmdCopyImageToBuffer(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         staging.buffer, 1, &region);
+
+  VkImageMemoryBarrier toGeneral{};
+  toGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+  toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  toGeneral.image = img.image;
+  toGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &toGeneral);
+  endFrame(s);
+  VCError e = streamSynchronize(s);
+  if (e == VCError::Success)
+    std::memcpy(hostData, staging.mapped, total);
+  freeBuffer(staging);
+  return e;
+}
+
 // Fill `bytes` of `buf` (offset 0) with byte `value` broadcast to uint32.
 // vkCmdFillBuffer writes a 4-byte uint32 repeatedly, so `bytes` must be a
 // multiple of 4. The buffer already carries TRANSFER_DST usage (see
@@ -1606,17 +1865,19 @@ VCError Runtime::synchronize() {
 // Size the graph descriptor pool generously: one set per recorded launch that
 // has pointer args, each with up to a handful of SSBO bindings.
 static VkDescriptorPool createGraphDescriptorPool(VkDevice dev) {
-  VkDescriptorPoolSize ps{};
-  ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  ps.descriptorCount = 1024;
+  VkDescriptorPoolSize ps[2]{};
+  ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  ps[0].descriptorCount = 1024;
+  ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  ps[1].descriptorCount = 256;
   VkDescriptorPoolCreateInfo dpci{};
   dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   // FREE_DESCRIPTOR_SET_BIT so resetGraph can free sets without destroying
   // the pool (allows re-recording).
   dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
   dpci.maxSets = 256;
-  dpci.poolSizeCount = 1;
-  dpci.pPoolSizes = &ps;
+  dpci.poolSizeCount = 2;
+  dpci.pPoolSizes = ps;
   VkDescriptorPool pool = VK_NULL_HANDLE;
   vkCreateDescriptorPool(dev, &dpci, nullptr, &pool);
   return pool;
@@ -2786,6 +3047,20 @@ bool Runtime::buildLayout(VCKernel &k, int deviceIdx,
       b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
       bindings.push_back(b);
       ++pointerOrdinal;
+    } else if (args[i].kind == VCKernelArg::Image) {
+      // Storage image: its own binding slot, a STORAGE_IMAGE descriptor (not
+      // an SSBO). Image bindings are interleaved with SSBO bindings in source
+      // argument order, matching the GLSL backend's emitBindings which assigns
+      // consecutive binding numbers across both kinds.
+      VkDescriptorSetLayoutBinding b{};
+      b.binding = pointerOrdinal;
+      if (pointerOrdinal < k.storageBufferBindings.size())
+        b.binding = k.storageBufferBindings[pointerOrdinal];
+      b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      b.descriptorCount = 1;
+      b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      bindings.push_back(b);
+      ++pointerOrdinal;
     } else {
       // Round scalar size up to 4 bytes for std140-friendly packing.
       uint32_t sz = static_cast<uint32_t>((args[i].size + 3) & ~size_t(3));
@@ -2971,10 +3246,11 @@ VkPipeline Runtime::bindKernelForDispatch(VkCommandBuffer cb,
   if (!pipeline) return VK_NULL_HANDLE; // getPipeline already reported
 
   VkDescriptorSet set = VK_NULL_HANDLE;
-  // Only allocate a set if there are pointer args (SSBO bindings).
+  // Only allocate a set if there are pointer (SSBO) or image args.
   bool hasPointer = false;
   for (int i = 0; i < argCount; ++i)
-    if (args[i].kind == VCKernelArg::Pointer) { hasPointer = true; break; }
+    if (args[i].kind == VCKernelArg::Pointer ||
+        args[i].kind == VCKernelArg::Image) { hasPointer = true; break; }
   if (hasPointer) {
     VkDescriptorSetAllocateInfo ai{};
     ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -2990,32 +3266,55 @@ VkPipeline Runtime::bindKernelForDispatch(VkCommandBuffer cb,
   }
   if (hasPointer && !set) return VK_NULL_HANDLE;
 
-  // Write descriptor bindings for pointer args. Reflected binding numbers keep
-  // the API argument order independent from SPIR-V declaration order.
+  // Write descriptor bindings for pointer (SSBO) and image args. Reflected
+  // binding numbers keep the API argument order independent from SPIR-V
+  // declaration order. Both kinds consume one binding slot per arg, in source
+  // order — matching the GLSL backend's emitBindings.
   std::vector<VkDescriptorBufferInfo> bufInfos;
+  std::vector<VkDescriptorImageInfo> imgInfos;
   std::vector<VkWriteDescriptorSet> writes;
   bufInfos.reserve(argCount);
+  imgInfos.reserve(argCount);
   writes.reserve(argCount);
   uint32_t bindIdx = 0;
   for (int i = 0; i < argCount; ++i) {
-    if (args[i].kind != VCKernelArg::Pointer) continue;
-    auto *b = reinterpret_cast<VCBuffer *>(const_cast<void *>(args[i].data));
-    VkDescriptorBufferInfo bi{};
-    bi.buffer = b ? b->buffer : VK_NULL_HANDLE;
-    bi.offset = 0;
-    bi.range = b ? b->size : 0;
-    bufInfos.push_back(bi);
-    VkWriteDescriptorSet w{};
-    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w.dstSet = set;
-    w.dstBinding = bindIdx;
-    if (bindIdx < k.storageBufferBindings.size())
-      w.dstBinding = k.storageBufferBindings[bindIdx];
-    ++bindIdx;
-    w.descriptorCount = 1;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    w.pBufferInfo = &bufInfos.back();
-    writes.push_back(w);
+    if (args[i].kind == VCKernelArg::Pointer) {
+      auto *b = reinterpret_cast<VCBuffer *>(const_cast<void *>(args[i].data));
+      VkDescriptorBufferInfo bi{};
+      bi.buffer = b ? b->buffer : VK_NULL_HANDLE;
+      bi.offset = 0;
+      bi.range = b ? b->size : 0;
+      bufInfos.push_back(bi);
+      VkWriteDescriptorSet w{};
+      w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      w.dstSet = set;
+      w.dstBinding = bindIdx;
+      if (bindIdx < k.storageBufferBindings.size())
+        w.dstBinding = k.storageBufferBindings[bindIdx];
+      w.descriptorCount = 1;
+      w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      w.pBufferInfo = &bufInfos.back();
+      writes.push_back(w);
+      ++bindIdx;
+    } else if (args[i].kind == VCKernelArg::Image) {
+      auto *im = reinterpret_cast<VCImage *>(const_cast<void *>(args[i].data));
+      VkDescriptorImageInfo ii{};
+      ii.sampler = VK_NULL_HANDLE;
+      ii.imageView = im ? im->view : VK_NULL_HANDLE;
+      ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      imgInfos.push_back(ii);
+      VkWriteDescriptorSet w{};
+      w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      w.dstSet = set;
+      w.dstBinding = bindIdx;
+      if (bindIdx < k.storageBufferBindings.size())
+        w.dstBinding = k.storageBufferBindings[bindIdx];
+      w.descriptorCount = 1;
+      w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      w.pImageInfo = &imgInfos.back();
+      writes.push_back(w);
+      ++bindIdx;
+    } else continue;
   }
   if (!writes.empty())
     vkUpdateDescriptorSets(dev, writes.size(), writes.data(), 0, nullptr);
@@ -3293,6 +3592,36 @@ VCError vcFree(void *devPtr) {
   VCError e = Runtime::get().freeBuffer(*b);
   delete b;
   return e;
+}
+
+// Storage image lifecycle. Images are tracked by a simple owning-pointer (no
+// pointer-attribute registry, since vcPointerGetAttributes is about buffers).
+VCError vcCreateImage2D(VCImageHandle *out, uint32_t width, uint32_t height,
+                        VCPixelFormat fmt) {
+  if (!out) return VCError::InvalidValue;
+  auto *img = new VCImage{};
+  VCError e = Runtime::get().createImage2D(width, height, fmt, *img);
+  if (e != VCError::Success) { delete img; return e; }
+  *out = img;
+  return VCError::Success;
+}
+
+VCError vcDestroyImage(VCImageHandle img) {
+  if (!img) return VCError::Success;
+  auto *i = reinterpret_cast<VCImage *>(img);
+  VCError e = Runtime::get().destroyImage(*i);
+  delete i;
+  return e;
+}
+
+VCError vcMemcpyToImage(VCImageHandle img, const void *hostData) {
+  if (!img || !hostData) return VCError::InvalidValue;
+  return Runtime::get().copyToImage(*reinterpret_cast<VCImage *>(img), hostData);
+}
+
+VCError vcMemcpyFromImage(void *hostData, VCImageHandle img) {
+  if (!img || !hostData) return VCError::InvalidValue;
+  return Runtime::get().copyFromImage(hostData, *reinterpret_cast<VCImage *>(img));
 }
 
 // Allocation is a host-side operation (vkCreateBuffer + vkAllocateMemory); it

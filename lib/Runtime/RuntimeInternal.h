@@ -88,6 +88,21 @@ struct VCBuffer {
   uint32_t memoryHeapIndex = UINT32_MAX;
 };
 
+/// A 2D storage image (VkImage + VkImageView) in the GENERAL layout, bound as
+/// a STORAGE_IMAGE descriptor. The compute-shader analogue of a CUDA texture
+/// object, but read/written by integer texel coordinate (no sampler/filtering).
+/// Pixel data transfers go through a staging buffer + vkCmdCopyBufferToImage /
+/// vkCmdCopyImageToBuffer (row-major, tightly packed, 4 channels per texel).
+struct VCImage {
+  VkImage image = VK_NULL_HANDLE;
+  VkImageView view = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  int deviceIdx = 0;
+};
+
 /// A frame in a stream's command-buffer ring. One command buffer + the fence
 /// that signals when the GPU has finished executing it. Frames are recycled:
 /// beginFrame waits on the fence of the frame it is about to reuse, then
@@ -322,6 +337,15 @@ public:
                            VCStream &s);                   // sync (staging freed)
   VCError copyDeviceToHost(void *hostDst, const VCBuffer &src, size_t bytes,
                            VCStream &s);                   // sync (readable on return)
+
+  // Storage image lifecycle + pixel transfer. vcCreateImage2D makes a GENERAL-
+  // layout VkImage+VkImageView; ToImage/FromImage stage through a host-visible
+  // buffer and vkCmdCopyBufferToImage / vkCmdCopyImageToBuffer (sync, on the
+  // default stream). Texel data is row-major, tightly packed, 4 channels.
+  VCError createImage2D(uint32_t w, uint32_t h, VCPixelFormat fmt, VCImage &out);
+  VCError destroyImage(VCImage &img);
+  VCError copyToImage(VCImage &img, const void *hostData);   // sync
+  VCError copyFromImage(void *hostData, const VCImage &img); // sync
 
   // Async variants: staging is owned by the stream's current frame and
   // reclaimed when that frame is recycled (after its fence signals). H2D

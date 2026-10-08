@@ -624,6 +624,18 @@ private:
 
   mlir::Type cvtType(const vc::Type *t) {
     if (!t) return mlir::Type();
+    // Storage images (texture2D<T>) are GLSL-only: MLIR's spirv dialect gained
+    // spirv.ImageRead/ImageWrite only in release/21.x, and this tree builds
+    // against MLIR 18. Reject up front with a diagnostic so the demo is
+    // skip-listed (see run_e2e.py MLIR_UNSUPPORTED) rather than silently
+    // producing a null type that crashes later codegen.
+    if (isa<vc::ImageType>(t)) {
+      emitError(mlir::UnknownLoc::get(&ctx),
+                "storage images (texture2D<T>) are not supported by the MLIR "
+                "backend (requires spirv.ImageRead/Write, MLIR 21+); use the "
+                "GLSL backend");
+      return mlir::Type();
+    }
     // typedef alias: resolve to the underlying type recursively. Sema keeps the
     // TypedefType on params/locals (e.g. `weight_t wgt`); without this, buildFunction
     // would get a null arg type and crash. Mirrors Sema's resolveTypedefs.

@@ -1,0 +1,141 @@
+// test/image_stencil.vc — storage image (texture memory) demo.
+//
+// Exercises Vulkan **storage images** (the compute analogue of CUDA texture
+// memory, minus sampler-based filtering) end-to-end through the GLSL backend:
+//   - `texture2D<float>` kernel parameter -> GLSL `layout(binding=N, r32f)
+//     uniform image2D` (a STORAGE_IMAGE descriptor, not an SSBO).
+//   - `imageRead(tex, x, y)` -> `imageLoad(tex, ivec2(x,y))` returns a vec4
+//     (storage images are always 4-channel on the device side).
+//   - `imageWrite(tex, x, y, v)` -> `imageStore(tex, ivec2(x,y), v)`.
+//   - Host: `vcCreateImage2D` / `vcMemcpyToImage` / `vcMemcpyFromImage` /
+//     `vcDestroyImage`, and passing a `VCImage*` as a kernel arg (the runtime
+//     binds it as a STORAGE_IMAGE descriptor at launch).
+//
+// The kernel is a 3x3 box blur over an 8x4 image. Storage images give integer
+// texel coordinates (no normalized coords, no filtering) — the read/write
+// pattern is the point, not a performance win at this size.
+//
+// MLIR backend: storage image read/write needs spirv.ImageRead/ImageWrite,
+// which MLIR's spirv dialect only gained in release/21.x (this tree builds
+// against MLIR 18). So this demo is GLSL-only — the MLIR backend rejects it
+// with a diagnostic and the e2e harness skip-lists it (see run_e2e.py).
+//
+//   vcc test/image_stencil.vc -o build/image_stencil_sf && ./build/image_stencil_sf
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+// 3x3 box blur: each output texel is the average of its 3x3 neighborhood in
+// the source image (clamped to the image border). Reads and writes go through
+// storage-image texel access, not SSBO loads.
+__global__ void boxBlurKernel(texture2D<float> src, texture2D<float> dst,
+                              int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+
+  // imageRead returns a vec4 (4-channel texel); .r is the red channel we care
+  // about for a single-channel blur.
+  float acc = 0.0f;
+  int n = 0;
+  for (int dy = -1; dy <= 1; ++dy) {
+    for (int dx = -1; dx <= 1; ++dx) {
+      int sx = x + dx;
+      int sy = y + dy;
+      if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+      acc += imageRead(src, sx, sy).r;
+      ++n;
+    }
+  }
+  float blurred = acc / float(n);
+
+  // imageWrite takes a vec4; only .r is used (the image format is r32f).
+  imageWrite(dst, x, y, make_float4(blurred, 0.0f, 0.0f, 0.0f));
+}
+
+int main() {
+  vcInit();
+
+  const int W = 8, H = 4;
+  const int N = W * H;
+
+  // Build a simple input pattern: a bright cross on a dim background. The image
+  // is R32G32B32A32 (4 channels/texel), so host storage is one float4 per texel;
+  // only .r carries the value, the rest are zero (matching the kernel, which
+  // reads .r and writes .r).
+  const int CH = 4;
+  float hostIn[N * CH];
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      float v = 0.1f;
+      if (x == W / 2 || y == H / 2) v = 1.0f; // cross
+      hostIn[(y * W + x) * CH + 0] = v;
+      hostIn[(y * W + x) * CH + 1] = 0.0f;
+      hostIn[(y * W + x) * CH + 2] = 0.0f;
+      hostIn[(y * W + x) * CH + 3] = 0.0f;
+    }
+
+  VCImage *src = nullptr, *dst = nullptr;
+  vcCreateImage2D(&src, W, H, VCPixelFormat::R32G32B32A32Float);
+  vcCreateImage2D(&dst, W, H, VCPixelFormat::R32G32B32A32Float);
+  vcMemcpyToImage(src, hostIn);
+
+  // 2D launch: one thread per texel. gridDim is the element count (W×H); the
+  // runtime divides by blockDim to get the workgroup count, so a (W,H) grid
+  // with a (2,2) block yields (W/2, H/2) workgroups × (2,2) threads = W×H
+  // threads — one per texel.
+  boxBlurKernel<<<dim3(W, H), dim3(2, 2)>>>(src, dst, W, H);
+  vcDeviceSynchronize();
+
+  float hostOut[N * CH];
+  vcMemcpyFromImage(hostOut, dst);
+
+  // CPU reference: same 3x3 box blur, border-clamped. Compare the red channel.
+  int ok = 1;
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      float acc = 0.0f;
+      int n = 0;
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+          int sx = x + dx, sy = y + dy;
+          if (sx < 0 || sx >= W || sy < 0 || sy >= H) continue;
+          acc += hostIn[(sy * W + sx) * CH + 0];
+          ++n;
+        }
+      float ref = acc / float(n);
+      float got = hostOut[(y * W + x) * CH + 0];
+      // Tolerant compare: the device and host sum the neighborhood in
+      // different orders, so allow a small ULP margin rather than exact ==.
+      if (fabsf(ref - got) > 1e-5f) { ok = 0; break; }
+    }
+  if (!ok) {
+    printf("first mismatches (got vs ref):\n");
+    int shown = 0;
+    for (int y = 0; y < H && shown < 8; ++y)
+      for (int x = 0; x < W && shown < 8; ++x) {
+        float acc = 0.0f;
+        int n = 0;
+        for (int dy = -1; dy <= 1; ++dy)
+          for (int dx = -1; dx <= 1; ++dx) {
+            int sx = x + dx, sy = y + dy;
+            if (sx < 0 || sx >= W || sy < 0 || sy >= H) continue;
+            acc += hostIn[(sy * W + sx) * CH + 0];
+            ++n;
+          }
+        float ref = acc / float(n);
+        float got = hostOut[(y * W + x) * CH + 0];
+        if (fabsf(ref - got) > 1e-5f) {
+          printf("  [%d,%d] got=%.4f ref=%.4f\n", x, y, got, ref);
+          ++shown;
+        }
+      }
+  }
+
+  vcDestroyImage(src);
+  vcDestroyImage(dst);
+  vcShutdown();
+  printf("image_stencil: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
+}

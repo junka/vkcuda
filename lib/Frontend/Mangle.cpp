@@ -64,6 +64,8 @@ std::string vc::mangleType(const Type *t) {
     return "S";
   case TypeKind::Typedef:
     return "?"; // resolved above; unreachable
+  case TypeKind::Image:
+    return "t2" + mangleType(static_cast<const ImageType *>(t)->elemType);
   }
   return "?";
 }

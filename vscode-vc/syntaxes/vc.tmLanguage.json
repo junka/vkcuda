@@ -245,6 +245,11 @@
           "comment": "dim3 launch-dimension constructor (intentionally lexes as identifier; highlight as a type)",
           "name": "support.type.cuda.vc",
           "match": "\\bdim3\\b"
+        },
+        {
+          "comment": "Storage-image type (texture2D<T> kernel param; GLSL image2D)",
+          "name": "support.type.cuda.vc",
+          "match": "\\btexture2D\\b"
         }
       ]
     },
@@ -299,6 +304,11 @@
           "comment": "make_<vec> constructor family",
           "name": "support.function.builtin.make.vc",
           "match": "\\b(?i:make_(float|int|uint|double|bool|long|ulong|half|short|ushort|char|uchar)(2|3|4)?)\\b"
+        },
+        {
+          "comment": "Storage-image texel access (texture2D<T> params; lowers to GLSL imageLoad/imageStore)",
+          "name": "support.function.builtin.image.vc",
+          "match": "\\b(imageRead|imageWrite)\\b"
         }
       ]
     },
@@ -307,7 +317,7 @@
       "patterns": [
         {
           "comment": "Qualified enum constant: VCMemcpyKind::DeviceToHost — matched before the bare-type rule below",
-          "match": "\\b(VCError|VCMemcpyKind|VCDeviceProperty)\\s*(::)\\s*([A-Z][A-Za-z0-9_]*)",
+          "match": "\\b(VCError|VCMemcpyKind|VCDeviceProperty|VCPixelFormat)\\s*(::)\\s*([A-Z][A-Za-z0-9_]*)",
           "captures": {
             "1": { "name": "support.type.enum.vc" },
             "2": { "name": "punctuation.separator.namespace.vc" },
@@ -319,9 +329,9 @@
           "match": "\\bvc[A-Z][A-Za-z0-9_]*\\b"
         },
         {
-          "comment": "Bare VC enum type (e.g. in a switch on vcInit()'s return): VCError, VCMemcpyKind",
+          "comment": "Bare VC enum/opaque types (e.g. in a switch on vcInit()'s return): VCError, VCMemcpyKind, VCImage",
           "name": "support.type.enum.vc",
-          "match": "\\b(VCError|VCMemcpyKind|VCDeviceProperty)\\b"
+          "match": "\\b(VCError|VCMemcpyKind|VCDeviceProperty|VCPixelFormat|VCImage)\\b"
         }
       ]
     },

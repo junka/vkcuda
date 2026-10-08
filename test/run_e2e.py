@@ -42,6 +42,11 @@ MLIR_UNSUPPORTED = {
     # SPIR-V) in the GLSL backend; the MLIR SPIR-V path does not emit arbitrary
     # NonSemantic ExtInst sets and emits a diagnostic instead.
     "printf.vc": "kernel printf not implemented in MLIR backend (GLSL only)",
+    # Storage images (texture2D<T> / imageRead / imageWrite) lower to GLSL
+    # image2D + imageLoad/imageStore. MLIR's spirv dialect gained
+    # spirv.ImageRead/ImageWrite only in release/21.x; this tree builds against
+    # MLIR 18, so the MLIR backend emits a diagnostic and rejects this demo.
+    "image_stencil.vc": "storage images need spirv.ImageRead/Write (MLIR 21+; GLSL only)",
 }
 
 # Demos the GLSL backend cannot build (and intentionally rejects with a

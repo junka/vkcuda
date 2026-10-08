@@ -202,6 +202,8 @@ std::string Sema::typeName(const Type *t) {
     return static_cast<const RecordType *>(t)->decl->name.str();
   case TypeKind::Typedef:
     return static_cast<const TypedefType *>(t)->decl->name.str();
+  case TypeKind::Image:
+    return "texture2D<" + typeName(static_cast<const ImageType *>(t)->elemType) + ">";
   }
   return "<unknown>";
 }
@@ -545,6 +547,9 @@ bool Sema::sameType(const Type *a, const Type *b) {
            static_cast<const RecordType *>(rb)->decl;
   case TypeKind::Typedef:
     return false; // resolved above; unreachable
+  case TypeKind::Image:
+    return sameType(static_cast<const ImageType *>(ra)->elemType,
+                    static_cast<const ImageType *>(rb)->elemType);
   }
   return false;
 }

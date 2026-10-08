@@ -286,6 +286,7 @@ errors.
 | `__constant__` globals | `constant.vc`, `const_local.vc` | lazily materialized per-kernel; **no `cudaMemcpyToSymbol`** (compile-time init only) |
 | Atomics | `atomics.vc` | `spirv.Atomic*` / `memref.atomic_rmw`; SSBO `atomicExch` via ordinal-marker rewrite. **MLIR is i32-only** — a float/double/64-bit target or value is rejected (GLSL supports float atomics) |
 | `__threadfence()` | `sync.vc` | `spirv.MemoryBarrier` (no `barrier()`) |
+| Storage images (`texture2D<T>`) | `image_stencil.vc` | `image2D`+`imageLoad`/`imageStore` (GLSL only; MLIR needs `spirv.ImageRead/Write`, 21+) |
 
 ### Intrinsics / builtins
 
@@ -307,6 +308,7 @@ errors.
 | Multi-device | `multigpu.vc` | `vcGetDevice/SetDevice/Count`, `vcMemcpyPeer` (host-bridge) |
 | Introspection | `profiling.vc`, `occupancy.vc` | `vcGetDeviceProperties`, `vcPointerGetAttributes`, `vcEventElapsedTime`, `vcOccupancyMaxPotentialBlockSize` |
 | Host callbacks | `stream_query.vc` | `vcLaunchHostFunc` (timeline sem + bg thread) |
+| Storage images | `image_stencil.vc` | `vcCreateImage2D`/`vcDestroyImage`/`vcMemcpyToImage`/`vcMemcpyFromImage` (STORAGE_IMAGE descriptors) |
 
 ## Long tail — deliberately not done
 

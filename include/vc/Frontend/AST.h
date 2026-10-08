@@ -61,7 +61,7 @@ enum class BuiltinTypeKind {
   Float64,
 };
 
-enum class TypeKind { Builtin, Pointer, Reference, Vector, Record, Typedef, WmmaFragment };
+enum class TypeKind { Builtin, Pointer, Reference, Vector, Record, Typedef, WmmaFragment, Image };
 
 // Forward declarations: RecordType/TypedefType point at these decls, which are
 // defined as ASTNodes further down. A pointer is all that's needed here.
@@ -165,6 +165,20 @@ public:
       : Type(TypeKind::WmmaFragment), use(u), prec(p), layout(l), M(m), N(n), K(k) {}
   static bool classof(const Type *t) { return t->getKind() == TypeKind::WmmaFragment; }
   bool isAccumulator() const { return use == WmmaUse::Accumulator; }
+};
+
+// A Vulkan storage image (`texture2D<T>`). Maps to a `spirv.Image` with
+// Sampled=0 (GLSL `image2D`). Storage images are read/written by integer texel
+// coordinate via `imageRead(tex,x,y)` / `imageWrite(tex,x,y,v)` — no sampler,
+// no hardware filtering. The element type T must be a scalar builtin (float,
+// half, int); the image is always 4-channel on the device side, so reads
+// return vec4<T> and writes take vec4<T>. Currently only 2D is supported.
+class ImageType : public Type {
+public:
+  Type *elemType; // BuiltinType (Float32/Float16/Int32)
+
+  ImageType(Type *e) : Type(TypeKind::Image), elemType(e) {}
+  static bool classof(const Type *t) { return t->getKind() == TypeKind::Image; }
 };
 
 //===----------------------------------------------------------------------===//

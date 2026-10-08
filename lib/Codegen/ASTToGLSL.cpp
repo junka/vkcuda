@@ -48,6 +48,11 @@ class GLSLEmitter {
   // treats `counter` as a pointer to a single value, but in GLSL it's an SSBO
   // array — so a bare reference must be lowered to `counter[0]`.
   SmallVector<StringRef, 8> ssboParams;
+  // Names of storage-image parameters (texture2D<T>). These bind as GLSL
+  // `image2D` (not `buffer`) and get a runtime image descriptor instead of an
+  // SSBO. Tracked separately so emitBindings emits the right declaration and
+  // the runtime distinguishes image vs buffer args at descriptor-write time.
+  SmallVector<StringRef, 8> imageParams;
   // Whether the kernel references any Vulkan subgroup primitive (CUDA warp
   // intrinsics or warpSize). Subgroup ops require SPIR-V 1.3 + the
   // GL_KHR_shader_subgroup_* extensions; emitHeader drives the extension list
@@ -754,7 +759,54 @@ private:
       auto *td = static_cast<const TypedefType *>(t);
       return glslType(td->decl->underlying);
     }
+    // texture2D<T> — the parameter type is `image2D` (GLSL storage image).
+    // The element type T only affects the format qualifier (imageFormatQualifier)
+    // and the read/write texel type (imageVecType); the declared GLSL type is
+    // always `image2D`.
+    if (t->getKind() == TypeKind::Image)
+      return "image2D";
     return "float";
+  }
+
+  // The GLSL layout format qualifier for a storage image, derived from the
+  // element type. Storage images are always 4-channel on the device side, so
+  // float->r32f, half->r16f, int->r32i. A concrete format keeps the shader
+  // portable without shaderStorageImageReadWithoutFormat support.
+  const char *imageFormatQualifier(const Type *t) {
+    if (t && t->getKind() == TypeKind::Image) {
+      auto *it = static_cast<const ImageType *>(t);
+      if (it->elemType &&
+          it->elemType->getKind() == TypeKind::Builtin) {
+        switch (static_cast<const BuiltinType *>(it->elemType)->builtin) {
+        case BuiltinTypeKind::Float32: return "r32f";
+        case BuiltinTypeKind::Float16: return "r16f";
+        case BuiltinTypeKind::Int32:
+        case BuiltinTypeKind::UInt32: return "r32i";
+        default: break;
+        }
+      }
+    }
+    return "r32f";
+  }
+
+  // The 4-component GLSL texel type returned by imageLoad / consumed by
+  // imageStore for a storage image of element type T (float->vec4, int->ivec4,
+  // half->f16vec4).
+  const char *imageVecType(const Type *t) {
+    if (t && t->getKind() == TypeKind::Image) {
+      auto *it = static_cast<const ImageType *>(t);
+      if (it->elemType &&
+          it->elemType->getKind() == TypeKind::Builtin) {
+        switch (static_cast<const BuiltinType *>(it->elemType)->builtin) {
+        case BuiltinTypeKind::Float32: return "vec4";
+        case BuiltinTypeKind::Float16: return "f16vec4";
+        case BuiltinTypeKind::Int32: return "ivec4";
+        case BuiltinTypeKind::UInt32: return "uvec4";
+        default: break;
+        }
+      }
+    }
+    return "vec4";
   }
 
   void emitHeader() {
@@ -820,11 +872,30 @@ private:
     for (unsigned i = 0; i < params.size(); ++i) {
       const ParamDecl *p = params[i];
       bool isPtr = p->type && p->type->getKind() == TypeKind::Pointer;
-      if (!isPtr) { scalars.push_back(p); scalarParams.push_back(p->name); continue; }
-      ssboParams.push_back(p->name);
-      const char *ty = glslType(p->type);
-      (*os) << "layout(set = 0, binding = " << bindIdx << ") buffer B" << bindIdx
-         << " {\n  " << ty << " " << glslName(p->name) << "[];\n};\n\n";
+      bool isImg = p->type && p->type->getKind() == TypeKind::Image;
+      if (!isPtr && !isImg) {
+        scalars.push_back(p);
+        scalarParams.push_back(p->name);
+        continue;
+      }
+      if (isImg) {
+        // Storage image (texture2D<T>) -> `layout(binding=N, <fmt>) uniform
+        // image2D`. The format qualifier is mandatory for storage images
+        // unless the device supports shaderStorageImageReadWithoutFormat
+        // (runtime queries it; we always emit a concrete format so the shader
+        // is portable). Images are 4-channel on the device side regardless of
+        // the declared element type.
+        imageParams.push_back(p->name);
+        const char *fmt = imageFormatQualifier(p->type);
+        (*os) << "layout(set = 0, binding = " << bindIdx << ", " << fmt
+              << ") uniform image2D " << glslName(p->name) << ";\n\n";
+      } else {
+        ssboParams.push_back(p->name);
+        const char *ty = glslType(p->type);
+        (*os) << "layout(set = 0, binding = " << bindIdx << ") buffer B"
+              << bindIdx << " {\n  " << ty << " " << glslName(p->name)
+              << "[];\n};\n\n";
+      }
       ++bindIdx;
     }
     if (!scalars.empty()) {
@@ -1451,6 +1522,38 @@ private:
     (*os) << "  }";
     // The enclosing ExprStmt appends `;` after this block, yielding `... }`
     // followed by an empty statement — harmless in GLSL.
+  }
+
+  // Storage image texel access. imageRead(tex, x, y) -> imageLoad(tex, ivec2(x,y))
+  // returns a 4-component texel; imageWrite(tex, x, y, v) -> imageStore(tex,
+  // ivec2(x,y), v). The texel type (vec4/ivec4/f16vec4/...) is derived from the
+  // image parameter's declared element type so the host C++ matches the device
+  // layout. Both coordinates are integer texel indices (storage images have no
+  // sampler, so no normalized coords / filtering).
+  void emitImageCall(StringRef name, const std::vector<NodePtr> &args) {
+    if (name == "imageRead") {
+      // imageRead(tex, x, y) -> imageLoad(tex, ivec2(x, y))
+      if (args.size() < 3) { (*os) << "vec4(0) /*imageRead: missing args*/"; return; }
+      (*os) << "imageLoad(";
+      emitExpr(args[0].get());
+      (*os) << ", ivec2(";
+      emitExpr(args[1].get());
+      (*os) << ", ";
+      emitExpr(args[2].get());
+      (*os) << "))";
+      return;
+    }
+    // imageWrite
+    if (args.size() < 4) { (*os) << "/*imageWrite: missing args*/"; return; }
+    (*os) << "imageStore(";
+    emitExpr(args[0].get());
+    (*os) << ", ivec2(";
+    emitExpr(args[1].get());
+    (*os) << ", ";
+    emitExpr(args[2].get());
+    (*os) << "), ";
+    emitExpr(args[3].get());
+    (*os) << ")";
   }
 
   // Pre-pass walker: visit a statement's expressions (with output discarded)
@@ -2852,6 +2955,13 @@ private:
         // barrier() wrappers. No hardware DMA exists in Vulkan.
         if (isAsyncCopyBuiltin(ref->name)) {
           emitAsyncCopyCall(ref->name, c->args);
+          return;
+        }
+        // Storage image texel access. texture2D<T> params are GLSL `image2D`;
+        // imageRead(tex,x,y) -> imageLoad(tex, ivec2(x,y)) returns a vec4<T>;
+        // imageWrite(tex,x,y,v) -> imageStore(tex, ivec2(x,y), v).
+        if (ref->name == "imageRead" || ref->name == "imageWrite") {
+          emitImageCall(ref->name, c->args);
           return;
         }
         // User __device__ helper or CUDA/math builtin: lower the name and emit

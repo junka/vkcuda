@@ -36,6 +36,13 @@ using VCKernelHandle = VCKernel *;
 struct VCStream;
 using VCStreamHandle = VCStream *;
 
+/// Opaque handle to a 2D storage image (Vulkan `VkImage` + `VkImageView` in
+/// the GENERAL layout, bound as a STORAGE_IMAGE descriptor). The compute
+/// equivalent of a CUDA texture object, but without sampler-based filtering:
+/// the kernel reads/writes texels by integer coordinate via imageRead/imageWrite.
+struct VCImage;
+using VCImageHandle = VCImage *;
+
 /// Opaque handle to a recorded command graph (CUDA-Graph-style "record once,
 /// replay many"). A graph captures a sequence of kernel launches and
 /// device-to-device copies issued while recording is active; vcGraphLaunch
@@ -71,6 +78,15 @@ enum class VCMemcpyKind {
   HostToDevice,
   DeviceToHost,
   DeviceToDevice,
+};
+
+/// Pixel format for a 2D storage image (vcCreateImage2D). Maps to a Vulkan
+/// VkFormat; the shader's layout format qualifier must match. All formats are
+/// 4-channel to match GLSL `image2D` texel reads (vec4/ivec4/...).
+enum class VCPixelFormat {
+  R32G32B32A32Float, // texture2D<float>; GLSL r32f, vec4 texels
+  R16G16B16A16Float, // texture2D<half>;  GLSL r16f, f16vec4 texels
+  R32G32B32A32Sint,  // texture2D<int>;   GLSL r32i, ivec4 texels
 };
 
 /// Initialize the runtime (creates the Vulkan instance/device/queue).
@@ -225,6 +241,28 @@ VCError vcMallocHostAsync(void **hostPtr, size_t bytes, VCStreamHandle stream);
 /// reclaimed at the next vcStreamSynchronize / vcDeviceSynchronize / vcShutdown
 /// once its stream's work is done.
 VCError vcFreeAsync(void *devPtr, VCStreamHandle stream);
+
+/// Create a 2D storage image. The image is created in the GENERAL layout
+/// (compute shaders read/write directly) and bound as a STORAGE_IMAGE
+/// descriptor when passed to a kernel via VCKernelArg::Image. `width`/`height`
+/// are texel counts. The host transfers data in/out with vcMemcpyToImage /
+/// vcMemcpyFromImage; the pixel data layout is row-major, tightly packed,
+/// 4 channels × (4 bytes for float/int, 2 bytes for half) per texel.
+VCError vcCreateImage2D(VCImageHandle *out, uint32_t width, uint32_t height,
+                        VCPixelFormat fmt);
+
+/// Destroy a storage image created by vcCreateImage2D.
+VCError vcDestroyImage(VCImageHandle img);
+
+/// Copy packed host pixel data into a storage image. `hostData` is
+/// width*height*texelsize bytes (row-major). Blocks until the upload completes
+/// (stages through a transient host-visible buffer + vkCmdCopyBufferToImage).
+VCError vcMemcpyToImage(VCImageHandle img, const void *hostData);
+
+/// Copy a storage image back to packed host pixel data. Blocks until the
+/// download completes (vkCmdCopyImageToBuffer + staging readback).
+VCError vcMemcpyFromImage(void *hostData, VCImageHandle img);
+
 
 /// Copy memory. `count` is bytes. D2D is asynchronous on the default stream;
 /// H2D and D2H block until the copy completes so the host can read/write the
@@ -439,12 +477,13 @@ VCError vcLoadKernelFromFile(const char *path, const char *entryPoint,
 /// Release a loaded kernel.
 VCError vcReleaseKernel(VCKernelHandle kernel);
 
-/// Argument passed to a kernel launch: a device pointer (from vcMalloc) or
-/// an immediate scalar. Scalars are copied into a uniform/SSBO binding.
+/// Argument passed to a kernel launch: a device pointer (from vcMalloc), a
+/// storage image (from vcCreateImage2D), or an immediate scalar. Scalars are
+/// copied into a uniform/SSBO binding.
 struct VCKernelArg {
-  enum Kind { Pointer, Scalar } kind = Pointer;
-  const void *data = nullptr; // device ptr, or pointer to scalar bytes
-  size_t size = 0;            // bytes (for scalar; ignored for Pointer)
+  enum Kind { Pointer, Scalar, Image } kind = Pointer;
+  const void *data = nullptr; // device ptr, VCImage*, or pointer to scalar bytes
+  size_t size = 0;            // bytes (for scalar; ignored for Pointer/Image)
 };
 
 /// Launch a kernel with a 1D grid/block. `gridDim`/`blockDim` are element
