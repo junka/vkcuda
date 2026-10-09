@@ -1272,25 +1272,38 @@ static uint32_t pixelFormatTexelSize(VCPixelFormat f) {
   return 16;
 }
 
-// Create a 2D storage image in the GENERAL layout (compute shaders read/write
+// Create a storage image in the GENERAL layout (compute shaders read/write
 // directly, no sampler). The VkImageView is the handle bound as a
 // STORAGE_IMAGE descriptor at launch. Image memory is device-local (falls back
 // to host-visible on integrated GPUs, matching mallocBuffer's policy).
-VCError Runtime::createImage2D(uint32_t w, uint32_t h, VCPixelFormat fmt,
-                               VCImage &out) {
+// `depth` is the 3D texel depth (1 for non-3D); `layers` is the array layer
+// count (>1 for 2DArray). The image type / view type / extent / layer count
+// are derived from which of (h, depth, layers) are meaningful; this single
+// path backs vcCreateImage1D/2D/3D/2DArray.
+VCError Runtime::createImage(uint32_t w, uint32_t h, uint32_t depth,
+                             uint32_t layers, VCPixelFormat fmt,
+                             VCImage &out) {
   if (!init_) return VCError::InitializationError;
-  if (w == 0 || h == 0) return VCError::InvalidValue;
+  if (w == 0 || h == 0 || depth == 0 || layers == 0)
+    return VCError::InvalidValue;
   VulkanDevice &vd = *devices_[currentDeviceIdx_];
   VkFormat vkfmt = pixelFormatToVk(fmt);
   if (vkfmt == VK_FORMAT_UNDEFINED) return VCError::InvalidValue;
 
+  // Classify the image shape from the meaningful extents. depth>1 ⇒ 3D;
+  // layers>1 ⇒ 2DArray; h==1 (and depth==1, layers==1) ⇒ 1D; else 2D.
+  bool is3D = depth > 1;
+  bool isArray = layers > 1;
+  bool is1D = !is3D && !isArray && h <= 1;
+
   VkImageCreateInfo ici{};
   ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-  ici.imageType = VK_IMAGE_TYPE_2D;
+  ici.imageType = is1D ? VK_IMAGE_TYPE_1D
+                  : (is3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D);
   ici.format = vkfmt;
-  ici.extent = {w, h, 1};
+  ici.extent = {w, is1D ? 1u : h, is3D ? depth : 1u};
   ici.mipLevels = 1;
-  ici.arrayLayers = 1;
+  ici.arrayLayers = isArray ? layers : 1;
   ici.samples = VK_SAMPLE_COUNT_1_BIT;
   ici.tiling = VK_IMAGE_TILING_OPTIMAL;
   ici.usage = VK_IMAGE_USAGE_STORAGE_BIT |    // imageLoad/imageStore
@@ -1328,13 +1341,16 @@ VCError Runtime::createImage2D(uint32_t w, uint32_t h, VCPixelFormat fmt,
   VkImageViewCreateInfo vci{};
   vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
   vci.image = out.image;
-  vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vci.viewType = is1D ? VK_IMAGE_VIEW_TYPE_1D
+                  : (is3D ? VK_IMAGE_VIEW_TYPE_3D
+                          : (isArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                     : VK_IMAGE_VIEW_TYPE_2D));
   vci.format = vkfmt;
   vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
   vci.subresourceRange.baseMipLevel = 0;
   vci.subresourceRange.levelCount = 1;
   vci.subresourceRange.baseArrayLayer = 0;
-  vci.subresourceRange.layerCount = 1;
+  vci.subresourceRange.layerCount = isArray ? layers : 1;
   if (vkCreateImageView(vd.device, &vci, nullptr, &out.view) != VK_SUCCESS) {
     vkDestroyImage(vd.device, out.image, nullptr);
     vkFreeMemory(vd.device, out.memory, nullptr);
@@ -1347,7 +1363,9 @@ VCError Runtime::createImage2D(uint32_t w, uint32_t h, VCPixelFormat fmt,
   // accessed in). The image was created UNDEFINED, so this is the first
   // transition. Use a one-time command buffer on the default stream.
   out.width = w;
-  out.height = h;
+  out.height = is1D ? 1 : h;
+  out.depth = is3D ? depth : 1;
+  out.layers = isArray ? layers : 1;
   out.format = vkfmt;
   out.pformat = fmt; // kept in sync with `format`; copy paths read this
   out.deviceIdx = currentDeviceIdx_;
@@ -1362,12 +1380,19 @@ VCError Runtime::createImage2D(uint32_t w, uint32_t h, VCPixelFormat fmt,
   b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   b.image = out.image;
-  b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                        isArray ? layers : 1};
   vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
                        nullptr, 1, &b);
   endFrame(s);
   return streamSynchronize(s);
+}
+
+// Backwards-compatible 2D entry: depth=1, layers=1.
+VCError Runtime::createImage2D(uint32_t w, uint32_t h, VCPixelFormat fmt,
+                               VCImage &out) {
+  return createImage(w, h, /*depth=*/1, /*layers=*/1, fmt, out);
 }
 
 VCError Runtime::destroyImage(VCImage &img) {
@@ -1392,7 +1417,11 @@ VCError Runtime::copyToImage(VCImage &img, const void *hostData) {
   // Texel size from the stored VC pixel format (not a VkFormat reverse-map,
   // which would break for future formats aliasing an existing VkFormat).
   uint32_t texelSize = pixelFormatTexelSize(img.pformat);
-  VkDeviceSize total = (VkDeviceSize)texelSize * img.width * img.height;
+  // Total texels covers every meaningful extent: width × height × depth (3D)
+  // × layers (2DArray). For 2D/1D, depth=1 and layers=1 so this collapses to
+  // the historic width × height.
+  VkDeviceSize total = (VkDeviceSize)texelSize * img.width * img.height *
+                       img.depth * img.layers;
 
   VCBuffer staging{};
   if (mallocHostBufferOn(img.deviceIdx, total, staging) != VCError::Success)
@@ -1410,7 +1439,8 @@ VCError Runtime::copyToImage(VCImage &img, const void *hostData) {
   toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   toTransfer.image = img.image;
-  toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                  img.layers};
   vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                        nullptr, 1, &toTransfer);
@@ -1419,9 +1449,9 @@ VCError Runtime::copyToImage(VCImage &img, const void *hostData) {
   region.bufferOffset = 0;
   region.bufferRowLength = 0; // tightly packed
   region.bufferImageHeight = 0;
-  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, img.layers};
   region.imageOffset = {0, 0, 0};
-  region.imageExtent = {img.width, img.height, 1};
+  region.imageExtent = {img.width, img.height, img.depth};
   vkCmdCopyBufferToImage(cb, staging.buffer, img.image,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
@@ -1434,7 +1464,8 @@ VCError Runtime::copyToImage(VCImage &img, const void *hostData) {
   toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   toGeneral.image = img.image;
-  toGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  toGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                 img.layers};
   vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
                        nullptr, 1, &toGeneral);
@@ -1451,7 +1482,10 @@ VCError Runtime::copyFromImage(void *hostData, const VCImage &img) {
   if (!init_ || !img.image) return VCError::InitializationError;
   VulkanDevice &vd = *devices_[img.deviceIdx];
   uint32_t texelSize = pixelFormatTexelSize(img.pformat);
-  VkDeviceSize total = (VkDeviceSize)texelSize * img.width * img.height;
+  // Covers every extent (width × height × depth × layers); collapses to
+  // width × height for 2D/1D where depth=1 and layers=1.
+  VkDeviceSize total = (VkDeviceSize)texelSize * img.width * img.height *
+                       img.depth * img.layers;
 
   VCBuffer staging{};
   if (mallocHostBufferOn(img.deviceIdx, total, staging) != VCError::Success)
@@ -1468,7 +1502,8 @@ VCError Runtime::copyFromImage(void *hostData, const VCImage &img) {
   toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   toTransfer.image = img.image;
-  toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                  img.layers};
   vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                        nullptr, 1, &toTransfer);
@@ -1477,9 +1512,9 @@ VCError Runtime::copyFromImage(void *hostData, const VCImage &img) {
   region.bufferOffset = 0;
   region.bufferRowLength = 0;
   region.bufferImageHeight = 0;
-  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, img.layers};
   region.imageOffset = {0, 0, 0};
-  region.imageExtent = {img.width, img.height, 1};
+  region.imageExtent = {img.width, img.height, img.depth};
   vkCmdCopyImageToBuffer(cb, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                          staging.buffer, 1, &region);
 
@@ -1492,7 +1527,8 @@ VCError Runtime::copyFromImage(void *hostData, const VCImage &img) {
   toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   toGeneral.image = img.image;
-  toGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  toGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                 img.layers};
   vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
                        nullptr, 1, &toGeneral);
@@ -3599,6 +3635,40 @@ VCError vcCreateImage2D(VCImageHandle *out, uint32_t width, uint32_t height,
   if (!out) return VCError::InvalidValue;
   auto *img = new VCImage{};
   VCError e = Runtime::get().createImage2D(width, height, fmt, *img);
+  if (e != VCError::Success) { delete img; return e; }
+  *out = img;
+  return VCError::Success;
+}
+
+VCError vcCreateImage1D(VCImageHandle *out, uint32_t width,
+                        VCPixelFormat fmt) {
+  if (!out) return VCError::InvalidValue;
+  auto *img = new VCImage{};
+  VCError e = Runtime::get().createImage(width, /*h=*/1, /*depth=*/1,
+                                         /*layers=*/1, fmt, *img);
+  if (e != VCError::Success) { delete img; return e; }
+  *out = img;
+  return VCError::Success;
+}
+
+VCError vcCreateImage3D(VCImageHandle *out, uint32_t width, uint32_t height,
+                        uint32_t depth, VCPixelFormat fmt) {
+  if (!out) return VCError::InvalidValue;
+  auto *img = new VCImage{};
+  VCError e = Runtime::get().createImage(width, height, depth, /*layers=*/1,
+                                         fmt, *img);
+  if (e != VCError::Success) { delete img; return e; }
+  *out = img;
+  return VCError::Success;
+}
+
+VCError vcCreateImage2DArray(VCImageHandle *out, uint32_t width,
+                             uint32_t height, uint32_t layers,
+                             VCPixelFormat fmt) {
+  if (!out) return VCError::InvalidValue;
+  auto *img = new VCImage{};
+  VCError e = Runtime::get().createImage(width, height, /*depth=*/1, layers,
+                                         fmt, *img);
   if (e != VCError::Success) { delete img; return e; }
   *out = img;
   return VCError::Success;

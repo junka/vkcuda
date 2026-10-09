@@ -95,14 +95,43 @@ SPIRVWidthUse scanWidthUses(ModuleOp module) {
   return use;
 }
 
-// The default target env only enables Shader without any extensions, while
-// the Vulkan interface variables we generate for kernel arguments live in the
-// StorageBuffer storage class, which SPIR-V 1.0 expresses via the
-// SPV_KHR_storage_buffer_storage_class extension. Without it the GPUToSPIRV
-// signature conversion cannot map the kernel arguments and memref.load/store
-// on them fails to legalize (<UNKNOWN SSA VALUE>).
+// True if the module declares any 1D storage image (texture1D<T>). A
+// spirv.image with Dim=1D requires the Image1D capability declared in the
+// target env, or GPUToSPIRV marks the image's spirv.GlobalVariable illegal
+// ("explicitly marked illegal") during legalization. 2D/3D/2DArray images are
+// covered by the core Shader capability and need no extra advertising.
+static bool scanUsesImage1D(ModuleOp module) {
+  bool found = false;
+  module.walk([&](Operation *op) {
+    if (found) return;
+    auto check = [&](Type t) {
+      // Image globals are spirv.ptr<!spirv.image<...>, UniformConstant>; the
+      // image type lives inside the pointer, so unwrap one level.
+      if (auto ptr = t.dyn_cast<mlir::spirv::PointerType>())
+        t = ptr.getPointeeType();
+      if (auto img = t.dyn_cast<mlir::spirv::ImageType>()) {
+        if (img.getDim() == mlir::spirv::Dim::Dim1D)
+          found = true;
+      }
+    };
+    for (Type t : op->getResultTypes()) check(t);
+    for (Value v : op->getOperands()) check(v.getType());
+    for (Region &region : op->getRegions())
+      for (Block &block : region.getBlocks())
+        for (BlockArgument arg : block.getArguments()) check(arg.getType());
+    // spirv.GlobalVariable carries its type as a TypeAttr (no result/operand),
+    // so the walks above miss it. Scan attributes too.
+    for (NamedAttribute na : op->getAttrs()) {
+      if (auto ta = na.getValue().dyn_cast<TypeAttr>()) check(ta.getValue());
+    }
+  });
+  return found;
+}
+
+
 spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context, bool usesSubgroup,
                                     bool usesCoopMatrix, bool usesF16Storage,
+                                    bool usesImage1D,
                                     const SPIRVWidthUse &widths) {
   // Float64/Int64/Float16 are advertised exactly when the kernels use a double
   // (`double`, `double2`), 64-bit integer (`long`, `long4`) or half (`__half`)
@@ -171,6 +200,11 @@ spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context, bool usesSubgroup,
     if (!llvm::is_contained(exts, spirv::Extension::SPV_KHR_16bit_storage))
       exts.push_back(spirv::Extension::SPV_KHR_16bit_storage);
   }
+  // A 1D storage image (texture1D<T>) lowers to OpTypeImage with Dim=1D; the
+  // Image1D capability must be advertised or GPUToSPIRV refuses to legalize
+  // the image's spirv.GlobalVariable. 2D/3D/2DArray images are core Shader.
+  if (usesImage1D)
+    caps.push_back(spirv::Capability::Image1D);
   auto triple = spirv::VerCapExtAttr::get(version, caps, exts, context);
   return spirv::TargetEnvAttr::get(triple,
                                    spirv::getDefaultResourceLimits(context));
@@ -475,6 +509,9 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
     return false;
   };
   bool usesF16Storage = kernelUsesF16VectorParam();
+  // Whether any kernel declares a 1D storage image (needs Image1D capability
+  // in the target env — see getVCTargetEnv). Computed once over the module.
+  bool usesImage1D = scanUsesImage1D(module);
   // Which numeric widths the kernels use, computed once over the module: the
   // target env is one attribute on the single gpu.module every kernel lands in.
   SPIRVWidthUse widths = scanWidthUses(module);
@@ -499,7 +536,8 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
     bool usesCoopMatrix = module->hasAttr("vc.uses_coopmatrix");
     gpuModule->setAttr(spirv::getTargetEnvAttrName(),
                        getVCTargetEnv(module.getContext(), usesSubgroup,
-                                      usesCoopMatrix, usesF16Storage, widths));
+                                      usesCoopMatrix, usesF16Storage,
+                                      usesImage1D, widths));
 
     rw.setInsertionPointToStart(gpuModule.getBody());
     auto gpuFn = rw.create<gpu::GPUFuncOp>(k.getLoc(), fn.getName(),

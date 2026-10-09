@@ -1200,13 +1200,21 @@ Type *Parser::parseBaseType() {
     // A user-named type (struct/typedef) or a vector name like float4.
     if (auto *vec = makeVectorType(curTok.text))
       base = vec;
-    else if (curTok.text == "texture2D") {
-      // texture2D<T> — a Vulkan storage image (GLSL image2D). T must be a
+    else if (curTok.text == "texture1D" || curTok.text == "texture2D" ||
+             curTok.text == "texture3D" || curTok.text == "texture2DArray") {
+      // textureND<T> — a Vulkan storage image (GLSL imageND). T must be a
       // scalar builtin (float/half/int). An optional access modifier may
-      // precede T: `texture2D<read_only float>` / `texture2D<write_only float>`
-      // / `texture2D<read_write float>` (OpenCL/CUDA-style; `read_write` is the
-      // default if omitted). Only 2D is surfaced by the parser today.
-      advance(); // consume `texture2D`
+      // precede T: `textureND<read_only float>` / `textureND<write_only float>`
+      // / `textureND<read_write float>` (OpenCL/CUDA-style; `read_write` is the
+      // default if omitted). The spelling selects the image dimension:
+      //   texture1D → Dim1D, texture2D → Dim2D, texture3D → Dim3D,
+      //   texture2DArray → Dim2DArray.
+      std::string spelling = curTok.text.str();
+      ImageDim dim = ImageDim::Dim2D;
+      if (spelling == "texture1D")        dim = ImageDim::Dim1D;
+      else if (spelling == "texture3D")   dim = ImageDim::Dim3D;
+      else if (spelling == "texture2DArray") dim = ImageDim::Dim2DArray;
+      advance(); // consume the texture spelling
       if (!expect(TokKind::lt, "'<'"))
         return nullptr;
       ImageAccess access = ImageAccess::ReadWrite;
@@ -1222,13 +1230,13 @@ Type *Parser::parseBaseType() {
       }
       Type *elem = parseBaseType();
       if (!elem) {
-        error(curTok, "expected element type in texture2D<T>");
+        error(curTok, "expected element type in " + spelling + "<T>");
         return nullptr;
       }
       if (!expect(TokKind::gt, "'>'"))
         return nullptr;
-      base = new ImageType(elem, ImageDim::Dim2D, access);
-      // texture2D<T> is fully consumed here (up to and including `>`); skip
+      base = new ImageType(elem, dim, access);
+      // textureND<T> is fully consumed here (up to and including `>`); skip
       // the shared advance() below.
       return base;
     } else {

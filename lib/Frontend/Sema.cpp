@@ -210,7 +210,15 @@ std::string Sema::typeName(const Type *t) {
     case ImageAccess::ReadOnly:  acc = "read_only "; break;
     case ImageAccess::WriteOnly: acc = "write_only "; break;
     }
-    return "texture2D<" + std::string(acc) + typeName(it->elemType) + ">";
+    const char *dim = "texture2D";
+    switch (it->dim) {
+    case ImageDim::Dim1D:      dim = "texture1D"; break;
+    case ImageDim::Dim2D:      dim = "texture2D"; break;
+    case ImageDim::Dim3D:      dim = "texture3D"; break;
+    case ImageDim::Dim2DArray: dim = "texture2DArray"; break;
+    }
+    return std::string(dim) + "<" + std::string(acc) +
+           typeName(it->elemType) + ">";
   }
   }
   return "<unknown>";

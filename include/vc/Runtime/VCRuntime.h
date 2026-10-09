@@ -251,7 +251,24 @@ VCError vcFreeAsync(void *devPtr, VCStreamHandle stream);
 VCError vcCreateImage2D(VCImageHandle *out, uint32_t width, uint32_t height,
                         VCPixelFormat fmt);
 
-/// Destroy a storage image created by vcCreateImage2D.
+/// Create a 1D storage image (texture1D<T>). `width` is the texel count; height
+/// and depth are 1. Pixel data is `width*texelsize` bytes, tightly packed.
+VCError vcCreateImage1D(VCImageHandle *out, uint32_t width,
+                        VCPixelFormat fmt);
+
+/// Create a 3D storage image (texture3D<T>). `width`/`height`/`depth` are texel
+/// counts. Pixel data is `width*height*depth*texelsize` bytes, row-major.
+VCError vcCreateImage3D(VCImageHandle *out, uint32_t width, uint32_t height,
+                        uint32_t depth, VCPixelFormat fmt);
+
+/// Create a 2D-arrayed storage image (texture2DArray<T>). `width`/`height` are
+/// per-layer texel counts; `layers` is the array length. Pixel data is
+/// `width*height*layers*texelsize` bytes, layer-major (each layer row-major).
+VCError vcCreateImage2DArray(VCImageHandle *out, uint32_t width,
+                             uint32_t height, uint32_t layers,
+                             VCPixelFormat fmt);
+
+/// Destroy a storage image created by vcCreateImageND.
 VCError vcDestroyImage(VCImageHandle img);
 
 /// Copy packed host pixel data into a storage image. `hostData` is

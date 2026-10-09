@@ -99,6 +99,8 @@ struct VCImage {
   VkDeviceMemory memory = VK_NULL_HANDLE;
   uint32_t width = 0;
   uint32_t height = 0;
+  uint32_t depth = 1;   // 3D depth (texels); 1 for 1D/2D/2DArray
+  uint32_t layers = 1;  // array layers; >1 for 2DArray
   VkFormat format = VK_FORMAT_UNDEFINED;
   // The VC pixel format the image was created with. Stored explicitly so the
   // copy paths can derive texel size from the format directly, rather than
@@ -348,6 +350,11 @@ public:
   // buffer and vkCmdCopyBufferToImage / vkCmdCopyImageToBuffer (sync, on the
   // default stream). Texel data is row-major, tightly packed, 4 channels.
   VCError createImage2D(uint32_t w, uint32_t h, VCPixelFormat fmt, VCImage &out);
+  // Dim-dispatched creation shared by 1D/2D/3D/2DArray. `extent`/`layers`
+  // follow the image type: 1D uses (w,1,1)/1, 2D (w,h,1)/1, 3D (w,h,d)/1,
+  // 2DArray (w,h,1)/layers.
+  VCError createImage(uint32_t w, uint32_t h, uint32_t depth, uint32_t layers,
+                      VCPixelFormat fmt, VCImage &out);
   VCError destroyImage(VCImage &img);
   VCError copyToImage(VCImage &img, const void *hostData);   // sync
   VCError copyFromImage(void *hostData, const VCImage &img); // sync

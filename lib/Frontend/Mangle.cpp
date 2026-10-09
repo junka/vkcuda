@@ -65,14 +65,16 @@ std::string vc::mangleType(const Type *t) {
   case TypeKind::Typedef:
     return "?"; // resolved above; unreachable
   case TypeKind::Image: {
-    // Encode the dimension so distinct image dims mangle distinctly (only Dim2D
-    // exists today; Dim1D/3D/2DArray will differ once surfaced). Access
-    // qualifiers do NOT participate — `readonly image2D` is the same type as
-    // `image2D` for overload identity (mirrors GLSL).
+    // Encode the dimension so distinct image dims mangle distinctly (1D/2D/3D/
+    // 2DArray). Access qualifiers do NOT participate — `readonly image2D` is
+    // the same type as `image2D` for overload identity (mirrors GLSL).
     const auto *it = static_cast<const ImageType *>(t);
     const char *d = "2";
     switch (it->dim) {
-    case ImageDim::Dim2D: d = "2"; break;
+    case ImageDim::Dim1D:      d = "1"; break;
+    case ImageDim::Dim2D:      d = "2"; break;
+    case ImageDim::Dim3D:      d = "3"; break;
+    case ImageDim::Dim2DArray: d = "2a"; break;
     }
     return "t" + std::string(d) + mangleType(it->elemType);
   }

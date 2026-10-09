@@ -1,0 +1,63 @@
+// test/image_1d.vc — 1D storage image (texture1D<T>) end-to-end, both backends.
+//
+// `texture1D<float>` lowers to a 1D storage image (GLSL image1D / SPIR-V
+// OpTypeImage Dim=1D). imageRead/imageWrite take a single scalar integer coord
+// (GLSL image1D's imageLoad takes a plain int, not ivec1; the MLIR backend
+// emits a scalar i32 coord for the carrier accordingly). Host uses
+// vcCreateImage1D / vcMemcpyToImage / vcMemcpyFromImage.
+//
+// The kernel copies src->dst with a marker (+1 on R) so a wrong-coord copy is
+// caught by the host comparison.
+//
+//   vcc test/image_1d.vc -o build/image_1d_sf && ./build/image_1d_sf
+//   vc  test/image_1d.vc -emit=full -o build/image_1d_mlir && ./build/image_1d_mlir
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void copy1DKernel(texture1D<read_only float> src,
+                             texture1D<write_only float> dst, int w) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  if (x >= w) return;
+  float4 v = imageRead(src, x);
+  imageWrite(dst, x, make_float4(v.r + 1.0f, v.g, v.b, v.a));
+}
+
+int main() {
+  vcInit();
+
+  const int W = 16;
+  const int CH = 4;
+  float hostIn[W * CH];
+  for (int x = 0; x < W; ++x) {
+    hostIn[x * CH + 0] = (float)x;
+    hostIn[x * CH + 1] = 0.0f;
+    hostIn[x * CH + 2] = 0.0f;
+    hostIn[x * CH + 3] = 0.0f;
+  }
+
+  VCImage *src = nullptr, *dst = nullptr;
+  vcCreateImage1D(&src, W, VCPixelFormat::R32G32B32A32Float);
+  vcCreateImage1D(&dst, W, VCPixelFormat::R32G32B32A32Float);
+  vcMemcpyToImage(src, hostIn);
+
+  copy1DKernel<<<W, 4>>>(src, dst, W);
+  vcDeviceSynchronize();
+
+  float hostOut[W * CH];
+  vcMemcpyFromImage(hostOut, dst);
+
+  int ok = 1;
+  for (int x = 0; x < W && ok; ++x) {
+    float ref = (float)x + 1.0f;
+    float got = hostOut[x * CH + 0];
+    if (fabsf(ref - got) > 1e-5f) { ok = 0; }
+  }
+
+  vcDestroyImage(src);
+  vcDestroyImage(dst);
+  vcShutdown();
+  printf("image_1d: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
+}

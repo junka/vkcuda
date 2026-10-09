@@ -624,15 +624,15 @@ private:
 
   mlir::Type cvtType(const vc::Type *t) {
     if (!t) return mlir::Type();
-    // Storage image (texture2D<T>): a 2D storage image. Sampled=2 (NoSampler)
+    // Storage image (textureND<T>): a storage image. Sampled=2 (NoSampler)
     // marks it as a storage image (no sampler, integer texel coords). The
     // sampled type and ImageFormat are derived from T (float->f32/Rgba32f,
     // half->f16/Rgba16f, int->i32/Rgba32i) so the spirv.image type matches the
     // runtime VkFormat and the GLSL backend's qualifier (4-channel). Dim comes
-    // from the type's `dim` field (Dim2D today). The ImageRead/Write ops don't
-    // exist in MLIR 18's spirv dialect, so calls are lowered via a
-    // post-serialize binary patch (see patchImageOps in tools/vc/vc.cpp); the
-    // type/variable/descriptor plumbing here is native.
+    // from the type's `dim` field (1D/2D/3D/2DArray); 2DArray is arrayed. The
+    // ImageRead/Write ops don't exist in MLIR 18's spirv dialect, so calls are
+    // lowered via a post-serialize binary patch (see patchImageOps in
+    // tools/vc/vc.cpp); the type/variable/descriptor plumbing here is native.
     if (isa<vc::ImageType>(t)) {
       auto *it = cast<vc::ImageType>(t);
       mlir::Type sampledTy = builder.getF32Type();
@@ -656,13 +656,27 @@ private:
         }
       }
       mlir::spirv::Dim dim = mlir::spirv::Dim::Dim2D;
+      mlir::spirv::ImageArrayedInfo arrayed =
+          mlir::spirv::ImageArrayedInfo::NonArrayed;
       switch (it->dim) {
-      case vc::ImageDim::Dim2D: dim = mlir::spirv::Dim::Dim2D; break;
+      case vc::ImageDim::Dim1D:
+        dim = mlir::spirv::Dim::Dim1D;
+        break;
+      case vc::ImageDim::Dim2D:
+        dim = mlir::spirv::Dim::Dim2D;
+        break;
+      case vc::ImageDim::Dim3D:
+        dim = mlir::spirv::Dim::Dim3D;
+        break;
+      case vc::ImageDim::Dim2DArray:
+        dim = mlir::spirv::Dim::Dim2D;
+        arrayed = mlir::spirv::ImageArrayedInfo::Arrayed;
+        break;
       }
       return mlir::spirv::ImageType::get(
           sampledTy, dim,
           mlir::spirv::ImageDepthInfo::NoDepth,
-          mlir::spirv::ImageArrayedInfo::NonArrayed,
+          arrayed,
           mlir::spirv::ImageSamplingInfo::SingleSampled,
           mlir::spirv::ImageSamplerUseInfo::NoSampler,
           fmt);
@@ -5252,17 +5266,62 @@ private:
     static unsigned counter = 0;
     unsigned id = counter++;
     bool isRead = name == "imageRead";
-    // coord = vec2(x, y) as i32 vector (OpImageRead/Write want integer coords).
-    Value cx = visitExpr(args[1].get());
-    Value cy = visitExpr(args[2].get());
-    cx = loadValue(cx, loc(args[1].get()));
-    cy = loadValue(cy, loc(args[2].get()));
-    cx = castValue(cx, builder.getI32Type(), l);
-    cy = castValue(cy, builder.getI32Type(), l);
-    Value coord = builder.create<spirv::CompositeConstructOp>(
-        l, mlir::VectorType::get({2}, builder.getI32Type()),
-        ValueRange{cx, cy});
     std::string imgName = declRefName(args[0].get());
+
+    // Resolve the image param's element type AND dimension. Both come from the
+    // kernel param named by args[0]. The element type selects the read result
+    // texel type (vec4<T>); the dim selects the coord arity/width
+    // (1D→scalar i32, 2D→vec2, 3D/2DArray→vec3). SPIR-V OpImageRead/Write
+    // require the coordinate's type to match the image dim's coordinate type
+    // (1D wants a scalar int, NOT a vec1).
+    mlir::Type elemTy = builder.getF32Type();
+    vc::ImageDim dim = vc::ImageDim::Dim2D;
+    if (currentFnDecl) {
+      for (const ParamDecl *p : currentFnDecl->params) {
+        if (p->name == imgName && p->type && isa<vc::ImageType>(p->type)) {
+          auto *it = cast<vc::ImageType>(p->type);
+          if (it->elemType && isa<BuiltinType>(it->elemType)) {
+            switch (cast<BuiltinType>(it->elemType)->builtin) {
+            case BuiltinTypeKind::Float32: elemTy = builder.getF32Type(); break;
+            case BuiltinTypeKind::Float16: elemTy = builder.getF16Type(); break;
+            case BuiltinTypeKind::Int32:
+            case BuiltinTypeKind::UInt32:  elemTy = builder.getI32Type(); break;
+            default: break;
+            }
+          }
+          dim = it->dim;
+          break;
+        }
+      }
+    }
+    unsigned ncoords = 2;
+    switch (dim) {
+    case vc::ImageDim::Dim1D:      ncoords = 1; break;
+    case vc::ImageDim::Dim2D:      ncoords = 2; break;
+    case vc::ImageDim::Dim3D:      ncoords = 3; break;
+    case vc::ImageDim::Dim2DArray: ncoords = 3; break;
+    }
+
+    // coord: integer texel coords (OpImageRead/Write want integer coords).
+    SmallVector<Value, 3> coords;
+    coords.reserve(ncoords);
+    for (unsigned c = 0; c < ncoords; ++c) {
+      Value cv = visitExpr(args[1 + c].get());
+      cv = loadValue(cv, loc(args[1 + c].get()));
+      cv = castValue(cv, builder.getI32Type(), l);
+      coords.push_back(cv);
+    }
+    // 1D: scalar coord (no CompositeConstruct — OpImageRead wants a scalar
+    // int for a 1D image, and the carrier stores whatever Value we pass).
+    // 2D/3D/2DArray: vector coord of width ncoords.
+    Value coord;
+    if (ncoords == 1) {
+      coord = coords[0];
+    } else {
+      coord = builder.create<spirv::CompositeConstructOp>(
+          l, mlir::VectorType::get({(int64_t)ncoords}, builder.getI32Type()),
+          ValueRange(coords));
+    }
 
     if (isRead) {
       emitImageCarrier(l, "__vc_imgread_" + imgName, id, coord);
@@ -5270,25 +5329,8 @@ private:
       // id is what the patcher rewrites into OpImageRead. The result type is
       // vec4<T> derived from the image param's element type (NOT hardcoded
       // v4float — a texture2D<half>/<int> read must yield f16vec4/ivec4 so the
-      // OpImageRead the patcher splices in is correctly typed).
-      mlir::Type elemTy = builder.getF32Type();
-      if (currentFnDecl) {
-        for (const ParamDecl *p : currentFnDecl->params) {
-          if (p->name == imgName && p->type && isa<vc::ImageType>(p->type)) {
-            auto *it = cast<vc::ImageType>(p->type);
-            if (it->elemType && isa<BuiltinType>(it->elemType)) {
-              switch (cast<BuiltinType>(it->elemType)->builtin) {
-              case BuiltinTypeKind::Float32: elemTy = builder.getF32Type(); break;
-              case BuiltinTypeKind::Float16: elemTy = builder.getF16Type(); break;
-              case BuiltinTypeKind::Int32:
-              case BuiltinTypeKind::UInt32:  elemTy = builder.getI32Type(); break;
-              default: break;
-              }
-            }
-            break;
-          }
-        }
-      }
+      // OpImageRead the patcher splices in is correctly typed). The result is
+      // 4-channel for ALL dims (storage image texels are always 4-component).
       auto resTy = mlir::VectorType::get({4}, elemTy);
       auto resPtrTy =
           spirv::PointerType::get(resTy, spirv::StorageClass::Private);
@@ -5302,9 +5344,9 @@ private:
       Value resAddr = builder.create<spirv::AddressOfOp>(l, resPtrTy, resSym);
       return builder.create<spirv::LoadOp>(l, resAddr);
     }
-    // imageWrite(tex, x, y, v): carrier keeps coord + texel alive.
-    Value texel = visitExpr(args[3].get());
-    texel = loadValue(texel, loc(args[3].get()));
+    // imageWrite(tex, coords..., v): carrier keeps coord + texel alive.
+    Value texel = visitExpr(args[1 + ncoords].get());
+    texel = loadValue(texel, loc(args[1 + ncoords].get()));
     emitImageCarrier(l, "__vc_imgwrite_coord_" + imgName, id, coord);
     emitImageCarrier(l, "__vc_imgwrite_texel_" + imgName, id, texel);
     return Value();

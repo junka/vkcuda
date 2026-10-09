@@ -759,12 +759,20 @@ private:
       auto *td = static_cast<const TypedefType *>(t);
       return glslType(td->decl->underlying);
     }
-    // texture2D<T> — the parameter type is `image2D` (GLSL storage image).
-    // The element type T only affects the format qualifier (imageFormatQualifier)
-    // and the read/write texel type (imageVecType); the declared GLSL type is
-    // always `image2D`.
-    if (t->getKind() == TypeKind::Image)
-      return "image2D";
+    // textureND<T> — the parameter type is `imageND` (GLSL storage image),
+    // where ND mirrors the declared dimension (1D/2D/3D/2DArray → image1D/
+    // image2D/image3D/image2DArray). The element type T only affects the
+    // format qualifier (imageFormatQualifier) and the read/write texel type
+    // (imageVecType); the declared GLSL type is always the dim-specific image.
+    if (t->getKind() == TypeKind::Image) {
+      auto *it = static_cast<const ImageType *>(t);
+      switch (it->dim) {
+      case ImageDim::Dim1D:      return "image1D";
+      case ImageDim::Dim2D:      return "image2D";
+      case ImageDim::Dim3D:      return "image3D";
+      case ImageDim::Dim2DArray: return "image2DArray";
+      }
+    }
     return "float";
   }
 
@@ -812,6 +820,36 @@ private:
       }
     }
     return "vec4";
+  }
+
+  // Resolve the ImageDim of the image operand of an imageRead/imageWrite call.
+  // args[0] is normally a DeclRefExpr naming a kernel param; match its name
+  // against `params` to recover the ImageType. Returns Dim2D as a safe default
+  // (matches the historic hardcoded behavior) when the image type can't be
+  // resolved — callers then get the existing ivec2(x,y) coord, which is at
+  // worst a clear GLSL error rather than a crash.
+  ImageDim imageDimOfArg(const ASTNode *arg) const {
+    if (arg && arg->getNodeType() == ASTNode::NodeKind::DeclRefExpr) {
+      StringRef name = static_cast<const DeclRefExpr *>(arg)->name;
+      for (const ParamDecl *p : params) {
+        if (p->name == name && p->type &&
+            p->type->getKind() == TypeKind::Image)
+          return static_cast<const ImageType *>(p->type)->dim;
+      }
+    }
+    return ImageDim::Dim2D;
+  }
+
+  // Number of coordinate args the image builtin takes for a given dim:
+  // 1D→1, 2D→2, 3D→3, 2DArray→3 (x, y, layer).
+  unsigned imageCoordArity(ImageDim d) const {
+    switch (d) {
+    case ImageDim::Dim1D:      return 1;
+    case ImageDim::Dim2D:      return 2;
+    case ImageDim::Dim3D:      return 3;
+    case ImageDim::Dim2DArray: return 3;
+    }
+    return 2;
   }
 
   void emitHeader() {
@@ -905,8 +943,8 @@ private:
           }
         }
         (*os) << "layout(set = 0, binding = " << bindIdx << ", " << fmt
-              << ") " << acc << "uniform image2D " << glslName(p->name)
-              << ";\n\n";
+              << ") " << acc << "uniform " << glslType(p->type) << " "
+              << glslName(p->name) << ";\n\n";
       } else {
         ssboParams.push_back(p->name);
         const char *ty = glslType(p->type);
@@ -1542,35 +1580,63 @@ private:
     // followed by an empty statement — harmless in GLSL.
   }
 
-  // Storage image texel access. imageRead(tex, x, y) -> imageLoad(tex, ivec2(x,y))
-  // returns a 4-component texel; imageWrite(tex, x, y, v) -> imageStore(tex,
-  // ivec2(x,y), v). The texel type (vec4/ivec4/f16vec4/...) is derived from the
-  // image parameter's declared element type so the host C++ matches the device
-  // layout. Both coordinates are integer texel indices (storage images have no
-  // sampler, so no normalized coords / filtering).
+  // Storage image texel access. imageRead(tex, coords...) -> imageLoad(tex,
+  // <coord ctor>) returns a 4-component texel; imageWrite(tex, coords..., v) ->
+  // imageStore(tex, <coord ctor>, v). The number of coords follows the image's
+  // dimension: 1D→1, 2D→2, 3D→3, 2DArray→3 (x,y,layer). The texel type
+  // (vec4/ivec4/f16vec4/...) is derived from the image parameter's declared
+  // element type so the host C++ matches the device layout. Coordinates are
+  // integer texel indices (storage images have no sampler, so no normalized
+  // coords / filtering). NOTE: GLSL image1D's imageLoad takes a SCALAR int
+  // coord (not ivec1) — special-cased below.
   void emitImageCall(StringRef name, const std::vector<NodePtr> &args) {
+    ImageDim dim = imageDimOfArg(args[0].get());
+    unsigned ncoords = imageCoordArity(dim);
     if (name == "imageRead") {
-      // imageRead(tex, x, y) -> imageLoad(tex, ivec2(x, y))
-      if (args.size() < 3) { (*os) << "vec4(0) /*imageRead: missing args*/"; return; }
+      // imageRead(tex, c1[, c2[, c3]]) -> imageLoad(tex, <coord>)
+      if (args.size() < 1 + ncoords) {
+        (*os) << "vec4(0) /*imageRead: missing coords*/";
+        return;
+      }
       (*os) << "imageLoad(";
       emitExpr(args[0].get());
-      (*os) << ", ivec2(";
-      emitExpr(args[1].get());
-      (*os) << ", ";
-      emitExpr(args[2].get());
-      (*os) << "))";
+      if (ncoords == 1) {
+        // 1D: scalar int coord (no ctor).
+        (*os) << ", ";
+        emitExpr(args[1].get());
+      } else {
+        const char *ctor = (ncoords == 2) ? "ivec2" : "ivec3";
+        (*os) << ", " << ctor << "(";
+        for (unsigned c = 0; c < ncoords; ++c) {
+          if (c) (*os) << ", ";
+          emitExpr(args[1 + c].get());
+        }
+        (*os) << ")";
+      }
+      (*os) << ")";
       return;
     }
-    // imageWrite
-    if (args.size() < 4) { (*os) << "/*imageWrite: missing args*/"; return; }
+    // imageWrite(tex, c1[, c2[, c3]], v) -> imageStore(tex, <coord>, v)
+    if (args.size() < 1 + ncoords + 1) {
+      (*os) << "/*imageWrite: missing args*/";
+      return;
+    }
     (*os) << "imageStore(";
     emitExpr(args[0].get());
-    (*os) << ", ivec2(";
-    emitExpr(args[1].get());
+    if (ncoords == 1) {
+      (*os) << ", ";
+      emitExpr(args[1].get());
+    } else {
+      const char *ctor = (ncoords == 2) ? "ivec2" : "ivec3";
+      (*os) << ", " << ctor << "(";
+      for (unsigned c = 0; c < ncoords; ++c) {
+        if (c) (*os) << ", ";
+        emitExpr(args[1 + c].get());
+      }
+      (*os) << ")";
+    }
     (*os) << ", ";
-    emitExpr(args[2].get());
-    (*os) << "), ";
-    emitExpr(args[3].get());
+    emitExpr(args[1 + ncoords].get());
     (*os) << ")";
   }
 

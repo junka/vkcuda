@@ -1,0 +1,23 @@
+// test/MLIR/storage_image_2darray.vc — 2D-arrayed storage image lowering.
+//
+// texture2DArray<T> lowers to OpTypeImage with Dim=2D + Arrayed=1 (Sampled=2,
+// Rgba32f); imageRead/imageWrite take 3 coords (x, y, layer). The coord is an
+// ivec3 carrier; patchImageOps is shape-agnostic so a vec3 works.
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && spirv-dis %t.spv | FileCheck %s
+
+// 2D-arrayed storage image: Dim=2D, arrayed (the 4th operand is 1), Sampled=2.
+// CHECK: OpTypeImage %float 2D 0 1 0 2 Rgba32f
+
+__global__ void copy2da(texture2DArray<float> src, texture2DArray<float> dst,
+                        int w, int h, int layers) {
+  int lin = blockIdx.x * blockDim.x + threadIdx.x;
+  if (lin >= w * h * layers) return;
+  int layer = lin / (w * h);
+  int rem = lin % (w * h);
+  int y = rem / w;
+  int x = rem % w;
+  imageWrite(dst, x, y, layer, imageRead(src, x, y, layer));
+}
+
+int main() { return 0; }

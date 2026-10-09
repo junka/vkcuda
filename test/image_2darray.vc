@@ -1,0 +1,75 @@
+// test/image_2darray.vc — 2D-arrayed storage image (texture2DArray<T>) e2e.
+//
+// `texture2DArray<float>` lowers to a 2D-arrayed storage image (GLSL
+// image2DArray / SPIR-V OpTypeImage Dim=2D, Arrayed=1). imageRead/imageWrite
+// take 3 coords (x, y, layer). Host uses vcCreateImage2DArray with a layer
+// count; the pixel data is width*height*layers texels, layer-major.
+//
+// The kernel copies src->dst with a marker (+1 on R) so a wrong-layer or
+// wrong-extent copy is caught by the host comparison.
+//
+//   vcc test/image_2darray.vc -o build/image_2darray_sf && ./build/image_2darray_sf
+//   vc  test/image_2darray.vc -emit=full -o build/image_2darray_mlir && ./build/image_2darray_mlir
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void copy2DArrayKernel(texture2DArray<read_only float> src,
+                                  texture2DArray<write_only float> dst,
+                                  int w, int h, int layers) {
+  // 1D launch (gridDim = element count); decode into (x, y, layer).
+  int lin = blockIdx.x * blockDim.x + threadIdx.x;
+  if (lin >= w * h * layers) return;
+  int layer = lin / (w * h);
+  int rem = lin % (w * h);
+  int y = rem / w;
+  int x = rem % w;
+  float4 v = imageRead(src, x, y, layer);
+  imageWrite(dst, x, y, layer, make_float4(v.r + 1.0f, v.g, v.b, v.a));
+}
+
+int main() {
+  vcInit();
+
+  const int W = 4, H = 3, LAYERS = 3;
+  const int N = W * H * LAYERS;
+  const int CH = 4;
+  float hostIn[N * CH];
+  for (int l = 0; l < LAYERS; ++l)
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x) {
+        int idx = (l * H * W + y * W + x) * CH;
+        hostIn[idx + 0] = (float)(x + y + l); // varies per layer + texel
+        hostIn[idx + 1] = 0.0f;
+        hostIn[idx + 2] = 0.0f;
+        hostIn[idx + 3] = 0.0f;
+      }
+
+  VCImage *src = nullptr, *dst = nullptr;
+  vcCreateImage2DArray(&src, W, H, LAYERS, VCPixelFormat::R32G32B32A32Float);
+  vcCreateImage2DArray(&dst, W, H, LAYERS, VCPixelFormat::R32G32B32A32Float);
+  vcMemcpyToImage(src, hostIn);
+
+  copy2DArrayKernel<<<W * H * LAYERS, 8>>>(src, dst, W, H, LAYERS);
+  vcDeviceSynchronize();
+
+  float hostOut[N * CH];
+  vcMemcpyFromImage(hostOut, dst);
+
+  int ok = 1;
+  for (int l = 0; l < LAYERS && ok; ++l)
+    for (int y = 0; y < H && ok; ++y)
+      for (int x = 0; x < W && ok; ++x) {
+        int idx = (l * H * W + y * W + x) * CH;
+        float ref = (float)(x + y + l) + 1.0f;
+        float got = hostOut[idx + 0];
+        if (fabsf(ref - got) > 1e-5f) { ok = 0; }
+      }
+
+  vcDestroyImage(src);
+  vcDestroyImage(dst);
+  vcShutdown();
+  printf("image_2darray: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
+}

@@ -1,0 +1,23 @@
+// test/MLIR/storage_image_3d.vc — 3D storage image (texture3D<T>) lowering.
+//
+// texture3D<T> lowers to OpTypeImage with Dim=3D (Sampled=2, Rgba32f), and
+// imageRead/imageWrite take 3 integer coords (x, y, z) lowered as an ivec3
+// carrier. The post-serialize patchImageOps pass rewrites the carriers into
+// OpImageRead / OpImageWrite (shape-agnostic — it reads the stored coord
+// operand id verbatim, so a vec3 coord works the same as the 2D vec2).
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && spirv-dis %t.spv | FileCheck %s
+
+// The image variable is a 3D storage image (Dim=3D, Sampled=2).
+// CHECK: OpTypeImage %float 3D 0 0 0 2 Rgba32f
+
+__global__ void copy3d(texture3D<float> src, texture3D<float> dst,
+                       int w, int h, int d) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int z = blockIdx.z * blockDim.z + threadIdx.z;
+  if (x >= w || y >= h || z >= d) return;
+  imageWrite(dst, x, y, z, imageRead(src, x, y, z));
+}
+
+int main() { return 0; }

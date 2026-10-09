@@ -181,7 +181,7 @@ public:
 // ReadOnly/WriteOnly). Dim1D/Dim3D/Dim2DArray are slots for follow-on work.
 // Format is still derived from `elemType` (float->Rgba32f, half->Rgba16f,
 // int->Rgba32i).
-enum class ImageDim { Dim2D };        // extend: Dim1D, Dim3D, Dim2DArray
+enum class ImageDim { Dim1D, Dim2D, Dim3D, Dim2DArray };
 enum class ImageAccess { ReadWrite, ReadOnly, WriteOnly };
 
 class ImageType : public Type {

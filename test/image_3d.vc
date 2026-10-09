@@ -1,0 +1,78 @@
+// test/image_3d.vc — 3D storage image (texture3D<T>) end-to-end, both backends.
+//
+// Extends image_stencil to three dimensions: `texture3D<float>` params lower
+// to a 3D storage image (GLSL image3D / SPIR-V OpTypeImage Dim=3D), and
+// imageRead/imageWrite take 3 integer coords (x, y, z). The host uses
+// vcCreateImage3D / vcMemcpyToImage / vcMemcpyFromImage with a 3D extent.
+//
+// The kernel is a trivial copy with a marker: it writes (src.r + 1) to dst so a
+// wrong-coord or wrong-extent copy is caught by the host comparison.
+//
+//   vcc test/image_3d.vc -o build/image_3d_sf && ./build/image_3d_sf
+//   vc  test/image_3d.vc -emit=full -o build/image_3d_mlir && ./build/image_3d_mlir
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void copy3DKernel(texture3D<read_only float> src,
+                             texture3D<write_only float> dst,
+                             int w, int h, int d) {
+  // 1D launch (gridDim = element count) over the full W*H*D voxel set; decode
+  // the linear thread index back into 3D texel coords. The host launch only
+  // supports 1D/2D grids today, so this keeps the 3D *image* test independent
+  // of the launch-dimension surface.
+  int lin = blockIdx.x * blockDim.x + threadIdx.x;
+  if (lin >= w * h * d) return;
+  int z = lin / (w * h);
+  int rem = lin % (w * h);
+  int y = rem / w;
+  int x = rem % w;
+  float4 v = imageRead(src, x, y, z);
+  imageWrite(dst, x, y, z, make_float4(v.r + 1.0f, v.g, v.b, v.a));
+}
+
+int main() {
+  vcInit();
+
+  const int W = 4, H = 3, D = 2;
+  const int N = W * H * D;
+  const int CH = 4;
+  float hostIn[N * CH];
+  for (int z = 0; z < D; ++z)
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x) {
+        int idx = (z * H * W + y * W + x) * CH;
+        hostIn[idx + 0] = (float)(x + y + z); // varies per voxel
+        hostIn[idx + 1] = 0.0f;
+        hostIn[idx + 2] = 0.0f;
+        hostIn[idx + 3] = 0.0f;
+      }
+
+  VCImage *src = nullptr, *dst = nullptr;
+  vcCreateImage3D(&src, W, H, D, VCPixelFormat::R32G32B32A32Float);
+  vcCreateImage3D(&dst, W, H, D, VCPixelFormat::R32G32B32A32Float);
+  vcMemcpyToImage(src, hostIn);
+
+  copy3DKernel<<<W * H * D, 8>>>(src, dst, W, H, D);
+  vcDeviceSynchronize();
+
+  float hostOut[N * CH];
+  vcMemcpyFromImage(hostOut, dst);
+
+  int ok = 1;
+  for (int z = 0; z < D && ok; ++z)
+    for (int y = 0; y < H && ok; ++y)
+      for (int x = 0; x < W && ok; ++x) {
+        int idx = (z * H * W + y * W + x) * CH;
+        float ref = (float)(x + y + z) + 1.0f;
+        float got = hostOut[idx + 0];
+        if (fabsf(ref - got) > 1e-5f) { ok = 0; }
+      }
+
+  vcDestroyImage(src);
+  vcDestroyImage(dst);
+  vcShutdown();
+  printf("image_3d: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
+}
