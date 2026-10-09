@@ -1,0 +1,31 @@
+// test/MLIR/storage_image_access.vc — read_only/write_only access qualifiers
+// on storage images (MLIR backend).
+//
+// `texture2D<read_only T>` / `texture2D<write_only T>` lower to a storage
+// image variable decorated NonReadable / NonWritable. MLIR 18's spirv
+// GlobalVariableOp has no first-class decoration operand, so the decoration is
+// produced by the post-serialize patchImageOps pass (which decodes the access
+// prefix on the image variable's symbol: __vc_imgro_ / __vc_imgwo_).
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && spirv-dis %t.spv | FileCheck %s
+
+// The read-only image gets a NonReadable decoration; the write-only image gets
+// NonWritable. (NonReadable means "cannot be written", i.e. read-only; this
+// mirrors GLSL's `readonly`/`writeonly` which decorate the *allowed* direction
+// inversely to SPIR-V's NonReadable/NonWritable naming.)
+// CHECK: OpDecorate {{%[a-zA-Z0-9_]+}} NonReadable
+// CHECK: OpDecorate {{%[a-zA-Z0-9_]+}} NonWritable
+//
+// The image variables are still storage images (Sampled=2, Rgba32f) and bind
+// to descriptors as usual.
+// CHECK: OpTypeImage %float 2D 0 0 0 2 Rgba32f
+
+__global__ void copy(texture2D<read_only float> src,
+                     texture2D<write_only float> dst, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  imageWrite(dst, x, y, imageRead(src, x, y));
+}
+
+int main() { return 0; }

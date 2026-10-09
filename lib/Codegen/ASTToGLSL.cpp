@@ -889,11 +889,24 @@ private:
         // unless the device supports shaderStorageImageReadWithoutFormat
         // (runtime queries it; we always emit a concrete format so the shader
         // is portable). Images are 4-channel on the device side regardless of
-        // the declared element type.
+        // the declared element type. An access qualifier (readonly/writeonly)
+        // is emitted when the image is not read-write; GLSL has these as
+        // native memory qualifiers, and they let the device skip hazard
+        // tracking for the disallowed direction.
         imageParams.push_back(p->name);
         const char *fmt = imageFormatQualifier(p->type);
+        const char *acc = "";
+        if (p->type->getKind() == TypeKind::Image) {
+          auto *it = static_cast<const ImageType *>(p->type);
+          switch (it->access) {
+          case ImageAccess::ReadWrite: acc = ""; break;
+          case ImageAccess::ReadOnly:  acc = "readonly "; break;
+          case ImageAccess::WriteOnly: acc = "writeonly "; break;
+          }
+        }
         (*os) << "layout(set = 0, binding = " << bindIdx << ", " << fmt
-              << ") uniform image2D " << glslName(p->name) << ";\n\n";
+              << ") " << acc << "uniform image2D " << glslName(p->name)
+              << ";\n\n";
       } else {
         ssboParams.push_back(p->name);
         const char *ty = glslType(p->type);

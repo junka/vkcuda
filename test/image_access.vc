@@ -1,0 +1,101 @@
+// test/image_access.vc — storage image with read_only / write_only access
+// qualifiers.
+//
+// Extends image_stencil with OpenCL/CUDA-style access modifiers on the
+// texture params: src is declared `texture2D<read_only float>` (only
+// imageRead), dst is `texture2D<write_only float>` (only imageWrite). The
+// backends lower these to access-qualifying decorations:
+//   - GLSL: `readonly uniform image2D src` / `writeonly uniform image2D dst`
+//     (native GLSL memory qualifiers).
+//   - MLIR: the image variable is named with an access prefix (`__vc_imgro_` /
+//     `__vc_imgwo_`), and the post-serialize patchImageOps pass emits
+//     `OpDecorate <id> NonReadable` / `OpDecorate <id> NonWritable` (MLIR 18's
+//     spirv GlobalVariableOp has no first-class decoration operand, and the
+//     serializer's handling of arbitrary decoration attrs isn't verified, so
+//     the decoration is produced by the binary patch).
+// Sema rejects a mismatched use (imageWrite on a read_only image, imageRead
+// from a write_only image) before it reaches the backends.
+//
+// The kernel is the same 3x3 box blur as image_stencil; the only difference
+// is the access qualifiers. Verifies the qualifiers don't break the data path.
+//
+//   vcc test/image_access.vc -o build/image_access_sf && ./build/image_access_sf
+//   vc  test/image_access.vc -emit=full -o build/image_access_mlir && ./build/image_access_mlir
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void boxBlurKernel(texture2D<read_only float> src,
+                              texture2D<write_only float> dst,
+                              int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+
+  float acc = 0.0f;
+  int n = 0;
+  for (int dy = -1; dy <= 1; ++dy) {
+    for (int dx = -1; dx <= 1; ++dx) {
+      int sx = x + dx;
+      int sy = y + dy;
+      if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+      acc += imageRead(src, sx, sy).r;
+      ++n;
+    }
+  }
+  float blurred = acc / float(n);
+  imageWrite(dst, x, y, make_float4(blurred, 0.0f, 0.0f, 0.0f));
+}
+
+int main() {
+  vcInit();
+
+  const int W = 8, H = 4;
+  const int N = W * H;
+  const int CH = 4;
+  float hostIn[N * CH];
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      float v = 0.1f;
+      if (x == W / 2 || y == H / 2) v = 1.0f;
+      hostIn[(y * W + x) * CH + 0] = v;
+      hostIn[(y * W + x) * CH + 1] = 0.0f;
+      hostIn[(y * W + x) * CH + 2] = 0.0f;
+      hostIn[(y * W + x) * CH + 3] = 0.0f;
+    }
+
+  VCImage *src = nullptr, *dst = nullptr;
+  vcCreateImage2D(&src, W, H, VCPixelFormat::R32G32B32A32Float);
+  vcCreateImage2D(&dst, W, H, VCPixelFormat::R32G32B32A32Float);
+  vcMemcpyToImage(src, hostIn);
+
+  boxBlurKernel<<<dim3(W, H), dim3(2, 2)>>>(src, dst, W, H);
+  vcDeviceSynchronize();
+
+  float hostOut[N * CH];
+  vcMemcpyFromImage(hostOut, dst);
+
+  int ok = 1;
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      float acc = 0.0f;
+      int n = 0;
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+          int sx = x + dx, sy = y + dy;
+          if (sx < 0 || sx >= W || sy < 0 || sy >= H) continue;
+          acc += hostIn[(sy * W + sx) * CH + 0];
+          ++n;
+        }
+      float ref = acc / float(n);
+      float got = hostOut[(y * W + x) * CH + 0];
+      if (fabsf(ref - got) > 1e-5f) { ok = 0; break; }
+    }
+
+  vcDestroyImage(src);
+  vcDestroyImage(dst);
+  vcShutdown();
+  printf("image_access: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
+}

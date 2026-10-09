@@ -1193,7 +1193,25 @@ private:
       if (!imgTy) continue;
       auto ptrTy = spirv::PointerType::get(
           imgTy, spirv::StorageClass::UniformConstant);
-      std::string sym = "__vc_img_" + p->name.str();
+      // The image variable's symbol encodes its access qualifier in a prefix so
+      // the post-serialize patcher (patchImageOps) can emit the matching SPIR-V
+      // OpDecorate (NonReadable for ReadOnly, NonWritable for WriteOnly). MLIR
+      // 18's GlobalVariableOp has no first-class decoration operand and the
+      // serializer's handling of arbitrary decoration attrs isn't verified
+      // against this build, so the decoration is produced by the binary patch
+      // (which already indexes image variables by OpName). ReadWrite (default)
+      // uses the bare `__vc_img_` prefix and gets no decoration.
+      std::string accPrefix;
+      if (p->type && isa<vc::ImageType>(p->type)) {
+        switch (cast<vc::ImageType>(p->type)->access) {
+        case vc::ImageAccess::ReadWrite: accPrefix = "__vc_img_"; break;
+        case vc::ImageAccess::ReadOnly:  accPrefix = "__vc_imgro_"; break;
+        case vc::ImageAccess::WriteOnly: accPrefix = "__vc_imgwo_"; break;
+        }
+      } else {
+        accPrefix = "__vc_img_";
+      }
+      std::string sym = accPrefix + p->name.str();
       unsigned binding = imgBindBase++;
       auto saved = builder.saveInsertionPoint();
       builder.setInsertionPointToStart(module.getBody());

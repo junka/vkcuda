@@ -202,8 +202,16 @@ std::string Sema::typeName(const Type *t) {
     return static_cast<const RecordType *>(t)->decl->name.str();
   case TypeKind::Typedef:
     return static_cast<const TypedefType *>(t)->decl->name.str();
-  case TypeKind::Image:
-    return "texture2D<" + typeName(static_cast<const ImageType *>(t)->elemType) + ">";
+  case TypeKind::Image: {
+    auto *it = static_cast<const ImageType *>(t);
+    const char *acc = "";
+    switch (it->access) {
+    case ImageAccess::ReadWrite: acc = ""; break;
+    case ImageAccess::ReadOnly:  acc = "read_only "; break;
+    case ImageAccess::WriteOnly: acc = "write_only "; break;
+    }
+    return "texture2D<" + std::string(acc) + typeName(it->elemType) + ">";
+  }
   }
   return "<unknown>";
 }
@@ -1609,6 +1617,43 @@ Type *Sema::checkExpr(const ASTNode *n) {
       // reported an error; stop. A non-wmma name returns null and falls through.
       if (calleeName.startswith("wmma_"))
         return nullptr;
+      // Storage-image texel access: imageRead(tex,x,y) / imageWrite(tex,x,y,v).
+      // Check the image arg's access qualifier — a read_only image can't be
+      // written, a write_only image can't be read. Catches real bugs (e.g. a
+      // dst marked write_only then read back) before they reach the backends.
+      // Must run BEFORE isMathBuiltin, since imageRead/imageWrite are registered
+      // builtins (isBuiltin returns true) and would otherwise be passed through
+      // as math builtins without this check.
+      if (calleeName == "imageRead" || calleeName == "imageWrite") {
+        // Check the image arg's access qualifier — a read_only image can't be
+        // written, a write_only image can't be read. Catches real bugs (e.g. a
+        // dst marked write_only then read back) before they reach the backends.
+        // Must run BEFORE isMathBuiltin, since imageRead/imageWrite are
+        // registered builtins (isBuiltin returns true) and would otherwise be
+        // passed through as math builtins without this check. checkExpr on the
+        // image arg returns its type directly (DeclRefExpr -> ParamDecl->type);
+        // we can't use the side-table typeOf() here because checkExpr for a
+        // DeclRefExpr returns the type without caching it in exprTypes.
+        Type *imgArgTy = nullptr;
+        if (!c->args.empty())
+          imgArgTy = checkExpr(c->args[0].get());
+        for (size_t i = 1; i < c->args.size(); ++i)
+          checkExpr(c->args[i].get());
+        if (imgArgTy) {
+          const Type *argTy = resolveTypedefs(imgArgTy);
+          if (argTy && argTy->getKind() == TypeKind::Image) {
+            auto *it = static_cast<const ImageType *>(argTy);
+            if (calleeName == "imageWrite" && it->access == ImageAccess::ReadOnly)
+              error(n, "imageWrite on a read_only image");
+            else if (calleeName == "imageRead" && it->access == ImageAccess::WriteOnly)
+              error(n, "imageRead from a write_only image");
+          }
+        }
+        // The backends synthesize the result type (imageRead -> vec4<T>,
+        // imageWrite -> void). Return null to match the existing pass-through
+        // behavior for builtins the frontend doesn't model as FunctionDecls.
+        return nullptr;
+      }
       if (isMathBuiltin(calleeName)) {
         for (auto &a : c->args) checkExpr(a.get());
         return nullptr;

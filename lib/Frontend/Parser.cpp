@@ -1202,12 +1202,24 @@ Type *Parser::parseBaseType() {
       base = vec;
     else if (curTok.text == "texture2D") {
       // texture2D<T> — a Vulkan storage image (GLSL image2D). T must be a
-      // scalar builtin (float/half/int). Parse the `<T>` and build an
-      // ImageType. Only 2D is surfaced by the parser today; the dim/access
-      // fields default to Dim2D/ReadWrite (see AST.h ImageType).
+      // scalar builtin (float/half/int). An optional access modifier may
+      // precede T: `texture2D<read_only float>` / `texture2D<write_only float>`
+      // / `texture2D<read_write float>` (OpenCL/CUDA-style; `read_write` is the
+      // default if omitted). Only 2D is surfaced by the parser today.
       advance(); // consume `texture2D`
       if (!expect(TokKind::lt, "'<'"))
         return nullptr;
+      ImageAccess access = ImageAccess::ReadWrite;
+      if (curTok.kind == TokKind::identifier &&
+          (curTok.text == "read_only" || curTok.text == "write_only" ||
+           curTok.text == "read_write")) {
+        if (curTok.text == "read_only")
+          access = ImageAccess::ReadOnly;
+        else if (curTok.text == "write_only")
+          access = ImageAccess::WriteOnly;
+        // read_write == default ReadWrite
+        advance();
+      }
       Type *elem = parseBaseType();
       if (!elem) {
         error(curTok, "expected element type in texture2D<T>");
@@ -1215,7 +1227,7 @@ Type *Parser::parseBaseType() {
       }
       if (!expect(TokKind::gt, "'>'"))
         return nullptr;
-      base = new ImageType(elem, ImageDim::Dim2D, ImageAccess::ReadWrite);
+      base = new ImageType(elem, ImageDim::Dim2D, access);
       // texture2D<T> is fully consumed here (up to and including `>`); skip
       // the shared advance() below.
       return base;

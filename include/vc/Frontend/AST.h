@@ -175,13 +175,14 @@ public:
 // return vec4<T> and writes take vec4<T>.
 //
 // `dim` and `access` parameterize the type so backends derive the SPIR-V/GLSL
-// shape from the type rather than hardcoding 2D/ReadWrite in five places. Only
-// Dim2D/ReadWrite are surfaced by the parser today (`texture2D<T>`); Dim1D/
-// Dim3D/Dim2DArray and ReadOnly/WriteOnly are slots for follow-on work (the
-// fields are the prerequisite; the spellings are not added here). Format is
-// still derived from `elemType` (float->Rgba32f, half->Rgba16f, int->Rgba32i).
+// shape from the type rather than hardcoding 2D/ReadWrite in five places. The
+// parser surfaces Dim2D and all three access modes (`texture2D<T>` defaults to
+// ReadWrite; `texture2D<read_only T>` / `texture2D<write_only T>` select
+// ReadOnly/WriteOnly). Dim1D/Dim3D/Dim2DArray are slots for follow-on work.
+// Format is still derived from `elemType` (float->Rgba32f, half->Rgba16f,
+// int->Rgba32i).
 enum class ImageDim { Dim2D };        // extend: Dim1D, Dim3D, Dim2DArray
-enum class ImageAccess { ReadWrite }; // extend: ReadOnly, WriteOnly
+enum class ImageAccess { ReadWrite, ReadOnly, WriteOnly };
 
 class ImageType : public Type {
 public:

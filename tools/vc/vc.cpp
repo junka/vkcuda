@@ -390,6 +390,10 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
   constexpr uint32_t kOpStore = 62;            // [wc|op, ptr_id, value_id, (mem-ops)...]
   constexpr uint32_t kOpImageRead = 98;        // [wc|op, type_id, result_id, image_id, coord_id]
   constexpr uint32_t kOpImageWrite = 99;       // [wc|op, image_id, coord_id, texel_id]
+  constexpr uint32_t kOpDecorate = 71;         // [wc|op, target_id, decoration, (extra operands)...]
+  constexpr uint32_t kOpMemoryModel = 14;      // [wc|op, addressing, memory]
+  constexpr uint32_t kDecorNonWritable = 24;   // OpDecorate <id> NonWritable
+  constexpr uint32_t kDecorNonReadable = 25;   // OpDecorate <id> NonReadable
 
   if (binary.size() < 5)
     return;
@@ -434,6 +438,19 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
   llvm::DenseSet<uint32_t> carrierVarIds;
   // set of result placeholder var ids (for deletion)
   llvm::DenseSet<uint32_t> resultVarIds;
+  // image var id -> decoration to emit (NonReadable / NonWritable). Absent =>
+  // read-write (no decoration). Populated from the __vc_imgro_/__vc_imgwo_
+  // symbol prefix the ASTToMLIR emitter stamps on the image variable.
+  llvm::DenseMap<uint32_t, uint32_t> imageAccess;
+  // Offset just past the OpMemoryModel instruction — the earliest legal point
+  // to insert OpDecorate (SPIR-V requires decorations to follow the memory
+  // model). 0 if no OpMemoryModel was seen (shouldn't happen for a valid
+  // module); inserts fall back to offset 5 in that case.
+  size_t memoryModelEnd = 0;
+  // Offset just past the last OpDecorate instruction — the end of the
+  // annotation section. New OpDecorate inserts anchor here so they stay
+  // contiguous with existing decorations and before the type section.
+  size_t lastDecorateEnd = 0;
 
   size_t i = 5;
   while (i < binary.size()) {
@@ -450,16 +467,24 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
         // imageRead result placeholder variable
         resultVarByName[name] = targetId;
         resultVarIds.insert(targetId);
-      } else if (name.starts_with("__vc_img_") &&
-                 !name.starts_with("__vc_imgread_") &&
-                 !name.starts_with("__vc_imgwrite_")) {
-        // image variable: __vc_img_<param>
-        std::string param = name.substr(strlen("__vc_img_"));
-        imageVarByName[param] = targetId;
       } else if (name.starts_with("__vc_imgread_") ||
                  name.starts_with("__vc_imgwrite_")) {
         carriers.push_back({name, targetId});
         carrierVarIds.insert(targetId);
+      } else if (name.starts_with("__vc_imgro_")) {
+        // read-only image variable: __vc_imgro_<param> -> decorate NonReadable
+        std::string param = name.substr(strlen("__vc_imgro_"));
+        imageVarByName[param] = targetId;
+        imageAccess[targetId] = kDecorNonReadable;
+      } else if (name.starts_with("__vc_imgwo_")) {
+        // write-only image variable: __vc_imgwo_<param> -> decorate NonWritable
+        std::string param = name.substr(strlen("__vc_imgwo_"));
+        imageVarByName[param] = targetId;
+        imageAccess[targetId] = kDecorNonWritable;
+      } else if (name.starts_with("__vc_img_")) {
+        // read-write image variable: __vc_img_<param> (no decoration)
+        std::string param = name.substr(strlen("__vc_img_"));
+        imageVarByName[param] = targetId;
       }
     } else if (opcode == kOpTypeImage && wordCount >= 9) {
       typeDefs[binary[i + 1]] = {i, opcode};
@@ -480,6 +505,17 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
       uint32_t ptrId = binary[i + 3];
       if (resultVarIds.contains(ptrId))
         resultLoad[ptrId] = {i, binary[i + 2], binary[i + 1]};
+    } else if (opcode == kOpMemoryModel) {
+      // OpDecorate must follow OpMemoryModel (SPIR-V layout: decorations come
+      // after the memory model instruction). Record its end offset as the
+      // anchor for the access-qualifier OpDecorate inserts.
+      memoryModelEnd = i + wordCount;
+    } else if (opcode == kOpDecorate) {
+      // Track the end of the last existing OpDecorate so new OpDecorate
+      // inserts land at the end of the annotation section (SPIR-V requires all
+      // decorations to be contiguous, after EntryPoint/ExecutionMode and
+      // before type definitions).
+      lastDecorateEnd = i + wordCount;
     }
     i += wordCount;
   }
@@ -722,6 +758,26 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
   // Mark read result placeholder OpVariables + their OpNames for deletion.
   for (const auto &kv : resultVarByName)
     markNameAndVar(kv.second);
+
+  // Emit OpDecorate NonReadable / NonWritable for access-qualified image
+  // variables (read_only / write_only). OpDecorate produces no result id, so
+  // no Bound bump is needed. SPIR-V layout requires decorations to come AFTER
+  // OpMemoryModel/OpEntryPoint/OpExecutionMode but BEFORE type definitions,
+  // and all OpDecorate must be contiguous. Anchor just past the last existing
+  // OpDecorate (the end of the annotation section); if none exist, fall back
+  // to just past OpMemoryModel. spirv-val rejects decorations placed in the
+  // wrong section.
+  size_t decorAnchor = lastDecorateEnd ? lastDecorateEnd
+                  : (memoryModelEnd ? memoryModelEnd : 5);
+  for (const auto &kv : imageAccess) {
+    uint32_t varId = kv.first;
+    uint32_t decor = kv.second;
+    SmallVector<uint32_t> seq;
+    seq.push_back((3u << 16) | kOpDecorate); // WC=3: op, target, decoration
+    seq.push_back(varId);
+    seq.push_back(decor);
+    inserts.push_back({decorAnchor, std::move(seq)});
+  }
 
   // Rebuild: walk the binary; at each instruction, if it's an insert point,
   // emit the insert words (and skip the original instruction if also deleted);
