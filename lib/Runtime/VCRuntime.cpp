@@ -1251,7 +1251,8 @@ VCError Runtime::freeBuffer(VCBuffer &buf) {
 
 // Map a VC pixel format to the Vulkan VkFormat the image is created with.
 // These must match the GLSL layout format qualifier emitted by the GLSL
-// backend (imageFormatQualifier): float->r32f, half->r16f, int->r32i.
+// backend (imageFormatQualifier): float->rgba32f, half->rgba16f, int->rgba32i
+// (4-channel spellings matching the RGBA VkFormats below).
 static VkFormat pixelFormatToVk(VCPixelFormat f) {
   switch (f) {
   case VCPixelFormat::R32G32B32A32Float: return VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -1348,6 +1349,7 @@ VCError Runtime::createImage2D(uint32_t w, uint32_t h, VCPixelFormat fmt,
   out.width = w;
   out.height = h;
   out.format = vkfmt;
+  out.pformat = fmt; // kept in sync with `format`; copy paths read this
   out.deviceIdx = currentDeviceIdx_;
   VCStream &s = *vd.defaultStream;
   VkCommandBuffer cb = beginFrame(s);
@@ -1387,10 +1389,9 @@ VCError Runtime::destroyImage(VCImage &img) {
 VCError Runtime::copyToImage(VCImage &img, const void *hostData) {
   if (!init_ || !img.image) return VCError::InitializationError;
   VulkanDevice &vd = *devices_[img.deviceIdx];
-  uint32_t texelSize = pixelFormatTexelSize(
-      img.format == VK_FORMAT_R32G32B32A32_SFLOAT ? VCPixelFormat::R32G32B32A32Float
-      : img.format == VK_FORMAT_R16G16B16A16_SFLOAT ? VCPixelFormat::R16G16B16A16Float
-      : VCPixelFormat::R32G32B32A32Sint);
+  // Texel size from the stored VC pixel format (not a VkFormat reverse-map,
+  // which would break for future formats aliasing an existing VkFormat).
+  uint32_t texelSize = pixelFormatTexelSize(img.pformat);
   VkDeviceSize total = (VkDeviceSize)texelSize * img.width * img.height;
 
   VCBuffer staging{};
@@ -1449,10 +1450,7 @@ VCError Runtime::copyToImage(VCImage &img, const void *hostData) {
 VCError Runtime::copyFromImage(void *hostData, const VCImage &img) {
   if (!init_ || !img.image) return VCError::InitializationError;
   VulkanDevice &vd = *devices_[img.deviceIdx];
-  uint32_t texelSize = pixelFormatTexelSize(
-      img.format == VK_FORMAT_R32G32B32A32_SFLOAT ? VCPixelFormat::R32G32B32A32Float
-      : img.format == VK_FORMAT_R16G16B16A16_SFLOAT ? VCPixelFormat::R16G16B16A16Float
-      : VCPixelFormat::R32G32B32A32Sint);
+  uint32_t texelSize = pixelFormatTexelSize(img.pformat);
   VkDeviceSize total = (VkDeviceSize)texelSize * img.width * img.height;
 
   VCBuffer staging{};

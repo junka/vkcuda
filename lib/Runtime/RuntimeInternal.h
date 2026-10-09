@@ -100,6 +100,11 @@ struct VCImage {
   uint32_t width = 0;
   uint32_t height = 0;
   VkFormat format = VK_FORMAT_UNDEFINED;
+  // The VC pixel format the image was created with. Stored explicitly so the
+  // copy paths can derive texel size from the format directly, rather than
+  // reverse-mapping VkFormat (which would break for any future format that
+  // aliases an existing VkFormat). Kept in sync with `format` at creation.
+  VCPixelFormat pformat = VCPixelFormat::R32G32B32A32Float;
   int deviceIdx = 0;
 };
 

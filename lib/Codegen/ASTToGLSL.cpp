@@ -770,23 +770,28 @@ private:
 
   // The GLSL layout format qualifier for a storage image, derived from the
   // element type. Storage images are always 4-channel on the device side, so
-  // float->r32f, half->r16f, int->r32i. A concrete format keeps the shader
-  // portable without shaderStorageImageReadWithoutFormat support.
+  // the qualifier spells the 4-channel format that matches the runtime's
+  // VkFormat (float->rgba32f, half->rgba16f, int->rgba32i). The qualifier MUST
+  // match the VkFormat the image was created with: a single-channel spelling
+  // like `r32f` happens to be tolerated on an RGBA32 image by Vulkan's
+  // format-compatibility rules, but the 4-channel spelling is the correct one
+  // and keeps validation honest. A concrete format also avoids needing the
+  // shaderStorageImageReadWithoutFormat capability.
   const char *imageFormatQualifier(const Type *t) {
     if (t && t->getKind() == TypeKind::Image) {
       auto *it = static_cast<const ImageType *>(t);
       if (it->elemType &&
           it->elemType->getKind() == TypeKind::Builtin) {
         switch (static_cast<const BuiltinType *>(it->elemType)->builtin) {
-        case BuiltinTypeKind::Float32: return "r32f";
-        case BuiltinTypeKind::Float16: return "r16f";
+        case BuiltinTypeKind::Float32: return "rgba32f";
+        case BuiltinTypeKind::Float16: return "rgba16f";
         case BuiltinTypeKind::Int32:
-        case BuiltinTypeKind::UInt32: return "r32i";
+        case BuiltinTypeKind::UInt32: return "rgba32i";
         default: break;
         }
       }
     }
-    return "r32f";
+    return "rgba32f";
   }
 
   // The 4-component GLSL texel type returned by imageLoad / consumed by

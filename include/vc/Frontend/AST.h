@@ -172,12 +172,26 @@ public:
 // coordinate via `imageRead(tex,x,y)` / `imageWrite(tex,x,y,v)` — no sampler,
 // no hardware filtering. The element type T must be a scalar builtin (float,
 // half, int); the image is always 4-channel on the device side, so reads
-// return vec4<T> and writes take vec4<T>. Currently only 2D is supported.
+// return vec4<T> and writes take vec4<T>.
+//
+// `dim` and `access` parameterize the type so backends derive the SPIR-V/GLSL
+// shape from the type rather than hardcoding 2D/ReadWrite in five places. Only
+// Dim2D/ReadWrite are surfaced by the parser today (`texture2D<T>`); Dim1D/
+// Dim3D/Dim2DArray and ReadOnly/WriteOnly are slots for follow-on work (the
+// fields are the prerequisite; the spellings are not added here). Format is
+// still derived from `elemType` (float->Rgba32f, half->Rgba16f, int->Rgba32i).
+enum class ImageDim { Dim2D };        // extend: Dim1D, Dim3D, Dim2DArray
+enum class ImageAccess { ReadWrite }; // extend: ReadOnly, WriteOnly
+
 class ImageType : public Type {
 public:
   Type *elemType; // BuiltinType (Float32/Float16/Int32)
+  ImageDim dim = ImageDim::Dim2D;
+  ImageAccess access = ImageAccess::ReadWrite;
 
-  ImageType(Type *e) : Type(TypeKind::Image), elemType(e) {}
+  ImageType(Type *e, ImageDim d = ImageDim::Dim2D,
+            ImageAccess a = ImageAccess::ReadWrite)
+      : Type(TypeKind::Image), elemType(e), dim(d), access(a) {}
   static bool classof(const Type *t) { return t->getKind() == TypeKind::Image; }
 };
 

@@ -624,21 +624,48 @@ private:
 
   mlir::Type cvtType(const vc::Type *t) {
     if (!t) return mlir::Type();
-    // Storage image (texture2D<T>): a 2D storage image of f32 texels. Sampled=2
-    // (NoSampler) marks it as a storage image (no sampler, integer texel
-    // coords); format Rgba32f matches the GLSL backend's r32f->R32G32B32A32
-    // mapping (4xf32 texel) and avoids the StorageImageReadWithoutFormat cap.
-    // The ImageRead/Write ops don't exist in MLIR 18's spirv dialect, so calls
-    // are lowered via a post-serialize binary patch (see patchImageOps in
-    // tools/vc/vc.cpp); the type/variable/descriptor plumbing here is native.
+    // Storage image (texture2D<T>): a 2D storage image. Sampled=2 (NoSampler)
+    // marks it as a storage image (no sampler, integer texel coords). The
+    // sampled type and ImageFormat are derived from T (float->f32/Rgba32f,
+    // half->f16/Rgba16f, int->i32/Rgba32i) so the spirv.image type matches the
+    // runtime VkFormat and the GLSL backend's qualifier (4-channel). Dim comes
+    // from the type's `dim` field (Dim2D today). The ImageRead/Write ops don't
+    // exist in MLIR 18's spirv dialect, so calls are lowered via a
+    // post-serialize binary patch (see patchImageOps in tools/vc/vc.cpp); the
+    // type/variable/descriptor plumbing here is native.
     if (isa<vc::ImageType>(t)) {
+      auto *it = cast<vc::ImageType>(t);
+      mlir::Type sampledTy = builder.getF32Type();
+      mlir::spirv::ImageFormat fmt = mlir::spirv::ImageFormat::Rgba32f;
+      if (it->elemType && isa<BuiltinType>(it->elemType)) {
+        switch (cast<BuiltinType>(it->elemType)->builtin) {
+        case BuiltinTypeKind::Float32:
+          sampledTy = builder.getF32Type();
+          fmt = mlir::spirv::ImageFormat::Rgba32f;
+          break;
+        case BuiltinTypeKind::Float16:
+          sampledTy = builder.getF16Type();
+          fmt = mlir::spirv::ImageFormat::Rgba16f;
+          break;
+        case BuiltinTypeKind::Int32:
+        case BuiltinTypeKind::UInt32:
+          sampledTy = builder.getI32Type();
+          fmt = mlir::spirv::ImageFormat::Rgba32i;
+          break;
+        default: break;
+        }
+      }
+      mlir::spirv::Dim dim = mlir::spirv::Dim::Dim2D;
+      switch (it->dim) {
+      case vc::ImageDim::Dim2D: dim = mlir::spirv::Dim::Dim2D; break;
+      }
       return mlir::spirv::ImageType::get(
-          builder.getF32Type(), mlir::spirv::Dim::Dim2D,
+          sampledTy, dim,
           mlir::spirv::ImageDepthInfo::NoDepth,
           mlir::spirv::ImageArrayedInfo::NonArrayed,
           mlir::spirv::ImageSamplingInfo::SingleSampled,
           mlir::spirv::ImageSamplerUseInfo::NoSampler,
-          mlir::spirv::ImageFormat::Rgba32f);
+          fmt);
     }
     // typedef alias: resolve to the underlying type recursively. Sema keeps the
     // TypedefType on params/locals (e.g. `weight_t wgt`); without this, buildFunction
@@ -1138,13 +1165,28 @@ private:
       ++argIdx;
     }
 
-    // PROBE: materialize each image param as a module-scope storage-image
-    // global + AddressOf + Load, bound to its descriptor slot. The binding
-    // index is the param's position among ALL pointer/image args (SSBOs get
-    // bindings from VCToGPU in source order; images interleave by position).
-    // For the probe we just assign bindings in image-param order starting
-    // after the SSBO count — exact binding assignment is finalized once the
-    // carrier design is validated.
+    // Materialize each image param as a module-scope storage-image global +
+    // AddressOf, bound to its descriptor slot. Image bindings are assigned
+    // 0,1,... in image-param order. This is CORRECT for a pure-image kernel
+    // (no SSBOs): the runtime's `pointerOrdinal` fallback (used when the
+    // SSBO-only reflection list is empty) assigns bindings 0,1,... in source
+    // order, matching this.
+    //
+    // KNOWN LIMITATION (mixed SSBO+image kernels): if a kernel has BOTH SSBO
+    // pointer params and image params, the bindings collide. SSBOs get
+    // bindings 0..N-1 from VCToGPU (source order among pointer args), and
+    // images ALSO start at 0 here, so an image and the first SSBO share
+    // binding 0. The "correct" fix (images bind at their source-position
+    // ordinal interleaved with SSBOs, as the GLSL backend does) does NOT work
+    // on the MLIR path because the runtime's reflection model is broken for
+    // mixed kernels: `storageBufferBindings` is the SSBO-ONLY reflected binding
+    // list (images use UniformConstant, excluded from reflection), yet the
+    // runtime indexes it with a `pointerOrdinal` that increments over BOTH
+    // Pointer and Image args (VCRuntime.cpp buildLayout). So a mixed kernel is
+    // broken at the runtime layer regardless of what bindings the compiler
+    // emits. Fixing mixed kernels requires runtime reflection changes (reflect
+    // image bindings separately, or stop interleaving the ordinal), not just a
+    // compiler fix. Tracked as a follow-on; no demo exercises it today.
     unsigned imgBindBase = 0; // bumped per image param
     for (const ParamDecl *p : imageParams) {
       mlir::Type imgTy = cvtType(p->type);
@@ -5207,8 +5249,29 @@ private:
     if (isRead) {
       emitImageCarrier(l, "__vc_imgread_" + imgName, id, coord);
       // Per-call result placeholder: a Private global + Load. The Load's result
-      // id is what the patcher rewrites into OpImageRead.
-      auto resTy = mlir::VectorType::get({4}, builder.getF32Type());
+      // id is what the patcher rewrites into OpImageRead. The result type is
+      // vec4<T> derived from the image param's element type (NOT hardcoded
+      // v4float — a texture2D<half>/<int> read must yield f16vec4/ivec4 so the
+      // OpImageRead the patcher splices in is correctly typed).
+      mlir::Type elemTy = builder.getF32Type();
+      if (currentFnDecl) {
+        for (const ParamDecl *p : currentFnDecl->params) {
+          if (p->name == imgName && p->type && isa<vc::ImageType>(p->type)) {
+            auto *it = cast<vc::ImageType>(p->type);
+            if (it->elemType && isa<BuiltinType>(it->elemType)) {
+              switch (cast<BuiltinType>(it->elemType)->builtin) {
+              case BuiltinTypeKind::Float32: elemTy = builder.getF32Type(); break;
+              case BuiltinTypeKind::Float16: elemTy = builder.getF16Type(); break;
+              case BuiltinTypeKind::Int32:
+              case BuiltinTypeKind::UInt32:  elemTy = builder.getI32Type(); break;
+              default: break;
+              }
+            }
+            break;
+          }
+        }
+      }
+      auto resTy = mlir::VectorType::get({4}, elemTy);
       auto resPtrTy =
           spirv::PointerType::get(resTy, spirv::StorageClass::Private);
       std::string resSym = "__vc_imgresult_" + imgName + "_" + Twine(id).str();

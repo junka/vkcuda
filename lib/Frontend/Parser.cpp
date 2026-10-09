@@ -1203,7 +1203,8 @@ Type *Parser::parseBaseType() {
     else if (curTok.text == "texture2D") {
       // texture2D<T> — a Vulkan storage image (GLSL image2D). T must be a
       // scalar builtin (float/half/int). Parse the `<T>` and build an
-      // ImageType. Only 2D is supported.
+      // ImageType. Only 2D is surfaced by the parser today; the dim/access
+      // fields default to Dim2D/ReadWrite (see AST.h ImageType).
       advance(); // consume `texture2D`
       if (!expect(TokKind::lt, "'<'"))
         return nullptr;
@@ -1214,7 +1215,7 @@ Type *Parser::parseBaseType() {
       }
       if (!expect(TokKind::gt, "'>'"))
         return nullptr;
-      base = new ImageType(elem);
+      base = new ImageType(elem, ImageDim::Dim2D, ImageAccess::ReadWrite);
       // texture2D<T> is fully consumed here (up to and including `>`); skip
       // the shared advance() below.
       return base;
