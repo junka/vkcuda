@@ -650,7 +650,14 @@ private:
         case BuiltinTypeKind::Int32:
         case BuiltinTypeKind::UInt32:
           sampledTy = builder.getI32Type();
-          fmt = mlir::spirv::ImageFormat::Rgba32i;
+          // Integer images use the single-channel R32i/R32ui format: GLSL/SPIR-V
+          // imageAtomic* require r32i/r32ui (rgba32i is rejected), and this
+          // matches the runtime's R32_SINT/R32_UINT VkFormat. imageRead/
+          // imageWrite still work (only R is meaningful).
+          fmt = (cast<BuiltinType>(it->elemType)->builtin ==
+                 BuiltinTypeKind::UInt32)
+                    ? mlir::spirv::ImageFormat::R32ui
+                    : mlir::spirv::ImageFormat::R32i;
           break;
         default: break;
         }
@@ -4666,6 +4673,18 @@ private:
     if (name == "imageRead" || name == "imageWrite") {
       return emitImageBuiltin(name, args, l);
     }
+    // Storage image atomics (imageAtomicAdd/...): same carrier/patch story as
+    // imageRead/imageWrite, but the patch splices OpImageTexelPointer +
+    // OpAtomic* (MLIR 18 has the native spirv.Atomic* ops but NO
+    // spirv.ImageTexelPointer). The result is a scalar i32 (the previous R-
+    // component value), not a vec4 texel.
+    if (name == "imageAtomicAdd" || name == "imageAtomicSub" ||
+        name == "imageAtomicMin" || name == "imageAtomicMax" ||
+        name == "imageAtomicAnd" || name == "imageAtomicOr" ||
+        name == "imageAtomicXor" || name == "imageAtomicExchange" ||
+        name == "imageAtomicCompSwap") {
+      return emitImageAtomicBuiltin(name, args, l);
+    }
     // emitWarpBuiltin handles void __syncwarp (returns null with warpMatched
     // set), so dispatch it before the matched=false fallback.
     bool warpMatched = false;
@@ -5378,6 +5397,140 @@ private:
     builder.restoreInsertionPoint(saved);
     Value addr = builder.create<spirv::AddressOfOp>(l, ptrTy, fullSym);
     builder.create<spirv::StoreOp>(l, addr, val);
+  }
+
+  // Storage image atomics (imageAtomicAdd/Min/Max/And/Or/Xor/Exchange/
+  // CompSwap). Like imageRead/imageWrite, these can't be lowered directly:
+  // MLIR 18 has spirv.Atomic* ops but NO spirv.ImageTexelPointer (the op that
+  // turns an image+coord into a texel pointer for the atomic). So we emit
+  // "carriers" — spirv.Stores of the coord/value into per-call dummy Private
+  // globals stamped with an OpName marker — and a result placeholder Load
+  // (scalar i32). The post-serialize patcher (patchImageOps) decodes the
+  // carriers, splices OpImageTexelPointer + OpAtomic*, and rewrites the result
+  // Load into the atomic's result (reusing the Load's result id).
+  //
+  // Carrier symbols (param = image param name, id = per-call counter):
+  //   __vc_imgatomic_coord_<param>_<id>   — coord (scalar i32 / vec2 / vec3)
+  //   __vc_imgatomic_value_<param>_<id>   — the data value (scalar i32)
+  //   __vc_imgatomic_cmp_<param>_<id>     — comparator (CompSwap only)
+  //   __vc_imgatomic_kind_<param>_<id>_<KIND>  — kind marker (no payload; the
+  //                                            kind is encoded in the OpName
+  //                                            suffix: add/sub/min/max/and/
+  //                                            or/xor/exch/cswap)
+  //   __vc_imgatomic_result_<param>_<id>  — result placeholder var (ptr<i32>)
+  //
+  // The result is the scalar previous value of the texel's R component (int),
+  // matching GLSL imageAtomic semantics. Sema has already guaranteed an
+  // integer read_write image, so elemTy is i32 here.
+  Value emitImageAtomicBuiltin(llvm::StringRef name,
+                               const std::vector<NodePtr> &args, Location l) {
+    static unsigned counter = 0;
+    unsigned id = counter++;
+    std::string imgName = declRefName(args[0].get());
+    bool isCompSwap = (name == "imageAtomicCompSwap");
+
+    // Resolve dim (elemType is i32 by Sema contract; we don't re-derive it).
+    vc::ImageDim dim = vc::ImageDim::Dim2D;
+    if (currentFnDecl) {
+      for (const ParamDecl *p : currentFnDecl->params) {
+        if (p->name == imgName && p->type && isa<vc::ImageType>(p->type)) {
+          dim = cast<vc::ImageType>(p->type)->dim;
+          break;
+        }
+      }
+    }
+    unsigned ncoords = 2;
+    switch (dim) {
+    case vc::ImageDim::Dim1D:      ncoords = 1; break;
+    case vc::ImageDim::Dim2D:      ncoords = 2; break;
+    case vc::ImageDim::Dim3D:      ncoords = 3; break;
+    case vc::ImageDim::Dim2DArray: ncoords = 3; break;
+    }
+
+    // coord: integer texel coords, same shape as imageRead (1D→scalar, else
+    // vec<n> i32). OpImageTexelPointer's Coordinate matches OpImageRead's.
+    SmallVector<Value, 3> coords;
+    coords.reserve(ncoords);
+    for (unsigned c = 0; c < ncoords; ++c) {
+      Value cv = visitExpr(args[1 + c].get());
+      cv = loadValue(cv, loc(args[1 + c].get()));
+      cv = castValue(cv, builder.getI32Type(), l);
+      coords.push_back(cv);
+    }
+    Value coord;
+    if (ncoords == 1) {
+      coord = coords[0];
+    } else {
+      coord = builder.create<spirv::CompositeConstructOp>(
+          l, mlir::VectorType::get({(int64_t)ncoords}, builder.getI32Type()),
+          ValueRange(coords));
+    }
+
+    // value (data) operand. For CompSwap, args = (image, coords..., compare,
+    // data): compare is at [1+ncoords], data at [1+ncoords+1].
+    unsigned valIdx = isCompSwap ? (1 + ncoords + 1) : (1 + ncoords);
+    Value dataVal = visitExpr(args[valIdx].get());
+    dataVal = loadValue(dataVal, loc(args[valIdx].get()));
+    dataVal = castValue(dataVal, builder.getI32Type(), l);
+
+    // Carriers pin coord + data (and comparator for CompSwap) operand ids.
+    emitImageCarrier(l, "__vc_imgatomic_coord_" + imgName, id, coord);
+    emitImageCarrier(l, "__vc_imgatomic_value_" + imgName, id, dataVal);
+    if (isCompSwap) {
+      Value cmp = visitExpr(args[1 + ncoords].get());
+      cmp = loadValue(cmp, loc(args[1 + ncoords].get()));
+      cmp = castValue(cmp, builder.getI32Type(), l);
+      emitImageCarrier(l, "__vc_imgatomic_cmp_" + imgName, id, cmp);
+    }
+
+    // Kind marker: a dummy Private global whose OpName carries the op kind in
+    // its suffix. No payload value is needed — patchImageOps reads the kind
+    // from the name. The global + OpName survive serialization (OpName is a
+    // debug section op the patcher scans). We still emit an AddressOf so the
+    // symbol has a use in the function body; if DCE drops it the global+OpName
+    // remain, which is all the patcher needs.
+    llvm::StringRef kind;
+    if (name == "imageAtomicAdd")          kind = "add";
+    else if (name == "imageAtomicSub")     kind = "sub";
+    else if (name == "imageAtomicMin")     kind = "min";
+    else if (name == "imageAtomicMax")     kind = "max";
+    else if (name == "imageAtomicAnd")     kind = "and";
+    else if (name == "imageAtomicOr")      kind = "or";
+    else if (name == "imageAtomicXor")     kind = "xor";
+    else if (name == "imageAtomicExchange") kind = "exch";
+    else                                   kind = "cswap";
+    std::string kindSym = "__vc_imgatomic_kind_" + imgName + "_" +
+                          Twine(id).str() + "_" + kind.str();
+    {
+      // A zero-bit-pointerless dummy: use ptr<i32> Private (the pointee type
+      // is irrelevant — this global is never loaded/stored, only named).
+      auto ptrTy = spirv::PointerType::get(builder.getI32Type(),
+                                           spirv::StorageClass::Private);
+      auto saved = builder.saveInsertionPoint();
+      builder.setInsertionPointToStart(module.getBody());
+      builder.create<spirv::GlobalVariableOp>(
+          l, TypeAttr::get(ptrTy), builder.getStringAttr(kindSym),
+          /*initializer=*/FlatSymbolRefAttr());
+      builder.restoreInsertionPoint(saved);
+    }
+
+    // Result placeholder: Private global ptr<i32> + Load. The Load's result id
+    // is what the patcher rewrites into the OpAtomic* result (scalar i32, NOT
+    // vec4 — distinct from imageRead). The Load reads a distinct pointer per
+    // call so it is not CSE'd (same trick as imageRead's result placeholder).
+    auto resTy = builder.getI32Type();
+    auto resPtrTy =
+        spirv::PointerType::get(resTy, spirv::StorageClass::Private);
+    std::string resSym = "__vc_imgatomic_result_" + imgName + "_" +
+                         Twine(id).str();
+    auto saved = builder.saveInsertionPoint();
+    builder.setInsertionPointToStart(module.getBody());
+    builder.create<spirv::GlobalVariableOp>(
+        l, TypeAttr::get(resPtrTy), builder.getStringAttr(resSym),
+        /*initializer=*/FlatSymbolRefAttr());
+    builder.restoreInsertionPoint(saved);
+    Value resAddr = builder.create<spirv::AddressOfOp>(l, resPtrTy, resSym);
+    return builder.create<spirv::LoadOp>(l, resAddr);
   }
 
   // CUDA atomic builtins -> spirv.Atomic*. Returns null if `name` is not an

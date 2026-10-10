@@ -761,30 +761,49 @@ private:
     }
     // textureND<T> — the parameter type is `imageND` (GLSL storage image),
     // where ND mirrors the declared dimension (1D/2D/3D/2DArray → image1D/
-    // image2D/image3D/image2DArray). The element type T only affects the
-    // format qualifier (imageFormatQualifier) and the read/write texel type
-    // (imageVecType); the declared GLSL type is always the dim-specific image.
+    // image2D/image3D/image2DArray). The element type T selects the signedness
+    // prefix (float→image, int→iimage, uint→uimage, half→image with rgba16f)
+    // AND the format qualifier (imageFormatQualifier) and the read/write texel
+    // type (imageVecType); the dim selects the base image spelling. The
+    // returned const char* points into static storage (glslType callers store
+    // the pointer across the emission of the whole decl), so the spellings live
+    // in a fixed table rather than a transient Twine/std::string.
     if (t->getKind() == TypeKind::Image) {
       auto *it = static_cast<const ImageType *>(t);
-      switch (it->dim) {
-      case ImageDim::Dim1D:      return "image1D";
-      case ImageDim::Dim2D:      return "image2D";
-      case ImageDim::Dim3D:      return "image3D";
-      case ImageDim::Dim2DArray: return "image2DArray";
+      unsigned signIdx = 0; // 0=float (image), 1=int (iimage), 2=uint (uimage)
+      if (it->elemType && it->elemType->getKind() == TypeKind::Builtin) {
+        switch (static_cast<const BuiltinType *>(it->elemType)->builtin) {
+        case BuiltinTypeKind::Int32:  signIdx = 1; break;
+        case BuiltinTypeKind::UInt32: signIdx = 2; break;
+        default: break; // float/half → image
+        }
       }
+      static const char *kSpellings[3][4] = {
+          {"image1D", "image2D", "image3D", "image2DArray"},
+          {"iimage1D", "iimage2D", "iimage3D", "iimage2DArray"},
+          {"uimage1D", "uimage2D", "uimage3D", "uimage2DArray"},
+      };
+      unsigned dimIdx = 1; // Dim2D default
+      switch (it->dim) {
+      case ImageDim::Dim1D:      dimIdx = 0; break;
+      case ImageDim::Dim2D:      dimIdx = 1; break;
+      case ImageDim::Dim3D:      dimIdx = 2; break;
+      case ImageDim::Dim2DArray: dimIdx = 3; break;
+      }
+      return kSpellings[signIdx][dimIdx];
     }
     return "float";
   }
 
   // The GLSL layout format qualifier for a storage image, derived from the
-  // element type. Storage images are always 4-channel on the device side, so
-  // the qualifier spells the 4-channel format that matches the runtime's
-  // VkFormat (float->rgba32f, half->rgba16f, int->rgba32i). The qualifier MUST
-  // match the VkFormat the image was created with: a single-channel spelling
-  // like `r32f` happens to be tolerated on an RGBA32 image by Vulkan's
-  // format-compatibility rules, but the 4-channel spelling is the correct one
-  // and keeps validation honest. A concrete format also avoids needing the
-  // shaderStorageImageReadWithoutFormat capability.
+  // element type. Float/half use 4-channel formats (rgba32f/rgba16f) matching
+  // the runtime's RGBA VkFormats. Integer images use the SINGLE-CHANNEL r32i/
+  // r32ui spelling: GLSL imageAtomic* are ONLY legal on r32i/r32ui (glslc
+  // rejects "only supported on image with format r32i or r32ui"), and
+  // imageRead/imageWrite on an r32i image still work (imageLoad returns ivec4
+  // with .yzw == 0; only R is meaningful). The qualifier MUST match the
+  // VkFormat the image was created with. A concrete format also avoids needing
+  // the shaderStorageImageReadWithoutFormat capability.
   const char *imageFormatQualifier(const Type *t) {
     if (t && t->getKind() == TypeKind::Image) {
       auto *it = static_cast<const ImageType *>(t);
@@ -793,8 +812,8 @@ private:
         switch (static_cast<const BuiltinType *>(it->elemType)->builtin) {
         case BuiltinTypeKind::Float32: return "rgba32f";
         case BuiltinTypeKind::Float16: return "rgba16f";
-        case BuiltinTypeKind::Int32:
-        case BuiltinTypeKind::UInt32: return "rgba32i";
+        case BuiltinTypeKind::Int32:  return "r32i";
+        case BuiltinTypeKind::UInt32: return "r32ui";
         default: break;
         }
       }
@@ -1640,6 +1659,53 @@ private:
     (*os) << ")";
   }
 
+  // Storage image atomic read-modify-write. imageAtomicAdd(tex, coords...,
+  // data) etc. lower to the native GLSL imageAtomic* call, which performs an
+  // atomic RMW on the texel's FIRST (R) component and returns the scalar
+  // previous value of that component (int). The image must be a read_write
+  // integer image (iimage2D / rgba32i); Sema has already rejected float images
+  // and read_only/write_only access. Coordinates follow the image's dimension
+  // exactly like imageRead/imageWrite (1D→scalar int, 2D→ivec2, 3D/2DArray→
+  // ivec3). imageAtomicCompSwap takes (image, coords..., compare, data).
+  //
+  // GLSL has no separate signed/unsigned imageAtomicMin/Max spelling: the
+  // signedness comes from the image (iimage → signed, uimage → unsigned). We
+  // only ever produce iimage (texture2D<int> → ivec4 → iimage2D), so the
+  // signed op is correct.
+  void emitImageAtomicCall(StringRef name, const std::vector<NodePtr> &args) {
+    ImageDim dim = imageDimOfArg(args[0].get());
+    unsigned ncoords = imageCoordArity(dim);
+    bool isCompSwap = (name == "imageAtomicCompSwap");
+    // (image) + ncoords + 1 (value), or +2 (compare, data) for CompSwap.
+    unsigned need = 1 + ncoords + (isCompSwap ? 2 : 1);
+    if (args.size() < need) {
+      (*os) << "0 /*" << name << ": missing args*/";
+      return;
+    }
+    // Our name → GLSL builtin name (identity, but makes the mapping explicit).
+    (*os) << name << "(";
+    emitExpr(args[0].get());
+    if (ncoords == 1) {
+      // 1D: scalar int coord (no ctor).
+      (*os) << ", ";
+      emitExpr(args[1].get());
+    } else {
+      const char *ctor = (ncoords == 2) ? "ivec2" : "ivec3";
+      (*os) << ", " << ctor << "(";
+      for (unsigned c = 0; c < ncoords; ++c) {
+        if (c) (*os) << ", ";
+        emitExpr(args[1 + c].get());
+      }
+      (*os) << ")";
+    }
+    // CompSwap: (image, coord, compare, data). Others: (image, coord, data).
+    for (unsigned a = 1 + ncoords; a < need; ++a) {
+      (*os) << ", ";
+      emitExpr(args[a].get());
+    }
+    (*os) << ")";
+  }
+
   // Pre-pass walker: visit a statement's expressions (with output discarded)
   // so vote calls push their reduction prologues into `preStmts`. Recurses
   // through nested statements so a vote buried in an `if` body is hoisted
@@ -2337,6 +2403,16 @@ private:
           c->callee->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
         return nullptr;
       StringRef name = static_cast<const DeclRefExpr *>(c->callee.get())->name;
+      // Image atomics return a scalar int (the previous R-component value),
+      // per GLSL imageAtomic semantics. Modeled here (not in ctorResultType,
+      // which is for type-name constructors) so `int old = imageAtomicAdd(..)`
+      // and arithmetic on the result infer as int.
+      if (name == "imageAtomicAdd" || name == "imageAtomicSub" ||
+          name == "imageAtomicMin" || name == "imageAtomicMax" ||
+          name == "imageAtomicAnd" || name == "imageAtomicOr" ||
+          name == "imageAtomicXor" || name == "imageAtomicExchange" ||
+          name == "imageAtomicCompSwap")
+        return new BuiltinType(BuiltinTypeKind::Int32);
       return ctorResultType(name);
     }
     case ASTNode::NodeKind::BinaryExpr: {
@@ -3043,9 +3119,19 @@ private:
         }
         // Storage image texel access. texture2D<T> params are GLSL `image2D`;
         // imageRead(tex,x,y) -> imageLoad(tex, ivec2(x,y)) returns a vec4<T>;
-        // imageWrite(tex,x,y,v) -> imageStore(tex, ivec2(x,y), v).
+        // imageWrite(tex,x,y,v) -> imageStore(tex, ivec2(x,y), v). Image
+        // atomics lower to native GLSL imageAtomic* (scalar R-component RMW).
         if (ref->name == "imageRead" || ref->name == "imageWrite") {
           emitImageCall(ref->name, c->args);
+          return;
+        }
+        if (ref->name == "imageAtomicAdd" || ref->name == "imageAtomicSub" ||
+            ref->name == "imageAtomicMin" || ref->name == "imageAtomicMax" ||
+            ref->name == "imageAtomicAnd" || ref->name == "imageAtomicOr" ||
+            ref->name == "imageAtomicXor" ||
+            ref->name == "imageAtomicExchange" ||
+            ref->name == "imageAtomicCompSwap") {
+          emitImageAtomicCall(ref->name, c->args);
           return;
         }
         // User __device__ helper or CUDA/math builtin: lower the name and emit

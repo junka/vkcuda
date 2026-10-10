@@ -1625,14 +1625,27 @@ Type *Sema::checkExpr(const ASTNode *n) {
       // reported an error; stop. A non-wmma name returns null and falls through.
       if (calleeName.startswith("wmma_"))
         return nullptr;
-      // Storage-image texel access: imageRead(tex,x,y) / imageWrite(tex,x,y,v).
-      // Check the image arg's access qualifier — a read_only image can't be
-      // written, a write_only image can't be read. Catches real bugs (e.g. a
-      // dst marked write_only then read back) before they reach the backends.
-      // Must run BEFORE isMathBuiltin, since imageRead/imageWrite are registered
-      // builtins (isBuiltin returns true) and would otherwise be passed through
-      // as math builtins without this check.
-      if (calleeName == "imageRead" || calleeName == "imageWrite") {
+      // Storage-image texel access: imageRead(tex,x,y) / imageWrite(tex,x,y,v),
+      // and image atomic RMW: imageAtomicAdd(tex,x,y,v) etc. Check the image
+      // arg's access qualifier — a read_only image can't be written, a
+      // write_only image can't be read. Catches real bugs (e.g. a dst marked
+      // write_only then read back) before they reach the backends. Image
+      // atomics additionally require a read_write integer image: an atomic is a
+      // read-modify-write, so read_only/write_only are both invalid, and the
+      // texel format must be a 32-bit integer (texture2D<int> → rgba32i) since
+      // GLSL/SPIR-V image atomics only operate on integer texels. Must run
+      // BEFORE isMathBuiltin, since imageRead/imageWrite/imageAtomic* are
+      // registered builtins (isBuiltin returns true) and would otherwise be
+      // passed through as math builtins without this check.
+      bool isImageAtomic =
+          calleeName == "imageAtomicAdd" || calleeName == "imageAtomicSub" ||
+          calleeName == "imageAtomicMin" || calleeName == "imageAtomicMax" ||
+          calleeName == "imageAtomicAnd" || calleeName == "imageAtomicOr" ||
+          calleeName == "imageAtomicXor" ||
+          calleeName == "imageAtomicExchange" ||
+          calleeName == "imageAtomicCompSwap";
+      if (calleeName == "imageRead" || calleeName == "imageWrite" ||
+          isImageAtomic) {
         // Check the image arg's access qualifier — a read_only image can't be
         // written, a write_only image can't be read. Catches real bugs (e.g. a
         // dst marked write_only then read back) before they reach the backends.
@@ -1651,11 +1664,46 @@ Type *Sema::checkExpr(const ASTNode *n) {
           const Type *argTy = resolveTypedefs(imgArgTy);
           if (argTy && argTy->getKind() == TypeKind::Image) {
             auto *it = static_cast<const ImageType *>(argTy);
-            if (calleeName == "imageWrite" && it->access == ImageAccess::ReadOnly)
+            if (calleeName == "imageWrite" &&
+                it->access == ImageAccess::ReadOnly)
               error(n, "imageWrite on a read_only image");
-            else if (calleeName == "imageRead" && it->access == ImageAccess::WriteOnly)
+            else if (calleeName == "imageRead" &&
+                     it->access == ImageAccess::WriteOnly)
               error(n, "imageRead from a write_only image");
+            if (isImageAtomic) {
+              // Atomics are read-modify-write: both ReadOnly and WriteOnly are
+              // invalid (need ReadWrite).
+              if (it->access != ImageAccess::ReadWrite)
+                error(n, std::string(calleeName) +
+                         " requires a read_write image (read_only/write_only "
+                         "cannot do atomic read-modify-write)");
+              // Atomics only operate on integer texels. The element type must
+              // be a 32-bit int (texture2D<int> → rgba32i); float/half images
+              // have no atomic ops in GLSL/SPIR-V.
+              bool intElem = false;
+              if (it->elemType &&
+                  it->elemType->getKind() == TypeKind::Builtin) {
+                auto bk = static_cast<const BuiltinType *>(it->elemType)
+                              ->builtin;
+                intElem = (bk == BuiltinTypeKind::Int32 ||
+                           bk == BuiltinTypeKind::UInt32);
+              }
+              if (!intElem)
+                error(n, std::string(calleeName) +
+                         " requires an integer image (texture2D<int>); "
+                         "float/half images do not support atomics");
+            }
           }
+        }
+        if (isImageAtomic) {
+          // imageAtomicAdd/Min/Max/And/Or/Xor/Exchange: (image, coords...,
+          // value). imageAtomicCompSwap: (image, coords..., compare, data).
+          // Result is the scalar previous value of the texel's R component
+          // (int), per GLSL imageAtomic semantics — NOT the whole vec4 texel.
+          // Returning the type here lets expr inference treat the call as an
+          // int value (e.g. `int old = imageAtomicAdd(...)`).
+          exprTypes[n] = builtin(BuiltinTypeKind::Int32);
+          return exprTypes[n];
         }
         // The backends synthesize the result type (imageRead -> vec4<T>,
         // imageWrite -> void). Return null to match the existing pass-through

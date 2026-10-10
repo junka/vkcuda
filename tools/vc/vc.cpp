@@ -390,6 +390,21 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
   constexpr uint32_t kOpStore = 62;            // [wc|op, ptr_id, value_id, (mem-ops)...]
   constexpr uint32_t kOpImageRead = 98;        // [wc|op, type_id, result_id, image_id, coord_id]
   constexpr uint32_t kOpImageWrite = 99;       // [wc|op, image_id, coord_id, texel_id]
+  constexpr uint32_t kOpImageTexelPointer = 60; // [wc|op, type_id, result_id, Image, Coordinate, Sample]
+  constexpr uint32_t kOpAtomicIAdd = 234;      // [wc|op, type_id, result_id, Pointer, Memory, Semantics, Value]
+  constexpr uint32_t kOpAtomicISub = 235;
+  constexpr uint32_t kOpAtomicSMin = 236;
+  constexpr uint32_t kOpAtomicSMax = 238;
+  constexpr uint32_t kOpAtomicAnd = 240;
+  constexpr uint32_t kOpAtomicOr = 241;
+  constexpr uint32_t kOpAtomicXor = 242;
+  constexpr uint32_t kOpAtomicExchange = 229;
+  constexpr uint32_t kOpAtomicCompareExchange = 230; // [wc|op, type_id, result_id, Pointer, Memory, Equal, Unequal, Value, Comparator]
+  constexpr uint32_t kOpTypeInt = 21;          // [wc|op, result_id, width, signedness]
+  constexpr uint32_t kOpConstant = 43;         // [wc|op, type_id, result_id, value...]
+  constexpr uint32_t kScopeDevice = 1;         // Scope::Device
+  constexpr uint32_t kSCUniformConstant = 0;   // StorageClass::UniformConstant
+  constexpr uint32_t kSCImage = 11;            // StorageClass::Image (texel ptr)
   constexpr uint32_t kOpDecorate = 71;         // [wc|op, target_id, decoration, (extra operands)...]
   constexpr uint32_t kOpMemoryModel = 14;      // [wc|op, addressing, memory]
   constexpr uint32_t kDecorNonWritable = 24;   // OpDecorate <id> NonWritable
@@ -438,6 +453,29 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
   llvm::DenseSet<uint32_t> carrierVarIds;
   // set of result placeholder var ids (for deletion)
   llvm::DenseSet<uint32_t> resultVarIds;
+
+  // ---- image atomic carrier state (imageAtomicAdd/...) ----
+  // Mirrors the read/write carrier machinery but splices OpImageTexelPointer +
+  // OpAtomic* (MLIR 18 has spirv.Atomic* but no spirv.ImageTexelPointer).
+  llvm::SmallVector<Carrier, 8> atomicCarriers;   // coord/value/cmp carriers
+  llvm::SmallVector<Carrier, 8> atomicKindMarkers; // kind marker dummy vars
+  llvm::DenseSet<uint32_t> atomicCarrierVarIds;    // all atomic dummy vars
+  // dummyVarId -> (storeOffset, valueId) for coord/value/cmp carriers
+  llvm::DenseMap<uint32_t, std::pair<size_t, uint32_t>> atomicCarrierStore;
+  // atomic result placeholder var name -> var id
+  llvm::StringMap<uint32_t> atomicResultVarByName;
+  llvm::DenseSet<uint32_t> atomicResultVarIds;
+  // result placeholder var id -> (loadOffset, loadResultId, resultTypeId=i32)
+  llvm::DenseMap<uint32_t, std::tuple<size_t, uint32_t, uint32_t>>
+      atomicResultLoad;
+  // 32-bit OpTypeInt result ids (to reuse for the atomic value/result type)
+  llvm::SmallVector<uint32_t, 4> intTypeIds;
+  // Offset just past the last type-definition instruction (OpType*, OpConstant,
+  // ...). New synthesized types/constants must be inserted HERE (after all
+  // types they may reference, like %uint) so there are no forward references in
+  // the type section. Tracked across all type-def and constant ops in Pass 1.
+  size_t lastTypeDefEnd = 0;
+
   // image var id -> decoration to emit (NonReadable / NonWritable). Absent =>
   // read-write (no decoration). Populated from the __vc_imgro_/__vc_imgwo_
   // symbol prefix the ASTToMLIR emitter stamps on the image variable.
@@ -467,6 +505,20 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
         // imageRead result placeholder variable
         resultVarByName[name] = targetId;
         resultVarIds.insert(targetId);
+      } else if (name.starts_with("__vc_imgatomic_result_")) {
+        // image atomic result placeholder variable (scalar i32)
+        atomicResultVarByName[name] = targetId;
+        atomicResultVarIds.insert(targetId);
+      } else if (name.starts_with("__vc_imgatomic_kind_")) {
+        // kind marker: __vc_imgatomic_kind_<param>_<id>_<KIND>. No payload
+        // store; the kind is encoded in the OpName suffix.
+        atomicKindMarkers.push_back({name, targetId});
+        atomicCarrierVarIds.insert(targetId); // delete the dummy var + OpName
+      } else if (name.starts_with("__vc_imgatomic_coord_") ||
+                 name.starts_with("__vc_imgatomic_value_") ||
+                 name.starts_with("__vc_imgatomic_cmp_")) {
+        atomicCarriers.push_back({name, targetId});
+        atomicCarrierVarIds.insert(targetId);
       } else if (name.starts_with("__vc_imgread_") ||
                  name.starts_with("__vc_imgwrite_")) {
         carriers.push_back({name, targetId});
@@ -488,10 +540,13 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
       }
     } else if (opcode == kOpTypeImage && wordCount >= 9) {
       typeDefs[binary[i + 1]] = {i, opcode};
+      lastTypeDefEnd = i + wordCount;
     } else if (opcode == kOpTypeVector && wordCount >= 4) {
       typeDefs[binary[i + 1]] = {i, opcode};
+      lastTypeDefEnd = i + wordCount;
     } else if (opcode == kOpTypePointer && wordCount >= 4) {
       typeDefs[binary[i + 1]] = {i, opcode};
+      lastTypeDefEnd = i + wordCount;
     } else if (opcode == kOpVariable && wordCount >= 4) {
       varResultType[binary[i + 2]] = binary[i + 1];
     } else if (opcode == kOpStore && wordCount >= 3) {
@@ -500,11 +555,26 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
       uint32_t valId = binary[i + 2];
       if (carrierVarIds.contains(ptrId))
         carrierStore[ptrId] = {i, valId};
+      else if (atomicCarrierVarIds.contains(ptrId))
+        atomicCarrierStore[ptrId] = {i, valId};
     } else if (opcode == kOpLoad && wordCount >= 4) {
       // [wc|op, type_id, result_id, ptr_id]
       uint32_t ptrId = binary[i + 3];
       if (resultVarIds.contains(ptrId))
         resultLoad[ptrId] = {i, binary[i + 2], binary[i + 1]};
+      else if (atomicResultVarIds.contains(ptrId))
+        atomicResultLoad[ptrId] = {i, binary[i + 2], binary[i + 1]};
+    } else if (opcode == kOpTypeInt && wordCount >= 4) {
+      // Track 32-bit int type ids so the atomic patch can reuse an existing
+      // OpTypeInt 32 rather than synthesizing a duplicate.
+      if (binary[i + 2] == 32)
+        intTypeIds.push_back(binary[i + 1]);
+      typeDefs[binary[i + 1]] = {i, opcode};
+      lastTypeDefEnd = i + wordCount;
+    } else if (opcode == kOpConstant && wordCount >= 4) {
+      // Constants live in the type/constant section; track the end so
+      // synthesized types/constants can be appended without forward refs.
+      lastTypeDefEnd = i + wordCount;
     } else if (opcode == kOpMemoryModel) {
       // OpDecorate must follow OpMemoryModel (SPIR-V layout: decorations come
       // after the memory model instruction). Record its end offset as the
@@ -520,7 +590,7 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
     i += wordCount;
   }
 
-  if (carriers.empty())
+  if (carriers.empty() && atomicCarriers.empty() && atomicKindMarkers.empty())
     return;
 
   // Resolve image variable id -> image type id (walk var -> ptr -> image).
@@ -651,7 +721,129 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
     }
   }
 
-  if (reads.empty() && writes.empty())
+  // ---- image atomic plan ----
+  // Each atomic call has: a coord carrier, a value carrier, an optional cmp
+  // carrier (CompSwap), a kind marker (OpName suffix encodes the op), and a
+  // result placeholder Load (scalar i32). Group carriers by (param, callId),
+  // match the kind, and locate the result Load.
+  struct AtomicOp {
+    uint32_t imageVarId = 0;
+    uint32_t coordId = 0;
+    uint32_t valueId = 0;     // the data operand
+    uint32_t cmpId = 0;       // comparator (CompSwap only); 0 otherwise
+    bool isCompSwap = false;
+    uint32_t opcode = 0;      // OpAtomic* opcode
+    size_t resultLoadOff = 0; // offset of the result OpLoad to rewrite
+    uint32_t resultId = 0;    // the Load's result id (reused for OpAtomic*)
+    size_t coordStoreOff = 0; // for deletion
+    size_t valueStoreOff = 0;
+    size_t cmpStoreOff = 0;
+    bool hasCmp = false;
+  };
+
+  // (param, callId) -> gathered pieces.
+  struct AtomicPieces {
+    uint32_t imageVarId = 0;
+    uint32_t coordId = 0;  size_t coordStoreOff = 0; bool hasCoord = false;
+    uint32_t valueId = 0;  size_t valueStoreOff = 0; bool hasValue = false;
+    uint32_t cmpId = 0;    size_t cmpStoreOff = 0;   bool hasCmp = false;
+    uint32_t opcode = 0;
+    bool isCompSwap = false;
+  };
+  llvm::StringMap<AtomicPieces> atomicByKey;
+
+  // Helper: parse "<param>_<id>" out of a carrier name whose prefix has been
+  // stripped (returns param in `outParam`, id in `outId`).
+  auto splitParamId = [](const std::string &s, std::string &outParam,
+                         std::string &outId) {
+    auto lastUS = s.rfind('_');
+    if (lastUS == std::string::npos) return false;
+    outParam = s.substr(0, lastUS);
+    outId = s.substr(lastUS + 1);
+    return true;
+  };
+
+  for (const Carrier &c : atomicCarriers) {
+    // name: __vc_imgatomic_{coord,value,cmp}_<param>_<id>
+    std::string rest;
+    bool isCoord = false, isValue = false, isCmp = false;
+    if (c.name.starts_with("__vc_imgatomic_coord_")) {
+      isCoord = true; rest = c.name.substr(strlen("__vc_imgatomic_coord_"));
+    } else if (c.name.starts_with("__vc_imgatomic_value_")) {
+      isValue = true; rest = c.name.substr(strlen("__vc_imgatomic_value_"));
+    } else if (c.name.starts_with("__vc_imgatomic_cmp_")) {
+      isCmp = true; rest = c.name.substr(strlen("__vc_imgatomic_cmp_"));
+    } else {
+      continue;
+    }
+    std::string param, callId;
+    if (!splitParamId(rest, param, callId)) continue;
+    auto imgIt = imageVarByName.find(param);
+    if (imgIt == imageVarByName.end()) continue;
+    auto stIt = atomicCarrierStore.find(c.dummyVarId);
+    if (stIt == atomicCarrierStore.end()) continue;
+    auto [storeOff, valId] = stIt->second;
+    std::string key = param + "_" + callId;
+    AtomicPieces &ap = atomicByKey[key];
+    ap.imageVarId = imgIt->second;
+    if (isCoord) { ap.coordId = valId; ap.coordStoreOff = storeOff; ap.hasCoord = true; }
+    else if (isValue) { ap.valueId = valId; ap.valueStoreOff = storeOff; ap.hasValue = true; }
+    else if (isCmp) { ap.cmpId = valId; ap.cmpStoreOff = storeOff; ap.hasCmp = true; }
+  }
+
+  // Kind markers: __vc_imgatomic_kind_<param>_<id>_<KIND>
+  static const llvm::StringMap<uint32_t> kKindOpcode = {
+      {"add", kOpAtomicIAdd},     {"sub", kOpAtomicISub},
+      {"min", kOpAtomicSMin},     {"max", kOpAtomicSMax},
+      {"and", kOpAtomicAnd},      {"or", kOpAtomicOr},
+      {"xor", kOpAtomicXor},      {"exch", kOpAtomicExchange},
+      {"cswap", kOpAtomicCompareExchange},
+  };
+  for (const Carrier &c : atomicKindMarkers) {
+    // rest = "<param>_<id>_<KIND>"
+    std::string rest = c.name.substr(strlen("__vc_imgatomic_kind_"));
+    // KIND is the suffix after the last '_'; (param,id) is before it.
+    auto lastUS = rest.rfind('_');
+    if (lastUS == std::string::npos) continue;
+    std::string kindStr = rest.substr(lastUS + 1);
+    std::string key = rest.substr(0, lastUS); // "<param>_<id>"
+    auto kit = kKindOpcode.find(kindStr);
+    if (kit == kKindOpcode.end()) continue;
+    AtomicPieces &ap = atomicByKey[key];
+    ap.opcode = kit->second;
+    ap.isCompSwap = (kindStr == "cswap");
+  }
+
+  llvm::SmallVector<AtomicOp, 8> atomics;
+  for (auto &kv : atomicByKey) {
+    AtomicPieces &ap = kv.second;
+    if (!ap.hasCoord || !ap.hasValue || ap.opcode == 0) continue;
+    if (ap.isCompSwap && !ap.hasCmp) continue;
+    std::string resName = "__vc_imgatomic_result_" + kv.first().str();
+    AtomicOp op;
+    op.imageVarId = ap.imageVarId;
+    op.coordId = ap.coordId;
+    op.valueId = ap.valueId;
+    op.cmpId = ap.cmpId;
+    op.isCompSwap = ap.isCompSwap;
+    op.opcode = ap.opcode;
+    op.coordStoreOff = ap.coordStoreOff;
+    op.valueStoreOff = ap.valueStoreOff;
+    op.cmpStoreOff = ap.cmpStoreOff;
+    op.hasCmp = ap.hasCmp;
+    auto rvIt = atomicResultVarByName.find(resName);
+    if (rvIt != atomicResultVarByName.end()) {
+      auto rlIt = atomicResultLoad.find(rvIt->second);
+      if (rlIt != atomicResultLoad.end()) {
+        auto [off, rid, ty] = rlIt->second;
+        op.resultLoadOff = off;
+        op.resultId = rid;
+      }
+    }
+    atomics.push_back(op);
+  }
+
+  if (reads.empty() && writes.empty() && atomicKindMarkers.empty())
     return;
 
   // Determine the current Bound (header word at index 3). New ids are
@@ -752,11 +944,180 @@ static void patchImageOps(SmallVectorImpl<uint32_t> &binary) {
     deleteOffsets.insert(w.texelStoreOff);
   }
 
+  // ---- image atomics: splice OpImageTexelPointer + OpAtomic* ----
+  // The atomic's result reuses the result placeholder Load's result id (so
+  // existing uses of the placeholder resolve to the real atomic result). The
+  // carrier coord/value/cmp stores and the result placeholder Load/Variable
+  // are deleted.
+  //
+  // Types needed (may not exist yet): OpTypeInt 32 (the atomic value/result
+  // scalar) and OpTypePointer UniformConstant <i32> (the texel pointer's result
+  // type), plus OpConstant 0/1 (Sample operand, scope, semantics — these are
+  // Ids, not literals). All are inserted at `typeAnchor` = just past the last
+  // existing type/constant def, so they come AFTER any type they reference
+  // (e.g. %uint) and before the first function — no forward references. Ids are
+  // allocated above Bound.
+  if (!atomics.empty()) {
+    size_t typeAnchor = lastTypeDefEnd ? lastTypeDefEnd
+                        : (lastDecorateEnd ? lastDecorateEnd
+                        : (memoryModelEnd ? memoryModelEnd : 5));
+
+    // Find or create a 32-bit int type id.
+    uint32_t i32Ty = 0;
+    for (uint32_t id : intTypeIds) { i32Ty = id; break; }
+    if (!i32Ty) {
+      i32Ty = bound++;
+      SmallVector<uint32_t> seq;
+      // OpTypeInt [wc|op, result_id, width, signedness]  signedness=1 (signed)
+      seq.push_back((4u << 16) | kOpTypeInt);
+      seq.push_back(i32Ty);
+      seq.push_back(32);
+      seq.push_back(1);
+      inserts.push_back({typeAnchor, std::move(seq)});
+    }
+
+    // Find or create OpTypePointer Image <i32> (the texel pointer result type
+    // for OpImageTexelPointer — its Result Type MUST be a pointer with Storage
+    // Class Image, NOT UniformConstant). Scan existing OpTypePointer defs for a
+    // match; else synthesize one.
+    uint32_t ptrI32Ty = 0;
+    for (auto &kv : typeDefs) {
+      if (kv.second.second != kOpTypePointer) continue;
+      size_t off = kv.second.first;
+      // [wc|op, result_id, SC, elem_id]
+      if (binary[off + 2] == kSCImage && binary[off + 3] == i32Ty) {
+        ptrI32Ty = kv.first;
+        break;
+      }
+    }
+    if (!ptrI32Ty) {
+      ptrI32Ty = bound++;
+      SmallVector<uint32_t> seq;
+      seq.push_back((4u << 16) | kOpTypePointer);
+      seq.push_back(ptrI32Ty);
+      seq.push_back(kSCImage);
+      seq.push_back(i32Ty);
+      inserts.push_back({typeAnchor, std::move(seq)});
+    }
+
+    // OpImageTexelPointer's Sample operand is an Id (a scalar integer), NOT a
+    // literal — it must be 0 for non-multisampled images, but it's still an Id
+    // referencing a 0 constant. Find an existing OpConstant <i32> 0, or
+    // synthesize one.
+    uint32_t zeroI32Id = 0;
+    for (size_t off = 5; off + 3 < binary.size();) {
+      uint32_t w = binary[off];
+      uint32_t op = w & 0xFFFF;
+      uint32_t wc = w >> 16;
+      if (wc == 0 || off + wc > binary.size()) break;
+      // OpConstant [wc|op, type_id, result_id, value...]  (i32 value is 1 word)
+      if (op == kOpConstant && wc == 4 && binary[off + 1] == i32Ty &&
+          binary[off + 3] == 0) {
+        zeroI32Id = binary[off + 2];
+        break;
+      }
+      off += wc;
+    }
+    if (!zeroI32Id) {
+      zeroI32Id = bound++;
+      SmallVector<uint32_t> seq;
+      // OpConstant [wc|op, type_id, result_id, value]
+      seq.push_back((4u << 16) | kOpConstant);
+      seq.push_back(i32Ty);
+      seq.push_back(zeroI32Id);
+      seq.push_back(0);
+      inserts.push_back({typeAnchor, std::move(seq)});
+    }
+
+    // OpAtomic*'s Memory (scope) and Semantics operands are Ids referencing
+    // constant integers, NOT literals. Scope=Device(1); Semantics=None(0) for
+    // relaxed atomics. Find or synthesize a constant `1` for the Device scope.
+    uint32_t oneI32Id = 0;
+    for (size_t off = 5; off + 3 < binary.size();) {
+      uint32_t w = binary[off];
+      uint32_t op = w & 0xFFFF;
+      uint32_t wc = w >> 16;
+      if (wc == 0 || off + wc > binary.size()) break;
+      if (op == kOpConstant && wc == 4 && binary[off + 1] == i32Ty &&
+          binary[off + 3] == 1) {
+        oneI32Id = binary[off + 2];
+        break;
+      }
+      off += wc;
+    }
+    if (!oneI32Id) {
+      oneI32Id = bound++;
+      SmallVector<uint32_t> seq;
+      seq.push_back((4u << 16) | kOpConstant);
+      seq.push_back(i32Ty);
+      seq.push_back(oneI32Id);
+      seq.push_back(1);
+      inserts.push_back({typeAnchor, std::move(seq)});
+    }
+
+    for (const AtomicOp &a : atomics) {
+      // OpImageTexelPointer takes the image VARIABLE pointer directly as its
+      // Image operand (NOT a loaded image value — this differs from
+      // OpImageRead/Write, which take the loaded image). Verified against
+      // glslc's lowering of `imageAtomicAdd`: the variable id is passed
+      // straight to OpImageTexelPointer.
+      SmallVector<uint32_t, 8> seq;
+
+      // OpImageTexelPointer [wc|op, type_id(ptr<Image,i32>), result_id, Image, Coord, Sample]
+      uint32_t texelPtrId = bound++;
+      seq.push_back((6u << 16) | kOpImageTexelPointer);
+      seq.push_back(ptrI32Ty);
+      seq.push_back(texelPtrId);
+      seq.push_back(a.imageVarId);  // the image variable pointer
+      seq.push_back(a.coordId);
+      seq.push_back(zeroI32Id);     // Sample Id = 0 (non-multisampled)
+
+      // OpAtomic* [wc|op, type_id, result_id, Pointer, Memory, Semantics, Value]
+      // OpAtomicCompareExchange adds Equal, Unequal, Comparator (no Semantics-
+      // Value collapse): [wc|op, type_id, result_id, Pointer, Memory, Equal,
+      // Unequal, Value, Comparator]
+      if (a.isCompSwap) {
+        seq.push_back((9u << 16) | kOpAtomicCompareExchange);
+        seq.push_back(i32Ty);
+        seq.push_back(a.resultId);
+        seq.push_back(texelPtrId);
+        seq.push_back(oneI32Id);    // Memory scope Id = Device(1)
+        seq.push_back(zeroI32Id);   // Equal semantics Id = None(0)
+        seq.push_back(zeroI32Id);   // Unequal semantics Id = None(0)
+        seq.push_back(a.valueId);   // Value (data)
+        seq.push_back(a.cmpId);     // Comparator
+      } else {
+        seq.push_back((7u << 16) | a.opcode);
+        seq.push_back(i32Ty);
+        seq.push_back(a.resultId);
+        seq.push_back(texelPtrId);
+        seq.push_back(oneI32Id);    // Memory scope Id = Device(1)
+        seq.push_back(zeroI32Id);   // Semantics Id = None(0)
+        seq.push_back(a.valueId);   // Value
+      }
+      inserts.push_back({a.resultLoadOff, std::move(seq)});
+      // Delete the carrier stores (coord/value/cmp) and the result Load.
+      deleteOffsets.insert(a.coordStoreOff);
+      deleteOffsets.insert(a.valueStoreOff);
+      if (a.hasCmp)
+        deleteOffsets.insert(a.cmpStoreOff);
+      deleteOffsets.insert(a.resultLoadOff);
+    }
+  }
+
   // Mark dummy carrier OpVariables + their OpNames for deletion.
   for (const Carrier &c : carriers)
     markNameAndVar(c.dummyVarId);
   // Mark read result placeholder OpVariables + their OpNames for deletion.
   for (const auto &kv : resultVarByName)
+    markNameAndVar(kv.second);
+  // Mark image-atomic carrier + kind-marker dummy OpVariables + OpNames.
+  for (const Carrier &c : atomicCarriers)
+    markNameAndVar(c.dummyVarId);
+  for (const Carrier &c : atomicKindMarkers)
+    markNameAndVar(c.dummyVarId);
+  // Mark atomic result placeholder OpVariables + their OpNames.
+  for (const auto &kv : atomicResultVarByName)
     markNameAndVar(kv.second);
 
   // Emit OpDecorate NonReadable / NonWritable for access-qualified image

@@ -1,0 +1,93 @@
+// test/image_atomics.vc — image atomic operations on a storage image.
+//
+// imageAtomicAdd/Min/Max/And/Or/Xor/Exchange/CompSwap perform a scalar
+// read-modify-write on the texel's FIRST (R) component and return the previous
+// value of that component (int). They require an integer-format read_write
+// image with a SINGLE-CHANNEL 32-bit format: texture2D<int> + R32Sint ->
+// GLSL `r32i` / SPIR-V OpTypeImage R32i. (GLSL imageAtomic* are ONLY legal on
+// r32i/r32ui; rgba32i is rejected by glslc.) The host stages one int per
+// texel (4 bytes/texel, R channel only).
+//
+// To keep the result deterministic, each op type targets its OWN texel, and the
+// accumulation counts are chosen so order doesn't matter (commutative adds) or
+// only one thread writes (exchange/compSwap). The host checks R at each texel.
+//
+//   vcc test/image_atomics.vc -o build/image_atomics_sf && ./build/image_atomics_sf
+//   vc  test/image_atomics.vc -emit=full -o build/image_atomics_mlir && ./build/image_atomics_mlir
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+// Texel roles (x selects the op; y=0 row unless noted):
+//  (0,0): imageAtomicAdd   - 16 threads add 1 each, init 0  -> R = 16
+//  (1,0): imageAtomicMin   - 16 threads min(tid), values 0..15, init 100 -> R = 0
+//  (2,0): imageAtomicMax   - 16 threads max(tid), values 0..15, init -1  -> R = 15
+//  (3,0): imageAtomicExchange then imageAtomicCompSwap (single thread) -> R = 42
+//  (0,1): imageAtomicAnd   - 16x & 0xFF, init 0xFF -> R = 0xFF
+//  (1,1): imageAtomicOr    - 16x or (1 << tid%8), init 0 -> R = 0xFF
+//  (2,1): imageAtomicXor   - 16x xor 0x55 (even count) -> R = 0
+__global__ void atomicKernel(texture2D<int> img, int w, int h) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= 16) return;
+
+  imageAtomicAdd(img, 0, 0, 1);
+  imageAtomicMin(img, 1, 0, tid);
+  imageAtomicMax(img, 2, 0, tid);
+  imageAtomicAnd(img, 0, 1, 0xFF);
+  imageAtomicOr(img, 1, 1, 1 << (tid % 8));
+  imageAtomicXor(img, 2, 1, 0x55);
+
+  if (tid == 0) {
+    imageAtomicExchange(img, 3, 0, 777);      // R = 777
+    imageAtomicCompSwap(img, 3, 0, 777, 42);  // R==777 -> swap to 42
+  }
+}
+
+int main() {
+  vcInit();
+
+  const int W = 4, H = 4;
+  const int N = W * H;
+  int hostIn[N];
+  for (int i = 0; i < N; ++i) hostIn[i] = 0;
+  hostIn[0 * W + 1] = 100; // min target init
+  hostIn[0 * W + 2] = -1;  // max target init
+  hostIn[1 * W + 0] = 0xFF; // and target init
+
+  VCImage *img = nullptr;
+  vcCreateImage2D(&img, W, H, VCPixelFormat::R32Sint);
+  vcMemcpyToImage(img, hostIn);
+
+  atomicKernel<<<16, 8>>>(img, W, H);
+  vcDeviceSynchronize();
+
+  int hostOut[N];
+  vcMemcpyFromImage(hostOut, img);
+
+  int ok = 1;
+  if (hostOut[0 * W + 0] != 16)   ok = 0; // add
+  if (hostOut[0 * W + 1] != 0)    ok = 0; // min
+  if (hostOut[0 * W + 2] != 15)   ok = 0; // max
+  if (hostOut[0 * W + 3] != 42)   ok = 0; // exchange->compSwap
+  if (hostOut[1 * W + 0] != 0xFF) ok = 0; // and
+  if (hostOut[1 * W + 1] != 0xFF) ok = 0; // or
+  if (hostOut[1 * W + 2] != 0)    ok = 0; // xor
+  // Untouched texels stay 0.
+  for (int y = 0; y < H && ok; ++y)
+    for (int x = 0; x < W && ok; ++x) {
+      if ((x == 0 && y == 0) || (x == 1 && y == 0) || (x == 2 && y == 0) ||
+          (x == 3 && y == 0) || (x == 0 && y == 1) || (x == 1 && y == 1) ||
+          (x == 2 && y == 1))
+        continue;
+      if (hostOut[y * W + x] != 0) ok = 0;
+    }
+
+  vcDestroyImage(img);
+  vcShutdown();
+  printf("image_atomics: %s (add=%d min=%d max=%d cswap=%d and=%d or=%d xor=%d)\n",
+         ok ? "PASS" : "FAIL", hostOut[0 * W + 0], hostOut[0 * W + 1],
+         hostOut[0 * W + 2], hostOut[0 * W + 3], hostOut[1 * W + 0],
+         hostOut[1 * W + 1], hostOut[1 * W + 2]);
+  return ok ? 0 : 1;
+}

@@ -1,0 +1,34 @@
+// test/MLIR/storage_image_atomic.vc — image atomic lowering (MLIR backend).
+//
+// imageAtomicAdd on texture2D<int> lowers to OpImageTexelPointer + OpAtomicIAdd.
+// MLIR 18 has spirv.Atomic* ops but no spirv.ImageTexelPointer, so the AST→MLIR
+// emitter stamps carrier symbols (__vc_imgatomic_*) and the post-serialize
+// patchImageOps pass splices the real ops. The image format is R32i (single-
+// channel signed int) — GLSL/SPIR-V image atomics require r32i/r32ui, NOT
+// rgba32i. The result is a scalar int (the previous R-component value).
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && spirv-dis %t.spv | FileCheck %s
+
+// Storage image with R32i format (int image for atomics). texture2D<int> lowers
+// to a signless OpTypeInt 32 0 texel (spirv-dis prints it as %uint by convention;
+// the signedness is carried by the R32i format, not the int type — same as glslc).
+// CHECK: OpTypeImage %{{[a-zA-Z0-9_]+}} 2D 0 0 0 2 R32i
+
+// OpImageTexelPointer's Result Type is a pointer with Storage Class Image
+// pointing at the 32-bit texel.
+// CHECK: OpTypePointer Image %{{[a-zA-Z0-9_]+}}
+// CHECK: OpImageTexelPointer %{{[a-zA-Z0-9_]+}} %{{[a-zA-Z0-9_]+}} %{{[a-zA-Z0-9_]+}} %uint_0
+
+// The atomic op itself: OpAtomicIAdd <texeltype> <texelptr> <scope> <sem> <value>.
+// Scope (Device=%uint_1) and Semantics (None=%uint_0) are Id operands named by
+// spirv-dis, not bare integers, so match any id token.
+// CHECK: OpAtomicIAdd %{{[a-zA-Z0-9_]+}} %{{[a-zA-Z0-9_]+}} %{{[a-zA-Z0-9_]+}} %{{[a-zA-Z0-9_]+}} %{{[a-zA-Z0-9_]+}}
+
+__global__ void addKernel(texture2D<int> img, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  imageAtomicAdd(img, x, y, 1);
+}
+
+int main() { return 0; }

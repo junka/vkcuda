@@ -1251,23 +1251,30 @@ VCError Runtime::freeBuffer(VCBuffer &buf) {
 
 // Map a VC pixel format to the Vulkan VkFormat the image is created with.
 // These must match the GLSL layout format qualifier emitted by the GLSL
-// backend (imageFormatQualifier): float->rgba32f, half->rgba16f, int->rgba32i
-// (4-channel spellings matching the RGBA VkFormats below).
+// backend (imageFormatQualifier): float->rgba32f, half->rgba16f, int->r32i
+// (int images use the single-channel r32i/r32ui spelling so imageAtomic* are
+// legal — GLSL requires r32i/r32ui for image atomics; rgba32i is rejected).
 static VkFormat pixelFormatToVk(VCPixelFormat f) {
   switch (f) {
   case VCPixelFormat::R32G32B32A32Float: return VK_FORMAT_R32G32B32A32_SFLOAT;
   case VCPixelFormat::R16G16B16A16Float: return VK_FORMAT_R16G16B16A16_SFLOAT;
   case VCPixelFormat::R32G32B32A32Sint:  return VK_FORMAT_R32G32B32A32_SINT;
+  case VCPixelFormat::R32Sint:           return VK_FORMAT_R32_SINT;
+  case VCPixelFormat::R32Uint:           return VK_FORMAT_R32_UINT;
   }
   return VK_FORMAT_UNDEFINED;
 }
 
-// Bytes per texel for a pixel format (4 channels × channel width).
+// Bytes per texel for a pixel format. Single-channel (R32*) formats are 4
+// bytes/texel (only the R component is stored; the device still exposes ivec4
+// texels with .yzw == 0).
 static uint32_t pixelFormatTexelSize(VCPixelFormat f) {
   switch (f) {
   case VCPixelFormat::R32G32B32A32Float:
   case VCPixelFormat::R32G32B32A32Sint:  return 16;
   case VCPixelFormat::R16G16B16A16Float: return 8;
+  case VCPixelFormat::R32Sint:
+  case VCPixelFormat::R32Uint:           return 4;
   }
   return 16;
 }

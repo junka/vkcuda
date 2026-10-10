@@ -35,7 +35,9 @@ enum class BuiltinClass {
   VectorCtor,  // float4/int3/uint4/.../make_float4/...
   Dim,         // dim3 (launch grid/block constructor)
   Other,       // printf (kernel-internal debug output)
-  Image,       // imageRead/imageWrite (storage image texel access)
+  Image,       // imageRead/imageWrite (whole-texel vec4 load/store) +
+               // imageAtomicAdd/Sub/Min/Max/And/Or/Xor/Exchange/CompSwap
+               // (scalar R-component read-modify-write; needs int image)
 };
 
 /// True if `name` is any recognized builtin (math, atomics, sync, warp,

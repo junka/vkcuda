@@ -87,6 +87,10 @@ enum class VCPixelFormat {
   R32G32B32A32Float, // texture2D<float>; GLSL rgba32f, vec4 texels
   R16G16B16A16Float, // texture2D<half>;  GLSL rgba16f, f16vec4 texels
   R32G32B32A32Sint,  // texture2D<int>;   GLSL rgba32i, ivec4 texels
+  R32Sint,           // texture2D<int> w/ atomics; GLSL r32i (single-channel;
+                     // imageAtomic* require r32i/r32ui). imageRead/imageWrite
+                     // use only the R component.
+  R32Uint,           // texture2D<uint> w/ atomics; GLSL r32ui.
 };
 
 /// Initialize the runtime (creates the Vulkan instance/device/queue).

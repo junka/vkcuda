@@ -81,8 +81,16 @@ BuiltinClass vc::builtinClass(llvm::StringRef name) {
   if (name == "printf")
     return BuiltinClass::Other;
 
-  // Storage image texel access (texture2D<T>).
-  if (name == "imageRead" || name == "imageWrite")
+  // Storage image texel access (texture2D<T>). imageRead/imageWrite do a
+  // whole-texel vec4 load/store; imageAtomic* do a scalar read-modify-write on
+  // the texel's first (R) component and require an integer-format image. Both
+  // share BuiltinClass::Image; the backends dispatch by name.
+  if (name == "imageRead" || name == "imageWrite" ||
+      name == "imageAtomicAdd" || name == "imageAtomicSub" ||
+      name == "imageAtomicMin" || name == "imageAtomicMax" ||
+      name == "imageAtomicAnd" || name == "imageAtomicOr" ||
+      name == "imageAtomicXor" || name == "imageAtomicExchange" ||
+      name == "imageAtomicCompSwap")
     return BuiltinClass::Image;
 
   // Vector constructors (float4, make_float4, ...).
