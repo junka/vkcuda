@@ -1281,7 +1281,10 @@ private:
       } else {
         accPrefix = "__vc_img_";
       }
-      std::string sym = accPrefix + p->name.str();
+      // Kernel-scoped symbol: __vc_img_<kernel>_<param>. The <kernel> prefix
+      // is essential when multiple kernels share one spirv.module and each
+      // has an image param of the same name — see imageKey().
+      std::string sym = accPrefix + imageKey(p->name);
       unsigned binding = imgBindBase++;
       auto saved = builder.saveInsertionPoint();
       builder.setInsertionPointToStart(module.getBody());
@@ -5335,6 +5338,9 @@ private:
     unsigned id = counter++;
     bool isRead = name == "imageRead";
     std::string imgName = declRefName(args[0].get());
+    // Kernel-scoped key for carrier/result symbols (see imageKey). imgName is
+    // still used to look up the image param's type in currentFnDecl->params.
+    std::string imgKey = imageKey(imgName);
 
     // Resolve the image param's element type AND dimension. Both come from the
     // kernel param named by args[0]. The element type selects the read result
@@ -5392,7 +5398,7 @@ private:
     }
 
     if (isRead) {
-      emitImageCarrier(l, "__vc_imgread_" + imgName, id, coord);
+      emitImageCarrier(l, "__vc_imgread_" + imgKey, id, coord);
       // Per-call result placeholder: a Private global + Load. The Load's result
       // id is what the patcher rewrites into OpImageRead. The result type is
       // vec4<T> derived from the image param's element type (NOT hardcoded
@@ -5402,7 +5408,7 @@ private:
       auto resTy = mlir::VectorType::get({4}, elemTy);
       auto resPtrTy =
           spirv::PointerType::get(resTy, spirv::StorageClass::Private);
-      std::string resSym = "__vc_imgresult_" + imgName + "_" + Twine(id).str();
+      std::string resSym = "__vc_imgresult_" + imgKey + "_" + Twine(id).str();
       auto saved = builder.saveInsertionPoint();
       builder.setInsertionPointToStart(module.getBody());
       builder.create<spirv::GlobalVariableOp>(
@@ -5415,8 +5421,8 @@ private:
     // imageWrite(tex, coords..., v): carrier keeps coord + texel alive.
     Value texel = visitExpr(args[1 + ncoords].get());
     texel = loadValue(texel, loc(args[1 + ncoords].get()));
-    emitImageCarrier(l, "__vc_imgwrite_coord_" + imgName, id, coord);
-    emitImageCarrier(l, "__vc_imgwrite_texel_" + imgName, id, texel);
+    emitImageCarrier(l, "__vc_imgwrite_coord_" + imgKey, id, coord);
+    emitImageCarrier(l, "__vc_imgwrite_texel_" + imgKey, id, texel);
     return Value();
   }
 
@@ -5425,6 +5431,24 @@ private:
     if (n && n->getNodeType() == ASTNode::NodeKind::DeclRefExpr)
       return static_cast<const DeclRefExpr *>(n)->name.str();
     return "img";
+  }
+
+  // The kernel-scoped key for an image symbol. The image global variable and
+  // every carrier/result symbol derived from a given image param share this
+  // key so the post-serialize patcher (patchImageOps) can match a carrier to
+  // its image variable by OpName. The key is `<mangledKernelName>_<paramName>`:
+  // kernels land in ONE shared spirv.module, so a bare `<paramName>` collides
+  // when two kernels both name their image param `img` — the second
+  // spirv.GlobalVariableOp would clash with the first (different image type,
+  // same symbol) and spirv.mlir.addressof would resolve to the wrong one.
+  // The mangled kernel name is unique per kernel (and namespace-scoped kernels
+  // mangle to `ns_k`), so prefixing with it makes every image symbol unique.
+  // `paramName` is the raw param name (still used to look up the param's type
+  // in currentFnDecl->params); this key is ONLY for symbol names.
+  std::string imageKey(llvm::StringRef paramName) const {
+    std::string kname =
+        currentFnDecl ? deviceMangledName(currentFnDecl) : "vc_kernel";
+    return kname + "_" + paramName.str();
   }
 
   // Create a dummy Private-storage global named `sym_<id>` whose pointee type
@@ -5476,6 +5500,9 @@ private:
     static unsigned counter = 0;
     unsigned id = counter++;
     std::string imgName = declRefName(args[0].get());
+    // Kernel-scoped key for carrier/result symbols (see imageKey). imgName is
+    // still used to look up the image param's dim in currentFnDecl->params.
+    std::string imgKey = imageKey(imgName);
     bool isCompSwap = (name == "imageAtomicCompSwap");
 
     // Resolve dim (elemType is i32 by Sema contract; we don't re-derive it).
@@ -5523,13 +5550,13 @@ private:
     dataVal = castValue(dataVal, builder.getI32Type(), l);
 
     // Carriers pin coord + data (and comparator for CompSwap) operand ids.
-    emitImageCarrier(l, "__vc_imgatomic_coord_" + imgName, id, coord);
-    emitImageCarrier(l, "__vc_imgatomic_value_" + imgName, id, dataVal);
+    emitImageCarrier(l, "__vc_imgatomic_coord_" + imgKey, id, coord);
+    emitImageCarrier(l, "__vc_imgatomic_value_" + imgKey, id, dataVal);
     if (isCompSwap) {
       Value cmp = visitExpr(args[1 + ncoords].get());
       cmp = loadValue(cmp, loc(args[1 + ncoords].get()));
       cmp = castValue(cmp, builder.getI32Type(), l);
-      emitImageCarrier(l, "__vc_imgatomic_cmp_" + imgName, id, cmp);
+      emitImageCarrier(l, "__vc_imgatomic_cmp_" + imgKey, id, cmp);
     }
 
     // Kind marker: a dummy Private global whose OpName carries the op kind in
@@ -5548,7 +5575,7 @@ private:
     else if (name == "imageAtomicXor")     kind = "xor";
     else if (name == "imageAtomicExchange") kind = "exch";
     else                                   kind = "cswap";
-    std::string kindSym = "__vc_imgatomic_kind_" + imgName + "_" +
+    std::string kindSym = "__vc_imgatomic_kind_" + imgKey + "_" +
                           Twine(id).str() + "_" + kind.str();
     {
       // A zero-bit-pointerless dummy: use ptr<i32> Private (the pointee type
@@ -5570,7 +5597,7 @@ private:
     auto resTy = builder.getI32Type();
     auto resPtrTy =
         spirv::PointerType::get(resTy, spirv::StorageClass::Private);
-    std::string resSym = "__vc_imgatomic_result_" + imgName + "_" +
+    std::string resSym = "__vc_imgatomic_result_" + imgKey + "_" +
                          Twine(id).str();
     auto saved = builder.saveInsertionPoint();
     builder.setInsertionPointToStart(module.getBody());
