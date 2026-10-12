@@ -1,0 +1,102 @@
+// test/image_multiread.vc — multi-kernel device-side imageRead on a shared
+// storage image.
+//
+// This is the e2e coverage for the multi-kernel image-symbol fix (commit
+// 937f363). The MLIR backend serializes every __global__ kernel of a .vc file
+// into ONE shared spirv.module and (after the fix) names each image global
+// `__vc_img_<mangledKernel>_<param>`. Before the fix, two kernels that both
+// named their image param `img` collided on `__vc_img_img`; this test exercises
+// exactly that — both kernels below name their source image param `img` — and
+// would have produced a spirv.mlir.addressof type mismatch (or a read from the
+// wrong image variable) on the old naming.
+//
+// The data path is deliberately PURE-IMAGE (no SSBO output) so it does not
+// trip the separate, still-open mixed-SSBO+image runtime binding limitation
+// (see vc-mlir-spirv-image-ops-gap): kRead writes its result back into a
+// SECOND storage image (`dst`), which the host reads via vcMemcpyFromImage.
+// Both image params use the float rgba32f format (the Intel-safe format for
+// device imageRead; the single-channel int/half formats crash this build's
+// Intel driver on OpImageRead).
+//
+//   vcc test/image_multiread.vc -o build/image_multiread_sf && ./build/image_multiread_sf
+//   vc  test/image_multiread.vc -emit=full -o build/image_multiread_mlir && ./build/image_multiread_mlir
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+// kWrite: write a per-texel pattern (x, y, 0, 1) into the shared image. The
+// image param is named `img` — the same name kRead uses for ITS source image,
+// which is the collision case the fix addresses.
+__global__ void kWrite(texture2D<float> img, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  imageWrite(img, x, y, make_float4((float)x, (float)y, 0.0f, 1.0f));
+}
+
+// kRead: read the shared image back via device imageRead, and copy each texel
+// into a second image `dst` (the host readback target). The source image param
+// is also named `img` — distinct from kWrite's only by kernel-scoped symbol,
+// not by param name. dst is a different param name so it cannot collide.
+__global__ void kRead(texture2D<float> img, texture2D<float> dst, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  float4 v = imageRead(img, x, y);
+  imageWrite(dst, x, y, v);
+}
+
+int main() {
+  vcInit();
+
+  const int W = 8, H = 4;
+  const int N = W * H;
+  const int CH = 4;
+
+  // One shared image (written by kWrite, read by kRead) + one output image
+  // (written by kRead, read back on the host). Both rgba32f.
+  VCImage *img = nullptr, *dst = nullptr;
+  vcCreateImage2D(&img, W, H, VCPixelFormat::R32G32B32A32Float);
+  vcCreateImage2D(&dst, W, H, VCPixelFormat::R32G32B32A32Float);
+
+  // Zero img first so an unwritten texel (there are none here, but defensively)
+  // is distinguishable from a successful read of a zero texel.
+  float zero[N * CH];
+  for (int i = 0; i < N * CH; ++i) zero[i] = 0.0f;
+  vcMemcpyToImage(img, zero);
+
+  // 2D launch: one thread per texel. gridDim is the element count (W*H); the
+  // runtime divides by blockDim to get the workgroup count.
+  kWrite<<<dim3(W, H), dim3(2, 2)>>>(img, W, H);
+  vcDeviceSynchronize();
+  kRead<<<dim3(W, H), dim3(2, 2)>>>(img, dst, W, H);
+  vcDeviceSynchronize();
+
+  float hostOut[N * CH];
+  vcMemcpyFromImage(hostOut, dst);
+
+  // Each texel should be (x, y, 0, 1) — proving kRead read what kWrite wrote
+  // from the SAME image (the collision case: kRead's `img` resolves to its own
+  // kernel-scoped global, not kWrite's).
+  int ok = 1;
+  for (int y = 0; y < H && ok; ++y)
+    for (int x = 0; x < W && ok; ++x) {
+      float r = hostOut[(y * W + x) * CH + 0];
+      float g = hostOut[(y * W + x) * CH + 1];
+      float b = hostOut[(y * W + x) * CH + 2];
+      float a = hostOut[(y * W + x) * CH + 3];
+      if (fabsf(r - (float)x) > 1e-5f || fabsf(g - (float)y) > 1e-5f ||
+          fabsf(b - 0.0f) > 1e-5f || fabsf(a - 1.0f) > 1e-5f) {
+        ok = 0;
+        printf("  mismatch [%d,%d] got=(%.4f,%.4f,%.4f,%.4f) ref=(%d,%d,0,1)\n",
+               x, y, r, g, b, a, x, y);
+      }
+    }
+
+  vcDestroyImage(img);
+  vcDestroyImage(dst);
+  vcShutdown();
+  printf("image_multiread: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
+}

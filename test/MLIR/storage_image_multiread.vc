@@ -1,0 +1,47 @@
+// test/MLIR/storage_image_multiread.vc — multi-kernel imageRead on a shared
+// storage image (MLIR).
+//
+// Pins the multi-kernel image-symbol fix (commit 937f363). The MLIR backend
+// serializes every __global__ kernel into ONE shared spirv.module and names
+// each image global `__vc_img_<mangledKernel>_<param>`. Two kernels that both
+// name their image param `img` (kWrite writes it, kRead reads it) must produce
+// DISTINCT globals — `__vc_img_kWrite_img` and `__vc_img_kRead_img` — not the
+// colliding `__vc_img_img` the old naming emitted (which made
+// spirv.mlir.addressof resolve kRead's `img` to kWrite's global, or aborted
+// with a type mismatch).
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && spirv-dis %t.spv | FileCheck %s
+
+// Both kernels name their source image param `img`. The kernel-scoped symbols
+// must be distinct: kWrite's is `__vc_img_kWrite_img`, kRead's is
+// `__vc_img_kRead_img`. kRead's `dst` is `__vc_img_kRead_dst`. The colliding
+// bare `__vc_img_img` must NOT appear for either source image.
+// CHECK: OpName %__vc_img_kWrite_img "__vc_img_kWrite_img"
+// CHECK: OpName %__vc_img_kRead_img "__vc_img_kRead_img"
+// CHECK: OpName %__vc_img_kRead_dst "__vc_img_kRead_dst"
+// CHECK-NOT: OpName %__vc_img_img "__vc_img_img"
+
+// kWrite writes the shared image; its image variable is loaded and passed to
+// OpImageWrite. (One OpImageWrite in kWrite.)
+// CHECK: OpImageWrite
+
+// kRead reads the shared image via OpImageRead (result type v4float, sampled
+// type f32 from the rgba32f format) and writes the texel into dst via a second
+// OpImageWrite. The OpImageRead must load kRead's OWN image global
+// (`__vc_img_kRead_img`), not kWrite's.
+// CHECK: OpImageRead %v4float
+
+__global__ void kWrite(texture2D<float> img, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  imageWrite(img, x, y, make_float4((float)x, (float)y, 0.0f, 1.0f));
+}
+
+__global__ void kRead(texture2D<float> img, texture2D<float> dst, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  float4 v = imageRead(img, x, y);
+  imageWrite(dst, x, y, v);
+}
