@@ -2598,6 +2598,7 @@ enum SpvDecoration : uint32_t {
 };
 
 enum SpvStorageClass : uint32_t {
+  SpvStorageUniformConstant = 0,
   SpvStorageUniform = 2,
   SpvStoragePushConstant = 9,
   SpvStorageStorageBuffer = 12,
@@ -2636,6 +2637,12 @@ struct SpirvVariableInfo {
 
 struct SpirvReflectionInfo {
   std::vector<uint32_t> storageBufferBindings;
+  // Storage-image (UniformConstant OpTypeImage Sampled=2) bindings, in
+  // ascending binding order. Separate from SSBO bindings because a mixed
+  // SSBO+image kernel's image args and SSBO args form two independent binding
+  // sequences (the compiler emits SSBOs 0..N-1 then images N..N+M-1), so the
+  // runtime must index them with separate ordinals, not one shared counter.
+  std::vector<uint32_t> imageBindings;
   std::vector<uint32_t> pushConstantOffsets;
   uint32_t pushConstantSize = 0;
 };
@@ -2828,7 +2835,27 @@ static SpirvReflectionInfo reflectSpirvResources(const uint32_t *words,
   struct Binding { uint32_t set; uint32_t binding; uint32_t id; };
   std::vector<Binding> buffers;
   std::vector<Binding> entryNamedBuffers;
+  std::vector<Binding> images;
+  std::vector<Binding> entryNamedImages;
   std::string entryArgPrefix = entryPoint + "_arg_";
+  // MLIR image globals are named `__vc_img{ro,wo,}_<mangledKernel>_<param>`.
+  // To keep multi-kernel modules from cross-contaminating (same as the
+  // `_arg_` filter for SSBOs above), an image variable belongs to this entry
+  // point iff, after the `__vc_img`/`__vc_imgro`/`__vc_imgwo` prefix, its name
+  // starts with `<entryPoint>_`. A GLSL-backend or hand-written module has no
+  // such names and takes the (single-kernel) fall-through path.
+  const std::string entryImgPrefix = entryPoint + "_";
+  auto imageBelongsToEntry = [&](const std::string &name) -> bool {
+    std::string rest = name;
+    for (const char *p : {"__vc_imgwo_", "__vc_imgro_", "__vc_img_"}) {
+      std::string prefix = p;
+      if (rest.rfind(prefix, 0) == 0) {
+        rest = rest.substr(prefix.size());
+        break;
+      }
+    }
+    return rest.rfind(entryImgPrefix, 0) == 0;
+  };
   // The MLIR backend serializes every kernel of a .vc file into ONE module and
   // names each interface variable `<kernel>_arg_<i>` and each push-constant
   // struct `__vc_pc_<kernel>`, so a multi-kernel binary holds every kernel's
@@ -2850,6 +2877,15 @@ static SpirvReflectionInfo reflectSpirvResources(const uint32_t *words,
       buffers.push_back({v.descriptorSet, v.binding, kv.first});
       if (!entryArgPrefix.empty() && v.name.rfind(entryArgPrefix, 0) == 0)
         entryNamedBuffers.push_back({v.descriptorSet, v.binding, kv.first});
+    }
+    // Storage images live in the UniformConstant storage class. Collected
+    // separately from SSBOs so buildLayout/descriptor-write can index them
+    // with a dedicated ordinal (the two binding sequences are independent).
+    if (v.storageClass == SpvStorageUniformConstant &&
+        v.binding != std::numeric_limits<uint32_t>::max()) {
+      images.push_back({v.descriptorSet, v.binding, kv.first});
+      if (imageBelongsToEntry(v.name))
+        entryNamedImages.push_back({v.descriptorSet, v.binding, kv.first});
     }
     if (v.storageClass == SpvStoragePushConstant) {
       if (v.name.rfind("__vc_pc_", 0) == 0 && v.name != entryPcVar) continue;
@@ -2880,6 +2916,8 @@ static SpirvReflectionInfo reflectSpirvResources(const uint32_t *words,
 
   if (!entryNamedBuffers.empty())
     buffers = std::move(entryNamedBuffers);
+  if (!entryNamedImages.empty())
+    images = std::move(entryNamedImages);
 
   std::sort(buffers.begin(), buffers.end(), [](const Binding &a, const Binding &b) {
     if (a.set != b.set) return a.set < b.set;
@@ -2888,6 +2926,16 @@ static SpirvReflectionInfo reflectSpirvResources(const uint32_t *words,
   });
   for (const Binding &b : buffers) {
     if (b.set == 0) out.storageBufferBindings.push_back(b.binding);
+  }
+  // Images: sort by binding so the runtime's image-argument ordinal maps to
+  // ascending device binding (matching the compiler's SSBOs-then-images emit).
+  std::sort(images.begin(), images.end(), [](const Binding &a, const Binding &b) {
+    if (a.set != b.set) return a.set < b.set;
+    if (a.binding != b.binding) return a.binding < b.binding;
+    return a.id < b.id;
+  });
+  for (const Binding &b : images) {
+    if (b.set == 0) out.imageBindings.push_back(b.binding);
   }
   return out;
 }
@@ -2993,7 +3041,9 @@ VCError Runtime::loadKernel(const uint32_t *words, size_t wordCount,
   SpirvReflectionInfo refl = reflectSpirvResources(words, wordCount,
                                                    out.entryPoint);
   out.storageBufferBindings = std::move(refl.storageBufferBindings);
-  out.hasResourceReflection = !out.storageBufferBindings.empty();
+  out.imageBindings = std::move(refl.imageBindings);
+  out.hasResourceReflection =
+      !out.storageBufferBindings.empty() || !out.imageBindings.empty();
   out.pushConstantOffsets = std::move(refl.pushConstantOffsets);
   out.pcSize = refl.pushConstantSize;
   return VCError::Success;
@@ -3102,6 +3152,7 @@ bool Runtime::buildLayout(VCKernel &k, int deviceIdx,
   // Collect pointer bindings + measure push-constant size for scalars.
   std::vector<VkDescriptorSetLayoutBinding> bindings;
   uint32_t pointerOrdinal = 0;
+  uint32_t imageOrdinal = 0;
   uint32_t scalarOrdinal = 0;
   uint32_t pcSize = k.pcSize;
   for (int i = 0; i < argCount; ++i) {
@@ -3117,18 +3168,20 @@ bool Runtime::buildLayout(VCKernel &k, int deviceIdx,
       ++pointerOrdinal;
     } else if (args[i].kind == VCKernelArg::Image) {
       // Storage image: its own binding slot, a STORAGE_IMAGE descriptor (not
-      // an SSBO). Image bindings are interleaved with SSBO bindings in source
-      // argument order, matching the GLSL backend's emitBindings which assigns
-      // consecutive binding numbers across both kinds.
+      // an SSBO). Image bindings form an INDEPENDENT sequence from SSBO
+      // bindings (the compiler emits SSBOs 0..N-1 then images N..N+M-1), so
+      // index the reflected imageBindings with a dedicated imageOrdinal — NOT
+      // the shared pointerOrdinal (which would read the SSBO's binding for an
+      // image arg and mis-bind a mixed kernel).
       VkDescriptorSetLayoutBinding b{};
-      b.binding = pointerOrdinal;
-      if (pointerOrdinal < k.storageBufferBindings.size())
-        b.binding = k.storageBufferBindings[pointerOrdinal];
+      b.binding = imageOrdinal;
+      if (imageOrdinal < k.imageBindings.size())
+        b.binding = k.imageBindings[imageOrdinal];
       b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
       b.descriptorCount = 1;
       b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
       bindings.push_back(b);
-      ++pointerOrdinal;
+      ++imageOrdinal;
     } else {
       // Round scalar size up to 4 bytes for std140-friendly packing.
       uint32_t sz = static_cast<uint32_t>((args[i].size + 3) & ~size_t(3));
@@ -3336,8 +3389,10 @@ VkPipeline Runtime::bindKernelForDispatch(VkCommandBuffer cb,
 
   // Write descriptor bindings for pointer (SSBO) and image args. Reflected
   // binding numbers keep the API argument order independent from SPIR-V
-  // declaration order. Both kinds consume one binding slot per arg, in source
-  // order — matching the GLSL backend's emitBindings.
+  // declaration order. SSBO and image args are indexed by SEPARATE ordinals
+  // into their own reflected binding lists: the compiler emits SSBOs first
+  // (bindings 0..N-1) then images (N..N+M-1) as two independent sequences, so
+  // a mixed kernel's image arg must not read the SSBO binding list.
   std::vector<VkDescriptorBufferInfo> bufInfos;
   std::vector<VkDescriptorImageInfo> imgInfos;
   std::vector<VkWriteDescriptorSet> writes;
@@ -3345,6 +3400,7 @@ VkPipeline Runtime::bindKernelForDispatch(VkCommandBuffer cb,
   imgInfos.reserve(argCount);
   writes.reserve(argCount);
   uint32_t bindIdx = 0;
+  uint32_t imageIdx = 0;
   for (int i = 0; i < argCount; ++i) {
     if (args[i].kind == VCKernelArg::Pointer) {
       auto *b = reinterpret_cast<VCBuffer *>(const_cast<void *>(args[i].data));
@@ -3374,14 +3430,17 @@ VkPipeline Runtime::bindKernelForDispatch(VkCommandBuffer cb,
       VkWriteDescriptorSet w{};
       w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
       w.dstSet = set;
-      w.dstBinding = bindIdx;
-      if (bindIdx < k.storageBufferBindings.size())
-        w.dstBinding = k.storageBufferBindings[bindIdx];
+      // Image bindings are a separate sequence from SSBO bindings: index the
+      // reflected imageBindings with a dedicated counter so a mixed kernel's
+      // image arg lands on its device binding, not the SSBO's.
+      w.dstBinding = imageIdx;
+      if (imageIdx < k.imageBindings.size())
+        w.dstBinding = k.imageBindings[imageIdx];
       w.descriptorCount = 1;
       w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
       w.pImageInfo = &imgInfos.back();
       writes.push_back(w);
-      ++bindIdx;
+      ++imageIdx;
     } else continue;
   }
   if (!writes.empty())

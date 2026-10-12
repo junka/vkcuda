@@ -1236,28 +1236,26 @@ private:
     }
 
     // Materialize each image param as a module-scope storage-image global +
-    // AddressOf, bound to its descriptor slot. Image bindings are assigned
-    // 0,1,... in image-param order. This is CORRECT for a pure-image kernel
-    // (no SSBOs): the runtime's `pointerOrdinal` fallback (used when the
-    // SSBO-only reflection list is empty) assigns bindings 0,1,... in source
-    // order, matching this.
+    // AddressOf, bound to its descriptor slot. Binding layout (shared with the
+    // GLSL backend's emitBindings and the runtime's reflection): SSBOs first,
+    // then images. SSBO pointer params take bindings 0..N-1 (assigned by
+    // VCToGPU::lowerScalarArgsToPushConstant); image params take bindings
+    // N..N+M-1, where N = the number of pointer (SSBO) params. So a kernel
+    // `k(texture2D<float> img, int s, float *out)` gives out binding 0 and img
+    // binding 1 — image bindings are always HIGHER than SSBO bindings.
     //
-    // KNOWN LIMITATION (mixed SSBO+image kernels): if a kernel has BOTH SSBO
-    // pointer params and image params, the bindings collide. SSBOs get
-    // bindings 0..N-1 from VCToGPU (source order among pointer args), and
-    // images ALSO start at 0 here, so an image and the first SSBO share
-    // binding 0. The "correct" fix (images bind at their source-position
-    // ordinal interleaved with SSBOs, as the GLSL backend does) does NOT work
-    // on the MLIR path because the runtime's reflection model is broken for
-    // mixed kernels: `storageBufferBindings` is the SSBO-ONLY reflected binding
-    // list (images use UniformConstant, excluded from reflection), yet the
-    // runtime indexes it with a `pointerOrdinal` that increments over BOTH
-    // Pointer and Image args (VCRuntime.cpp buildLayout). So a mixed kernel is
-    // broken at the runtime layer regardless of what bindings the compiler
-    // emits. Fixing mixed kernels requires runtime reflection changes (reflect
-    // image bindings separately, or stop interleaving the ordinal), not just a
-    // compiler fix. Tracked as a follow-on; no demo exercises it today.
-    unsigned imgBindBase = 0; // bumped per image param
+    // This ordering is not arbitrary: this build's Intel (Mesa) Vulkan driver
+    // crashes (SIGFPE, arithmetic exception) inside vkCreateComputePipelines
+    // when a compute pipeline's descriptor set has a STORAGE_IMAGE at a LOWER
+    // binding number than a STORAGE_BUFFER — i.e. an image at binding 0 with an
+    // SSBO at binding 1. Validation doesn't catch it (the SPIR-V and layout are
+    // legal); it's a driver compiler bug. Putting SSBOs first (image bindings
+    // strictly greater than every SSBO binding) sidesteps it. A pure-image or
+    // pure-SSBO kernel is unaffected (no image-vs-SSBO ordering to get wrong).
+    unsigned ssboParamCount = 0;
+    for (auto *p : fn->params)
+      if (p->type && p->type->getKind() == TypeKind::Pointer) ++ssboParamCount;
+    unsigned imgIndex = 0;
     for (const ParamDecl *p : imageParams) {
       mlir::Type imgTy = cvtType(p->type);
       if (!imgTy) continue;
@@ -1285,7 +1283,8 @@ private:
       // is essential when multiple kernels share one spirv.module and each
       // has an image param of the same name — see imageKey().
       std::string sym = accPrefix + imageKey(p->name);
-      unsigned binding = imgBindBase++;
+      unsigned binding = ssboParamCount + imgIndex;
+      ++imgIndex;
       auto saved = builder.saveInsertionPoint();
       builder.setInsertionPointToStart(module.getBody());
       auto gvar = builder.create<spirv::GlobalVariableOp>(

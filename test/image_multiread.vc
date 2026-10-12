@@ -10,13 +10,15 @@
 // would have produced a spirv.mlir.addressof type mismatch (or a read from the
 // wrong image variable) on the old naming.
 //
-// The data path is deliberately PURE-IMAGE (no SSBO output) so it does not
-// trip the separate, still-open mixed-SSBO+image runtime binding limitation
-// (see vc-mlir-spirv-image-ops-gap): kRead writes its result back into a
-// SECOND storage image (`dst`), which the host reads via vcMemcpyFromImage.
-// Both image params use the float rgba32f format (the Intel-safe format for
-// device imageRead; the single-channel int/half formats crash this build's
-// Intel driver on OpImageRead).
+// The data path is PURE-IMAGE (no SSBO output): kRead writes its result back
+// into a SECOND storage image (`dst`), which the host reads via
+// vcMemcpyFromImage. (This was originally to avoid the mixed-SSBO+image
+// runtime binding limitation while it was still open; that limitation is now
+// fixed — see test/image_mixed_ssbo.vc for the mixed-kernel coverage — but the
+// pure-image path is kept here because it is the most direct exercise of the
+// multi-kernel symbol fix.) Both image params use the float rgba32f format
+// (the Intel-safe format for device imageRead; the single-channel int/half
+// formats crash this build's Intel driver on OpImageRead).
 //
 //   vcc test/image_multiread.vc -o build/image_multiread_sf && ./build/image_multiread_sf
 //   vc  test/image_multiread.vc -emit=full -o build/image_multiread_mlir && ./build/image_multiread_mlir

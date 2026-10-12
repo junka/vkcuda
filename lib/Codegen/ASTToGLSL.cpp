@@ -936,12 +936,23 @@ private:
   }
 
   void emitBindings() {
-    // Pointer params get consecutive SSBO bindings (0,1,2,...). Scalar
-    // params are packed into a single push-constant block instead of SSBOs,
-    // so the runtime can pass them via vkCmdPushConstants without staging
-    // buffers. Binding indices skip scalars, matching the runtime's layout.
+    // SSBOs first, then images: pointer params get consecutive SSBO bindings
+    // (0,1,2,...), then image params get the next bindings (N,N+1,...), where
+    // N = the number of pointer params. Scalar params are packed into a single
+    // push-constant block instead of SSBOs, so the runtime can pass them via
+    // vkCmdPushConstants without staging buffers.
+    //
+    // SSBOs-first is not arbitrary: this build's Intel (Mesa) Vulkan driver
+    // crashes (SIGFPE in vkCreateComputePipelines) when a compute pipeline's
+    // descriptor set has a STORAGE_IMAGE at a LOWER binding number than a
+    // STORAGE_BUFFER — i.e. an image at binding 0 with an SSBO at binding 1.
+    // Putting SSBOs first (image bindings strictly greater than every SSBO
+    // binding) sidesteps it, and matches the MLIR backend's binding scheme and
+    // the runtime's reflection (two independent binding sequences). A
+    // pure-image or pure-SSBO kernel is unaffected.
     SmallVector<const ParamDecl *, 8> scalars;
     unsigned bindIdx = 0;
+    // Pass 1: SSBO pointer params.
     for (unsigned i = 0; i < params.size(); ++i) {
       const ParamDecl *p = params[i];
       bool isPtr = p->type && p->type->getKind() == TypeKind::Pointer;
@@ -951,37 +962,42 @@ private:
         scalarParams.push_back(p->name);
         continue;
       }
-      if (isImg) {
-        // Storage image (texture2D<T>) -> `layout(binding=N, <fmt>) uniform
-        // image2D`. The format qualifier is mandatory for storage images
-        // unless the device supports shaderStorageImageReadWithoutFormat
-        // (runtime queries it; we always emit a concrete format so the shader
-        // is portable). Images are 4-channel on the device side regardless of
-        // the declared element type. An access qualifier (readonly/writeonly)
-        // is emitted when the image is not read-write; GLSL has these as
-        // native memory qualifiers, and they let the device skip hazard
-        // tracking for the disallowed direction.
-        imageParams.push_back(p->name);
-        const char *fmt = imageFormatQualifier(p->type);
-        const char *acc = "";
-        if (p->type->getKind() == TypeKind::Image) {
-          auto *it = static_cast<const ImageType *>(p->type);
-          switch (it->access) {
-          case ImageAccess::ReadWrite: acc = ""; break;
-          case ImageAccess::ReadOnly:  acc = "readonly "; break;
-          case ImageAccess::WriteOnly: acc = "writeonly "; break;
-          }
+      if (isImg) continue; // images emitted in pass 2, after all SSBOs
+      ssboParams.push_back(p->name);
+      const char *ty = glslType(p->type);
+      (*os) << "layout(set = 0, binding = " << bindIdx << ") buffer B"
+            << bindIdx << " {\n  " << ty << " " << glslName(p->name)
+            << "[];\n};\n\n";
+      ++bindIdx;
+    }
+    // Pass 2: image params, continuing the binding counter past the SSBOs.
+    for (unsigned i = 0; i < params.size(); ++i) {
+      const ParamDecl *p = params[i];
+      bool isImg = p->type && p->type->getKind() == TypeKind::Image;
+      if (!isImg) continue;
+      // Storage image (texture2D<T>) -> `layout(binding=N, <fmt>) uniform
+      // image2D`. The format qualifier is mandatory for storage images
+      // unless the device supports shaderStorageImageReadWithoutFormat
+      // (runtime queries it; we always emit a concrete format so the shader
+      // is portable). Images are 4-channel on the device side regardless of
+      // the declared element type. An access qualifier (readonly/writeonly)
+      // is emitted when the image is not read-write; GLSL has these as
+      // native memory qualifiers, and they let the device skip hazard
+      // tracking for the disallowed direction.
+      imageParams.push_back(p->name);
+      const char *fmt = imageFormatQualifier(p->type);
+      const char *acc = "";
+      if (p->type->getKind() == TypeKind::Image) {
+        auto *it = static_cast<const ImageType *>(p->type);
+        switch (it->access) {
+        case ImageAccess::ReadWrite: acc = ""; break;
+        case ImageAccess::ReadOnly:  acc = "readonly "; break;
+        case ImageAccess::WriteOnly: acc = "writeonly "; break;
         }
-        (*os) << "layout(set = 0, binding = " << bindIdx << ", " << fmt
-              << ") " << acc << "uniform " << glslType(p->type) << " "
-              << glslName(p->name) << ";\n\n";
-      } else {
-        ssboParams.push_back(p->name);
-        const char *ty = glslType(p->type);
-        (*os) << "layout(set = 0, binding = " << bindIdx << ") buffer B"
-              << bindIdx << " {\n  " << ty << " " << glslName(p->name)
-              << "[];\n};\n\n";
       }
+      (*os) << "layout(set = 0, binding = " << bindIdx << ", " << fmt
+            << ") " << acc << "uniform " << glslType(p->type) << " "
+            << glslName(p->name) << ";\n\n";
       ++bindIdx;
     }
     if (!scalars.empty()) {

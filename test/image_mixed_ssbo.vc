@@ -1,0 +1,92 @@
+// test/image_mixed_ssbo.vc — a kernel with BOTH a storage image and an SSBO.
+//
+// This is the e2e coverage for the mixed-SSBO+image binding fix. A kernel that
+// takes both a texture2D<T> (storage image, UniformConstant descriptor) and a
+// pointer (SSBO, StorageBuffer descriptor) in the SAME descriptor set has two
+// independent binding sequences, and this build's Intel (Mesa) Vulkan driver
+// crashes (SIGFPE in vkCreateComputePipelines) when a STORAGE_IMAGE sits at a
+// LOWER binding number than a STORAGE_BUFFER. Both backends now emit SSBOs
+// first (bindings 0..N-1) then images (N..N+M-1), and the runtime reflects
+// image bindings separately from SSBO bindings so each arg lands on its
+// device binding instead of the other kind's.
+//
+// The kernel below puts the IMAGE first in source order on purpose: before the
+// fix that gave the image binding 0 and the SSBO binding 1 (image lower than
+// SSBO) on both backends, crashing the Intel driver. kRead reads each texel
+// from the image via device imageRead and writes a reduced value into the SSBO,
+// which the host reads back — exercising both descriptor kinds in one launch.
+//
+// rgba32f is the Intel-safe format for device imageRead (single-channel int/half
+// formats crash this build's Intel driver on OpImageRead).
+//
+//   vcc test/image_mixed_ssbo.vc -o build/image_mixed_ssbo_sf && ./build/image_mixed_ssbo_sf
+//   vc  test/image_mixed_ssbo.vc -emit=full -o build/image_mixed_ssbo_mlir && ./build/image_mixed_ssbo_mlir
+
+#include <cstdio>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+// Image FIRST in source, SSBO SECOND. Before the fix both backends gave the
+// image binding 0 and the SSBO binding 1 (image lower than SSBO) and crashed
+// the Intel driver. Now: SSBO binding 0, image binding 1.
+__global__ void kRead(texture2D<float> img, int w, int h, float *out) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  float4 v = imageRead(img, x, y);
+  // Reduce the 4-channel texel to one scalar so the SSBO carries a distinct,
+  // checkable value per texel (proving BOTH the image read AND the SSBO write
+  // bound correctly — a mis-bind would read zeros or write to the wrong buffer).
+  out[y * w + x] = v.x + v.y + v.z + v.w;
+}
+
+int main() {
+  vcInit();
+
+  const int W = 8, H = 4;
+  const int N = W * H;
+  const int CH = 4;
+
+  // Source image: each texel is (x, y, 0, 1) so the per-texel sum is x+y+1.
+  VCImage *img = nullptr;
+  vcCreateImage2D(&img, W, H, VCPixelFormat::R32G32B32A32Float);
+  float hostImg[N * CH];
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      float *t = &hostImg[(y * W + x) * CH];
+      t[0] = (float)x;
+      t[1] = (float)y;
+      t[2] = 0.0f;
+      t[3] = 1.0f;
+    }
+  vcMemcpyToImage(img, hostImg);
+
+  // Output SSBO.
+  float *dev = nullptr;
+  vcMalloc((void **)&dev, N * sizeof(float));
+
+  // 2D launch: one thread per texel. gridDim is the element count (W*H); the
+  // runtime divides by blockDim to get the workgroup count.
+  kRead<<<dim3(W, H), dim3(2, 2)>>>(img, W, H, dev);
+  vcDeviceSynchronize();
+
+  float host[N];
+  vcMemcpy(host, dev, N * sizeof(float), VCMemcpyKind::DeviceToHost);
+
+  int ok = 1;
+  for (int y = 0; y < H && ok; ++y)
+    for (int x = 0; x < W && ok; ++x) {
+      float ref = (float)(x + y + 1);
+      if (fabsf(host[y * W + x] - ref) > 1e-5f) {
+        ok = 0;
+        printf("  mismatch [%d,%d] got=%.4f ref=%.4f\n", x, y,
+               host[y * W + x], ref);
+      }
+    }
+
+  vcFree(dev);
+  vcDestroyImage(img);
+  vcShutdown();
+  printf("image_mixed_ssbo: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
+}

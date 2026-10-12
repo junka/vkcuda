@@ -443,6 +443,11 @@ static void lowerScalarArgsToPushConstant(gpu::GPUFuncOp gpuFn,
 
   // Assign StorageBuffer bindings to the surviving pointer args in order.
   // After eraseArguments the pointer args occupy slots 0..N-1 in source order.
+  // SSBOs take bindings 0..N-1 here; image params take bindings N..N+M-1,
+  // assigned in ASTToMLIR::materializeImageParams (ssboParamCount + imgIndex).
+  // SSBOs-first is not arbitrary: this build's Intel (Mesa) Vulkan driver
+  // crashes (SIGFPE in vkCreateComputePipelines) when a STORAGE_IMAGE sits at a
+  // LOWER binding number than a STORAGE_BUFFER in the same descriptor set.
   for (auto [slot, _] : llvm::enumerate(pointerArgIdxs))
     gpuFn.setArgAttr(slot, spirv::getInterfaceVarABIAttrName(),
                      spirv::getInterfaceVarABIAttr(/*descSet=*/0, slot,

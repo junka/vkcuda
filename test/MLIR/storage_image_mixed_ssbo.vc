@@ -1,0 +1,35 @@
+// test/MLIR/storage_image_mixed_ssbo.vc — a kernel with BOTH a storage image
+// and an SSBO (MLIR).
+//
+// Pins the mixed-SSBO+image binding fix. A kernel that takes both a
+// texture2D<T> (storage image, UniformConstant) and a pointer (SSBO,
+// StorageBuffer) in the same descriptor set has two independent binding
+// sequences, and this build's Intel (Mesa) Vulkan driver crashes (SIGFPE in
+// vkCreateComputePipelines) when a STORAGE_IMAGE sits at a LOWER binding
+// number than a STORAGE_BUFFER. The MLIR backend therefore emits SSBOs first
+// (bindings 0..N-1, assigned by VCToGPU::lowerScalarArgsToPushConstant) then
+// images (N..N+M-1, assigned by ASTToMLIR::materializeImageParams as
+// ssboParamCount + imgIndex). The image param comes FIRST in source here so
+// the test would catch a regression to image-binding-0: the SSBO must still
+// land on binding 0 and the image on binding 1.
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && spirv-dis %t.spv | FileCheck %s
+
+// kRead has one SSBO param (`out`) and one image param (`img`). The SSBO must
+// get binding 0 and the image binding 1 (SSBOs first, then images), even
+// though the image is declared first in source order.
+// CHECK: OpDecorate %__vc_img_kRead_img Binding 1
+// CHECK: OpDecorate %__vc_img_kRead_img DescriptorSet 0
+// CHECK: OpDecorate %kRead_arg_0 Binding 0
+// CHECK: OpDecorate %kRead_arg_0 DescriptorSet 0
+// CHECK: OpTypeImage %float 2D 0 0 0 2 Rgba32f
+// CHECK: OpVariable %_ptr_UniformConstant_{{[0-9]+}} UniformConstant
+// CHECK: OpVariable %_ptr_StorageBuffer_{{[^ ]+}} StorageBuffer
+
+__global__ void kRead(texture2D<float> img, int w, int h, float *out) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  float4 v = imageRead(img, x, y);
+  out[y * w + x] = v.x + v.y + v.z + v.w;
+}

@@ -195,6 +195,12 @@ struct VCKernel {
   // runtime ABI tied to the shader's actual DescriptorSet/Binding decorations
   // instead of assuming bindings are dense from zero.
   std::vector<uint32_t> storageBufferBindings;
+  // Reflected storage-image bindings in API image-argument order (ascending
+  // device binding). Separate from SSBO bindings: a mixed SSBO+image kernel
+  // has two independent binding sequences (SSBOs 0..N-1, images N..N+M-1), so
+  // image args are indexed by their own ordinal, not the shared pointer
+  // ordinal.
+  std::vector<uint32_t> imageBindings;
   bool hasResourceReflection = false;
   // Push-constant range (offset/size) for scalar args, in bytes. size==0
   // means no push constants. Layout is built once per device and cached there.
