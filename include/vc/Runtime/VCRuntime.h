@@ -102,6 +102,23 @@ enum class VCPixelFormat {
   Rgba8Unorm,     // GLSL rgba8;   4 channels, 4 bytes
   R16Sint,        // GLSL r16i;    1 channel, 2 bytes
   Rg16Sint,       // GLSL rg16i;   2 channels, 4 bytes
+  // Extended formats (texture2D<r32f float>, texture2D<rgba8i int>, etc.).
+  // These mirror the compiler's ImageFormatInfo table for the formats both
+  // backends can emit (everything glslc accepts as an image format qualifier
+  // plus the MLIR/SPIR-V path). Each must keep its VkFormat + texel size in
+  // sync with the kPixelFormatTable row in VCRuntime.cpp.
+  R32Float,        // GLSL r32f;     1 channel float,  4 bytes
+  Rg32Float,       // GLSL rg32f;    2 channels float, 8 bytes
+  R8Unorm,         // GLSL r8;       1 channel unorm,  1 byte
+  Rg8Unorm,        // GLSL rg8;      2 channels unorm, 2 bytes
+  Rgba8Snorm,      // GLSL rgba8_snorm; 4 channels snorm, 4 bytes
+  Rgba16Sint,      // GLSL rgba16i;  4 channels int,   8 bytes
+  Rgba8Sint,       // GLSL rgba8i;   4 channels int,   4 bytes
+  R8Sint,          // GLSL r8i;      1 channel int,    1 byte
+  R32G32B32A32Uint,// GLSL rgba32ui; 4 channels uint,  16 bytes
+  Rgba16Uint,      // GLSL rgba16ui; 4 channels uint,  8 bytes
+  Rgba8Uint,       // GLSL rgba8ui;  4 channels uint,  4 bytes
+  R8Uint,          // GLSL r8ui;     1 channel uint,   1 byte
 };
 
 /// Initialize the runtime (creates the Vulkan instance/device/queue).

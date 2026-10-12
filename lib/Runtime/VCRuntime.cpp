@@ -1249,46 +1249,61 @@ VCError Runtime::freeBuffer(VCBuffer &buf) {
   return VCError::Success;
 }
 
-// Map a VC pixel format to the Vulkan VkFormat the image is created with.
-// These must match the GLSL layout format qualifier emitted by the GLSL
-// backend (imageFormatQualifier): float->rgba32f, half->rgba16f, int->r32i
-// (int images use the single-channel r32i/r32ui spelling so imageAtomic* are
-// legal — GLSL requires r32i/r32ui for image atomics; rgba32i is rejected).
+// One row per VCPixelFormat: its Vulkan VkFormat + the HOST staging texel size
+// (channels x bytes/channel). The device still exposes 4-wide vec texels via
+// the format's VkFormat; only the real channels are meaningful on the host.
+//
+// This is the single source of truth for the runtime side of the
+// storage-image format table — the compiler's matching table lives in
+// ImageFormatInfo.cpp (glslQualifier / elemClass / channels / bytesPerTexel).
+// The two must agree on VkFormat<->GLSL qualifier and on texel size; adding a
+// format is one enumerator (VCRuntime.h) + one row here, NOT two drifted
+// switches. The GLSL qualifier emitted by the GLSL backend
+// (imageFormatQualifier) and the spirv::ImageFormat emitted by the MLIR
+// backend (spirvImageFormat) must each resolve to the VkFormat below for the
+// host-staged texels to line up with the device's imageLoad/imageStore.
+namespace {
+struct PixelFormatRow { VCPixelFormat fmt; VkFormat vk; uint32_t texelSize; };
+constexpr PixelFormatRow kPixelFormatTable[] = {
+  {VCPixelFormat::R32G32B32A32Float, VK_FORMAT_R32G32B32A32_SFLOAT, 16},
+  {VCPixelFormat::R16G16B16A16Float, VK_FORMAT_R16G16B16A16_SFLOAT, 8},
+  {VCPixelFormat::R32G32B32A32Sint,  VK_FORMAT_R32G32B32A32_SINT,  16},
+  {VCPixelFormat::R32Sint,           VK_FORMAT_R32_SINT,            4},
+  {VCPixelFormat::R32Uint,           VK_FORMAT_R32_UINT,            4},
+  {VCPixelFormat::R16Float,          VK_FORMAT_R16_SFLOAT,          2},
+  {VCPixelFormat::Rg16Float,         VK_FORMAT_R16G16_SFLOAT,       4},
+  {VCPixelFormat::R11G11B10Float,    VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4},
+  {VCPixelFormat::Rgba8Unorm,        VK_FORMAT_R8G8B8A8_UNORM,      4},
+  {VCPixelFormat::R16Sint,           VK_FORMAT_R16_SINT,            2},
+  {VCPixelFormat::Rg16Sint,          VK_FORMAT_R16G16_SINT,         4},
+  {VCPixelFormat::R32Float,          VK_FORMAT_R32_SFLOAT,          4},
+  {VCPixelFormat::Rg32Float,         VK_FORMAT_R32G32_SFLOAT,       8},
+  {VCPixelFormat::R8Unorm,           VK_FORMAT_R8_UNORM,            1},
+  {VCPixelFormat::Rg8Unorm,          VK_FORMAT_R8G8_UNORM,          2},
+  {VCPixelFormat::Rgba8Snorm,        VK_FORMAT_R8G8B8A8_SNORM,      4},
+  {VCPixelFormat::Rgba16Sint,        VK_FORMAT_R16G16B16A16_SINT,   8},
+  {VCPixelFormat::Rgba8Sint,         VK_FORMAT_R8G8B8A8_SINT,       4},
+  {VCPixelFormat::R8Sint,            VK_FORMAT_R8_SINT,             1},
+  {VCPixelFormat::R32G32B32A32Uint,  VK_FORMAT_R32G32B32A32_UINT,  16},
+  {VCPixelFormat::Rgba16Uint,        VK_FORMAT_R16G16B16A16_UINT,   8},
+  {VCPixelFormat::Rgba8Uint,         VK_FORMAT_R8G8B8A8_UINT,       4},
+  {VCPixelFormat::R8Uint,            VK_FORMAT_R8_UINT,             1},
+};
+const PixelFormatRow *findPixelFormatRow(VCPixelFormat f) {
+  for (const auto &r : kPixelFormatTable)
+    if (r.fmt == f) return &r;
+  return nullptr;
+}
+} // namespace
+
 static VkFormat pixelFormatToVk(VCPixelFormat f) {
-  switch (f) {
-  case VCPixelFormat::R32G32B32A32Float: return VK_FORMAT_R32G32B32A32_SFLOAT;
-  case VCPixelFormat::R16G16B16A16Float: return VK_FORMAT_R16G16B16A16_SFLOAT;
-  case VCPixelFormat::R32G32B32A32Sint:  return VK_FORMAT_R32G32B32A32_SINT;
-  case VCPixelFormat::R32Sint:           return VK_FORMAT_R32_SINT;
-  case VCPixelFormat::R32Uint:           return VK_FORMAT_R32_UINT;
-  case VCPixelFormat::R16Float:       return VK_FORMAT_R16_SFLOAT;
-  case VCPixelFormat::Rg16Float:      return VK_FORMAT_R16G16_SFLOAT;
-  case VCPixelFormat::R11G11B10Float: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-  case VCPixelFormat::Rgba8Unorm:     return VK_FORMAT_R8G8B8A8_UNORM;
-  case VCPixelFormat::R16Sint:        return VK_FORMAT_R16_SINT;
-  case VCPixelFormat::Rg16Sint:       return VK_FORMAT_R16G16_SINT;
-  }
-  return VK_FORMAT_UNDEFINED;
+  const auto *r = findPixelFormatRow(f);
+  return r ? r->vk : VK_FORMAT_UNDEFINED;
 }
 
-// Bytes per texel for a pixel format — the HOST staging size (channels x
-// bits). The device still exposes 4-wide vec texels via the format's VkFormat;
-// only the real channels are meaningful.
 static uint32_t pixelFormatTexelSize(VCPixelFormat f) {
-  switch (f) {
-  case VCPixelFormat::R32G32B32A32Float:
-  case VCPixelFormat::R32G32B32A32Sint:  return 16;
-  case VCPixelFormat::R16G16B16A16Float: return 8;
-  case VCPixelFormat::R32Sint:
-  case VCPixelFormat::R32Uint:           return 4;
-  case VCPixelFormat::R11G11B10Float:
-  case VCPixelFormat::Rgba8Unorm:        return 4;
-  case VCPixelFormat::Rg16Float:
-  case VCPixelFormat::Rg16Sint:          return 4;
-  case VCPixelFormat::R16Float:
-  case VCPixelFormat::R16Sint:           return 2;
-  }
-  return 16;
+  const auto *r = findPixelFormatRow(f);
+  return r ? r->texelSize : 16;
 }
 
 // Create a storage image in the GENERAL layout (compute shaders read/write

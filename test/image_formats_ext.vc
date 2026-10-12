@@ -1,0 +1,176 @@
+// test/image_formats_ext.vc — extended storage-image texel formats (runtime).
+//
+// Extends image_formats.vc with formats added to the runtime VCPixelFormat enum
+// to close the gap between the compiler's ImageFormatInfo table (34 formats)
+// and the runtime enum. Each format below was previously compilable on the
+// device side (the GLSL/MLIR backends spell the qualifier / spirv::ImageFormat)
+// but had NO matching VCPixelFormat, so the host could not create a correctly-
+// sized image — vcMemcpyToImage/FromImage would mis-stage the texels. This
+// demo writes a distinct value per texel on the device and reads it back on
+// the host, proving the runtime's VkFormat + texel-size rows line up with the
+// device's imageStore.
+//
+// Like image_formats.vc, this is WRITE + host readback only (no device
+// imageRead): this build's Intel driver crashes (SIGFPE in
+// vkCreateComputePipelines) on OpImageRead from a single-channel int/half
+// image, and the pure-image write path avoids the mixed-SSBO+image runtime
+// binding limitation (each kernel has one image param, no SSBO).
+//
+//   vcc test/image_formats_ext.vc -o build/image_formats_ext_sf && ./build/image_formats_ext_sf
+//   vc  test/image_formats_ext.vc -emit=full -o build/image_formats_ext_mlir && ./build/image_formats_ext_mlir
+
+#include <cstdio>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include "vc/Runtime/VCRuntime.h"
+
+// r32f: 1 channel, 4 bytes (float). Write .x; host stages one float/texel.
+__global__ void kR32f(texture2D<r32f float> img, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  float v = (float)(y * w + x) * 0.25f;
+  imageWrite(img, x, y, make_float4(v, 0.0f, 0.0f, 1.0f));
+}
+
+// rgba8_snorm: 4 channels, 4 bytes (signed normalized). Write all 4; the
+// device stores them as signed 8-bit normalized [-1,1] and the host reads
+// them back as signed bytes in [-128,127].
+__global__ void kRgba8Snorm(texture2D<rgba8_snorm float> img, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  // Distinct signed-normalized values in [-1, 1].
+  float r = (x & 1) ? 1.0f : -1.0f;
+  float g = (y & 1) ? 0.5f : -0.5f;
+  float b = 0.0f;
+  float a = 1.0f;
+  imageWrite(img, x, y, make_float4(r, g, b, a));
+}
+
+// rgba8ui: 4 channels, 4 bytes (unsigned int). Write all 4; host reads 4
+// unsigned bytes/texel.
+__global__ void kRgba8ui(texture2D<rgba8ui uint> img, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  unsigned r = (unsigned)(x * 17) & 0xffu;
+  unsigned g = (unsigned)(y * 31) & 0xffu;
+  unsigned b = (unsigned)((x + y) * 7) & 0xffu;
+  unsigned a = 255u;
+  imageWrite(img, x, y, make_uint4(r, g, b, a));
+}
+
+// r8ui: 1 channel, 1 byte (unsigned int). Write .x only; host stages one
+// unsigned byte/texel.
+__global__ void kR8ui(texture2D<r8ui uint> img, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  unsigned v = (unsigned)((y * w + x) * 13) & 0xffu;
+  imageWrite(img, x, y, make_uint4(v, 0u, 0u, 0u));
+}
+
+static bool approx(float a, float b, float eps) {
+  return fabsf(a - b) <= eps;
+}
+
+int main() {
+  vcInit();
+
+  const int W = 8, H = 4;
+  const int N = W * H;
+  int ok = 1;
+
+  // --- r32f: 1 float/texel ---
+  {
+    VCImage *img = nullptr;
+    vcCreateImage2D(&img, W, H, VCPixelFormat::R32Float);
+    kR32f<<<dim3(W, H), dim3(2, 2)>>>(img, W, H);
+    vcDeviceSynchronize();
+    float host[N];
+    vcMemcpyFromImage(host, img);
+    for (int y = 0; y < H && ok; ++y)
+      for (int x = 0; x < W && ok; ++x) {
+        float ref = (float)(y * W + x) * 0.25f;
+        if (!approx(host[y * W + x], ref, 1e-5f)) {
+          ok = 0;
+          printf("  r32f mismatch [%d,%d] got=%.4f ref=%.4f\n", x, y,
+                 host[y * W + x], ref);
+        }
+      }
+    vcDestroyImage(img);
+  }
+
+  // --- rgba8_snorm: 4 signed bytes/texel ---
+  {
+    VCImage *img = nullptr;
+    vcCreateImage2D(&img, W, H, VCPixelFormat::Rgba8Snorm);
+    kRgba8Snorm<<<dim3(W, H), dim3(2, 2)>>>(img, W, H);
+    vcDeviceSynchronize();
+    int8_t host[N * 4];
+    vcMemcpyFromImage(host, img);
+    for (int y = 0; y < H && ok; ++y)
+      for (int x = 0; x < W && ok; ++x) {
+        int8_t *t = &host[(y * W + x) * 4];
+        int8_t refR = (x & 1) ? 127 : -128;
+        int8_t refG = (y & 1) ? 64 : -64;   // 0.5 -> ~64, -0.5 -> ~-64
+        // snorm round-trips through the device's normalized conversion; allow a
+        // 1-LSB tolerance on each channel.
+        if (abs((int)t[0] - (int)refR) > 2 || abs((int)t[1] - (int)refG) > 2) {
+          ok = 0;
+          printf("  rgba8_snorm mismatch [%d,%d] got=(%d,%d,%d,%d)\n", x, y,
+                 t[0], t[1], t[2], t[3]);
+        }
+      }
+    vcDestroyImage(img);
+  }
+
+  // --- rgba8ui: 4 unsigned bytes/texel ---
+  {
+    VCImage *img = nullptr;
+    vcCreateImage2D(&img, W, H, VCPixelFormat::Rgba8Uint);
+    kRgba8ui<<<dim3(W, H), dim3(2, 2)>>>(img, W, H);
+    vcDeviceSynchronize();
+    uint8_t host[N * 4];
+    vcMemcpyFromImage(host, img);
+    for (int y = 0; y < H && ok; ++y)
+      for (int x = 0; x < W && ok; ++x) {
+        uint8_t *t = &host[(y * W + x) * 4];
+        uint8_t refR = (uint8_t)((x * 17) & 0xff);
+        uint8_t refG = (uint8_t)((y * 31) & 0xff);
+        uint8_t refB = (uint8_t)(((x + y) * 7) & 0xff);
+        if (t[0] != refR || t[1] != refG || t[2] != refB || t[3] != 255u) {
+          ok = 0;
+          printf("  rgba8ui mismatch [%d,%d] got=(%u,%u,%u,%u) ref=(%u,%u,%u,255)\n",
+                 x, y, t[0], t[1], t[2], t[3], refR, refG, refB);
+        }
+      }
+    vcDestroyImage(img);
+  }
+
+  // --- r8ui: 1 unsigned byte/texel ---
+  {
+    VCImage *img = nullptr;
+    vcCreateImage2D(&img, W, H, VCPixelFormat::R8Uint);
+    kR8ui<<<dim3(W, H), dim3(2, 2)>>>(img, W, H);
+    vcDeviceSynchronize();
+    uint8_t host[N];
+    vcMemcpyFromImage(host, img);
+    for (int y = 0; y < H && ok; ++y)
+      for (int x = 0; x < W && ok; ++x) {
+        uint8_t ref = (uint8_t)(((y * W + x) * 13) & 0xff);
+        if (host[y * W + x] != ref) {
+          ok = 0;
+          printf("  r8ui mismatch [%d,%d] got=%u ref=%u\n", x, y,
+                 host[y * W + x], ref);
+        }
+      }
+    vcDestroyImage(img);
+  }
+
+  vcShutdown();
+  printf("image_formats_ext: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
+}
