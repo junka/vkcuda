@@ -217,8 +217,12 @@ std::string Sema::typeName(const Type *t) {
     case ImageDim::Dim3D:      dim = "texture3D"; break;
     case ImageDim::Dim2DArray: dim = "texture2DArray"; break;
     }
-    return std::string(dim) + "<" + std::string(acc) +
-           typeName(it->elemType) + ">";
+    std::string s = std::string(dim) + "<" + std::string(acc);
+    if (it->format != ImageFormat::Default) {
+      s += std::string(imageFormatInfo(it->format).glslQualifier) + " ";
+    }
+    s += typeName(it->elemType) + ">";
+    return s;
   }
   }
   return "<unknown>";
@@ -1692,6 +1696,46 @@ Type *Sema::checkExpr(const ASTNode *n) {
                 error(n, std::string(calleeName) +
                          " requires an integer image (texture2D<int>); "
                          "float/half images do not support atomics");
+              // Atomics require the single-channel r32i/r32ui format — a
+              // multi-channel int format (rgba32i/rgba16i/...) is rejected by
+              // glslc ("only supported on image with format r32i or r32ui").
+              // Default int resolves to R32i/R32ui, which is fine; only an
+              // EXPLICIT non-r32 format on an int image is an error.
+              ImageFormat rf = it->format;
+              if (rf == ImageFormat::Default)
+                rf = ImageFormat::R32i; // int default — legal
+              if (rf != ImageFormat::R32i && rf != ImageFormat::R32ui)
+                error(n, std::string(calleeName) +
+                         " requires an r32i/r32ui format image "
+                         "(imageAtomic* are only legal on single-channel "
+                         "r32i/r32ui, not multi-channel int formats)");
+            }
+            // Format/element compatibility: an explicit format's elemClass
+            // must match the declared T. r16f expects float/half; r16i expects
+            // int; rgba8ui expects uint; etc. Default derives from elemType so
+            // it's always compatible.
+            if (it->format != ImageFormat::Default && it->elemType &&
+                it->elemType->getKind() == TypeKind::Builtin) {
+              auto bk =
+                  static_cast<const BuiltinType *>(it->elemType)->builtin;
+              const auto &fi = imageFormatInfo(it->format);
+              bool ok = false;
+              switch (fi.elemClass) {
+              case ImageFormatElemClass::Float:
+                ok = (bk == BuiltinTypeKind::Float32); break;
+              case ImageFormatElemClass::Half:
+                ok = (bk == BuiltinTypeKind::Float16 ||
+                      bk == BuiltinTypeKind::Float32); break;
+              case ImageFormatElemClass::SInt:
+                ok = (bk == BuiltinTypeKind::Int32); break;
+              case ImageFormatElemClass::UInt:
+                ok = (bk == BuiltinTypeKind::UInt32 ||
+                      bk == BuiltinTypeKind::Int32); break;
+              }
+              if (!ok)
+                error(n, std::string("image format ") + fi.glslQualifier +
+                         " is not compatible with element type " +
+                         typeName(it->elemType));
             }
           }
         }

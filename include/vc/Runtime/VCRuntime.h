@@ -81,8 +81,10 @@ enum class VCMemcpyKind {
 };
 
 /// Pixel format for a 2D storage image (vcCreateImage2D). Maps to a Vulkan
-/// VkFormat; the shader's layout format qualifier must match. All formats are
-/// 4-channel to match GLSL `image2D` texel reads (vec4/ivec4/...).
+/// VkFormat; the shader's layout format qualifier must match. The device-side
+/// texel is always a 4-wide vec (GLSL/SPIR-V imageLoad returns vec4 regardless
+/// of channel count; unused channels are 0/1) — the format's channel count
+/// only governs how many scalars the HOST stages per texel.
 enum class VCPixelFormat {
   R32G32B32A32Float, // texture2D<float>; GLSL rgba32f, vec4 texels
   R16G16B16A16Float, // texture2D<half>;  GLSL rgba16f, f16vec4 texels
@@ -91,6 +93,15 @@ enum class VCPixelFormat {
                      // imageAtomic* require r32i/r32ui). imageRead/imageWrite
                      // use only the R component.
   R32Uint,           // texture2D<uint> w/ atomics; GLSL r32ui.
+  // Explicit single/dual/triple-channel formats (texture2D<r16f half>, etc.).
+  // The host stages `channels` scalars per texel; the device still reads/writes
+  // a 4-wide vec (unused channels are 0/1 per the GLSL/SPIR-V imageLoad rule).
+  R16Float,       // GLSL r16f;    1 channel, 2 bytes
+  Rg16Float,      // GLSL rg16f;   2 channels, 4 bytes
+  R11G11B10Float, // GLSL r11f_g11b10f; 3 channels, 4 bytes
+  Rgba8Unorm,     // GLSL rgba8;   4 channels, 4 bytes
+  R16Sint,        // GLSL r16i;    1 channel, 2 bytes
+  Rg16Sint,       // GLSL rg16i;   2 channels, 4 bytes
 };
 
 /// Initialize the runtime (creates the Vulkan instance/device/queue).

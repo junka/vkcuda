@@ -1,0 +1,64 @@
+// test/MLIR/storage_image_formats.vc — explicit storage-image texel formats (MLIR).
+//
+// texture2D<T> defaults to a format derived from T (float->rgba32f, half->
+// rgba16f, int->r32i, uint->r32ui). An explicit format is named inside the
+// angle brackets before the element type: texture2D<r16f half>, texture2D<
+// rg16f float>, texture2D<rgba8 float>. The shared table that resolves these
+// spellings lives in ImageFormatInfo.h; this test pins the MLIR backend's
+// SPIR-V output for each.
+//
+// The crucial invariant under test: the OpTypeImage Sampled Type follows the
+// FORMAT's numeric class, NOT the declared T. GLSL has no f16 storage image
+// (no `f16image2D`), so every float/half format lowers to an f32 sampled type
+// — `texture2D<r16f half>` produces `OpTypeImage %float ... R16f`, never
+// `OpTypeImage %half ... R16f` (the latter would drag in the Float16
+// capability and, on Intel, crash the pipeline on OpImageRead). This is the
+// same rule the GLSL backend applies via its `image2D` spelling + vec4 texel.
+//
+// RUN: mlirc -emit=spirv %s -o %t.spv && spirv-dis %t.spv | FileCheck %s
+
+// The capabilities lead the binary (OpCapability precedes the type section),
+// so check them before any OpTypeImage. The three formats below (r16f, rg16f,
+// rgba8) are not in the core Shader storage-image format set, so the module
+// must declare StorageImageExtendedFormats. Because every sampled type is f32
+// (checked below), Float16 must NOT appear even though one image is declared
+// `half` — proving the format (not the elemType) drives the sampled type.
+// CHECK: OpCapability Shader
+// CHECK: OpCapability StorageImageExtendedFormats
+// CHECK-NOT: OpCapability Float16
+
+// NOTE: each kernel's image param has a distinct name (imgR16/imgRg16/imgRgba8).
+// The MLIR backend names each image global `__vc_img_<param>` (see ASTToMLIR
+// materializeImageParams), so two kernels that both name their image param
+// `img` collide on `__vc_img_img` when they share one spirv.module (the
+// multi-kernel single-module case). Distinct param names sidestep that; the
+// e2e test image_formats.vc does the same. This is a known limitation of the
+// image-global naming, not a format-table concern.
+
+// r16f: 1 channel, 2 bytes/texel. Declared `half` but the format is a FLOAT
+// storage format, so the sampled type is %float (f32).
+// CHECK: OpTypeImage %float 2D 0 0 0 2 R16f
+__global__ void kR16(texture2D<r16f half> imgR16, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  imageWrite(imgR16, x, y, make_float4(0.0f, 0.0f, 0.0f, 1.0f));
+}
+
+// rg16f: 2 channels, 4 bytes/texel. Declared `float`; FLOAT format -> %float.
+// CHECK: OpTypeImage %float 2D 0 0 0 2 Rg16f
+__global__ void kRg16(texture2D<rg16f float> imgRg16, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  imageWrite(imgRg16, x, y, make_float4(0.0f, 0.0f, 0.0f, 1.0f));
+}
+
+// rgba8: 4 channels, 4 bytes/texel (unorm). FLOAT format -> %float.
+// CHECK: OpTypeImage %float 2D 0 0 0 2 Rgba8
+__global__ void kRgba8(texture2D<rgba8 float> imgRgba8, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  imageWrite(imgRgba8, x, y, make_float4(0.0f, 0.0f, 0.0f, 1.0f));
+}

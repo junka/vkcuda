@@ -71,6 +71,21 @@ void noteWidthUse(Type t, SPIRVWidthUse &use) {
       noteWidthUse(result, use);
     return;
   }
+  // A storage image's sampled type, or a pointer's pointee, may be f16/i64
+  // (e.g. a half SSBO lowered to a ptr<f16>, or an image whose format genuinely
+  // takes an f16 sampled type). The SPIR-V Float16/Int64 capability must be
+  // advertised for those, or spirv-val rejects the OpTypeFloat 16 / OpTypeInt 64.
+  // Unwrap the pointer+image to reach the sampled/element type. (Storage images
+  // of float/half formats use an f32 sampled type — see ASTToMLIR cvtType — so
+  // this only fires for genuine f16/i64 pointees, not for every half image.)
+  if (auto ptr = t.dyn_cast<mlir::spirv::PointerType>()) {
+    noteWidthUse(ptr.getPointeeType(), use);
+    return;
+  }
+  if (auto img = t.dyn_cast<mlir::spirv::ImageType>()) {
+    noteWidthUse(img.getElementType(), use);
+    return;
+  }
   if (auto intTy = t.dyn_cast<IntegerType>()) {
     if (intTy.getWidth() == 64) use.i64 = true;
     return;
@@ -91,6 +106,14 @@ SPIRVWidthUse scanWidthUses(ModuleOp module) {
       for (Block &block : region.getBlocks())
         for (BlockArgument arg : block.getArguments())
           noteWidthUse(arg.getType(), use);
+    // spirv.GlobalVariable carries its type as a TypeAttr (no result/operand),
+    // so the walks above miss it. Scan attributes too — this is how an f16/i64
+    // pointee living inside a GlobalVariable's pointer TypeAttr is detected
+    // (e.g. a half SSBO global, or an image global with an f16 sampled type).
+    for (NamedAttribute na : op->getAttrs()) {
+      if (auto ta = na.getValue().dyn_cast<TypeAttr>())
+        noteWidthUse(ta.getValue(), use);
+    }
   });
   return use;
 }
@@ -128,10 +151,51 @@ static bool scanUsesImage1D(ModuleOp module) {
   return found;
 }
 
+// True if the module declares a storage image whose format needs the
+// StorageImageExtendedFormats capability (r16f, rg16f, r11f_g11b10f, rgba8,
+// rgb10a2, rg8/r16/r8, etc.). The core Shader capability only covers the
+// "basic" image formats (rgba32f/rgba16f/r32f/rgba8/r32i/...). An image with an
+// extended format whose target env doesn't advertise the capability is marked
+// illegal by GPUToSPIRV ("explicitly marked illegal"), same failure mode as the
+// Image1D case above.
+static bool scanUsesImageExtendedFormats(ModuleOp module) {
+  bool found = false;
+  module.walk([&](Operation *op) {
+    if (found) return;
+    auto check = [&](Type t) {
+      if (auto ptr = t.dyn_cast<mlir::spirv::PointerType>())
+        t = ptr.getPointeeType();
+      if (auto img = t.dyn_cast<mlir::spirv::ImageType>()) {
+        using F = mlir::spirv::ImageFormat;
+        F f = img.getImageFormat();
+        // Formats covered by the core Shader capability (no extra cap needed).
+        if (f == F::Unknown || f == F::Rgba32f || f == F::Rgba16f ||
+            f == F::R32f || f == F::Rgba8 || f == F::Rgba8Snorm ||
+            f == F::Rgba16 || f == F::Rgba16Snorm || f == F::Rgba32i ||
+            f == F::Rgba16i || f == F::Rgba8i || f == F::R32i ||
+            f == F::Rgba32ui || f == F::Rgba16ui || f == F::Rgba8ui ||
+            f == F::R32ui)
+          return;
+        found = true; // any other format is an extended format
+      }
+    };
+    for (Type t : op->getResultTypes()) check(t);
+    for (Value v : op->getOperands()) check(v.getType());
+    for (Region &region : op->getRegions())
+      for (Block &block : region.getBlocks())
+        for (BlockArgument arg : block.getArguments()) check(arg.getType());
+    for (NamedAttribute na : op->getAttrs()) {
+      if (auto ta = na.getValue().dyn_cast<TypeAttr>()) check(ta.getValue());
+    }
+  });
+  return found;
+}
+
 
 spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context, bool usesSubgroup,
                                     bool usesCoopMatrix, bool usesF16Storage,
                                     bool usesImage1D,
+                                    bool usesImageExtendedFormats,
                                     const SPIRVWidthUse &widths) {
   // Float64/Int64/Float16 are advertised exactly when the kernels use a double
   // (`double`, `double2`), 64-bit integer (`long`, `long4`) or half (`__half`)
@@ -205,6 +269,11 @@ spirv::TargetEnvAttr getVCTargetEnv(MLIRContext *context, bool usesSubgroup,
   // the image's spirv.GlobalVariable. 2D/3D/2DArray images are core Shader.
   if (usesImage1D)
     caps.push_back(spirv::Capability::Image1D);
+  // StorageImageExtendedFormats covers non-basic image formats (r16f, rg16f,
+  // r11f_g11b10f, rgba8 variants beyond the core set, etc.). Without it the
+  // image's spirv.GlobalVariable is marked illegal during legalization.
+  if (usesImageExtendedFormats)
+    caps.push_back(spirv::Capability::StorageImageExtendedFormats);
   auto triple = spirv::VerCapExtAttr::get(version, caps, exts, context);
   return spirv::TargetEnvAttr::get(triple,
                                    spirv::getDefaultResourceLimits(context));
@@ -512,6 +581,9 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
   // Whether any kernel declares a 1D storage image (needs Image1D capability
   // in the target env — see getVCTargetEnv). Computed once over the module.
   bool usesImage1D = scanUsesImage1D(module);
+  // Whether any kernel declares a storage image with an extended (non-core)
+  // format (needs StorageImageExtendedFormats). Computed once over the module.
+  bool usesImageExtendedFormats = scanUsesImageExtendedFormats(module);
   // Which numeric widths the kernels use, computed once over the module: the
   // target env is one attribute on the single gpu.module every kernel lands in.
   SPIRVWidthUse widths = scanWidthUses(module);
@@ -537,7 +609,8 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
     gpuModule->setAttr(spirv::getTargetEnvAttrName(),
                        getVCTargetEnv(module.getContext(), usesSubgroup,
                                       usesCoopMatrix, usesF16Storage,
-                                      usesImage1D, widths));
+                                      usesImage1D, usesImageExtendedFormats,
+                                      widths));
 
     rw.setInsertionPointToStart(gpuModule.getBody());
     auto gpuFn = rw.create<gpu::GPUFuncOp>(k.getLoc(), fn.getName(),

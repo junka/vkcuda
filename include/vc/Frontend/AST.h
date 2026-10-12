@@ -13,6 +13,8 @@
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/Support/SMLoc.h"
 
+#include "vc/Frontend/ImageFormatInfo.h"
+
 #include <memory>
 #include <string>
 #include <deque>
@@ -189,10 +191,16 @@ public:
   Type *elemType; // BuiltinType (Float32/Float16/Int32)
   ImageDim dim = ImageDim::Dim2D;
   ImageAccess access = ImageAccess::ReadWrite;
+  // Texel format. Default = derive from elemType (float->Rgba32f, half->
+  // Rgba16f, int->R32i, uint->R32ui). A non-Default value is an explicit
+  // format chosen by the source spelling (`texture2D<r16f half>`). See
+  // ImageFormatInfo.h — the five backend switches all go through one table.
+  ImageFormat format = ImageFormat::Default;
 
   ImageType(Type *e, ImageDim d = ImageDim::Dim2D,
-            ImageAccess a = ImageAccess::ReadWrite)
-      : Type(TypeKind::Image), elemType(e), dim(d), access(a) {}
+            ImageAccess a = ImageAccess::ReadWrite,
+            ImageFormat fmt = ImageFormat::Default)
+      : Type(TypeKind::Image), elemType(e), dim(d), access(a), format(fmt) {}
   static bool classof(const Type *t) { return t->getKind() == TypeKind::Image; }
 };
 

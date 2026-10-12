@@ -206,7 +206,11 @@ int main(int argc, char **argv) {
       return sys::ExecuteAndWait(glslc, args, std::nullopt, std::nullopt);
     };
     int rc = runGlslc();
-    sys::fs::remove(glslPath);
+    bool keepTemps = std::getenv("VC_KEEP_TEMPS") != nullptr;
+    // VC_KEEP_TEMPS keeps each kernel's temp .comp/.spv on disk for inspection
+    // (mirrors the MLIR backend's VC_SPIRV_DEBUG). Normally both are removed.
+    if (!keepTemps)
+      sys::fs::remove(glslPath);
     if (rc != 0) {
       errs() << "glslc failed for kernel '" << mod.entryName
              << "' (rc=" << rc << ")\n--- GLSL source ---\n" << mod.source;
@@ -225,7 +229,8 @@ int main(int argc, char **argv) {
         reinterpret_cast<const uint32_t *>((*spvBuf)->getBufferStart());
     hostModules.push_back({mod.entryName, words, spvBytes / sizeof(uint32_t)});
     spvBuffers.push_back(std::move(*spvBuf));
-    sys::fs::remove(spvPath);
+    if (!keepTemps)
+      sys::fs::remove(spvPath);
 
     if (kind == EmitKind::SPIRV) {
       // SPIR-V cannot concatenate entry points, so each kernel is written to its

@@ -1261,13 +1261,19 @@ static VkFormat pixelFormatToVk(VCPixelFormat f) {
   case VCPixelFormat::R32G32B32A32Sint:  return VK_FORMAT_R32G32B32A32_SINT;
   case VCPixelFormat::R32Sint:           return VK_FORMAT_R32_SINT;
   case VCPixelFormat::R32Uint:           return VK_FORMAT_R32_UINT;
+  case VCPixelFormat::R16Float:       return VK_FORMAT_R16_SFLOAT;
+  case VCPixelFormat::Rg16Float:      return VK_FORMAT_R16G16_SFLOAT;
+  case VCPixelFormat::R11G11B10Float: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+  case VCPixelFormat::Rgba8Unorm:     return VK_FORMAT_R8G8B8A8_UNORM;
+  case VCPixelFormat::R16Sint:        return VK_FORMAT_R16_SINT;
+  case VCPixelFormat::Rg16Sint:       return VK_FORMAT_R16G16_SINT;
   }
   return VK_FORMAT_UNDEFINED;
 }
 
-// Bytes per texel for a pixel format. Single-channel (R32*) formats are 4
-// bytes/texel (only the R component is stored; the device still exposes ivec4
-// texels with .yzw == 0).
+// Bytes per texel for a pixel format — the HOST staging size (channels x
+// bits). The device still exposes 4-wide vec texels via the format's VkFormat;
+// only the real channels are meaningful.
 static uint32_t pixelFormatTexelSize(VCPixelFormat f) {
   switch (f) {
   case VCPixelFormat::R32G32B32A32Float:
@@ -1275,6 +1281,12 @@ static uint32_t pixelFormatTexelSize(VCPixelFormat f) {
   case VCPixelFormat::R16G16B16A16Float: return 8;
   case VCPixelFormat::R32Sint:
   case VCPixelFormat::R32Uint:           return 4;
+  case VCPixelFormat::R11G11B10Float:
+  case VCPixelFormat::Rgba8Unorm:        return 4;
+  case VCPixelFormat::Rg16Float:
+  case VCPixelFormat::Rg16Sint:          return 4;
+  case VCPixelFormat::R16Float:
+  case VCPixelFormat::R16Sint:           return 2;
   }
   return 16;
 }

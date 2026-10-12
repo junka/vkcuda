@@ -66,8 +66,10 @@ std::string vc::mangleType(const Type *t) {
     return "?"; // resolved above; unreachable
   case TypeKind::Image: {
     // Encode the dimension so distinct image dims mangle distinctly (1D/2D/3D/
-    // 2DArray). Access qualifiers do NOT participate — `readonly image2D` is
-    // the same type as `image2D` for overload identity (mirrors GLSL).
+    // 2DArray). Access qualifiers and explicit formats do NOT participate —
+    // `readonly image2D` and `image2D<r16f float>` are the same type as
+    // `image2D` for overload identity (mirrors GLSL, where the format/layout
+    // qualifier is not part of the type).
     const auto *it = static_cast<const ImageType *>(t);
     const char *d = "2";
     switch (it->dim) {

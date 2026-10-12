@@ -795,47 +795,58 @@ private:
     return "float";
   }
 
-  // The GLSL layout format qualifier for a storage image, derived from the
-  // element type. Float/half use 4-channel formats (rgba32f/rgba16f) matching
-  // the runtime's RGBA VkFormats. Integer images use the SINGLE-CHANNEL r32i/
-  // r32ui spelling: GLSL imageAtomic* are ONLY legal on r32i/r32ui (glslc
-  // rejects "only supported on image with format r32i or r32ui"), and
-  // imageRead/imageWrite on an r32i image still work (imageLoad returns ivec4
-  // with .yzw == 0; only R is meaningful). The qualifier MUST match the
-  // VkFormat the image was created with. A concrete format also avoids needing
-  // the shaderStorageImageReadWithoutFormat capability.
+  // The GLSL layout format qualifier for a storage image. Resolved through the
+  // shared ImageFormatInfo table (ImageFormatInfo.h): Default derives from
+  // elemType (float->rgba32f, half->rgba16f, int->r32i, uint->r32ui); an
+  // explicit format (`texture2D<r16f half>`) yields that spelling. Integer
+  // images default to the SINGLE-CHANNEL r32i/r32ui spelling: GLSL imageAtomic*
+  // are ONLY legal on r32i/r32ui (glslc rejects "only supported on image with
+  // format r32i or r32ui"), and imageRead/imageWrite on an r32i image still
+  // work (imageLoad returns ivec4 with .yzw == 0; only R is meaningful). The
+  // qualifier MUST match the VkFormat the image was created with. A concrete
+  // format also avoids needing the shaderStorageImageReadWithoutFormat cap.
   const char *imageFormatQualifier(const Type *t) {
     if (t && t->getKind() == TypeKind::Image) {
       auto *it = static_cast<const ImageType *>(t);
-      if (it->elemType &&
-          it->elemType->getKind() == TypeKind::Builtin) {
-        switch (static_cast<const BuiltinType *>(it->elemType)->builtin) {
-        case BuiltinTypeKind::Float32: return "rgba32f";
-        case BuiltinTypeKind::Float16: return "rgba16f";
-        case BuiltinTypeKind::Int32:  return "r32i";
-        case BuiltinTypeKind::UInt32: return "r32ui";
-        default: break;
-        }
-      }
+      int elem = (it->elemType && it->elemType->getKind() == TypeKind::Builtin)
+                     ? static_cast<int>(
+                           static_cast<const BuiltinType *>(it->elemType)
+                               ->builtin)
+                     : static_cast<int>(BuiltinTypeKind::Float32);
+      return imageFormatInfo(resolveImageFormat(it->format, elem)).glslQualifier;
     }
     return "rgba32f";
   }
 
   // The 4-component GLSL texel type returned by imageLoad / consumed by
-  // imageStore for a storage image of element type T (float->vec4, int->ivec4,
-  // half->f16vec4).
+  // imageStore for a storage image. GLSL mandates imageLoad return a
+  // 4-component vector regardless of the format's real channel count (unused
+  // channels are 0/1), so the vec WIDTH is always 4 — only the component TYPE
+  // varies, and it follows the FORMAT's elemClass (not the declared elemType).
+  //
+  // NOTE: this helper is currently dead code — imageStore/imageRead emit a
+  // bare `vec4(...)` / `imageLoad(...)` whose type GLSL infers from the
+  // `image2D`/`iimage2D`/`uimage2D` spelling (which is driven by elemType's
+  // signedness, see glslType). GLSL has no `f16image2D`, so every float/half
+  // storage image is an f32 `image2D` whose texel is `vec4`. The helper is kept
+  // as documentation of that rule and as the single place to change if a real
+  // f16 texel type is ever needed. The MLIR backend mirrors this with an f32
+  // sampled type for every float/half format (see ASTToMLIR cvtType).
   const char *imageVecType(const Type *t) {
     if (t && t->getKind() == TypeKind::Image) {
       auto *it = static_cast<const ImageType *>(t);
-      if (it->elemType &&
-          it->elemType->getKind() == TypeKind::Builtin) {
-        switch (static_cast<const BuiltinType *>(it->elemType)->builtin) {
-        case BuiltinTypeKind::Float32: return "vec4";
-        case BuiltinTypeKind::Float16: return "f16vec4";
-        case BuiltinTypeKind::Int32: return "ivec4";
-        case BuiltinTypeKind::UInt32: return "uvec4";
-        default: break;
-        }
+      int elem = (it->elemType && it->elemType->getKind() == TypeKind::Builtin)
+                     ? static_cast<int>(
+                           static_cast<const BuiltinType *>(it->elemType)
+                               ->builtin)
+                     : static_cast<int>(BuiltinTypeKind::Float32);
+      ImageFormat rf = resolveImageFormat(it->format, elem);
+      const ImageFormatInfo &fi = imageFormatInfo(rf);
+      switch (fi.elemClass) {
+      case ImageFormatElemClass::Float: return "vec4";
+      case ImageFormatElemClass::Half:  return "f16vec4";
+      case ImageFormatElemClass::SInt:  return "ivec4";
+      case ImageFormatElemClass::UInt:  return "uvec4";
       }
     }
     return "vec4";

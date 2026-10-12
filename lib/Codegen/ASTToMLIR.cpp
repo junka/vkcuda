@@ -48,6 +48,54 @@ using namespace mlir;
 
 namespace {
 
+// Map the VC ImageFormat enum to the spirv dialect's ImageFormat. This is the
+// one place that bridges the shared table (ImageFormatInfo.h, which avoids an
+// MLIR header dependency) and the spirv enum used by cvtType. Keeping this in
+// the .cpp keeps the spirv include out of AST.h / ImageFormatInfo.h.
+static mlir::spirv::ImageFormat spirvImageFormat(vc::ImageFormat f) {
+  using IF = vc::ImageFormat;
+  using SF = mlir::spirv::ImageFormat;
+  switch (f) {
+  case IF::Rgba32f: return SF::Rgba32f;
+  case IF::Rgba16f: return SF::Rgba16f;
+  case IF::R32f:    return SF::R32f;
+  case IF::R16f:    return SF::R16f;
+  case IF::Rg32f:   return SF::Rg32f;
+  case IF::Rg16f:   return SF::Rg16f;
+  case IF::R11fG11fB10f: return SF::R11fG11fB10f;
+  case IF::Rgba8:        return SF::Rgba8;
+  case IF::Rgba8Snorm:   return SF::Rgba8Snorm;
+  case IF::Rg8:          return SF::Rg8;
+  case IF::Rg8Snorm:     return SF::Rg8Snorm;
+  case IF::R8:           return SF::R8;
+  case IF::R8Snorm:      return SF::R8Snorm;
+  case IF::Rgba16Snorm:  return SF::Rgba16Snorm;
+  case IF::Rg16Snorm:    return SF::Rg16Snorm;
+  case IF::R16Snorm:     return SF::R16Snorm;
+  case IF::Rgba32i: return SF::Rgba32i;
+  case IF::Rgba16i: return SF::Rgba16i;
+  case IF::Rgba8i:  return SF::Rgba8i;
+  case IF::R32i:    return SF::R32i;
+  case IF::Rg32i:   return SF::Rg32i;
+  case IF::Rg16i:   return SF::Rg16i;
+  case IF::Rg8i:    return SF::Rg8i;
+  case IF::R16i:    return SF::R16i;
+  case IF::R8i:     return SF::R8i;
+  case IF::Rgba32ui: return SF::Rgba32ui;
+  case IF::Rgba16ui: return SF::Rgba16ui;
+  case IF::Rgba8ui:  return SF::Rgba8ui;
+  case IF::R32ui:    return SF::R32ui;
+  case IF::Rgb10a2ui: return SF::Rgb10a2ui;
+  case IF::Rg32ui:   return SF::Rg32ui;
+  case IF::Rg16ui:   return SF::Rg16ui;
+  case IF::Rg8ui:    return SF::Rg8ui;
+  case IF::R16ui:    return SF::R16ui;
+  case IF::R8ui:     return SF::R8ui;
+  case IF::Default:  return SF::Rgba32f;
+  }
+  return SF::Rgba32f;
+}
+
 class ASTToMLIRImpl {
   MLIRContext &ctx;
   OpBuilder builder;
@@ -635,33 +683,34 @@ private:
     // tools/vc/vc.cpp); the type/variable/descriptor plumbing here is native.
     if (isa<vc::ImageType>(t)) {
       auto *it = cast<vc::ImageType>(t);
+      // The ImageFormat is resolved through the shared table (ImageFormatInfo.h):
+      // Default derives from elemType (float->Rgba32f, half->Rgba16f,
+      // int->R32i, uint->R32ui); an explicit format yields that spirv enum.
+      int elem = (it->elemType && isa<BuiltinType>(it->elemType))
+                     ? static_cast<int>(
+                           cast<BuiltinType>(it->elemType)->builtin)
+                     : static_cast<int>(BuiltinTypeKind::Float32);
+      ImageFormat rf = resolveImageFormat(it->format, elem);
+      const ImageFormatInfo &fi = imageFormatInfo(rf);
+      // The spirv sampled type follows the FORMAT's numeric class, NOT the
+      // declared elemType — exactly as the GLSL backend picks the image
+      // spelling (`image2D`/`iimage2D`/`uimage2D`, all of whose imageLoad/
+      // imageStore use vec4/ivec4/uvec4 = f32/i32). GLSL has no f16 storage
+      // image type, so every float/half format lowers to an f32 sampled type.
+      // This matters for `texture2D<r16f half>` and `texture2D<half>`:
+      // declaring `half` must NOT produce `OpTypeImage %half ... R16f`, which
+      // would drag in the Float16 capability (and, on Intel, crash the
+      // pipeline on OpImageRead). The f32 sampled type is what glslc emits for
+      // the equivalent `layout(r16f) image2D` and is accepted by spirv-val for
+      // every float/half storage format.
       mlir::Type sampledTy = builder.getF32Type();
-      mlir::spirv::ImageFormat fmt = mlir::spirv::ImageFormat::Rgba32f;
-      if (it->elemType && isa<BuiltinType>(it->elemType)) {
-        switch (cast<BuiltinType>(it->elemType)->builtin) {
-        case BuiltinTypeKind::Float32:
-          sampledTy = builder.getF32Type();
-          fmt = mlir::spirv::ImageFormat::Rgba32f;
-          break;
-        case BuiltinTypeKind::Float16:
-          sampledTy = builder.getF16Type();
-          fmt = mlir::spirv::ImageFormat::Rgba16f;
-          break;
-        case BuiltinTypeKind::Int32:
-        case BuiltinTypeKind::UInt32:
-          sampledTy = builder.getI32Type();
-          // Integer images use the single-channel R32i/R32ui format: GLSL/SPIR-V
-          // imageAtomic* require r32i/r32ui (rgba32i is rejected), and this
-          // matches the runtime's R32_SINT/R32_UINT VkFormat. imageRead/
-          // imageWrite still work (only R is meaningful).
-          fmt = (cast<BuiltinType>(it->elemType)->builtin ==
-                 BuiltinTypeKind::UInt32)
-                    ? mlir::spirv::ImageFormat::R32ui
-                    : mlir::spirv::ImageFormat::R32i;
-          break;
-        default: break;
-        }
+      switch (fi.elemClass) {
+      case ImageFormatElemClass::Float:
+      case ImageFormatElemClass::Half:  sampledTy = builder.getF32Type(); break;
+      case ImageFormatElemClass::SInt:
+      case ImageFormatElemClass::UInt:  sampledTy = builder.getI32Type(); break;
       }
+      mlir::spirv::ImageFormat fmt = spirvImageFormat(rf);
       mlir::spirv::Dim dim = mlir::spirv::Dim::Dim2D;
       mlir::spirv::ImageArrayedInfo arrayed =
           mlir::spirv::ImageArrayedInfo::NonArrayed;

@@ -1,0 +1,169 @@
+// test/image_formats.vc — explicit (non-derived) storage-image texel formats.
+//
+// texture2D<T> defaults to a format derived from T (float->rgba32f, half->
+// rgba16f, int->r32i, uint->r32ui). An explicit format is selected by naming
+// it inside the angle brackets, before the element type:
+//
+//   texture2D<r16f half>          // 1 channel, 2 bytes/texel
+//   texture2D<rg16f float>        // 2 channels, 4 bytes/texel
+//   texture2D<r11f_g11b10f float> // 3 channels, 4 bytes/texel (packed)
+//   texture2D<rgba8 float>        // 4 channels, 4 bytes/texel (unorm)
+//
+// GLSL/SPIR-V imageLoad always returns a 4-wide vec regardless of the format's
+// real channel count (unused channels are 0/1) — so the device writes the
+// leading N components and the host stages exactly N scalars per texel. This
+// demo writes a distinct value into each texel's R channel (and G/B/A for the
+// multi-channel formats) and the host checks them back.
+//
+//   vcc test/image_formats.vc -o build/image_formats_sf && ./build/image_formats_sf
+//   vc  test/image_formats.vc -emit=full -o build/image_formats_mlir && ./build/image_formats_mlir
+
+#include <cstdio>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include "vc/Runtime/VCRuntime.h"
+
+// r16f: 1 channel (half). Write .x; .yzw are discarded by the format.
+__global__ void kR16(texture2D<r16f half> img16, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  float v = (float)(y * w + x) * 0.5f;
+  imageWrite(img16, x, y, make_float4(v, 0.0f, 0.0f, 1.0f));
+}
+
+// rg16f: 2 channels (float). Write .x and .y.
+__global__ void kRg16(texture2D<rg16f float> imgRg16, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  float r = (float)x;
+  float g = (float)y;
+  imageWrite(imgRg16, x, y, make_float4(r, g, 0.0f, 1.0f));
+}
+
+// r11f_g11b10f is a valid SPIR-V format (3 channels, packed) but this build's
+// glslc doesn't recognize the `r11f_g11b10f` GLSL layout qualifier, so it is
+// not exercised here. The compiler/runtime support it (see ImageFormatInfo.h).
+
+// rgba8: 4 channels (unorm). Write all four; host reads them back scaled 0..255.
+__global__ void kRgba8(texture2D<rgba8 float> imgRgba8, int w, int h) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= w || y >= h) return;
+  float r = (float)(x & 15) / 15.0f;
+  float g = (float)(y & 15) / 15.0f;
+  float b = (float)((x ^ y) & 15) / 15.0f;
+  float a = 1.0f;
+  imageWrite(imgRgba8, x, y, make_float4(r, g, b, a));
+}
+
+// NOTE on device-side imageRead: this build's Intel Vulkan driver crashes
+// (SIGFPE in vkCreateComputePipelines) on OpImageRead from a single-channel
+// int/half storage image (r32i/r16f). The WRITE path and host vcMemcpyFromImage
+// are unaffected, so each format below is verified by writing distinct texels
+// on the device and reading them back on the host. (image_stencil.vc covers
+// device imageRead on the float rgba32f format, which works.)
+
+static bool approx(float a, float b, float eps) {
+  return fabsf(a - b) <= eps;
+}
+
+// Minimal IEEE-754 half -> float for host-side r16f verification.
+static float halfToFloat(uint16_t h) {
+  unsigned sign = (h >> 15) & 1;
+  unsigned exp = (h >> 10) & 0x1f;
+  unsigned mant = h & 0x3ff;
+  float val;
+  if (exp == 0) {
+    val = (mant / 1024.0f) * (1.0f / 65536.0f); // subnormal
+  } else {
+    val = (1.0f + mant / 1024.0f) * powf(2.0f, (int)exp - 15);
+  }
+  return sign ? -val : val;
+}
+
+// Host staging layouts (one per format's real channel count + bit depth).
+// Defined at file scope because VC requires struct definitions outside
+// function bodies. rg16f stores 2×16-bit halfs; rgba8 stores 4×8-bit unorm.
+struct RG { uint16_t r; uint16_t g; };
+struct RGBA { uint8_t r; uint8_t g; uint8_t b; uint8_t a; };
+
+int main() {
+  vcInit();
+  const int W = 4, H = 4;
+  const int N = W * H;
+  int ok = 1;
+
+  // ---- r16f (1 channel, 2 bytes/texel, half) ----
+  // Verify via host readback (vcMemcpyFromImage) + a half->float decode.
+  {
+    uint16_t host[N]; // one half per texel
+    for (int i = 0; i < N; ++i) host[i] = 0;
+    VCImage *img16 = nullptr;
+    vcCreateImage2D(&img16, W, H, VCPixelFormat::R16Float);
+    vcMemcpyToImage(img16, host);
+    kR16<<<dim3(W, H), dim3(2, 2)>>>(img16, W, H);
+    vcDeviceSynchronize();
+    for (int i = 0; i < N; ++i) host[i] = 0;
+    vcMemcpyFromImage(host, img16); // exercises 2-byte/texel D2H
+    for (int y = 0; y < H && ok; ++y)
+      for (int x = 0; x < W && ok; ++x) {
+        float got = halfToFloat(host[y * W + x]);
+        float exp = (float)(y * W + x) * 0.5f;
+        if (!approx(got, exp, 0.06f)) ok = 0;
+      }
+    vcDestroyImage(img16);
+  }
+
+  // ---- rg16f (2 channels, 4 bytes/texel, 2×16-bit half) ----
+  {
+    RG host[N];
+    for (int i = 0; i < N; ++i) { host[i].r = 0; host[i].g = 0; }
+    VCImage *imgRg16 = nullptr;
+    vcCreateImage2D(&imgRg16, W, H, VCPixelFormat::Rg16Float);
+    vcMemcpyToImage(imgRg16, host);
+    kRg16<<<dim3(W, H), dim3(2, 2)>>>(imgRg16, W, H);
+    vcDeviceSynchronize();
+    for (int i = 0; i < N; ++i) { host[i].r = 0; host[i].g = 0; }
+    vcMemcpyFromImage(host, imgRg16);
+    for (int y = 0; y < H && ok; ++y)
+      for (int x = 0; x < W && ok; ++x) {
+        RG &p = host[y * W + x];
+        if (!approx(halfToFloat(p.r), (float)x, 0.02f) ||
+            !approx(halfToFloat(p.g), (float)y, 0.02f))
+          ok = 0;
+      }
+    vcDestroyImage(imgRg16);
+  }
+
+  // ---- rgba8 (4 channels, 4 bytes/texel, unorm) ----
+  {
+    RGBA host[N];
+    for (int i = 0; i < N; ++i) { host[i].r = 0; host[i].g = 0; host[i].b = 0; host[i].a = 0; }
+    VCImage *imgRgba8 = nullptr;
+    vcCreateImage2D(&imgRgba8, W, H, VCPixelFormat::Rgba8Unorm);
+    vcMemcpyToImage(imgRgba8, host);
+    kRgba8<<<dim3(W, H), dim3(2, 2)>>>(imgRgba8, W, H);
+    vcDeviceSynchronize();
+    for (int i = 0; i < N; ++i) { host[i].r = 0; host[i].g = 0; host[i].b = 0; host[i].a = 0; }
+    vcMemcpyFromImage(host, imgRgba8);
+    for (int y = 0; y < H && ok; ++y)
+      for (int x = 0; x < W && ok; ++x) {
+        RGBA &p = host[y * W + x];
+        uint8_t er = (uint8_t)((x & 15) * 17); // /15*255 ~ *17
+        uint8_t eg = (uint8_t)((y & 15) * 17);
+        uint8_t eb = (uint8_t)(((x ^ y) & 15) * 17);
+        // unorm quantizes to 8 bits; allow ±1.
+        if (abs((int)p.r - er) > 1 || abs((int)p.g - eg) > 1 ||
+            abs((int)p.b - eb) > 1 || p.a != 255)
+          ok = 0;
+      }
+    vcDestroyImage(imgRgba8);
+  }
+
+  vcShutdown();
+  printf("image_formats: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
+}

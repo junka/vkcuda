@@ -8,6 +8,7 @@ add_library(VCFrontend STATIC
   AstTransforms.cpp
   ASTDumper.cpp
   BuiltinRegistry.cpp
+  ImageFormatInfo.cpp
   Mangle.cpp
   Sema.cpp
   ../Codegen/ASTToGLSL.cpp

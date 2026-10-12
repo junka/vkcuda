@@ -1228,6 +1228,20 @@ Type *Parser::parseBaseType() {
         // read_write == default ReadWrite
         advance();
       }
+      // Optional explicit texel format: `texture2D<r16f half>` /
+      // `texture2D<read_only rg16f float>`. The format spelling is any token
+      // recognized by parseImageFormatSpelling (a GLSL image-format qualifier
+      // like r16f, rg16f, r11f_g11b10f, rgba8, ...). Default (omitted) means
+      // the format is derived from elemType (float->rgba32f, int->r32i, ...).
+      ImageFormat format = ImageFormat::Default;
+      if (curTok.kind == TokKind::identifier) {
+        ImageFormat parsed =
+            parseImageFormatSpelling(curTok.text.str().c_str());
+        if (parsed != ImageFormat::Default) {
+          format = parsed;
+          advance();
+        }
+      }
       Type *elem = parseBaseType();
       if (!elem) {
         error(curTok, "expected element type in " + spelling + "<T>");
@@ -1235,7 +1249,7 @@ Type *Parser::parseBaseType() {
       }
       if (!expect(TokKind::gt, "'>'"))
         return nullptr;
-      base = new ImageType(elem, dim, access);
+      base = new ImageType(elem, dim, access, format);
       // textureND<T> is fully consumed here (up to and including `>`); skip
       // the shared advance() below.
       return base;
