@@ -19,6 +19,7 @@
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
 #include "mlir/Conversion/MemRefToSPIRV/MemRefToSPIRVPass.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -37,6 +38,7 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -638,6 +640,144 @@ struct RewriteResidualIndexCastsPass
   }
 };
 
+// Promote scalar Function-storage memref allocas to SSA values.
+//
+// ASTToMLIR lowers every C local — loop induction variables, derived indices,
+// the accumulator — to:
+//   %a = memref.alloca() : memref<T, #spirv.storage_class<Function>>
+//   memref.store %v, %a[]
+//   %l = memref.load %a[]
+//
+// MLIR's stock promoter (AffineScalarReplacement) only sees affine.for /
+// affine.load; we emit scf.while + memref.load/store, so it is a no-op on our
+// IR. This pass fills that gap for the common case: a local written once and
+// read many times (initialized-once locals are the overwhelming majority —
+// `int tx = threadIdx.x;`, the `float acc = 0.0f;` before the loop, derived
+// indices). Promoting them turns the eventual SPIR-V's per-thread
+// OpVariable+OpLoad+OpStore into direct value uses.
+//
+// Safety contract — an alloca is promoted ONLY when:
+//   1. rank-0 (scalar) memref in Function storage;
+//   2. every use is a zero-index memref.store or memref.load (no address
+//      escape via AccessChain / call arg / ...);
+//   3. exactly one store, and that store statically dominates every load.
+// (3) makes this a "store once, read many" promotion: the stored value is the
+// single dominating definition, so each load is replaced by it. Loop-carried
+// induction variables (store inside scf.while body, read next iteration — the
+// store does not dominate the load across the back-edge) are deliberately
+// left untouched; they need scf.while iter_args and are a separate step.
+struct PromoteScalarAllocasPass
+    : public PassWrapper<PromoteScalarAllocasPass,
+                         OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PromoteScalarAllocasPass)
+
+  StringRef getArgument() const final {
+    return "vc-promote-scalar-allocas";
+  }
+  StringRef getDescription() const final {
+    return "promote rank-0 Function-storage memref allocas to SSA values";
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    IRRewriter rw(&getContext());
+    DominanceInfo &dom = getAnalysis<DominanceInfo>();
+
+    unsigned promoted = 0, skippedLoopCarried = 0, skippedEscape = 0;
+
+    // Collect first; rewriting mutates the IR and would invalidate a live walk.
+    SmallVector<memref::AllocaOp> allocas;
+    module.walk([&](memref::AllocaOp alloca) {
+      auto mt = alloca.getType().dyn_cast<MemRefType>();
+      if (!mt || mt.getRank() != 0)
+        return;
+      auto scAttr =
+          mt.getMemorySpace().dyn_cast_or_null<spirv::StorageClassAttr>();
+      if (!scAttr || scAttr.getValue() != spirv::StorageClass::Function)
+        return;
+      allocas.push_back(alloca);
+    });
+
+    for (memref::AllocaOp alloca : allocas) {
+      Value ptr = alloca.getResult();
+
+      // Any use that is not a plain (zero-index) load or store means the
+      // address escapes and we must not touch it.
+      SmallVector<memref::StoreOp> stores;
+      SmallVector<memref::LoadOp> loads;
+      bool escapes = false;
+      for (OpOperand &use : ptr.getUses()) {
+        Operation *owner = use.getOwner();
+        if (auto st = dyn_cast<memref::StoreOp>(owner)) {
+          if (st.getMemRef() != ptr || !st.getIndices().empty()) {
+            escapes = true;
+            break;
+          }
+          stores.push_back(st);
+          continue;
+        }
+        if (auto ld = dyn_cast<memref::LoadOp>(owner)) {
+          if (ld.getMemRef() != ptr || !ld.getIndices().empty()) {
+            escapes = true;
+            break;
+          }
+          loads.push_back(ld);
+          continue;
+        }
+        escapes = true;
+        break;
+      }
+      if (escapes) {
+        ++skippedEscape;
+        continue;
+      }
+
+      // Exactly one store whose value dominates every load. Zero stores means
+      // dead (leave for DCE); >1 store means reassigned/loop-carried (not
+      // handled here).
+      if (stores.size() != 1) {
+        if (!stores.empty())
+          ++skippedLoopCarried;
+        continue;
+      }
+      memref::StoreOp soleStore = stores.front();
+      Value stored = soleStore.getValue();
+
+      bool allDominated = true;
+      for (memref::LoadOp ld : loads) {
+        if (!dom.dominates(soleStore, ld)) {
+          allDominated = false;
+          break;
+        }
+      }
+      if (!allDominated) {
+        // A load the store does not dominate: read-before-write across the
+        // loop back-edge => loop-carried. Leave it.
+        ++skippedLoopCarried;
+        continue;
+      }
+
+      // Promote: every load becomes the stored value (which dominates them
+      // all), then drop the store and the now-dead alloca.
+      for (memref::LoadOp ld : loads) {
+        ld.getResult().replaceAllUsesWith(stored);
+        rw.eraseOp(ld);
+      }
+      rw.eraseOp(soleStore);
+      if (ptr.use_empty())
+        rw.eraseOp(alloca);
+      ++promoted;
+    }
+
+    if (std::getenv("VC_SPIRV_DEBUG") &&
+        (promoted || skippedLoopCarried || skippedEscape))
+      llvm::errs() << "vc-promote-scalar-allocas: promoted " << promoted
+                   << " allocas, skipped " << skippedLoopCarried
+                   << " loop-carried, " << skippedEscape << " escaping\n";
+  }
+};
+
+
 } // namespace
 
 // Does any func.func in the module carry a Function-storage memref parameter?
@@ -730,6 +870,25 @@ LogicalResult runLoweringPipeline(ModuleOp module) {
     module->print(llvm::errs(), OpPrintingFlags().assumeVerified());
     llvm::errs() << "\n";
   }
+
+  // ---- Stage 1b: scalar alloca promotion + cleanup -----------------------
+  // ASTToMLIR lowers every C local to a Function-storage memref.alloca +
+  // store/load, and every `for` to scf.while with the induction variable in
+  // such a slot. MLIR's AffineScalarReplacement is a no-op on scf.while, so
+  // without this stage those locals survive as real OpVariable+OpLoad+OpStore
+  // in the SPIR-V (a matmul kernel disassembles to 13 Function slots).
+  //
+  // PromoteScalarAllocasPass handles the "store once, read many" case
+  // (initialized-once locals: derived indices, the accumulator before the
+  // loop, ...). Loop-carried induction variables (store inside the while
+  // body, read next iteration) are NOT handled here — they need scf.while
+  // iter_args — but canonicalize + CSE around the promotion still folds the
+  // redundant loads/stores the promoted locals leave behind, and simplifies
+  // the address arithmetic that survives.
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(std::make_unique<PromoteScalarAllocasPass>());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
 
   // ---- Stage 2: gpu/standard -> SPIR-V -----------------------------------
   // ConvertGPUToSPIRV clones every gpu.module and fully legalizes the clone
