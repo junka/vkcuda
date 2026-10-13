@@ -354,31 +354,78 @@ single-shot timings (and even "best of 3") are not meaningful; the medians are.
 Anything reported in this README as a single run should be read as
 order-of-magnitude only.
 
-### What is actually bounding the kernel
+### What was actually bounding the kernel (now fixed)
 
-Two costs live in the compiler rather than in the kernel source, and both are
-larger than the tile-shape choice above:
+Two costs used to live in the compiler rather than in the kernel source, and
+both were larger than the tile-shape choice above. Both have since been fixed:
 
-- **The MLIR backend runs no canonicalize / SROA / CSE pass.**
-  `lib/Codegen/LoweringPasses.cpp` registers only the conversion passes
-  (`ConvertFuncToSPIRV`, `ConvertGPUToSPIRV`, `SPIRVLowerABIAttributes`, …) —
-  there is no canonicalizer and no alloca-promotion. The consequence is that
-  **every local variable is a real memory access**: disassembling the SPIR-V
-  for `matmul_bench.vc` shows 13 `OpVariable ... Function` slots — the loop
-  induction variables, the derived indices, and the accumulator array — each
-  loaded and stored around the arithmetic.
-- **Every `for` lowers to `scf.while`,** with the induction variable in a
+- **The MLIR backend ran no canonicalize / SROA / CSE pass.**
+  `lib/Codegen/LoweringPasses.cpp` registered only the conversion passes
+  (`ConvertFuncToSPIRV`, `ConvertGPUToSPIRV`, `SPIRVLowerABIAttributes`, …).
+  The consequence was that **every local variable was a real memory access**:
+  disassembling the SPIR-V for `matmul_bench.vc` showed 13
+  `OpVariable ... Function` slots — the loop induction variables, the derived
+  indices, and the accumulator array — each loaded and stored around the
+  arithmetic. **Fixed** by a `PromoteScalarAllocasPass` + canonicalize + CSE
+  inserted as stage 1b of `runLoweringPipeline`
+  ([`lib/Codegen/LoweringPasses.cpp`](../lib/Codegen/LoweringPasses.cpp)).
+  On `mmvar.vc` this promoted 43 scalar allocas to SSA (Function slots
+  126→81, load/store 670→410) and lifted N=1024 `v2` from ~253 to ~348 median.
+- **Every `for` lowered to `scf.while`,** with the induction variable in a
   `memref<i32, Function>` slot, and each guarded statement wrapped in an
-  `scf.if` ([`lib/Codegen/ASTToMLIR.cpp:3358`](../lib/Codegen/ASTToMLIR.cpp#L3358)).
-  The comment there calls this out as the conservative option: *"A tighter
-  `scf.for` lowering could be added later once cond is a canonical
-  `i < bound` form."*
+  `scf.if`. **Fixed** by `tryEmitCanonicalFor` in
+  [`lib/Codegen/ASTToMLIR.cpp`](../lib/Codegen/ASTToMLIR.cpp): a `for` of the
+  shape `for (int i = start; i < bound; i = i + step)` with no `break`/
+  `continue`/write-to-`i` in the body now lowers directly to `scf.for`, with
+  `start` allowed to be any integer expression (not just a literal). This
+  dropped `scf.while` 23→0, Function slots 81→9, load/store 410→87, and SPIR-V
+  134K→59K; N=1024 `v2` went from ~212 to ~347 median.
 
-Adding a canonicalizer + SROA to the pipeline would promote those Function
-slots to SSA values and delete the redundant loads/stores — and it would apply
-to **all four variants above** without touching a line of kernel code. That is
-the highest-value next step for matmul performance in this toolchain, ahead of
-any further tile-shape tuning.
+Both fixes apply to **every** kernel, not just matmul. They are the reason the
+GFLOPS figures in the table above are reproducible at all — earlier runs on the
+unfixed pipeline were dominated by slot traffic.
+
+### Split-K: does splitting K help on an iGPU? (no)
+
+Split-K parallelises the K reduction: instead of one workgroup owning a whole
+output tile and walking all of K, P workgroups collaborate on each tile, each
+computing the partial sum over its `1/P` slice of K. The P partials are then
+summed into C. This helps when **M and N are small but K is large** — the output
+tile grid is too small to fill the device, so splitting K along its long axis
+creates more parallelism.
+
+The VC MLIR backend does not yet lower `float atomicAdd` (only i32), so the
+prototype uses a **two-stage reduction**: each part writes its partial sum into
+its own slot of a `partials[P][N*N]` buffer (no atomics), and a second small
+kernel sums the P slots into C. Measured (median of 12, same `v2` tile shape
+`TS=32`/`BLK=16`/2×2-per-thread, N=K square):
+
+| N | `v2_reg2x2` | split P=1 | split P=4 | split P=16 |
+|---|---|---|---|---|
+| 256 | 40 | 66 | 60 | 41 |
+| 512 | 79 | 123 | 137 | 95 |
+| 1024 | 101 | 212 | 204 | 140 |
+
+(GFLOPS, median; the device's 3–10× run-to-run noise means treat these as
+order-of-magnitude.) Two takeaways:
+
+- **Split-K does not help on this integrated GPU, and large P actively hurts.**
+  P=16 loses ~30% at every size. The reason is that an iGPU has very few SMs
+  (and Vulkan does not even report the count), so the output tile grid already
+  fills the device at these N — splitting K does not raise occupancy, it only
+  adds the `partials` memory traffic and a second kernel launch. The benefit
+  case (small M×N, large K) does not arise for a square matmul at N≥256.
+- **P=1 ≈ the plain kernel, as it should be.** The P=1 column is the same tile
+  and the same 2×2 register blocking as `v2_reg2x2`, just routed through the
+  split launcher (`tc = blockIdx.x % numTileCols`, `partIdx = 0`). Its
+  higher-looking medians are run-to-run noise plus the warmup-then-time
+  back-to-back pattern keeping the GPU clocked up — not a real win.
+
+The two-stage reduction is the right design if Split-K is ever wanted on this
+backend (it sidesteps the float-atomic limitation cleanly), but on this device
+the conclusion is: **don't split K for square matmul; spend the parallelism on
+a bigger output grid instead.** Stream-K (the load-balanced variant) is the
+remaining unexplored option and is listed as a future step.
 
 
 ---

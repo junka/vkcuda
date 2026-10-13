@@ -3454,13 +3454,15 @@ private:
   }
 
   // tryEmitCanonicalFor: for the common canonical shape
-  //   for (int ivar = cStart; ivar < bound; ivar = ivar + cStep) { body }
+  //   for (int ivar = start; ivar < bound; ivar = ivar + cStep) { body }
   // with no break/continue and no assignment to ivar inside the body, lower
-  // directly to scf.for. See emitFor for the rationale.
+  // directly to scf.for. `start` may be any integer expression (constant OR
+  // runtime value, e.g. a slice-dependent lower bound like `klo`); only the
+  // step must be a compile-time positive integer. See emitFor for the rationale.
   bool tryEmitCanonicalFor(const ForStmt *s) {
     Location l = loc(s);
 
-    // --- init: `int ivar = <IntegerLiteral>` ---
+    // --- init: `int ivar = <integer expr>` ---
     if (!s->init || s->init->getNodeType() != ASTNode::NodeKind::DeclStmt)
       return false;
     auto *ds = static_cast<DeclStmt *>(s->init.get());
@@ -3469,10 +3471,14 @@ private:
     VarDecl *ivar = ds->decl;
     if (!ivar->type || ivar->type->getKind() != TypeKind::Builtin)
       return false;
-    if (!ivar->init ||
-        ivar->init->getNodeType() != ASTNode::NodeKind::IntegerLiteral)
+    {
+      auto bt = static_cast<const BuiltinType *>(ivar->type)->builtin;
+      if (bt != BuiltinTypeKind::Int32 && bt != BuiltinTypeKind::UInt32 &&
+          bt != BuiltinTypeKind::Int64 && bt != BuiltinTypeKind::UInt64)
+        return false; // only integer induction variables
+    }
+    if (!ivar->init)
       return false;
-    int64_t cStart = static_cast<IntegerLiteral *>(ivar->init.get())->value;
 
     // --- cond: `ivar < bound` ---
     if (!s->cond || s->cond->getNodeType() != ASTNode::NodeKind::BinaryExpr)
@@ -3525,8 +3531,10 @@ private:
     // All checks passed — emit scf.for.
     localTypes[ivar->name] = ivar->type;
 
-    Value lb = builder.create<arith::ConstantOp>(l, builder.getIndexType(),
-                                                 builder.getIndexAttr(cStart));
+    // lb: evaluate the start expression (constant or runtime) to an index.
+    Value startVal = visitExpr(ivar->init.get());
+    if (!startVal) { error(s, "canonical for: start did not lower"); return false; }
+    Value lb = toIndexValue(startVal, l);
     Value stepVal = builder.create<arith::ConstantOp>(
         l, builder.getIndexType(), builder.getIndexAttr(cStep));
     // bound: visitExpr on a DeclRefExpr returns the slot (memref) for a local
