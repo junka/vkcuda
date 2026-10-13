@@ -215,7 +215,8 @@ The Vulkan runtime implements a CUDA-style host API over Vulkan compute:
   cross-checking it against PyTorch's SDPA kernels (needs torch; the demo
   dumps tensors with `--dump`), and `matmul_bench.vc` /
   `matmul_coopmat_bench.vc` — the same GPU-timed matmul benchmark on the
-  SIMT and cooperative-matrix paths, measured side by side
+  SIMT and cooperative-matrix paths, measured side by side (plus a
+  measured [tile-shape comparison and performance breakdown](examples/README.md#matmul--tile-shape-and-performance))
 - `docs/language-spec.md` — language design notes
 - `docs/plans/` — pre-implementation design plans (all shipped; kept for the
   rationale and the rejected alternatives)

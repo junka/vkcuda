@@ -242,7 +242,9 @@ a separate `vc`-driven target in `CMakeLists.txt` for the same reason.
 (Both columns measured through the **MLIR** backend — `vc ... -emit=full` — back to
 back on the same device, best of 5 runs per size, so the comparison is
 like-for-like. Even so these are wall-clock numbers: read them as
-order-of-magnitude ratios, not exact.)
+order-of-magnitude ratios, not exact. This device's run-to-run variance is
+large; see [matmul — tile shape and performance](#matmul--tile-shape-and-performance) for the measured spread
+and what is actually limiting both kernels.)
 
 The shape of the curve is the interesting part. At N=128 the coopmat kernel is
 *slower*: the problem is far too small to fill the machine, and it pays fixed
@@ -253,7 +255,9 @@ decisively ahead, and at N=1024 they win ~4.4× while the SIMT kernel gets no
 faster (251 → 332 GFLOPS from 512 to 1024): it walks the same four N×N
 operand row ranges per workgroup at every size, so the miss traffic per
 output grows with N, whereas each coopmat workgroup reads its panels the
-same way regardless.
+same way regardless. The SIMT column is the `TS=16` shape; the section
+[matmul — tile shape and performance](#matmul--tile-shape-and-performance)
+below measures what a better-shaped fp32 kernel gets instead.
 
 ### What the kernel does
 
@@ -296,6 +300,85 @@ The correctness check is *exact*: inputs are small integers (exactly
 representable in fp16) and every partial sum stays inside fp32's
 exact-integer range, so each `C[i][j]` is compared for bit equality against a
 `double` reference rather than against a tolerance.
+
+---
+
+## matmul — tile shape and performance
+
+`matmul_bench` above answers *"can VC express a tiled matmul?"* and
+`matmul_coopmat_bench` answers *"and on the tensor cores?"*. This section
+answers the follow-up: **what shape should a hand-written fp32 matmul take on
+this device, and what do the numbers mean.**
+
+The table below comes from a scratch harness — four kernels, same `C = A·B`,
+each changing exactly one thing, back to back on one device with `vcEvent`
+timing. To reproduce it, copy the four kernels into one `.vc` file and build it
+with `vc ... -emit=full`.
+
+| variant | what it changes | N=256 | N=512 | N=1024 | N=1024 (best) |
+|---|---|---|---|---|---|
+| `v0` — `TS=16`, 1 output/thread | *the current `matmul_bench` shape* | 64 | 167 | 238 | 342 |
+| `v1` — no shared memory | drop the staging entirely | 18 | 39 | 44 | 93 |
+| `v2` — `TS=32`, 2×2 register blocking | bigger tile + 4 accumulators/thread | **72** | **215** | 253 | **618** |
+| `v3` — `TS=64`, 4×4 register blocking | the CUDA-textbook shape | 60 | 165 | **289** | 416 |
+
+All values are GFLOPS (fp32), **median of 12 runs**, with the best-of-12 in the
+last column. `v1` walks K straight out of global memory. `v2`/`v3` stage a tile
+through `__shared__` with `__syncthreads()` on both sides of the inner loop, and
+give each thread a 2×2 / 4×4 quad of outputs so the shared loads are amortized
+over more FMAs.
+
+**Shared staging is not optional, and it matters more as N grows.** At N=1024
+the staged kernel beats the unstaged one by ~3.7× (342 vs 93, best case). That
+gap is the entire reason the tile exists — the unstaged version re-reads
+`A[row][k]` and `B[k][col]` from global memory on every FMA.
+
+**Register blocking is the single biggest win.** `v2` (2×2) is roughly 1.5–2×
+`v0` at every size. The surprise is that **4×4 is not better than 2×2**: at
+N=512 the two are within noise, and at N=1024 `v3` leads the median by only
+~14% while `v2` wins the best case by 1.5×. The cause is occupancy, not
+arithmetic — this device reports `sharedMemPerBlock = 65536`, so `TS=64` needs
+32 KB per workgroup (2 resident) where `TS=32` needs 8 KB (8 resident). The
+extra register blocking buys fewer shared loads but pays for them in a much
+smaller working set. **`TS=32` with a 2×2 per-thread quad is the right default
+here**; the textbook 4×4 shape is not worth the shared-memory cost on an
+integrated GPU.
+
+### Reading these numbers: this device is very noisy
+
+Every figure above is a **median**, and that is not incidental. On the Intel
+(ARL) integrated GPU used here, the *same* kernel at the *same* size varies by
+3–10× between consecutive runs — `v2` at N=1024 ranged from 113 to 618 GFLOPS
+across 12 runs of one binary. This is a power- and thermally-shared iGPU, so
+single-shot timings (and even "best of 3") are not meaningful; the medians are.
+Anything reported in this README as a single run should be read as
+order-of-magnitude only.
+
+### What is actually bounding the kernel
+
+Two costs live in the compiler rather than in the kernel source, and both are
+larger than the tile-shape choice above:
+
+- **The MLIR backend runs no canonicalize / SROA / CSE pass.**
+  `lib/Codegen/LoweringPasses.cpp` registers only the conversion passes
+  (`ConvertFuncToSPIRV`, `ConvertGPUToSPIRV`, `SPIRVLowerABIAttributes`, …) —
+  there is no canonicalizer and no alloca-promotion. The consequence is that
+  **every local variable is a real memory access**: disassembling the SPIR-V
+  for `matmul_bench.vc` shows 13 `OpVariable ... Function` slots — the loop
+  induction variables, the derived indices, and the accumulator array — each
+  loaded and stored around the arithmetic.
+- **Every `for` lowers to `scf.while`,** with the induction variable in a
+  `memref<i32, Function>` slot, and each guarded statement wrapped in an
+  `scf.if` ([`lib/Codegen/ASTToMLIR.cpp:3358`](../lib/Codegen/ASTToMLIR.cpp#L3358)).
+  The comment there calls this out as the conservative option: *"A tighter
+  `scf.for` lowering could be added later once cond is a canonical
+  `i < bound` form."*
+
+Adding a canonicalizer + SROA to the pipeline would promote those Function
+slots to SSA values and delete the redundant loads/stores — and it would apply
+to **all four variants above** without touching a line of kernel code. That is
+the highest-value next step for matmul performance in this toolchain, ahead of
+any further tile-shape tuning.
 
 
 ---
