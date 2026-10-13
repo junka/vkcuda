@@ -11,7 +11,8 @@ directory and the e2e test corpus). The hand-written examples kept here are
 [`singlefile.vc`](singlefile.vc) — the canonical minimal program — and
 [`flash_attn.vc`](flash_attn.vc) — a worked FlashAttention-2/3 kernel, with
 [`compare_flash_attn.py`](compare_flash_attn.py) cross-checking it against
-PyTorch.
+PyTorch, and [`matmul_bench.vc`](matmul_bench.vc) — a GPU-timed tiled matmul
+benchmark.
 
 ## Prerequisites
 
@@ -143,6 +144,56 @@ The GLSL backend emits the workgroup size as specialization constants
 on which `.x`/`.y`/`.z` components the kernel reads. At launch, a 2D launch
 specializes the compute pipeline to the given block dimensions, so the same
 `.spv` runs at any block shape without recompiling.
+
+---
+
+## matmul_bench — tiled matmul, GPU-timed
+
+**Source:** [`matmul_bench.vc`](matmul_bench.vc)
+
+The same tiled `C = A·B` kernel as the [matmul](#matmul--tiled-matrix-multiply)
+test demo (16×16 tiles, one workgroup per output tile, `__shared__` A/B tiles,
+boundary fill), but scaled to non-trivial sizes and wrapped in a benchmark.
+For each N ∈ {128, 256, 512, 1024} it records GPU-side start/end events around
+the launch (`vcEvent*`), reports `ms` and `GFLOPS = 2·N³ / (ms·10⁶)`, and
+verifies every element against a naive O(N³) host reference accumulated in
+`double`.
+
+```bash
+./build/tools/vcc/vcc examples/matmul_bench.vc -o build/matmul_bench && ./build/matmul_bench
+# matmul_bench: tiled 16x16, float32
+#   N= 128    0.18 ms      22.8 GFLOPS   maxrelerr=5.8e-07   PASS
+#   N= 256    0.40 ms      84.1 GFLOPS   maxrelerr=8.3e-07   PASS
+#   N= 512    1.31 ms     204.6 GFLOPS   maxrelerr=1.9e-06   PASS
+#   N=1024   12.78 ms     168.0 GFLOPS   maxrelerr=4.4e-06   PASS
+# matmul_bench: PASS
+```
+
+| param | value |
+|-------|-------|
+| sizes | 128, 256, 512, 1024 (square, multiple of TS) |
+| tile/block | 16 × 16 |
+| grid | N × N (element count → N/16 workgroups per axis) |
+| args | `A*`, `B*`, `C*`, `N` (scalar) |
+| timing | `vcEventRecord`/`vcEventElapsedTime` (GPU-side) |
+
+Two things worth calling out, because they are what makes the numbers
+trustworthy:
+
+- **Warmup before timing.** The first compute-pipeline instantiation on a
+  freshly-created device is dominated by shader compile / `vkCreateComputePipelines`,
+  not by the matmul. A tiny 16×16 launch runs (untimed) before the timed loop,
+  so the N=128 number is the kernel itself, not one-time setup. Without it the
+  first size reads ~15 ms regardless of N.
+- **Relative-error correctness.** Each `C[i][j]` is a sum of N products of
+  O(N)-magnitude inputs; the largest terms reach ~1e7 at N=1024, so an absolute
+  error of ~10 there is meaningless. The check is relative: `|ref − got| / |ref|`
+  against `1e-4`, which is comfortably above fp32 accumulation drift (~1e-7 eps
+  × N terms ≈ 1e-4 worst case) and below any real bug.
+
+The benchmark runs identically on the MLIR backend
+(`vc examples/matmul_bench.vc -emit=full -o build/matmul_bench_mlir`); the two
+backends emit different SPIR-V and can be compared head-to-head this way.
 
 ---
 

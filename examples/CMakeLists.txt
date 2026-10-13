@@ -27,7 +27,7 @@ endforeach()
 # they are written to be read: singlefile is the canonical minimal program,
 # flash_attn the worked FlashAttention-3-style kernel (also cross-checked
 # against PyTorch by compare_flash_attn.py in this directory).
-foreach(example singlefile flash_attn)
+foreach(example singlefile flash_attn matmul_bench)
   add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/${example}
     COMMAND vcc ${CMAKE_CURRENT_SOURCE_DIR}/${example}.vc

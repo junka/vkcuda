@@ -1,0 +1,176 @@
+// examples/matmul_bench.vc — tiled matmul kernel + GPU-timed benchmark.
+//
+// A "written to be read" example: the same tiled C = A·B kernel as
+// test/matmul.vc, but scaled up to non-trivial N and wrapped in a benchmark
+// that times the kernel with GPU-side events (vcEvent*) and reports GFLOPS.
+// Correctness is checked against a naive O(N³) host reference accumulated in
+// double, so accumulation drift between the fp32 tiled kernel and the double
+// reference is tolerated rather than asserted away.
+//
+//   vcc examples/matmul_bench.vc -o build/matmul_bench && ./build/matmul_bench
+//   vc  examples/matmul_bench.vc -emit=full -o build/matmul_bench_mlir && ./build/matmul_bench_mlir
+//
+// Expect: one line per matrix size, then "matmul_bench: PASS".
+
+#include <cstdio>
+#include <cstdlib>
+#include "vc/Runtime/VCRuntime.h"
+
+// Tiled matrix multiply: C = A * B, row-major, N x N, single-precision.
+// TS=16 tile; one workgroup computes one TS x TS output tile. The boundary
+// fill (zeros past N) handles N that is not a multiple of TS.
+__global__ void matmulTiled(float *A, float *B, float *C, int N) {
+  const int TS = 16;
+  int row = blockIdx.y * TS + threadIdx.y;
+  int col = blockIdx.x * TS + threadIdx.x;
+
+  __shared__ float As[16][16];
+  __shared__ float Bs[16][16];
+
+  float acc = 0.0f;
+  int numTiles = (N + TS - 1) / TS;
+
+  for (int t = 0; t < numTiles; t = t + 1) {
+    int aCol = t * TS + threadIdx.x;
+    int bRow = t * TS + threadIdx.y;
+    if (row < N && aCol < N)
+      As[threadIdx.y][threadIdx.x] = A[row * N + aCol];
+    else
+      As[threadIdx.y][threadIdx.x] = 0.0f;
+    if (bRow < N && col < N)
+      Bs[threadIdx.y][threadIdx.x] = B[bRow * N + col];
+    else
+      Bs[threadIdx.y][threadIdx.x] = 0.0f;
+    __syncthreads();
+
+    for (int k = 0; k < TS; k = k + 1) {
+      acc = acc + As[threadIdx.y][k] * Bs[k][threadIdx.x];
+    }
+    __syncthreads();
+  }
+
+  if (row < N && col < N)
+    C[row * N + col] = acc;
+}
+
+// Run one size: allocate, fill, launch, time, verify. Returns 0 on success.
+static int runSize(int N, float *outMs) {
+  int bytes = N * N * 4;
+
+  // Host buffers (malloc — VC host lowers to C++; stack VLAs of N up to 1024^2
+  // would risk a 4 MB stack frame, so heap it is).
+  float *hA = (float *)malloc(bytes);
+  float *hB = (float *)malloc(bytes);
+  float *hC = (float *)malloc(bytes);
+  if (!hA || !hB || !hC) {
+    printf("  N=%d: host alloc failed\n", N);
+    free(hA); free(hB); free(hC);
+    return 1;
+  }
+
+  // Deterministic, bounded, nonzero inputs — no identity (would hide errors
+  // and let the kernel shortcut). Values stay O(1) so fp32 accumulation drift
+  // over N MACs stays well below the tolerance.
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < N; j++) {
+      hA[i * N + j] = 0.1f * (float)i + 0.01f * (float)j;
+      hB[i * N + j] = 0.1f * (float)j + 0.01f * (float)i;
+    }
+  }
+
+  void *dA = 0, *dB = 0, *dC = 0;
+  vcMalloc(&dA, bytes);
+  vcMalloc(&dB, bytes);
+  vcMalloc(&dC, bytes);
+  vcMemcpy(dA, hA, bytes, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dB, hB, bytes, VCMemcpyKind::HostToDevice);
+
+  const int TS = 16;
+  VCEventHandle start = 0, end = 0;
+  vcEventCreate(&start);
+  vcEventCreate(&end);
+
+  vcEventRecord(start, 0); // default stream
+  matmulTiled<<<dim3(N, N), dim3(TS, TS)>>>(dA, dB, dC, N);
+  vcEventRecord(end, 0);
+  vcEventSynchronize(end);
+
+  float ms = 0.0f;
+  VCError te = vcEventElapsedTime(&ms, start, end);
+  vcEventDestroy(start);
+  vcEventDestroy(end);
+
+  vcMemcpy(hC, dC, bytes, VCMemcpyKind::DeviceToHost);
+
+  // Naive O(N^3) host reference, accumulated in double. Check RELATIVE error:
+  // each C[i][j] is a sum of N products of O(N)-magnitude inputs (the largest
+  // terms reach ~1e7 at N=1024), so absolute error of ~10 there is fine —
+  // relative error is the meaningful measure.
+  int ok = 1;
+  double maxRelErr = 0.0;
+  for (int i = 0; i < N && ok; i++) {
+    for (int j = 0; j < N; j++) {
+      double ref = 0.0;
+      for (int k = 0; k < N; k++) {
+        ref += (double)hA[i * N + k] * (double)hB[k * N + j];
+      }
+      double err = ref - (double)hC[i * N + j];
+      if (err < 0.0) err = -err;
+      double rel = (ref != 0.0) ? err / ref : err;
+      if (rel > maxRelErr) maxRelErr = rel;
+      // fp32 accumulation over N terms: 1e-4 relative is generous (fp32 eps
+      // is ~1e-7, N=1024 terms -> ~1e-4 worst case).
+      if (rel > 1e-4) { ok = 0; break; }
+    }
+  }
+
+  // GFLOPS = 2*N^3 flops / (ms * 1e6). 2 flops per multiply-accumulate.
+  double gflops = (te == VCError::Success)
+      ? (2.0 * (double)N * (double)N * (double)N) / ((double)ms * 1e6)
+      : 0.0;
+
+  if (te != VCError::Success) {
+    printf("  N=%4d  (event error %d)                                   FAIL\n",
+           N, (int)te);
+  } else {
+    printf("  N=%4d  %8.4f ms   %8.2f GFLOPS   maxrelerr=%.2e   %s\n",
+           N, ms, gflops, maxRelErr, ok ? "PASS" : "FAIL");
+  }
+
+  *outMs = ms;
+  vcFree(dA); vcFree(dB); vcFree(dC);
+  free(hA); free(hB); free(hC);
+  return ok ? 0 : 1;
+}
+
+int main() {
+  vcInit();
+
+  printf("matmul_bench: tiled 16x16, float32\n");
+
+  // Warm up the pipeline (shader compile + first-submit overhead) on a tiny
+  // launch so it doesn't inflate the first timed size.
+  {
+    void *dA = 0, *dB = 0, *dC = 0;
+    int w = 16, wb = w * w * 4;
+    vcMalloc(&dA, wb); vcMalloc(&dB, wb); vcMalloc(&dC, wb);
+    float z[16 * 16];
+    for (int i = 0; i < 16 * 16; i++) z[i] = 0.0f;
+    vcMemcpy(dA, z, wb, VCMemcpyKind::HostToDevice);
+    vcMemcpy(dB, z, wb, VCMemcpyKind::HostToDevice);
+    matmulTiled<<<dim3(w, w), dim3(16, 16)>>>(dA, dB, dC, w);
+    vcDeviceSynchronize();
+    vcFree(dA); vcFree(dB); vcFree(dC);
+  }
+
+  int sizes[4] = { 128, 256, 512, 1024 };
+  int allOk = 1;
+  for (int i = 0; i < 4; i++) {
+    float ms = 0.0f;
+    if (runSize(sizes[i], &ms) != 0) allOk = 0;
+  }
+  printf("matmul_bench: %s\n", allOk ? "PASS" : "FAIL");
+
+  vcShutdown();
+  return allOk ? 0 : 1;
+}
