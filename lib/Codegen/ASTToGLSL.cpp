@@ -2207,7 +2207,7 @@ private:
     // Bind params to parenthesized arg text, saving any prior binding so nested
     // inlines (a ref-returning call whose arg is itself a ref-returning call)
     // restore correctly.
-    struct Saved { std::string name; std::string prev; bool had; };
+    struct Saved { std::string name; std::string prev; bool had = false; };
     SmallVector<Saved, 4> savedBindings;
     unsigned n = std::min(args.size(), calleeFn->params.size());
     for (unsigned i = 0; i < n; ++i) {
@@ -2298,7 +2298,7 @@ private:
 
     // Bind params to parenthesized arg text (same substitution as the read
     // case), restored on scope exit.
-    struct Saved { std::string name; std::string prev; bool had; };
+    struct Saved { std::string name; std::string prev; bool had = false; };
     SmallVector<Saved, 4> savedBindings;
     unsigned n = std::min(call->args.size(), calleeFn->params.size());
     for (unsigned i = 0; i < n; ++i) {
