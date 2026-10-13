@@ -1,0 +1,146 @@
+// overlap_probe.vc — do two streams' worth of work actually run at the same
+// time, or does everything queue up behind everything else?
+//
+// Three GPU-timed spans, each measured with its own event pair:
+//   kernel-only : one kernel on streamB
+//   copy-only   : one device->device memcpy on streamA
+//   both        : the same copy and the same kernel issued on two streams at
+//                 once.  ~max(a,b) means they overlapped; ~a+b means they
+//                 serialized.
+//
+// This probe measures the STREAM machinery, not the copy engine. On a device
+// that exposes a dedicated transfer-only queue family the runtime routes D2D
+// copies there automatically (see Runtime::canRouteCopyToTransfer); run with
+// VC_DEBUG=1 to see whether that is happening here, or with
+// VC_DISABLE_TRANSFER_QUEUE=1 to force the compute-queue path for comparison.
+//
+// The copy is DEVICE-TO-DEVICE on purpose: an H2D async copy snapshots the host
+// source into a staging buffer with a blocking std::memcpy on the calling
+// thread, which serializes it against anything else and hides the overlap. D2D
+// is pure device work, so the two spans are compared engine-to-engine.
+//
+// Buffers are disjoint so the two are independent and free to overlap.
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void spin(float *in, float *out, int n, int iters) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float v = in[i];
+    for (int k = 0; k < iters; k++) v = v * 1.0000001f + 0.5f;
+    out[i] = v;
+  }
+}
+
+// Overridable so a single binary can be swept on the target machine
+// (VC_PROBE_N / VC_PROBE_ITERS / VC_PROBE_REPEAT) instead of rebuilding:
+// the overlap signal is only readable when the copy-only span and the
+// kernel-only span are comparable, and the right sizes differ per GPU.
+static int envInt(const char *name, int dflt) {
+  const char *v = getenv(name);
+  return (v && v[0]) ? atoi(v) : dflt;
+}
+
+static const int BLOCK = 256;
+
+int main() {
+  vcInit();
+  const int N = envInt("VC_PROBE_N", 4 * 1024 * 1024);
+  const int ITERS = envInt("VC_PROBE_ITERS", 8000);
+  const int REPEAT = envInt("VC_PROBE_REPEAT", 7);
+  const size_t bytes = (size_t)N * sizeof(float);
+
+  float *hIn = (float *)malloc(bytes);
+  for (int i = 0; i < N; i++) hIn[i] = (float)i * 0.25f;
+
+  void *dIn = 0, *dIn2 = 0, *dOut = 0, *dCpy = 0;
+  vcMalloc(&dIn, bytes);    // copy source
+  vcMalloc(&dCpy, bytes);   // copy destination
+  vcMalloc(&dIn2, bytes);   // kernel input (disjoint from the copy)
+  vcMalloc(&dOut, bytes);
+  vcMemcpy(dIn2, hIn, bytes, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dIn, hIn, bytes, VCMemcpyKind::HostToDevice);
+
+  VCStreamHandle sA = 0, sB = 0;
+  vcStreamCreate(&sA);
+  vcStreamCreate(&sB);
+
+  VCEventHandle k0 = 0, k1 = 0, c0 = 0, c1 = 0, b0 = 0, b1 = 0, cdone = 0;
+  vcEventCreate(&k0); vcEventCreate(&k1);
+  vcEventCreate(&c0); vcEventCreate(&c1);
+  vcEventCreate(&b0); vcEventCreate(&b1);
+  vcEventCreate(&cdone);
+
+  float kOnly = 0.0f, cOnly = 0.0f, both = 0.0f;
+
+  for (int r = 0; r < REPEAT; r++) {
+    float ms = 0.0f;
+
+    //--- kernel alone ---
+    vcEventRecord(k0, sB);
+    spin<<<N, BLOCK, 0, sB>>>(dIn2, dOut, N, ITERS);
+    vcEventRecord(k1, sB);
+    vcStreamSynchronize(sB);
+    vcEventElapsedTime(&ms, k0, k1);
+    if (r == 0 || ms < kOnly) kOnly = ms;
+
+    //--- device->device copy alone ---
+    vcEventRecord(c0, sA);
+    vcMemcpyS(dCpy, dIn, bytes, VCMemcpyKind::DeviceToDevice, sA);
+    vcEventRecord(c1, sA);
+    vcStreamSynchronize(sA);
+    vcEventElapsedTime(&ms, c0, c1);
+    if (r == 0 || ms < cOnly) cOnly = ms;
+
+    //--- both at once, on two different streams ---
+    // The kernel is launched BEFORE the stream waits on the copy, so the wait
+    // sits behind the kernel and only extends the span to cover the copy if the
+    // copy outlives it. Putting the wait first would serialize the two by
+    // construction and hide any overlap the engine could provide.
+    vcEventRecord(b0, sB);              // span opens on the compute stream
+    spin<<<N, BLOCK, 0, sB>>>(dIn2, dOut, N, ITERS);
+    vcMemcpyS(dCpy, dIn, bytes, VCMemcpyKind::DeviceToDevice, sA);
+    vcEventRecord(cdone, sA);           // fires when the copy finishes
+    vcStreamWaitEvent(sB, cdone);       // hold the span until the copy is done
+    vcEventRecord(b1, sB);
+    vcStreamSynchronize(sB);
+    vcStreamSynchronize(sA);
+    vcEventElapsedTime(&ms, b0, b1);
+    if (r == 0 || ms < both) both = ms;
+  }
+
+  void *hCheck = malloc(bytes);
+  vcMemcpy(hCheck, dCpy, bytes, VCMemcpyKind::DeviceToHost);
+  int ok = (memcmp(hCheck, hIn, bytes) == 0);
+
+  const float sum = kOnly + cOnly;
+  const float mx = kOnly > cOnly ? kOnly : cOnly;
+  // How much of the copy hid behind the kernel. 0 = fully serialized (both ==
+  // sum), 1 = fully hidden (both == max).
+  const float hidden = cOnly > 0.0f ? (sum - both) / cOnly : 0.0f;
+  const char *verdict = hidden > 0.6f ? "YES"
+                        : hidden > 0.2f ? "partial"
+                                        : "no";
+  printf("overlap_probe: N=%d iters=%d repeat=%d (best of)\n", N, ITERS, REPEAT);
+  printf("  kernel only : %8.3f ms\n", kOnly);
+  printf("  copy only   : %8.3f ms\n", cOnly);
+  printf("  both (2 str): %8.3f ms\n", both);
+  printf("  sum         : %8.3f ms  (serialized on one engine)\n", sum);
+  printf("  max         : %8.3f ms  (fully overlapped)\n", mx);
+  printf("  overlap     : %s (%+.0f%% of the copy hidden behind the kernel)\n",
+         verdict, hidden * 100.0f);
+  printf("overlap_probe: %s\n", ok ? "PASS" : "FAIL");
+
+  vcStreamDestroy(sA);
+  vcStreamDestroy(sB);
+  vcFree(dIn);
+  vcFree(dIn2);
+  vcFree(dOut);
+  vcFree(dCpy);
+  vcShutdown();
+  free(hIn);
+  free(hCheck);
+  return ok ? 0 : 1;
+}

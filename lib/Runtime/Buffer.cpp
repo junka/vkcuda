@@ -12,6 +12,6 @@
 
 namespace vc {
 // TODO: VkDeviceMemory sub-allocation pool.
-// TODO: dedicated transfer queue + cross-queue semaphores for device-local
-//       memory copies when a separate queue family is available.
+// The dedicated-transfer-queue TODO that used to live here is done: see
+// Runtime::canRouteCopyToTransfer / beginTransferCopy in VCRuntime.cpp.
 } // namespace vc

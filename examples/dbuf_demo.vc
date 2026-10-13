@@ -1,0 +1,187 @@
+// examples/dbuf_demo.vc — double-buffering: overlap H2D staging with compute.
+//
+// The VC runtime routes async copies to a dedicated transfer queue (the Vulkan
+// analogue of CUDA's copy engine) whenever the device exposes a transfer-only
+// queue family — see lib/Runtime/Buffer.cpp's TODO and the routing in
+// VCRuntime.cpp (beginTransferCopy). On such a device, an H2D memcpy on one
+// stream can execute on the copy engine while a kernel on ANOTHER stream runs
+// on the compute engine, so the classic double-buffering pattern (load stage
+// n+1 while computing stage n) hides the copy behind the compute.
+//
+// This demo runs the same pipeline twice and reports both timings:
+//   serial   — every stage does H2D, then compute, then the next stage. The
+//              copy and the kernel never overlap.
+//   dbuf     — a copy stream prefetches stage n+1's input while the compute
+//              stream runs stage n's kernel; a per-stage event orders the two.
+//
+// On a device with NO separate transfer queue (an integrated GPU, e.g. Intel
+// ARL, or llvmpipe) both engines are the same hardware, so the two timings come
+// out close — that is the expected result there, not a failure. The demo only
+// asserts correctness; the timings are informational, and at this small N the
+// ratio is dominated by per-call overhead. `examples/overlap_probe.vc` measures
+// the overlap directly with a compute-heavy kernel; `VC_DEBUG=1` here prints
+// whether the copy engine is actually active on this machine.
+//
+//   vcc examples/dbuf_demo.vc -o build/dbuf_demo && ./build/dbuf_demo
+//   vc  examples/dbuf_demo.vc -emit=full -o build/dbuf_demo_m && ./build/dbuf_demo_m
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include "vc/Runtime/VCRuntime.h"
+
+// A deliberately compute-heavy transform: out[i] = in[i] * 2 + 1, iterated a
+// few times so the kernel costs enough to be worth hiding a copy behind.
+__global__ void scale(float *in, float *out, int n, int iters) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float v = in[i];
+    for (int k = 0; k < iters; k++) v = v * 2.0f + 1.0f;
+    out[i] = v;
+  }
+}
+
+static const int STAGES = 4;   // pipeline depth (one buffer pair per stage)
+static const int N = 16384;    // elements per stage
+static const int BLOCK = 256;
+static const int REPEAT = 5;   // timed runs per mode; the best one is reported
+static int g_fail = 0;
+
+static void check(const char *what, const float *got, const float *expected,
+                  int n) {
+  for (int i = 0; i < n; i++) {
+    if (got[i] != expected[i]) {
+      printf("  %s: mismatch at %d (got %g, want %g)\n", what, i, got[i],
+             expected[i]);
+      g_fail = 1;
+      return;
+    }
+  }
+}
+
+int main() {
+  vcInit();
+
+  const size_t bytes = (size_t)N * sizeof(float);
+  const size_t stageBytes = bytes;
+
+  // Host-side input/output: one slab per stage.
+  float *hIn = (float *)malloc(STAGES * stageBytes);
+  float *hOut = (float *)malloc(STAGES * stageBytes);
+  float *hExpect = (float *)malloc(STAGES * stageBytes);
+  for (int s = 0; s < STAGES; s++) {
+    for (int i = 0; i < N; i++) {
+      float v = (float)(s * N + i) * 0.5f;
+      hIn[s * N + i] = v;
+      float e = v;
+      for (int k = 0; k < 64; k++) e = e * 2.0f + 1.0f;
+      hExpect[s * N + i] = e;
+    }
+  }
+  memset(hOut, 0, STAGES * stageBytes);
+
+  // Device buffers: one pair per stage so a stage can be in flight while the
+  // next one is being loaded.
+  void *dIn[STAGES], *dOut[STAGES];
+  for (int s = 0; s < STAGES; s++) {
+    vcMalloc(&dIn[s], stageBytes);
+    vcMalloc(&dOut[s], stageBytes);
+  }
+
+  VCEventHandle evStart = 0, evEnd = 0, evStage[STAGES];
+  vcEventCreate(&evStart);
+  vcEventCreate(&evEnd);
+  for (int s = 0; s < STAGES; s++) vcEventCreate(&evStage[s]);
+
+  VCStreamHandle serialStream = 0, copyStream = 0, computeStream = 0;
+  vcStreamCreate(&serialStream);
+  vcStreamCreate(&copyStream);
+  vcStreamCreate(&computeStream);
+
+  //--- serial: H2D then compute, stage after stage (no overlap) -------------
+  // Each mode is timed REPEAT times and the best run is reported. This machine
+  // is a shared integrated GPU, so a single run can be descheduled for
+  // milliseconds (observed 8-35 ms for the same work); the minimum is the
+  // closest estimate of the work's real cost and keeps the comparison stable.
+  float serialMs = 0.0f;
+  for (int rep = 0; rep < REPEAT; rep++) {
+    memset(hOut, 0, STAGES * stageBytes);
+    vcEventRecord(evStart, serialStream);
+    for (int s = 0; s < STAGES; s++) {
+      vcMemcpyS(dIn[s], hIn + s * N, stageBytes, VCMemcpyKind::HostToDevice,
+                serialStream);
+      scale<<<N, BLOCK, 0, serialStream>>>(dIn[s], dOut[s], N, 64);
+      vcMemcpyS(hOut + s * N, dOut[s], stageBytes, VCMemcpyKind::DeviceToHost,
+                serialStream);
+    }
+    vcEventRecord(evEnd, serialStream);
+    vcStreamSynchronize(serialStream);
+    float ms = 0.0f;
+    vcEventElapsedTime(&ms, evStart, evEnd);
+    if (rep == 0 || ms < serialMs) serialMs = ms;
+  }
+  check("serial", hOut, hExpect, STAGES * N);
+
+  //--- double-buffered: prefetch stage n+1 while computing stage n ----------
+  float dbufMs = 0.0f;
+  for (int rep = 0; rep < REPEAT; rep++) {
+    memset(hOut, 0, STAGES * stageBytes);
+
+    vcEventRecord(evStart, computeStream);
+    // Prime the pipeline: load stage 0 and mark it ready.
+    vcMemcpyS(dIn[0], hIn, stageBytes, VCMemcpyKind::HostToDevice, copyStream);
+    vcEventRecord(evStage[0], copyStream);
+    for (int s = 0; s < STAGES; s++) {
+      // Prefetch the NEXT stage's input while this stage's kernel runs. The
+      // H2D is issued on copyStream, so on a device with a copy engine it runs
+      // on the transfer queue, concurrently with the kernel below.
+      if (s + 1 < STAGES) {
+        vcMemcpyS(dIn[s + 1], hIn + (s + 1) * N, stageBytes,
+                  VCMemcpyKind::HostToDevice, copyStream);
+        vcEventRecord(evStage[s + 1], copyStream);
+      }
+      // This stage's kernel waits only for THIS stage's H2D, not the prefetch.
+      vcStreamWaitEvent(computeStream, evStage[s]);
+      scale<<<N, BLOCK, 0, computeStream>>>(dIn[s], dOut[s], N, 64);
+      vcMemcpyS(hOut + s * N, dOut[s], stageBytes, VCMemcpyKind::DeviceToHost,
+                computeStream);
+    }
+    vcEventRecord(evEnd, computeStream);
+    vcStreamSynchronize(computeStream);
+    vcStreamSynchronize(copyStream);
+    float ms = 0.0f;
+    vcEventElapsedTime(&ms, evStart, evEnd);
+    if (rep == 0 || ms < dbufMs) dbufMs = ms;
+  }
+  check("dbuf", hOut, hExpect, STAGES * N);
+
+  printf("dbuf_demo: stages=%d N=%d repeat=%d (best of)\n", STAGES, N, REPEAT);
+  printf("  serial : %8.3f ms\n", serialMs);
+  printf("  dbuf   : %8.3f ms\n", dbufMs);
+  if (serialMs > 0.0f) {
+    printf("  speedup: %8.2fx\n", serialMs / dbufMs);
+    // Informational only. The two engines are the same hardware unless the
+    // device exposes a dedicated transfer queue (see `VC_DEBUG=1`); on one
+    // shared engine the ratio hovers near 1.0x, and a clear win (>1.1x) is the
+    // signature of real copy/compute overlap. Reported per-run, so it varies.
+    printf("  (run VC_DEBUG=1 to see whether a copy engine is active here)\n");
+  }
+  printf("dbuf_demo: %s\n", g_fail ? "FAIL" : "PASS");
+
+  for (int s = 0; s < STAGES; s++) {
+    vcFree(dIn[s]);
+    vcFree(dOut[s]);
+    vcEventDestroy(evStage[s]);
+  }
+  vcEventDestroy(evStart);
+  vcEventDestroy(evEnd);
+  vcStreamDestroy(serialStream);
+  vcStreamDestroy(copyStream);
+  vcStreamDestroy(computeStream);
+  vcShutdown();
+  free(hIn);
+  free(hOut);
+  free(hExpect);
+  return g_fail ? 1 : 0;
+}

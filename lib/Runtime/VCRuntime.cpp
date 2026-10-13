@@ -70,7 +70,9 @@ debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
 
 // Forward declarations: enumerateDevices (called from init) builds default
 // streams before the static definitions below.
-static bool initStream(VulkanDevice &dev, VCStream &s, size_t frameRing = 2);
+enum class QueueKind { Compute, Transfer };
+static bool initStream(VulkanDevice &dev, VCStream &s, QueueKind kind,
+                       size_t frameRing = 2);
 static void teardownStream(VulkanDevice &dev, VCStream &s);
 static bool canUseDeviceGroupPeerCopy(const VulkanDevice &dstDevice,
                                       const VulkanDevice &srcDevice,
@@ -89,12 +91,38 @@ static uint32_t selectComputeQueueFamily(VkPhysicalDevice physical) {
   return UINT32_MAX;
 }
 
+// Look for a hardware copy engine: a queue family that can do TRANSFER but is
+// neither GRAPHICS nor COMPUTE, and is a different family than the compute one.
+// Such a family runs independently of the compute queue, which is what lets an
+// async copy overlap a running kernel (the CUDA copy-engine setup). Discrete
+// GPUs commonly expose one; integrated GPUs (and llvmpipe) usually do not, in
+// which case this returns UINT32_MAX and every copy stays on the compute queue
+// (the pre-feature path, byte for byte).
+static uint32_t selectTransferQueueFamily(VkPhysicalDevice physical,
+                                          uint32_t computeFamily) {
+  uint32_t qf = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(physical, &qf, nullptr);
+  std::vector<VkQueueFamilyProperties> props(qf);
+  vkGetPhysicalDeviceQueueFamilyProperties(physical, &qf, props.data());
+  for (uint32_t i = 0; i < qf; ++i) {
+    const VkQueueFlags f = props[i].queueFlags;
+    if (!(f & VK_QUEUE_TRANSFER_BIT)) continue;
+    if (f & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) continue;
+    if (i == computeFamily) continue;
+    if (props[i].queueCount == 0) continue;
+    return i;
+  }
+  return UINT32_MAX;
+}
+
 static void fillPhysicalDeviceInfo(VulkanDevice &vd, VkInstance instance,
                                    VkPhysicalDevice physical,
                                    uint32_t queueFamily) {
   vd.instance = instance;
   vd.physical = physical;
   vd.computeQueueFamily = queueFamily;
+  vd.transferQueueFamily = selectTransferQueueFamily(physical, queueFamily);
+  vd.hasDedicatedTransferQueue = vd.transferQueueFamily != UINT32_MAX;
   vkGetPhysicalDeviceMemoryProperties(physical, &vd.memProps);
   VkPhysicalDeviceSubgroupProperties sub{};
   sub.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
@@ -125,6 +153,9 @@ Runtime::~Runtime() {
   for (auto &d : devices_) {
     if (!d) continue;
     vkDeviceWaitIdle(d->device);
+    // The transfer stream owns command pools/buffers and fences on this device,
+    // so it must be torn down before the device handle goes away.
+    if (d->transferStream) teardownStream(*d, *d->transferStream);
     if (d->ownsDevice)
       vkDestroyDevice(d->device, nullptr);
   }
@@ -357,7 +388,7 @@ bool Runtime::enumerateDevices(VkInstance instance) {
         fillPhysicalDeviceInfo(*vd, instance, members[i], queueFamilies[i]);
         if (!setupLogicalDevice(*vd)) continue;
         vd->defaultStream = std::make_unique<VCStream>();
-        if (!initStream(*vd, *vd->defaultStream)) continue;
+        if (!initStream(*vd, *vd->defaultStream, QueueKind::Compute)) continue;
         vd->defaultStream->deviceIdx = (int)devices_.size();
         VkPipelineCacheCreateInfo pci{};
         pci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
@@ -411,12 +442,33 @@ bool Runtime::enumerateDevices(VkInstance instance) {
 
     for (auto &vd : groupDevices) {
       vd->defaultStream = std::make_unique<VCStream>();
-      if (!initStream(*vd, *vd->defaultStream)) continue;
+      if (!initStream(*vd, *vd->defaultStream, QueueKind::Compute)) continue;
       vd->defaultStream->deviceIdx = (int)devices_.size();
       VkPipelineCacheCreateInfo pci{};
       pci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
       vkCreatePipelineCache(vd->device, &pci, nullptr, &vd->pipelineCache);
       devices_.push_back(std::move(vd));
+    }
+  }
+  // VC_DEBUG=1 reports whether async-copy routing to a dedicated transfer queue
+  // is active, so that "routing is off on this machine" is distinguishable
+  // between a device with no transfer-only family and one where the caller
+  // forced the compute-queue path with VC_DISABLE_TRANSFER_QUEUE=1.
+  const char *dbg = std::getenv("VC_DEBUG");
+  if (dbg && dbg[0] != '0') {
+    const char *off = std::getenv("VC_DISABLE_TRANSFER_QUEUE");
+    const bool disabled = off && off[0] != '0';
+    for (size_t i = 0; i < devices_.size(); ++i) {
+      const VulkanDevice &d = *devices_[i];
+      const bool capable = d.transferQueueFamily != UINT32_MAX;
+      std::fprintf(stderr,
+                   "[vc] device %zu: dedicated transfer queue = %s\n", i,
+                   d.hasDedicatedTransferQueue && !disabled
+                       ? "yes (copy engine active)"
+                       : capable ? (disabled ? "no (available, disabled by "
+                                               "VC_DISABLE_TRANSFER_QUEUE)"
+                                             : "no (routing failed to enable)")
+                                 : "no (copies share compute queue)");
     }
   }
   return !devices_.empty();
@@ -550,6 +602,25 @@ bool Runtime::setupLogicalDevice(
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qi;
 
+  // Request a second queue on the dedicated transfer family so async copies can
+  // run on the copy engine concurrently with compute. Skipped for device groups
+  // (all members share the owner's single compute queue) and when the device has
+  // no separate transfer family.
+  float transferPrio = 1.0f;
+  VkDeviceQueueCreateInfo tqi{};
+  VkDeviceQueueCreateInfo qcis[2];
+  const bool wantTransferQueue = vd.hasDedicatedTransferQueue && !useDeviceGroup;
+  if (wantTransferQueue) {
+    tqi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    tqi.queueFamilyIndex = vd.transferQueueFamily;
+    tqi.queueCount = 1;
+    tqi.pQueuePriorities = &transferPrio;
+    qcis[0] = qi;
+    qcis[1] = tqi;
+    dci.queueCreateInfoCount = 2;
+    dci.pQueueCreateInfos = qcis;
+  }
+
   // Device extensions. When kernel printf is on, enable
   // VK_KHR_shader_non_semantic_info so the validation layer recognizes the
   // NonSemantic.DebugPrintf extended instruction set the shaders emit. It is
@@ -618,6 +689,8 @@ bool Runtime::setupLogicalDevice(
     return false;
   }
   vkGetDeviceQueue(vd.device, vd.computeQueueFamily, 0, &vd.computeQueue);
+  if (wantTransferQueue)
+    vkGetDeviceQueue(vd.device, vd.transferQueueFamily, 0, &vd.transferQueue);
   return true;
 }
 
@@ -668,6 +741,7 @@ VCError Runtime::shutdown() {
   for (auto &d : devices_) {
     if (!d) continue;
     if (d->defaultStream) teardownStream(*d, *d->defaultStream);
+    if (d->transferStream) teardownStream(*d, *d->transferStream);
     if (d->pipelineCache) vkDestroyPipelineCache(d->device, d->pipelineCache, nullptr);
     if (d->ownsDevice)
       vkDestroyDevice(d->device, nullptr);
@@ -689,10 +763,16 @@ VCError Runtime::shutdown() {
   return VCError::Success;
 }
 
-static bool initStream(VulkanDevice &dev, VCStream &s,
+// Which queue an execution stream is bound to (QueueKind is declared at the top
+// of the file). Compute streams drive kernels and, on a device with a copy
+// engine, the compute side of a bridged copy; transfer streams only ever carry
+// vkCmdCopyBuffer / vkCmdFillBuffer work.
+static bool initStream(VulkanDevice &dev, VCStream &s, QueueKind kind,
                        size_t frameRing) {
-  s.queue = dev.computeQueue;
-  s.queueFamily = dev.computeQueueFamily;
+  s.isTransfer = (kind == QueueKind::Transfer);
+  s.queue = s.isTransfer ? dev.transferQueue : dev.computeQueue;
+  s.queueFamily =
+      s.isTransfer ? dev.transferQueueFamily : dev.computeQueueFamily;
   s.frames.resize(frameRing);
   s.frameIdx = 0;
 
@@ -770,6 +850,11 @@ static void teardownStream(VulkanDevice &dev, VCStream &s) {
     vkFreeCommandBuffers(dev.device, s.commandPool,
                          static_cast<uint32_t>(cbs.size()), cbs.data());
   if (s.commandPool) vkDestroyCommandPool(dev.device, s.commandPool, nullptr);
+  // Cross-queue bridge semaphores, if this stream ever routed a copy.
+  if (s.toCopy) vkDestroySemaphore(dev.device, s.toCopy, nullptr);
+  if (s.fromCopy) vkDestroySemaphore(dev.device, s.fromCopy, nullptr);
+  s.toCopy = s.fromCopy = VK_NULL_HANDLE;
+  s.copyGateInited = false;
 }
 
 static bool shouldCacheStaging(const VCBuffer &buf) {
@@ -812,7 +897,8 @@ VCStream &Runtime::resolveStream(VCStreamHandle h) {
 VCError Runtime::createStream(VCStreamHandle *out) {
   if (!init_ || !out) return VCError::InitializationError;
   auto s = std::make_unique<VCStream>();
-  if (!initStream(device(), *s)) return VCError::InitializationError;
+  if (!initStream(device(), *s, QueueKind::Compute))
+    return VCError::InitializationError;
   s->deviceIdx = currentDeviceIdx_;
   *out = reinterpret_cast<VCStreamHandle>(s.get());
   streams_.push_back(std::move(s));
@@ -860,6 +946,20 @@ VCError Runtime::streamSynchronize(VCStream &s) {
   }
   // Now every fence is signaled: deliver all deferred D2H readbacks so the
   // caller can read the host destinations immediately after sync returns.
+  VulkanDevice &vd = *devices_[s.deviceIdx];
+  // Async copies may have been routed to the dedicated transfer queue (see
+  // beginTransferCopy). Their frames live on vd.transferStream, not on `s`, so
+  // wait those too and deliver the readbacks they own — otherwise a D2H copy
+  // routed to the copy engine would never surface its staging data.
+  if (s.usedTransfer && vd.transferStream) {
+    VCStream &ts = *vd.transferStream;
+    for (size_t i = 0; i < ts.frames.size(); ++i) {
+      if (vkWaitForFences(dev, 1, &ts.frames[i].fence, VK_TRUE,
+                          UINT64_MAX) != VK_SUCCESS)
+        return VCError::Unknown;
+    }
+    drainReadyReadbacks(vd, ts);
+  }
   drainReadyReadbacks(*devices_[s.deviceIdx], s);
   // Dispatch any stream-ordered host callbacks (vcLaunchHostFunc) whose
   // semaphore signaled with the stream's submissions — they are due now.
@@ -1017,9 +1117,123 @@ void Runtime::endFrame(VCStream &s) {
   s.frameIdx = (s.frameIdx + 1) % s.frames.size();
 }
 
+//----------------------------------------------------------------------------
+// Dedicated transfer queue (copy engine) routing
+//----------------------------------------------------------------------------
+
+bool Runtime::canRouteCopyToTransfer(const VCStream &s) const {
+  if (s.captureTarget) return false;         // recorded into a secondary cb
+  if (s.isTransfer) return false;            // already the transfer stream
+  // Automatic: a device that exposes a transfer-only queue family gets its
+  // async copies routed there with no caller involvement, which is the point of
+  // a copy engine. On a device without one (integrated GPUs, llvmpipe) this is
+  // false and every copy stays on the compute queue -- the pre-feature path.
+  //
+  // NOTE: the RTX 4000 Ada on b3 exposes a transfer-only family, yet routing
+  // there measured ~3x SLOWER for sustained D2D (0.45 -> 1.45 ms/copy for 64
+  // MB), and a same-machine probe found two kernels on two streams fully
+  // serialized (ratio 2.05x), so there is no compute gap for the copy engine to
+  // overlap with. That machine was busy during the run, so treat the ratio as
+  // indicative rather than definitive -- the feature is verified to route and to
+  // be correct there, not verified to be faster. VC_DISABLE_TRANSFER_QUEUE=1
+  // forces the compute-queue path on any device when routing turns out to hurt.
+  const char *off = std::getenv("VC_DISABLE_TRANSFER_QUEUE");
+  if (off && off[0] != '0') return false;
+  const VulkanDevice &vd = *devices_[s.deviceIdx];
+  if (!vd.hasDedicatedTransferQueue) return false;
+  if (!vd.timelineSemaphore) return false;   // bridge needs timeline semaphores
+  return true;
+}
+
+VCStream *Runtime::ensureTransferStream(VulkanDevice &vd) {
+  if (!vd.hasDedicatedTransferQueue) return nullptr;
+  if (!vd.transferStream) {
+    auto ts = std::make_unique<VCStream>();
+    if (!initStream(vd, *ts, QueueKind::Transfer))
+      return nullptr;
+    // The transfer stream belongs to the device that owns the buffers it
+    // touches; deviceIdx is the index of that device (transferQueue is only
+    // created on the owner of a logical device).
+    ts->deviceIdx = vd.defaultStream ? vd.defaultStream->deviceIdx : 0;
+    vd.transferStream = std::move(ts);
+  }
+  return vd.transferStream.get();
+}
+
+bool Runtime::ensureCopyBridge(VCStream &s) {
+  if (s.copyGateInited) return true;
+  VulkanDevice &vd = *devices_[s.deviceIdx];
+  if (!vd.timelineSemaphore) return false;
+  VkSemaphoreTypeCreateInfo tci{};
+  tci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+  tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  tci.initialValue = 0;
+  VkSemaphoreCreateInfo sci{};
+  sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  sci.pNext = &tci;
+  if (vkCreateSemaphore(vd.device, &sci, nullptr, &s.toCopy) != VK_SUCCESS)
+    return false;
+  if (vkCreateSemaphore(vd.device, &sci, nullptr, &s.fromCopy) != VK_SUCCESS) {
+    vkDestroySemaphore(vd.device, s.toCopy, nullptr);
+    s.toCopy = VK_NULL_HANDLE;
+    return false;
+  }
+  s.toCopyVal = 0;
+  s.fromCopyVal = 0;
+  s.copyGateInited = true;
+  // VC_DEBUG=1 says so on the first copy a stream routes to the copy engine; a
+  // device-wide "copy engine active" line alone does not prove a given copy
+  // took the routed branch (the routing can still decline per stream).
+  const char *dbg = std::getenv("VC_DEBUG");
+  if (dbg && dbg[0] != '0')
+    std::fprintf(stderr,
+                 "[vc] stream %p: async copies route to the transfer queue\n",
+                 (void *)&s);
+  return true;
+}
+
+bool Runtime::beginTransferCopy(VCStream &computeStream, VCStream **transfer,
+                                VkCommandBuffer *cb, size_t *submitIdx) {
+  *transfer = nullptr;
+  if (!canRouteCopyToTransfer(computeStream)) return false;
+  VulkanDevice &vd = *devices_[computeStream.deviceIdx];
+  VCStream *ts = ensureTransferStream(vd);
+  if (!ts) return false;
+  if (!ensureCopyBridge(computeStream)) return false;
+
+  // compute -> transfer: bump toCopy and signal it from the compute queue. The
+  // submitted command buffer is empty, but the timeline signal is ordered after
+  // everything already queued on the stream, so the copy engine only starts
+  // once the stream's prior writes (e.g. a fill or an earlier kernel) are done.
+  computeStream.toCopyVal++;
+  computeStream.pendingSignals.push_back({computeStream.toCopy,
+                                          computeStream.toCopyVal});
+  beginFrame(computeStream);
+  endFrame(computeStream);
+
+  // transfer side: wait on that value, then run the copy.
+  ts->pendingWaits.push_back({computeStream.toCopy, computeStream.toCopyVal});
+  *submitIdx = ts->frameIdx;
+  *cb = beginFrame(*ts);
+  *transfer = ts;
+  return true;
+}
+
+void Runtime::endTransferCopy(VCStream &computeStream, VCStream &transfer) {
+  // transfer -> compute: the transfer stream signals fromCopy after the copy,
+  // and the compute stream waits on it, so a later kernel on the same stream
+  // sees the copied data (cudaMemcpyAsync stream ordering).
+  computeStream.fromCopyVal++;
+  transfer.pendingSignals.push_back({computeStream.fromCopy,
+                                     computeStream.fromCopyVal});
+  endFrame(transfer);
+  computeStream.pendingWaits.push_back({computeStream.fromCopy,
+                                        computeStream.fromCopyVal});
+  computeStream.usedTransfer = true;
+}
+
 VkDescriptorSet Runtime::allocFrameDescriptorSet(VCStream &s,
-                                                 VkDescriptorSetLayout layout) {
-  StreamFrame &f = s.frames[s.frameIdx];
+                                                 VkDescriptorSetLayout layout) {  StreamFrame &f = s.frames[s.frameIdx];
   VkDescriptorSetAllocateInfo ai{};
   ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
   ai.descriptorPool = f.descriptorPool;
@@ -1049,7 +1263,29 @@ uint32_t Runtime::findMemoryTypeOn(const VulkanDevice &vd, uint32_t reqBits,
   return UINT32_MAX;
 }
 
-static VkBuffer createBuffer(VkDevice dev, size_t bytes) {
+// Fill a resource's sharing mode + family list. On a device with a dedicated
+// transfer queue, buffers/images are touched by two queue families (compute and
+// transfer), so they must be CONCURRENT across both — that is what lets the
+// copy engine address the same memory the compute queue wrote, with the
+// timeline-semaphore bridge providing the cross-queue memory dependency. No
+// ownership-transfer barriers are needed. On every other device the resource
+// stays EXCLUSIVE (single family) exactly as before.
+//
+// `indices` must have room for 2 entries and must outlive the create call.
+static void fillSharing(const VulkanDevice &vd, VkSharingMode &mode,
+                        uint32_t &count, uint32_t *indices) {
+  if (vd.hasDedicatedTransferQueue) {
+    mode = VK_SHARING_MODE_CONCURRENT;
+    indices[0] = vd.computeQueueFamily;
+    indices[1] = vd.transferQueueFamily;
+    count = 2;
+  } else {
+    mode = VK_SHARING_MODE_EXCLUSIVE;
+    count = 0;
+  }
+}
+
+static VkBuffer createBuffer(const VulkanDevice &vd, size_t bytes) {
   VkBufferCreateInfo bci{};
   bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
   bci.size = bytes;
@@ -1057,9 +1293,11 @@ static VkBuffer createBuffer(VkDevice dev, size_t bytes) {
               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
               VK_BUFFER_USAGE_TRANSFER_DST_BIT |
               VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
-  bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  uint32_t sharingFamilies[2];
+  fillSharing(vd, bci.sharingMode, bci.queueFamilyIndexCount, sharingFamilies);
+  bci.pQueueFamilyIndices = sharingFamilies;
   VkBuffer buf = VK_NULL_HANDLE;
-  vkCreateBuffer(dev, &bci, nullptr, &buf);
+  vkCreateBuffer(vd.device, &bci, nullptr, &buf);
   return buf;
 }
 
@@ -1107,7 +1345,7 @@ VCError Runtime::mallocBuffer(size_t bytes, VCBuffer &out) {
   VulkanDevice &vd = device();
   out.deviceIdx = currentDeviceIdx_;
   out.size = bytes;
-  out.buffer = createBuffer(vd.device, bytes);
+  out.buffer = createBuffer(vd, bytes);
   if (!out.buffer) return VCError::OutOfMemory;
 
   VkMemoryRequirements reqs;
@@ -1154,7 +1392,7 @@ VCError Runtime::mallocHostBufferOn(int deviceIdx, size_t bytes,
   VulkanDevice &vd = *devices_[deviceIdx];
   out.deviceIdx = deviceIdx;
   out.size = bytes;
-  out.buffer = createBuffer(vd.device, bytes);
+  out.buffer = createBuffer(vd, bytes);
   if (!out.buffer) return VCError::OutOfMemory;
 
   VkMemoryRequirements reqs;
@@ -1199,7 +1437,7 @@ VCError Runtime::mallocManagedBuffer(size_t bytes, VCBuffer &out) {
   VulkanDevice &vd = *devices_[currentDeviceIdx_];
   out.deviceIdx = currentDeviceIdx_;
   out.size = bytes;
-  out.buffer = createBuffer(vd.device, bytes);
+  out.buffer = createBuffer(vd, bytes);
   if (!out.buffer) return VCError::OutOfMemory;
 
   VkMemoryRequirements reqs;
@@ -1343,7 +1581,9 @@ VCError Runtime::createImage(uint32_t w, uint32_t h, uint32_t depth,
   ici.usage = VK_IMAGE_USAGE_STORAGE_BIT |    // imageLoad/imageStore
               VK_IMAGE_USAGE_TRANSFER_DST_BIT | // vcMemcpyToImage
               VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // vcMemcpyFromImage
-  ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  uint32_t sharingFamilies[2];
+  fillSharing(vd, ici.sharingMode, ici.queueFamilyIndexCount, sharingFamilies);
+  ici.pQueueFamilyIndices = sharingFamilies;
   ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (vkCreateImage(vd.device, &ici, nullptr, &out.image) != VK_SUCCESS)
     return VCError::OutOfMemory;
@@ -1625,6 +1865,17 @@ VCError Runtime::memsetBufferAsync(VCBuffer &buf, int value, size_t bytes,
                          0, 1, &mb, 0, nullptr, 0, nullptr);
     return VCError::Success;
   }
+  // Route to the copy engine when available: a fill is pure transfer work, so
+  // it runs on the copy engine and overlaps any compute already queued on this
+  // stream. The fill itself is the only work: begin/endTransferCopy bracket it.
+  VCStream *ts = nullptr;
+  VkCommandBuffer tcb = VK_NULL_HANDLE;
+  size_t tIdx = 0;
+  if (beginTransferCopy(s, &ts, &tcb, &tIdx)) {
+    vkCmdFillBuffer(tcb, buf.buffer, 0, bytes, fill);
+    endTransferCopy(s, *ts);
+    return VCError::Success;
+  }
   VkCommandBuffer cb = beginFrame(s);
   vkCmdFillBuffer(cb, buf.buffer, 0, bytes, fill);
   endFrame(s);
@@ -1695,6 +1946,15 @@ VCError Runtime::copy2DAsync(VCBuffer &dst, size_t dpitch, const VCBuffer &src,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 1, &mb, 0, nullptr, 0, nullptr);
+    return VCError::Success;
+  }
+  VCStream *ts = nullptr;
+  VkCommandBuffer tcb = VK_NULL_HANDLE;
+  size_t tIdx = 0;
+  if (beginTransferCopy(s, &ts, &tcb, &tIdx)) {
+    vkCmdCopyBuffer(tcb, src.buffer, dst.buffer,
+                    static_cast<uint32_t>(height), regions.data());
+    endTransferCopy(s, *ts);
     return VCError::Success;
   }
   VkCommandBuffer cb = beginFrame(s);
@@ -1773,6 +2033,18 @@ VCError Runtime::copyDeviceToDevice(VCBuffer &dst, const VCBuffer &src,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 1, &mb, 0, nullptr, 0, nullptr);
+    return VCError::Success;
+  }
+  // Route to the copy engine when available (D2D copies are pure transfer
+  // work). Buffers are CONCURRENT-shared across the two families, so the copy
+  // engine can address both without an ownership transfer.
+  VCStream *ts = nullptr;
+  VkCommandBuffer tcb = VK_NULL_HANDLE;
+  size_t tIdx = 0;
+  if (beginTransferCopy(s, &ts, &tcb, &tIdx)) {
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(tcb, src.buffer, dst.buffer, 1, &region);
+    endTransferCopy(s, *ts);
     return VCError::Success;
   }
   VkCommandBuffer cb = beginFrame(s);
@@ -1865,6 +2137,18 @@ VCError Runtime::copyHostToDeviceAsync(VCBuffer &dst, const void *hostSrc,
   // Snapshot the host source NOW so the caller can overwrite it immediately.
   std::memcpy(staging->mapped,
               resolveHostAccess(const_cast<void *>(hostSrc)), bytes);
+  // Route the device copy to the copy engine when one is available: it then
+  // overlaps whatever compute work this stream still has queued.
+  VCStream *ts = nullptr;
+  VkCommandBuffer tcb = VK_NULL_HANDLE;
+  size_t tIdx = 0;
+  if (beginTransferCopy(s, &ts, &tcb, &tIdx)) {
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(tcb, staging->buffer, dst.buffer, 1, &region);
+    ts->frames[tIdx].stagingBuffers.push_back(std::move(staging));
+    endTransferCopy(s, *ts);
+    return VCError::Success;
+  }
   // Record which frame we submit into so we can attach staging to it. endFrame
   // advances frameIdx, so capture the index before calling it.
   size_t submitIdx = s.frameIdx;
@@ -1900,6 +2184,22 @@ VCError Runtime::copyDeviceToHostAsync(void *hostDst, const VCBuffer &src,
     if (mallocHostBufferOn(s.deviceIdx, bytes, *staging) != VCError::Success)
       return VCError::OutOfMemory;
   }
+  // Route to the copy engine when available. Both the staging buffer and the
+  // deferred readback ride the transfer stream's frame: the readback is
+  // delivered by drainReadyReadbacks once the copy has executed, which
+  // streamSynchronize(s) arranges for (see usedTransfer).
+  VCStream *ts = nullptr;
+  VkCommandBuffer tcb = VK_NULL_HANDLE;
+  size_t tIdx = 0;
+  if (beginTransferCopy(s, &ts, &tcb, &tIdx)) {
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(tcb, src.buffer, staging->buffer, 1, &region);
+    VCBuffer *raw = staging.get();
+    ts->frames[tIdx].d2hReadbacks.push_back({hostDst, raw, bytes});
+    ts->frames[tIdx].stagingBuffers.push_back(std::move(staging));
+    endTransferCopy(s, *ts);
+    return VCError::Success;
+  }
   size_t submitIdx = s.frameIdx;
   VkCommandBuffer cb = beginFrame(s);
   VkBufferCopy region{0, 0, bytes};
@@ -1921,6 +2221,10 @@ VCError Runtime::synchronize() {
   for (auto &d : devices_)
     if (d && d->defaultStream) drainReadyReadbacks(*d, *d->defaultStream);
   for (auto &s : streams_) if (s) drainReadyReadbacks(*devices_[s->deviceIdx], *s);
+  // Copies routed to a dedicated transfer queue left their D2H readbacks on the
+  // transfer stream's frames; the device is idle, so deliver those too.
+  for (auto &d : devices_)
+    if (d && d->transferStream) drainReadyReadbacks(*d, *d->transferStream);
   // The device is idle: every deferred free is now safe to reclaim.
   drainPendingFrees();
   return VCError::Success;

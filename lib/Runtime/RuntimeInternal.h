@@ -37,6 +37,17 @@ struct VulkanDevice {
   VkDevice device = VK_NULL_HANDLE;
   uint32_t computeQueueFamily = 0;
   VkQueue computeQueue = VK_NULL_HANDLE;
+  // A queue family that supports TRANSFER but is NOT the compute family (no
+  // GRAPHICS/COMPUTE bit). When present this is the hardware copy engine: async
+  // copies routed to it can run concurrently with compute. UINT32_MAX when the
+  // device has no dedicated transfer family (e.g. integrated GPUs), in which
+  // case every copy stays on the compute queue and nothing changes.
+  uint32_t transferQueueFamily = UINT32_MAX;
+  VkQueue transferQueue = VK_NULL_HANDLE;
+  bool hasDedicatedTransferQueue = false;
+  // Lazily created on the first async copy that can use the copy engine. Bound
+  // to transferQueue; null when unavailable or never needed.
+  std::unique_ptr<VCStream> transferStream;
   VkCommandPool commandPool = VK_NULL_HANDLE; // backs the default stream
   VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
   VkPipelineCache pipelineCache = VK_NULL_HANDLE;
@@ -158,6 +169,22 @@ struct VCStream {
   // are appended to this graph's secondary command buffer instead of being
   // submitted. Set by vcGraphBeginRecord on the default stream.
   struct VCGraph *captureTarget = nullptr;
+
+  // Which queue family this stream's queue belongs to.
+  bool isTransfer = false; // bound to the device's dedicated transfer queue
+
+  // Cross-queue bridge semaphores, used only by compute streams on a device
+  // with a dedicated transfer queue. Copies go: compute stream signals toCopy
+  // (so the copy engine waits for the stream's earlier work), the copy engine
+  // does the transfer and signals fromCopy, and the compute stream then waits
+  // on fromCopy before its next submission. Both are timeline semaphores, so a
+  // single value counter suffices. Created lazily on the first routed copy.
+  VkSemaphore toCopy = VK_NULL_HANDLE;   uint64_t toCopyVal = 0;
+  VkSemaphore fromCopy = VK_NULL_HANDLE; uint64_t fromCopyVal = 0;
+  bool copyGateInited = false;
+  // Set when this stream has routed at least one copy to the transfer queue;
+  // streamSynchronize must then also drain the transfer stream's frames.
+  bool usedTransfer = false;
 
   // Pending timeline-semaphore operations to attach to the NEXT endFrame
   // submission on this stream. vcStreamWaitEvent pushes a wait here;
@@ -304,6 +331,34 @@ public:
   // endFrame: end recording, submit to the stream's queue with the frame's
   //           fence. Does NOT wait.
   void endFrame(VCStream &s);
+
+  // ---- Dedicated transfer queue (copy engine) routing ----
+  // True when async copies issued on `s` should be routed to the device's
+  // dedicated transfer queue instead of the compute queue. False for graph
+  // capture (copies are recorded into a secondary command buffer), for the
+  // transfer stream itself, and on devices without a separate transfer family.
+  bool canRouteCopyToTransfer(const VCStream &s) const;
+  // Lazily create the device's transfer stream (bound to transferQueue).
+  // Returns null when the device has no dedicated transfer queue.
+  VCStream *ensureTransferStream(VulkanDevice &vd);
+  // Lazily create the timeline semaphores that bridge a compute stream to the
+  // transfer stream. False when timeline semaphores are unavailable.
+  bool ensureCopyBridge(VCStream &s);
+  // Bracket a copy onto the device's transfer queue. On success `*transfer` is
+  // the transfer stream, `*cb` the command buffer to record the copy into, and
+  // `*submitIdx` the transfer-stream frame index to attach staging buffers or
+  // deferred readbacks to. This is the compute->copy half of the bridge: the
+  // compute stream submits an empty command buffer that signals `toCopy`, so
+  // the copy engine waits for everything the stream had queued. Returns false
+  // (with *transfer null) when the copy must stay on the compute queue.
+  bool beginTransferCopy(VCStream &computeStream, VCStream **transfer,
+                         VkCommandBuffer *cb, size_t *submitIdx);
+  // Submit the copy recorded after beginTransferCopy and make the compute
+  // stream wait for it: the transfer stream signals `fromCopy`, and the compute
+  // stream's next submission waits on that value. This is the copy->compute
+  // half of the bridge, and it is what orders a later kernel after a copy on
+  // the same stream (matching cudaMemcpyAsync's stream semantics).
+  void endTransferCopy(VCStream &computeStream, VCStream &transfer);
 
   // Allocate a descriptor set on the current frame's pool for the kernel's
   // set layout. The set is reclaimed when the frame is reset.

@@ -1167,6 +1167,14 @@ private:
     if (kernelFunc && idx < kernelFunc->params.size()) {
       const Type *pt = kernelFunc->params[idx]->type;
       if (pt && pt->getKind() == TypeKind::Image) return false;
+      // The kernel's declared parameter type is authoritative. Falling back to
+      // the host variable's type below only recognises a bare DeclRefExpr, so a
+      // device handle reached through an expression — `dIn[0]`, `ptr[i]`, a
+      // ternary — used to be misclassified as a Scalar. That spilled the handle
+      // into a local and passed its address as push-constant bytes, so the
+      // kernel read a garbage pointer at a descriptor slot: an Intel driver
+      // crash in pipeline creation. Trust the parameter type instead.
+      if (pt && pt->getKind() == TypeKind::Pointer) return true;
     }
     if (!arg || arg->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
       return false;

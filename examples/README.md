@@ -544,6 +544,65 @@ independent.
 
 ---
 
+## overlap_probe — do two streams actually overlap?
+
+**Source:** [`overlap_probe.vc`](overlap_probe.vc)
+
+Three GPU-timed spans, each with its own event pair, best-of-N:
+
+- **kernel only** — one compute-heavy kernel on stream B
+- **copy only** — one device→device `vcMemcpyS` on stream A
+- **both** — the same kernel *and* the same copy issued at once on the two
+  streams. `≈ max` means they overlapped; `≈ sum` means they serialized.
+
+```bash
+./build/tools/vcc/vcc examples/overlap_probe.vc -o build/overlap_probe
+./build/overlap_probe
+# overlap_probe: PASS
+```
+
+Size and iteration count are overridable (`VC_PROBE_N`, `VC_PROBE_ITERS`,
+`VC_PROBE_REPEAT`) so one binary can be swept on the target machine — the
+overlap signal is only readable when the copy-only and kernel-only spans are
+comparable, and the right sizes differ per GPU.
+
+The copy is **device→device** on purpose: an H2D async copy snapshots the host
+source into staging with a blocking `std::memcpy` on the calling thread, which
+serializes it against everything else and hides the overlap. D2D is pure device
+work, so the two spans are compared engine-to-engine.
+
+`VC_DEBUG=1` prints which device has a copy engine and whether this stream's
+copies route to it; `VC_DISABLE_TRANSFER_QUEUE=1` forces the compute-queue path
+for comparison (see [Stream & memcpy semantics](#stream--memcpy-semantics)).
+
+---
+
+## dbuf_demo — double buffering, serial vs pipelined
+
+**Source:** [`dbuf_demo.vc`](dbuf_demo.vc)
+
+Four pipeline stages, each of which must be copied in, computed, and copied out.
+Two schedules are timed and checked against each other:
+
+- **serial** — copy stage *k* in, run it, copy it out, repeat
+- **dbuf** — copy stage *k+1* in while stage *k* computes, on a second stream
+
+```bash
+./build/tools/vcc/vcc examples/dbuf_demo.vc -o build/dbuf_demo
+./build/dbuf_demo
+# dbuf_demo: PASS
+```
+
+`speedup` is `serial / dbuf`. On a device with a dedicated copy engine the
+prefetch has somewhere else to run and the ratio rises above 1; on a
+single-family device (an iGPU, llvmpipe) both schedules share one engine and the
+ratio hovers near 1 — that is the expected result there, not a failure. The demo
+only *asserts* correctness; the timings are informational, and at small N they
+are dominated by per-call overhead. Use `overlap_probe` for a like-for-like
+overlap measurement.
+
+---
+
 ## Stream & memcpy semantics
 
 The runtime mirrors a subset of the CUDA Runtime API semantics:
@@ -569,6 +628,18 @@ The runtime mirrors a subset of the CUDA Runtime API semantics:
   emitted GLSL), not staging buffers; pointer args get consecutive SSBO
   bindings. This is handled jointly by the GLSL backend and the runtime, and
   is transparent to `.vc` source and host code.
+- **A dedicated transfer queue is used when the device has one.** If a queue
+  family supports `TRANSFER` but not `GRAPHICS`/`COMPUTE`, the runtime creates a
+  second queue for it and routes async copies there, so a copy can run on the
+  copy engine while a kernel runs on the compute engine — the Vulkan analogue
+  of CUDA's copy engine. Resources the copy engine may touch are created
+  `CONCURRENT` across the two families, and timeline-semaphore bridges order the
+  copy against the issuing stream, so this is transparent: nothing in `.vc`
+  source or host code changes. **On a device with no such family (most
+  integrated GPUs, llvmpipe) there is no second queue and every copy stays on
+  the compute queue — exactly the old path.** `VC_DEBUG=1` reports which case a
+  machine is in; `VC_DISABLE_TRANSFER_QUEUE=1` forces the compute-queue path on
+  a device that does have a copy engine.
 
 ---
 
