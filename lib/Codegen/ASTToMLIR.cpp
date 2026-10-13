@@ -3355,7 +3355,221 @@ private:
     builder.restoreInsertionPoint(saved);
   }
 
+  // Does `n` (a statement subtree) contain a break, a continue, or an
+  // assignment / increment / decrement to the named variable? Any of those
+  // disqualifies the canonical scf.for lowering: scf.for's induction variable
+  // is immutable, and break/continue need the flag machinery the scf.while
+  // path provides.
+  bool bodyWritesOrBreaks(const ASTNode *n, StringRef name) {
+    if (!n) return false;
+    switch (n->getNodeType()) {
+    case ASTNode::NodeKind::BreakStmt:
+    case ASTNode::NodeKind::ContinueStmt:
+      return true;
+    case ASTNode::NodeKind::CompoundStmt: {
+      for (const auto &st :
+           static_cast<const CompoundStmt *>(n)->statements)
+        if (bodyWritesOrBreaks(st.get(), name))
+          return true;
+      return false;
+    }
+    case ASTNode::NodeKind::DeclStmt: {
+      auto *ds = static_cast<const DeclStmt *>(n);
+      for (VarDecl *d : ds->decls)
+        if (d && d->init && bodyWritesOrBreaks(d->init.get(), name))
+          return true;
+      return false;
+    }
+    case ASTNode::NodeKind::ExprStmt:
+      return bodyWritesOrBreaks(
+          static_cast<const ExprStmt *>(n)->expr.get(), name);
+    case ASTNode::NodeKind::IfStmt: {
+      auto *i = static_cast<const IfStmt *>(n);
+      if (bodyWritesOrBreaks(i->cond.get(), name)) return true;
+      if (bodyWritesOrBreaks(i->thenStmt.get(), name)) return true;
+      if (bodyWritesOrBreaks(i->elseStmt.get(), name)) return true;
+      return false;
+    }
+    case ASTNode::NodeKind::ForStmt: {
+      auto *f = static_cast<const ForStmt *>(n);
+      return bodyWritesOrBreaks(f->init.get(), name) ||
+             bodyWritesOrBreaks(f->cond.get(), name) ||
+             bodyWritesOrBreaks(f->step.get(), name) ||
+             bodyWritesOrBreaks(f->body.get(), name);
+    }
+    case ASTNode::NodeKind::WhileStmt: {
+      auto *w = static_cast<const WhileStmt *>(n);
+      return bodyWritesOrBreaks(w->cond.get(), name) ||
+             bodyWritesOrBreaks(w->body.get(), name);
+    }
+    case ASTNode::NodeKind::DoStmt: {
+      auto *d = static_cast<const DoStmt *>(n);
+      return bodyWritesOrBreaks(d->cond.get(), name) ||
+             bodyWritesOrBreaks(d->body.get(), name);
+    }
+    case ASTNode::NodeKind::ReturnStmt:
+      return bodyWritesOrBreaks(
+          static_cast<const ReturnStmt *>(n)->value.get(), name);
+    case ASTNode::NodeKind::UnaryExpr: {
+      auto *u = static_cast<const UnaryExpr *>(n);
+      if (u->op == UnaryOp::PreInc || u->op == UnaryOp::PostInc ||
+          u->op == UnaryOp::PreDec || u->op == UnaryOp::PostDec) {
+        if (u->operand->getNodeType() == ASTNode::NodeKind::DeclRefExpr &&
+            static_cast<const DeclRefExpr *>(u->operand.get())->name == name)
+          return true;
+      }
+      return bodyWritesOrBreaks(u->operand.get(), name);
+    }
+    case ASTNode::NodeKind::BinaryExpr: {
+      auto *b = static_cast<const BinaryExpr *>(n);
+      // An assignment (incl. compound assigns, which lower as Assign) whose
+      // lhs is the named variable.
+      if (b->op == BinaryOp::Assign &&
+          b->lhs->getNodeType() == ASTNode::NodeKind::DeclRefExpr &&
+          static_cast<const DeclRefExpr *>(b->lhs.get())->name == name)
+        return true;
+      return bodyWritesOrBreaks(b->lhs.get(), name) ||
+             bodyWritesOrBreaks(b->rhs.get(), name);
+    }
+    case ASTNode::NodeKind::CallExpr: {
+      auto *c = static_cast<const CallExpr *>(n);
+      for (const auto &a : c->args)
+        if (bodyWritesOrBreaks(a.get(), name)) return true;
+      return bodyWritesOrBreaks(c->callee.get(), name);
+    }
+    case ASTNode::NodeKind::IndexExpr: {
+      auto *x = static_cast<const IndexExpr *>(n);
+      return bodyWritesOrBreaks(x->base.get(), name) ||
+             bodyWritesOrBreaks(x->index.get(), name);
+    }
+    case ASTNode::NodeKind::ConditionalExpr: {
+      auto *c = static_cast<const ConditionalExpr *>(n);
+      return bodyWritesOrBreaks(c->cond.get(), name) ||
+             bodyWritesOrBreaks(c->thenExpr.get(), name) ||
+             bodyWritesOrBreaks(c->elseExpr.get(), name);
+    }
+    default:
+      return false;
+    }
+  }
+
+  // tryEmitCanonicalFor: for the common canonical shape
+  //   for (int ivar = cStart; ivar < bound; ivar = ivar + cStep) { body }
+  // with no break/continue and no assignment to ivar inside the body, lower
+  // directly to scf.for. See emitFor for the rationale.
+  bool tryEmitCanonicalFor(const ForStmt *s) {
+    Location l = loc(s);
+
+    // --- init: `int ivar = <IntegerLiteral>` ---
+    if (!s->init || s->init->getNodeType() != ASTNode::NodeKind::DeclStmt)
+      return false;
+    auto *ds = static_cast<DeclStmt *>(s->init.get());
+    if (!ds->decl || ds->decls.size() != 1)
+      return false; // multi-declarator init not handled
+    VarDecl *ivar = ds->decl;
+    if (!ivar->type || ivar->type->getKind() != TypeKind::Builtin)
+      return false;
+    if (!ivar->init ||
+        ivar->init->getNodeType() != ASTNode::NodeKind::IntegerLiteral)
+      return false;
+    int64_t cStart = static_cast<IntegerLiteral *>(ivar->init.get())->value;
+
+    // --- cond: `ivar < bound` ---
+    if (!s->cond || s->cond->getNodeType() != ASTNode::NodeKind::BinaryExpr)
+      return false;
+    auto *cond = static_cast<BinaryExpr *>(s->cond.get());
+    if (cond->op != BinaryOp::Lt)
+      return false;
+    if (cond->lhs->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+      return false;
+    if (static_cast<DeclRefExpr *>(cond->lhs.get())->name != ivar->name)
+      return false;
+
+    // --- step: `ivar = ivar + <IntegerLiteral>` ---
+    if (!s->step || s->step->getNodeType() != ASTNode::NodeKind::BinaryExpr)
+      return false;
+    auto *step = static_cast<BinaryExpr *>(s->step.get());
+    if (step->op != BinaryOp::Assign)
+      return false;
+    if (step->lhs->getNodeType() != ASTNode::NodeKind::DeclRefExpr)
+      return false;
+    if (static_cast<DeclRefExpr *>(step->lhs.get())->name != ivar->name)
+      return false;
+    if (step->rhs->getNodeType() != ASTNode::NodeKind::BinaryExpr)
+      return false;
+    auto *stepRhs = static_cast<BinaryExpr *>(step->rhs.get());
+    if (stepRhs->op != BinaryOp::Add)
+      return false;
+    // ivar + const  OR  const + ivar
+    bool lhsIsIvar = (stepRhs->lhs->getNodeType() ==
+                          ASTNode::NodeKind::DeclRefExpr &&
+                      static_cast<DeclRefExpr *>(stepRhs->lhs.get())->name ==
+                          ivar->name);
+    bool rhsIsIvar = (stepRhs->rhs->getNodeType() ==
+                          ASTNode::NodeKind::DeclRefExpr &&
+                      static_cast<DeclRefExpr *>(stepRhs->rhs.get())->name ==
+                          ivar->name);
+    if (lhsIsIvar == rhsIsIvar) // neither or both -> not `ivar + k`
+      return false;
+    const ASTNode *stepConstNode = lhsIsIvar ? stepRhs->rhs.get() : stepRhs->lhs.get();
+    if (stepConstNode->getNodeType() != ASTNode::NodeKind::IntegerLiteral)
+      return false;
+    int64_t cStep = static_cast<const IntegerLiteral *>(stepConstNode)->value;
+    if (cStep <= 0)
+      return false;
+
+    // --- body: no break/continue, no assignment to ivar ---
+    if (bodyWritesOrBreaks(s->body.get(), ivar->name))
+      return false;
+
+    // All checks passed — emit scf.for.
+    localTypes[ivar->name] = ivar->type;
+
+    Value lb = builder.create<arith::ConstantOp>(l, builder.getIndexType(),
+                                                 builder.getIndexAttr(cStart));
+    Value stepVal = builder.create<arith::ConstantOp>(
+        l, builder.getIndexType(), builder.getIndexAttr(cStep));
+    // bound: visitExpr on a DeclRefExpr returns the slot (memref) for a local
+    // like numTiles, or an SSA value for an ivar / param — loadValue handles
+    // both, then toIndexValue casts the i32 result to index for scf.for's ub.
+    Value boundVal = visitExpr(cond->rhs.get());
+    if (!boundVal) { error(s, "canonical for: bound did not lower"); return false; }
+    Value boundIdx = toIndexValue(boundVal, l);
+
+    auto saved = builder.saveInsertionPoint();
+    // scf::ForOp's builder creates the body block pre-terminated with an empty
+    // scf.yield; set the insertion point to the block start so emitted ops
+    // land before that terminator.
+    auto forOp = builder.create<scf::ForOp>(l, lb, boundIdx, stepVal,
+                                            ValueRange{});
+    builder.setInsertionPointToStart(forOp.getBody());
+
+    // Bind ivar's name to its induction variable (as i32, the C type): a
+    // DeclRefExpr(ivar) in the body resolves to this SSA value instead of a
+    // load from a Function alloca. Erase after the loop so the name goes out
+    // of scope (C: `for (int i...)` i is loop-local).
+    Value ivarI32 = builder.create<arith::IndexCastOp>(l, builder.getI32Type(),
+                                                       forOp.getInductionVar());
+    locals[ivar->name] = ivarI32;
+
+    ++loopDepth;
+    ++structuredDepth;
+    if (s->body) visitStmt(s->body.get());
+    --structuredDepth;
+    --loopDepth;
+
+    locals.erase(ivar->name);
+    builder.restoreInsertionPoint(saved);
+    return true;
+  }
+
   void emitFor(const ForStmt *s) {
+    // Canonical shape: `for (int i = c0; i < bound; i = i + c1) { body }`
+    // with no break/continue and no assignment to i in body. Lowers directly
+    // to scf.for, giving i a real SSA induction variable and skipping the two
+    // flag slots + the i Function-alloca the scf.while fallback creates.
+    if (tryEmitCanonicalFor(s))
+      return;
     // for (init; cond; step) lowers to
     //   init;
     //   scf.while { cond && !breakReq } do { body; step }
