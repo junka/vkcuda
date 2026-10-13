@@ -11,8 +11,9 @@ directory and the e2e test corpus). The hand-written examples kept here are
 [`singlefile.vc`](singlefile.vc) — the canonical minimal program — and
 [`flash_attn.vc`](flash_attn.vc) — a worked FlashAttention-2/3 kernel, with
 [`compare_flash_attn.py`](compare_flash_attn.py) cross-checking it against
-PyTorch, and [`matmul_bench.vc`](matmul_bench.vc) — a GPU-timed tiled matmul
-benchmark.
+PyTorch, [`matmul_bench.vc`](matmul_bench.vc) — a GPU-timed tiled matmul
+benchmark, and [`matmul_coopmat_bench.vc`](matmul_coopmat_bench.vc) — the
+same benchmark on the cooperative-matrix (tensor-core) path.
 
 ## Prerequisites
 
@@ -194,6 +195,108 @@ trustworthy:
 The benchmark runs identically on the MLIR backend
 (`vc examples/matmul_bench.vc -emit=full -o build/matmul_bench_mlir`); the two
 backends emit different SPIR-V and can be compared head-to-head this way.
+
+---
+## matmul_coopmat_bench — cooperative-matrix matmul, GPU-timed
+
+**Source:** [`matmul_coopmat_bench.vc`](matmul_coopmat_bench.vc)
+
+The [`matmul_bench`](#matmul_bench--tiled-matmul-gpu-timed) problem solved a
+second way: instead of `__shared__` tiles and per-thread FMAs, the inner
+product runs on the Vulkan **cooperative-matrix** units via the CUDA `wmma::`
+API. Same host harness — same sizes, same GPU-side `vcEvent*` timing, same
+GFLOPS formula — so the two benchmarks are directly comparable.
+
+```bash
+./build-mlir/tools/vc/vc examples/matmul_coopmat_bench.vc -emit=full -o build/mc && ./build/mc
+# matmul_coopmat_bench: 16x16 tile (2x2 of 8x8x16 fp16->fp32), accumulator streamed through C
+#   N= 128    0.2879 ms      14.56 GFLOPS   PASS
+#   N= 256    0.3687 ms      91.00 GFLOPS   PASS
+#   N= 512    0.5248 ms     511.53 GFLOPS   PASS
+#   N=1024    1.4559 ms    1474.98 GFLOPS   PASS
+# matmul_coopmat_bench: PASS
+```
+
+No `vcc` variant: the GLSL backend rejects the `wmma::` namespace
+(`Sema::usesCoopMatrix()`), so this one is MLIR-only by design. It is built by
+a separate `vc`-driven target in `CMakeLists.txt` for the same reason.
+
+| param | value |
+|-------|-------|
+| sizes | 128, 256, 512, 1024 (square, multiple of 16) |
+| tile/block | 16 × 16 output tile per workgroup, 32 threads |
+| MMA shape | 8×8×16, fp16 → fp32 (device-native) |
+| grid | `((N/16)*32) × (N/16)` (element count — x scaled by block size) |
+| args | `A*` `__half`, `B*` `__half`, `C*` `float`, `N` (scalar) |
+| timing | `vcEventRecord`/`vcEventElapsedTime` (GPU-side) |
+
+### Side by side
+
+| N | matmul_bench (SIMT fp32) | matmul_coopmat_bench (wmma fp16) | speedup |
+|------|--------------------------|----------------------------------|---------|
+| 128 | 28.4 GFLOPS (0.147 ms) | 14.6 GFLOPS (0.288 ms) | 0.51× |
+| 256 | 90.1 GFLOPS (0.373 ms) | 91.0 GFLOPS (0.369 ms) | 1.01× |
+| 512 | 250.6 GFLOPS (1.071 ms) | 511.5 GFLOPS (0.525 ms) | 2.0× |
+| 1024 | 331.6 GFLOPS (6.476 ms) | 1475.0 GFLOPS (1.456 ms) | 4.4× |
+
+(Both columns measured through the **MLIR** backend — `vc ... -emit=full` — back to
+back on the same device, best of 5 runs per size, so the comparison is
+like-for-like. Even so these are wall-clock numbers: read them as
+order-of-magnitude ratios, not exact.)
+
+The shape of the curve is the interesting part. At N=128 the coopmat kernel is
+*slower*: the problem is far too small to fill the machine, and it pays fixed
+costs the SIMT kernel does not — a fresh cooperative-matrix pipeline, the
+tile zeroing pass, and 8 fragment loads plus 4 accumulator round-trips per K
+step. Up to N=256 they are roughly even. From N=512 the tensor cores pull
+decisively ahead, and at N=1024 they win ~4.4× while the SIMT kernel gets no
+faster (251 → 332 GFLOPS from 512 to 1024): it walks the same four N×N
+operand row ranges per workgroup at every size, so the miss traffic per
+output grows with N, whereas each coopmat workgroup reads its panels the
+same way regardless.
+
+### What the kernel does
+
+One workgroup is one subgroup (32 threads). It computes a 16× 16 output tile
+as **four** 8×8 accumulator fragments — `8x8x16` is the device-native
+cooperative shape, so a 16× 16 tile is 2× 2 of them. The four MMAs share the
+A/B fragment loads exactly as the SIMT kernel shares `As`/`Bs`:
+
+```
+for k in 0..N step 16:
+    load a0,a1  <- A[rows ..+16][k ..+16]   (2 fragments)
+    load b0,b1  <- B[k ..+16][cols ..+16]   (2 fragments)
+    load c00..c11 <- C[rows ..+16][cols ..+16]
+    mma(c00,a0,b0) mma(c01,a0,b1) mma(c10,a1,b0) mma(c11,a1,b1)
+    store c00..c11 -> C
+```
+
+### Two constraints this kernel is shaped around
+
+- **The accumulator lives in global memory.** CUDA WMMA keeps it in registers
+  across the K loop. Here that would mean threading a `!gpu.mma_matrix` through
+  `scf.while` iter_args across every nested structured region in the loop body.
+  Spilling to per-thread (Function) storage instead is *illegal Vulkan*:
+  `OpCooperativeMatrixStoreKHR`'s pointer must be Workgroup, StorageBuffer or
+  PhysicalStorageBuffer (`VUID-StandaloneSpirv-Pointer-08973`) — `spirv-val`
+  rejects it, and this driver silently drops the store. `__shared__` is not an
+  option either: WMMA load/store take a memref, and `__shared__` lowers to a
+  `spirv.ptr<..., Workgroup>`. So the accumulation is streamed through `C`
+  itself: zero the tile once, then each K step does load-C → mma → store-C.
+  Each workgroup owns a disjoint tile, so there is no race. The extra 8×8 fp32
+  load+store per MMA per K step is the visible price, and the honest cost of
+  register blocking this backend can currently express.
+- **The leading dimension is a compile-time constant.** `leadDimension` is a
+  static `IndexAttr` on the `gpu.subgroup_mma_*` ops, not an operand, so a
+  single kernel cannot take the row stride as a runtime argument. `L` is set to
+  the largest benchmarked N and every size reuses it; tiles only ever address
+  the N×N corner, so the oversize stride costs no traffic.
+
+The correctness check is *exact*: inputs are small integers (exactly
+representable in fp16) and every partial sum stays inside fp32's
+exact-integer range, so each `C[i][j]` is compared for bit equality against a
+`double` reference rather than against a tolerance.
+
 
 ---
 

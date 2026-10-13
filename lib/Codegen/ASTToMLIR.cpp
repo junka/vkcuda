@@ -3555,11 +3555,73 @@ private:
     return notAny; // true = keep executing this iteration
   }
 
+  // True when this statement/expression subtree contains a `wmma::*` intrinsic
+  // call. Such a statement must not be wrapped in the loop-body break/continue
+  // guard: that guard is an scf.if region, and the gpu.mma_matrix SSA value a
+  // load/mma produces inside one region cannot be referenced from the sibling
+  // region holding the next statement (the load -> mma -> store chain spans
+  // several statements). Recognized the same way lowerWmmaCall is dispatched:
+  // a scope-qualified member access on `wmma`.
+  static bool containsWmmaCall(const ASTNode *n) {
+    if (!n) return false;
+    switch (n->getNodeType()) {
+    case ASTNode::NodeKind::CallExpr: {
+      auto *c = static_cast<const CallExpr *>(n);
+      if (c->callee &&
+          c->callee->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+        auto *ma = static_cast<const MemberAccessExpr *>(c->callee.get());
+        if (ma->isScope && ma->base &&
+            ma->base->getNodeType() == ASTNode::NodeKind::DeclRefExpr &&
+            static_cast<const DeclRefExpr *>(ma->base.get())->name == "wmma")
+          return true;
+      }
+      if (containsWmmaCall(c->callee.get())) return true;
+      for (const auto &a : c->args)
+        if (containsWmmaCall(a.get())) return true;
+      return false;
+    }
+    case ASTNode::NodeKind::BinaryExpr: {
+      auto *b = static_cast<const BinaryExpr *>(n);
+      return containsWmmaCall(b->lhs.get()) || containsWmmaCall(b->rhs.get());
+    }
+    case ASTNode::NodeKind::UnaryExpr:
+      return containsWmmaCall(static_cast<const UnaryExpr *>(n)->operand.get());
+    case ASTNode::NodeKind::CommaExpr: {
+      auto *c = static_cast<const CommaExpr *>(n);
+      return containsWmmaCall(c->lhs.get()) || containsWmmaCall(c->rhs.get());
+    }
+    case ASTNode::NodeKind::IndexExpr: {
+      auto *x = static_cast<const IndexExpr *>(n);
+      return containsWmmaCall(x->base.get()) || containsWmmaCall(x->index.get());
+    }
+    case ASTNode::NodeKind::CStyleCastExpr:
+      return containsWmmaCall(static_cast<const CStyleCastExpr *>(n)->sub.get());
+    case ASTNode::NodeKind::ConditionalExpr: {
+      auto *c = static_cast<const ConditionalExpr *>(n);
+      return containsWmmaCall(c->cond.get()) ||
+             containsWmmaCall(c->thenExpr.get()) ||
+             containsWmmaCall(c->elseExpr.get());
+    }
+    case ASTNode::NodeKind::ExprStmt:
+      return containsWmmaCall(static_cast<const ExprStmt *>(n)->expr.get());
+    default:
+      return false;
+    }
+  }
+
   // Emit a statement, guarded by the current loop's break/continue flags so
   // that code after a break/continue is skipped within the same iteration.
   void emitGuarded(ASTNode *n) {
     if (!n) return;
     if (loopDepth == 0 || !guarding) { visitStmt(n); return; }
+    // A wmma statement is emitted unguarded: wrapping it in the scf.if guard
+    // would trap the gpu.mma_matrix SSA value inside that region, where the
+    // next statement's mma/store (a sibling region) cannot reach it
+    // ("operand does not dominate this use"). The trade-off is that a
+    // break/continue earlier in the same iteration no longer suppresses a
+    // wmma statement; the straight-line load -> mma -> store shape this
+    // backend supports never depends on that.
+    if (containsWmmaCall(n)) { visitStmt(n); return; }
     Location l = loc(n);
     Value keep = loopPending(l);
     auto ifOp = builder.create<scf::IfOp>(l, TypeRange{}, keep, /*else=*/false);
@@ -3637,6 +3699,97 @@ private:
     return ty->layout == WmmaLayout::ColMajor;
   }
 
+  // Resolve a wmma source/destination matrix argument to the backing memref
+  // plus the *element* offset of the tile's (0,0) element within it. The
+  // gpu.subgroup_mma_{load,store}_matrix ops take a `Variadic<Index>:$indices`
+  // operand, so a tile other than the one at [0,0] is reachable by passing a
+  // computed index — that is what makes a tiled cooperative-matrix GEMM
+  // expressible (the first tile was the whole story only because the op's
+  // index list was hardcoded to [0,0]).
+  //
+  // Accepted spellings, all of which name a matrix start inside one buffer:
+  //   A              bare SSBO pointer / memref param    -> (A, 0)
+  //   A + k          pointer arithmetic (either operand order)
+  //   p, *p          a derived pointer local (pointerLocalsML)
+  //   p[k], q[k]     subscript of a derived pointer
+  //   &A[k]          address of an indexed element
+  // Returns false when the argument is not a buffer-with-offset expression, in
+  // which case the offset evaluation has already failed and the caller reports
+  // the diagnostic.
+  bool wmmaBufferAndOffset(ASTNode *n, Location l, Value &buf, Value &off) {
+    auto zeroIndex = [&]() {
+      return builder.create<arith::ConstantOp>(l, builder.getIndexType(),
+                                               builder.getIndexAttr(0));
+    };
+    if (!n) return false;
+
+    // `p`, `*p`, `p[k]`, `q[k]` — a derived pointer local already carries a
+    // (base, offset) pair; its single index is exactly the element offset.
+    {
+      Value base;
+      SmallVector<Value, 2> idx;
+      if (pointerLValue(n, base, idx) && idx.size() == 1) {
+        buf = base;
+        off = idx[0];
+        return true;
+      }
+    }
+
+    // `base + k` / `k + base`: recursive, so `A + i * N + j` (chained Adds)
+    // accumulates every term into one offset.
+    if (n->getNodeType() == ASTNode::NodeKind::BinaryExpr) {
+      auto *b = static_cast<BinaryExpr *>(n);
+      if (b->op == BinaryOp::Add) {
+        Value base, lhsOff;
+        if (wmmaBufferAndOffset(b->lhs.get(), l, base, lhsOff)) {
+          Value k = toIndexValue(visitExpr(b->rhs.get()), l);
+          if (!k) return false;
+          buf = base;
+          off = builder.create<arith::AddIOp>(l, lhsOff, k);
+          return true;
+        }
+        if (wmmaBufferAndOffset(b->rhs.get(), l, base, lhsOff)) {
+          Value k = toIndexValue(visitExpr(b->lhs.get()), l);
+          if (!k) return false;
+          buf = base;
+          off = builder.create<arith::AddIOp>(l, lhsOff, k);
+          return true;
+        }
+        return false;
+      }
+      return false;
+    }
+
+    // `&A[k]` — address of an indexed element of a buffer.
+    if (n->getNodeType() == ASTNode::NodeKind::UnaryExpr &&
+        static_cast<UnaryExpr *>(n)->op == UnaryOp::AddrOf) {
+      ASTNode *operand = static_cast<UnaryExpr *>(n)->operand.get();
+      if (operand &&
+          operand->getNodeType() == ASTNode::NodeKind::IndexExpr) {
+        auto *ie = static_cast<IndexExpr *>(operand);
+        Value base = visitExpr(ie->base.get());
+        if (base && base.getType().isa<MemRefType>()) {
+          Value k = toIndexValue(visitExpr(ie->index.get()), l);
+          if (!k) return false;
+          buf = base;
+          off = k;
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // Bare buffer: a pointer/memref expression with no displacement, i.e. the
+    // tile at the buffer's origin.
+    Value v = visitExpr(n);
+    if (v && v.getType().isa<MemRefType>()) {
+      buf = v;
+      off = zeroIndex();
+      return true;
+    }
+    return false;
+  }
+
   // Lower a wmma::* intrinsic call to a gpu.subgroup_mma_* op. `mangled` is
   // `wmma_<intrinsic>`. Returns null (these are statement-form, void).
   Value lowerWmmaCall(CallExpr *c, StringRef mangled, Location l) {
@@ -3654,14 +3807,15 @@ private:
       if (tit == localTypes.end() || !isa<WmmaFragmentType>(tit->second))
         return error(c, "wmma::load_matrix_sync argument 1 must be a fragment");
       auto *fty = cast<WmmaFragmentType>(tit->second);
-      // arg1: the SSBO memref. gpu.subgroup_mma_load_matrix takes the memref
-      // directly plus a 2-element index vector — no manual AccessChain.
-      Value buf = visitExpr(c->args[1].get());
-      if (!buf) return error(c->args[1].get(), "could not evaluate pointer");
-      // The memref must be a contiguous buffer of the fragment's element
-      // type. A bare T* lowers to memref<?xT> which works; index [0,0].
-      Value c0 = builder.create<arith::ConstantOp>(l, builder.getIndexType(),
-                                                    builder.getIndexAttr(0));
+      // arg1: the source buffer *and* the element offset of the tile's origin.
+      // The buffer is the SSBO memref (a bare T* lowers to memref<?xT>); the
+      // offset lets one workgroup pick its own tile out of the operand matrix,
+      // which is what a tiled GEMM needs (`A + row*N + k0`, `&A[k]`,
+      // `p + k`, …). gpu.subgroup_mma_load_matrix takes the memref directly
+      // with the offset as its index operand — no manual AccessChain.
+      Value buf, off;
+      if (!wmmaBufferAndOffset(c->args[1].get(), l, buf, off))
+        return error(c->args[1].get(), "could not evaluate wmma source matrix");
       // arg2: leading dimension (compile-time constant, in elements).
       int64_t ldm = 0;
       if (!evalConstInt(c->args[2].get(), ldm))
@@ -3671,7 +3825,7 @@ private:
       UnitAttr transpose = fragTransposed(fty) ? builder.getUnitAttr()
                                                : UnitAttr();
       auto load = builder.create<gpu::SubgroupMmaLoadMatrixOp>(
-          l, mmaTy, buf, ValueRange{c0, c0},
+          l, mmaTy, buf, ValueRange{off},
           builder.getIndexAttr(ldm), /*transpose=*/transpose);
       writeFragment(ref->name, load.getResult());
       return Value();
@@ -3684,16 +3838,18 @@ private:
       Value frag = fragmentArg(c->args[1].get(), fty, l);
       if (!frag || !fty)
         return error(c, "wmma::store_matrix_sync argument 2 must be an accumulator fragment");
-      Value buf = visitExpr(c->args[0].get());
-      if (!buf) return error(c->args[0].get(), "could not evaluate pointer");
-      Value c0 = builder.create<arith::ConstantOp>(l, builder.getIndexType(),
-                                                    builder.getIndexAttr(0));
+      // arg0: destination buffer + tile-origin element offset (see the load
+      // path: a store to a tile other than the origin is the same problem).
+      Value buf, off;
+      if (!wmmaBufferAndOffset(c->args[0].get(), l, buf, off))
+        return error(c->args[0].get(),
+                     "could not evaluate wmma destination matrix");
       int64_t ldm = 0;
       if (!evalConstInt(c->args[2].get(), ldm))
         return error(c->args[2].get(),
                      "wmma::store_matrix_sync stride must be a constant");
       builder.create<gpu::SubgroupMmaStoreMatrixOp>(
-          l, frag, buf, ValueRange{c0, c0}, builder.getIndexAttr(ldm),
+          l, frag, buf, ValueRange{off}, builder.getIndexAttr(ldm),
           /*transpose=*/UnitAttr());
       return Value();
     }

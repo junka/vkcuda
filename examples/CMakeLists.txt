@@ -39,3 +39,18 @@ foreach(example singlefile flash_attn matmul_bench)
     SOURCES ${example}.vc
     DEPENDS ${CMAKE_BINARY_DIR}/${example})
 endforeach()
+
+# matmul_coopmat_bench is the wmma:: counterpart to matmul_bench: same problem,
+# but the inner product runs on the cooperative-matrix units. It is built by the
+# MLIR driver (`vc`) rather than `vcc`, because the GLSL backend rejects the
+# wmma:: namespace. Kept out of the loop above for exactly that reason.
+add_custom_command(
+  OUTPUT ${CMAKE_BINARY_DIR}/matmul_coopmat_bench
+  COMMAND vc ${CMAKE_CURRENT_SOURCE_DIR}/matmul_coopmat_bench.vc
+          -emit=full -o ${CMAKE_BINARY_DIR}/matmul_coopmat_bench
+  DEPENDS vc ${CMAKE_CURRENT_SOURCE_DIR}/matmul_coopmat_bench.vc
+  COMMENT "vc compiling matmul_coopmat_bench.vc (cooperative-matrix, MLIR backend)"
+  VERBATIM)
+add_custom_target(matmul_coopmat_bench ALL
+  SOURCES matmul_coopmat_bench.vc
+  DEPENDS ${CMAKE_BINARY_DIR}/matmul_coopmat_bench)

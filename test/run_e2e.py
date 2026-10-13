@@ -50,6 +50,9 @@ MLIR_UNSUPPORTED = {
 # the GLSL backend so the suite reports them as skipped, not as build failures.
 GLSL_UNSUPPORTED = {
     "wmma_gemm.vc": "wmma:: tensor-core intrinsics require the MLIR backend",
+    # The cooperative-matrix matmul benchmark (the wmma:: counterpart to
+    # matmul_bench) is MLIR-only for the same reason.
+    "matmul_coopmat_bench.vc": "wmma:: tensor-core intrinsics require the MLIR backend",
     # Sub-array-to-pointer decay (`sumRow(b[i], 3)` with `int *row`): the GLSL
     # backend has no pointer type and rejects this with a clear `#error`. The
     # MLIR backend inlines the callee (binding the pointer param to a sub-array

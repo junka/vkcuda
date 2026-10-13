@@ -210,10 +210,12 @@ The Vulkan runtime implements a CUDA-style host API over Vulkan compute:
   end-to-end test corpus
 - `test/Frontend/`, `test/MLIR/` — FileCheck regression tests (targets
   `vc-check` / `mlir-check`)
-- `examples/` — the hand-written demos meant to be read: `singlefile.vc`, and
+- `examples/` — the hand-written demos meant to be read: `singlefile.vc`,
   `flash_attn.vc` (FlashAttention-2/3) with `compare_flash_attn.py`
   cross-checking it against PyTorch's SDPA kernels (needs torch; the demo
-  dumps tensors with `--dump`)
+  dumps tensors with `--dump`), and `matmul_bench.vc` /
+  `matmul_coopmat_bench.vc` — the same GPU-timed matmul benchmark on the
+  SIMT and cooperative-matrix paths, measured side by side
 - `docs/language-spec.md` — language design notes
 - `docs/plans/` — pre-implementation design plans (all shipped; kept for the
   rationale and the rejected alternatives)

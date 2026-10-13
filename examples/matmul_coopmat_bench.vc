@@ -1,0 +1,235 @@
+// examples/matmul_coopmat_bench.vc — cooperative-matrix (tensor-core) matmul
+// kernel + GPU-timed benchmark, the wmma:: counterpart to matmul_bench.vc.
+//
+// Same shape of problem as matmul_bench (C[n][m] = A[n][k]·B[k][m], square
+// N x N, GPU-side vcEvent* timing, GFLOPS = 2·N³/(ms·1e6)), but the inner
+// product runs on the Vulkan cooperative-matrix units instead of the SIMT
+// ALUs. Run both and compare the GFLOPS columns.
+//
+//   vc examples/matmul_coopmat_bench.vc -emit=full -o build/mc && ./build/mc
+//
+// Requires the MLIR backend (`vc`); the GLSL backend (`vcc`) rejects wmma::.
+//
+// --- How the tile is organized -------------------------------------------
+//
+// One workgroup = one subgroup = 32 threads. Each workgroup computes a 16x16
+// output tile, decomposed into four 8x8 accumulator fragments (c00 c01 c10
+// c11) — the device's native cooperative-matrix shape is 8x8x16 fp16→fp32, so
+// a 16x16 tile is 2x2 such tiles and the four MMAs share the A/B operand
+// loads (register blocking, exactly as the SIMT kernel shares As/Bs through
+// shared memory).
+//
+// The K dimension is walked in 16-wide steps. Each step loads a 8x16 A panel
+// (two 8x8 fragments), a 16x8 B panel (two fragments), runs four
+// mma_sync(A,B,C) ops, and writes the four accumulators back out.
+//
+// --- Why the accumulator lives in global memory --------------------------
+//
+// CUDA WMMA keeps the accumulator in registers ("fragment") across the K
+// loop. That needs the accumulator to be loop-carried, which in this backend
+// would mean threading a !gpu.mma_matrix through scf.while iter_args across
+// every nested structured region in the body. It also cannot be spilled to
+// Function (per-thread local) storage: Vulkan forbids it —
+//   [VUID-StandaloneSpirv-Pointer-08973] OpCooperativeMatrixStoreKHR storage
+//   class ... is not Workgroup, StorageBuffer, or PhysicalStorageBuffer.
+// (spirv-val flags it, and this driver silently drops the store, leaving the
+// destination untouched.) So the only legal accumulator home is a
+// StorageBuffer, and the accumulation is streamed through C itself: the
+// kernel zeroes its tile once, then each K step does load-C → mma → store-C.
+// C is therefore read-modify-written, but each workgroup owns a disjoint tile
+// so there is no race. The cost is one extra 8x8 fp32 load + store per MMA per
+// K step — visible in the GFLOPS below, and the honest price of the
+// register-blocking this backend can currently express.
+//
+// The leading dimension is baked in as the compile-time constant L below:
+// gpu.subgroup_mma_*'s `leadDimension` is a static attribute (not an operand),
+// so a single kernel cannot take it as a runtime argument. L is set to the
+// largest benchmarked N and every size reuses it; the unused columns of each
+// row are never addressed by a tile, so the oversize stride costs no traffic.
+
+#include <cstdio>
+#include <cstdlib>
+#include "vc/Runtime/VCRuntime.h"
+
+// Row stride for A, B and C. Must be >= every N benchmarked. See the note
+// above: only the 16-column tiles we actually compute are ever touched.
+#define L 1024
+
+// C[n][m] = sum_k A[n][k] * B[k][m], one 16x16 output tile per workgroup.
+// A/B are row-major fp16 with row stride L; C is row-major fp32, stride L.
+__global__ void matmulCoopmat(__half *A, __half *B, float *C, int N) {
+  // 8x8x16 fp16→fp32: the Vulkan-native cooperative-matrix shape.
+  wmma::fragment<wmma::matrix_a, 8, 8, 16, half, wmma::row_major> a0;
+  wmma::fragment<wmma::matrix_a, 8, 8, 16, half, wmma::row_major> a1;
+  wmma::fragment<wmma::matrix_b, 8, 8, 16, half, wmma::row_major> b0;
+  wmma::fragment<wmma::matrix_b, 8, 8, 16, half, wmma::row_major> b1;
+  wmma::fragment<wmma::accumulator, 8, 8, 16, float> c00;
+  wmma::fragment<wmma::accumulator, 8, 8, 16, float> c01;
+  wmma::fragment<wmma::accumulator, 8, 8, 16, float> c10;
+  wmma::fragment<wmma::accumulator, 8, 8, 16, float> c11;
+
+  // This workgroup's 16x16 tile origin. blockIdx carries the element count the
+  // host passed divided by the block size (see the launch note below), so it
+  // is already a workgroup index here.
+  int row = blockIdx.y * 16;
+  int col = blockIdx.x * 16;
+
+  // Zero this tile so the first K step's accumulator load reads zeros. Each
+  // thread strides through the tile; __syncthreads below orders it against the
+  // cooperative loads. (The tile is 16x16 = 256 elements over 32 threads.)
+  for (int i = threadIdx.x; i < 256; i = i + 32) {
+    C[row * L + col + (i / 16) * L + (i % 16)] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int k = 0; k < N; k = k + 16) {
+    // A panel: rows [row, row+16) x cols [k, k+16), as two 8x8 fragments
+    // (ldm = L is the row stride of the source matrix).
+    wmma::load_matrix_sync(a0, A + row * L + k, L);
+    wmma::load_matrix_sync(a1, A + (row + 8) * L + k, L);
+    // B panel: rows [k, k+16) x cols [col, col+16).
+    wmma::load_matrix_sync(b0, B + k * L + col, L);
+    wmma::load_matrix_sync(b1, B + k * L + col + 8, L);
+
+    // Stream the accumulators through C: load, accumulate, store.
+    wmma::load_matrix_sync(c00, C + row * L + col, L, wmma::mem_row_major);
+    wmma::load_matrix_sync(c01, C + row * L + col + 8, L, wmma::mem_row_major);
+    wmma::load_matrix_sync(c10, C + (row + 8) * L + col, L, wmma::mem_row_major);
+    wmma::load_matrix_sync(c11, C + (row + 8) * L + col + 8, L, wmma::mem_row_major);
+
+    wmma::mma_sync(c00, a0, b0, c00);
+    wmma::mma_sync(c01, a0, b1, c01);
+    wmma::mma_sync(c10, a1, b0, c10);
+    wmma::mma_sync(c11, a1, b1, c11);
+
+    wmma::store_matrix_sync(C + row * L + col, c00, L, wmma::mem_row_major);
+    wmma::store_matrix_sync(C + row * L + col + 8, c01, L, wmma::mem_row_major);
+    wmma::store_matrix_sync(C + (row + 8) * L + col, c10, L, wmma::mem_row_major);
+    wmma::store_matrix_sync(C + (row + 8) * L + col + 8, c11, L, wmma::mem_row_major);
+  }
+}
+
+// Launch a kernel over an N x N problem. VC's gridDim is an ELEMENT count: the
+// runtime divides each grid extent by the corresponding block extent before
+// dispatching, so the x extent must be (number of workgroups in x) * 32 for a
+// 32-thread block.
+#define COOP_GX(N) (((N) / 16) * 32)
+#define COOP_GY(N) ((N) / 16)
+
+// Run one size: allocate, fill, launch, time, verify. Returns 0 on success.
+static int runSize(int N, float *outMs) {
+  int abytes = N * L * 2; // A, B: N rows x L columns, fp16
+  int cbytes = N * L * 4; // C: N rows x L columns, fp32
+
+  __half *hA = (__half *)malloc(abytes);
+  __half *hB = (__half *)malloc(abytes);
+  float *hC = (float *)malloc(cbytes);
+  if (!hA || !hB || !hC) {
+    printf("  N=%d: host alloc failed\n", N);
+    free(hA); free(hB); free(hC);
+    return 1;
+  }
+
+  // Small integer inputs: exactly representable in fp16, and every partial sum
+  // stays inside fp32's exact-integer range (N terms x <=49 < 2^24), so the
+  // result is bit-exact against a double reference rather than merely close.
+  // (The SIMT benchmark deliberately uses fractional inputs and a tolerance;
+  // here exactness is available and is a stronger check.)
+  for (int n = 0; n < N; n++) {
+    for (int m = 0; m < L; m++) {
+      hA[n * L + m] = (__half)((n * 3 + m * 5) % 7);
+      hB[n * L + m] = (__half)((n * 2 + m * 3) % 7);
+    }
+  }
+
+  void *dA = 0, *dB = 0, *dC = 0;
+  vcMalloc(&dA, abytes);
+  vcMalloc(&dB, abytes);
+  vcMalloc(&dC, cbytes);
+  vcMemcpy(dA, hA, abytes, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dB, hB, abytes, VCMemcpyKind::HostToDevice);
+
+  VCEventHandle start = 0, end = 0;
+  vcEventCreate(&start);
+  vcEventCreate(&end);
+
+  vcEventRecord(start, 0); // default stream
+  matmulCoopmat<<<dim3(COOP_GX(N), COOP_GY(N)), dim3(32, 1, 1)>>>(dA, dB, dC, N);
+  vcEventRecord(end, 0);
+  vcEventSynchronize(end);
+
+  float ms = 0.0f;
+  VCError te = vcEventElapsedTime(&ms, start, end);
+  vcEventDestroy(start);
+  vcEventDestroy(end);
+
+  vcMemcpy(hC, dC, cbytes, VCMemcpyKind::DeviceToHost);
+
+  // Exact reference in double over the N x N corner (only that corner holds a
+  // computed tile).
+  int ok = 1;
+  for (int n = 0; n < N && ok; n++) {
+    for (int m = 0; m < N; m++) {
+      double ref = 0.0;
+      for (int k = 0; k < N; k++) {
+        ref += (double)hA[n * L + k] * (double)hB[k * L + m];
+      }
+      if (ref != (double)hC[n * L + m]) {
+        printf("  N=%d [%d][%d] got %.1f want %.1f\n", N, n, m,
+               (double)hC[n * L + m], ref);
+        ok = 0;
+        break;
+      }
+    }
+  }
+
+  // GFLOPS = 2*N^3 flops / (ms * 1e6). 2 flops per multiply-accumulate.
+  double gflops = (te == VCError::Success)
+      ? (2.0 * (double)N * (double)N * (double)N) / ((double)ms * 1e6)
+      : 0.0;
+
+  if (te != VCError::Success) {
+    printf("  N=%4d  (event error %d)                                   FAIL\n",
+           N, (int)te);
+  } else {
+    printf("  N=%4d  %8.4f ms   %8.2f GFLOPS   %s\n", N, ms, gflops,
+           ok ? "PASS" : "FAIL");
+  }
+
+  *outMs = ms;
+  vcFree(dA); vcFree(dB); vcFree(dC);
+  free(hA); free(hB); free(hC);
+  return ok ? 0 : 1;
+}
+
+int main() {
+  vcInit();
+
+  printf("matmul_coopmat_bench: 16x16 tile (2x2 of 8x8x16 fp16->fp32), accumulator streamed through C\n");
+
+  // Warm up the pipeline (shader compile + first-submit overhead) so it does
+  // not inflate the first timed size.
+  {
+    int w = 16, ab = w * L * 2, cb = w * L * 4;
+    void *dA = 0, *dB = 0, *dC = 0;
+    vcMalloc(&dA, ab); vcMalloc(&dB, ab); vcMalloc(&dC, cb);
+    __half z[16 * L];
+    for (int i = 0; i < 16 * L; i++) z[i] = (__half)0;
+    vcMemcpy(dA, z, ab, VCMemcpyKind::HostToDevice);
+    vcMemcpy(dB, z, ab, VCMemcpyKind::HostToDevice);
+    matmulCoopmat<<<dim3(COOP_GX(w), COOP_GY(w)), dim3(32, 1, 1)>>>(dA, dB, dC, w);
+    vcDeviceSynchronize();
+    vcFree(dA); vcFree(dB); vcFree(dC);
+  }
+
+  int sizes[4] = { 128, 256, 512, 1024 };
+  int allOk = 1;
+  for (int i = 0; i < 4; i++) {
+    float ms = 0.0f;
+    if (runSize(sizes[i], &ms) != 0) allOk = 0;
+  }
+  printf("matmul_coopmat_bench: %s\n", allOk ? "PASS" : "FAIL");
+
+  vcShutdown();
+  return allOk ? 0 : 1;
+}
