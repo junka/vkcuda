@@ -344,6 +344,41 @@ smaller working set. **`TS=32` with a 2×2 per-thread quad is the right default
 here**; the textbook 4×4 shape is not worth the shared-memory cost on an
 integrated GPU.
 
+### Tile-shape sweep (N=1024, post-compiler-fix)
+
+After the canonical-for + SROA fixes landed, a wider sweep over `(TS, BLK, REG)`
+shapes — `TS = BLK·REG` so one workgroup owns one `TS×TS` output tile — confirms
+the `v2` choice holds up against more shapes. Median of 12 runs, N=1024:
+
+| shape | TS | BLK | REG | shared/tile | med GF | best GF |
+|---|---|---|---|---|---|---|
+| **`s32_16_2`** | 32 | 16 | 2 | 8 KB | **352** | **394** |
+| `s48_16_3` | 48 | 16 | 3 | 18 KB | 277 | 288 |
+| `s64_16_4` | 64 | 16 | 4 | 32 KB | 256 | 278 |
+| `s64_32_2` | 64 | 32 | 2 | 32 KB | 183 | 223 |
+| `s32_32_1` | 32 | 32 | 1 | 8 KB | 155 | 177 |
+| `s64_8_8` | 64 | 8 | 8 | 32 KB | 149 | 175 |
+
+Three patterns, all pointing the same way:
+
+- **Smaller tile wins.** `TS=32` beats `TS=64` at every block shape — the 8 KB
+  shared footprint lets more workgroups run concurrently on this few-SM iGPU.
+  The textbook "bigger tile amortizes shared loads" argument does not hold when
+  the device is occupancy-bound, not memory-bound.
+- **Bigger block hurts at fixed tile.** `s32_32_1` vs `s32_16_2`: same `TS=32`,
+  but `BLK=32` collapses `REG` to 1 (no register blocking) and halves the
+  resident workgroup count — 2× slower. `s64_32_2` vs `s64_16_4` shows the same
+  block-size penalty at `TS=64`.
+- **Too much register blocking hurts.** `s64_8_8` (8×8/thread = 64 accumulators)
+  is the worst: register pressure spills, and `BLK=8` is too small a block to
+  hide latency. The sweet spot is moderate blocking (2×2) on a moderate block
+  (16×16).
+
+**Conclusion: `TS=32 / BLK=16 / 2×2-per-thread` is the fp32 default for this
+device**, and it is not close. The sweep gives the compiler a single shape to
+autotune *toward*; a sweep over only this neighborhood (TS∈{24,32,40}, BLK∈{8,16},
+REG∈{2,3,4}) would be enough for a runtime autotuner.
+
 ### Reading these numbers: this device is very noisy
 
 Every figure above is a **median**, and that is not incidental. On the Intel
@@ -424,8 +459,50 @@ order-of-magnitude.) Two takeaways:
 The two-stage reduction is the right design if Split-K is ever wanted on this
 backend (it sidesteps the float-atomic limitation cleanly), but on this device
 the conclusion is: **don't split K for square matmul; spend the parallelism on
-a bigger output grid instead.** Stream-K (the load-balanced variant) is the
-remaining unexplored option and is listed as a future step.
+a bigger output grid instead.**
+
+### Stream-K: load-balanced K split (also no)
+
+Stream-K is the load-balanced variant of Split-K: instead of dividing K into P
+fixed slices (which leaves a ragged tail when P ∤ K), it divides the **total
+work** — `numTiles × numKTiles` micro-tiles — into equal contiguous chunks, one
+per workgroup, so every workgroup does exactly the same amount of work. A
+micro-tile `m` maps to `tileIdx = m / numKTiles`, `kTile = m % numKTiles`. When
+a workgroup's range crosses a tile boundary, two workgroups share an output
+tile and their partials must combine.
+
+That combination is exactly where the float-atomic limit bites. Without atomics,
+the prototype gives each workgroup its **own** partials plane (up to 2 per
+workgroup, since a contiguous range crosses at most one tile boundary) and a
+second kernel sums all planes. This works correctly but the partials buffer is
+`2·G·N²·4` bytes — it grows with the workgroup count `G`, so at N=1024 even
+`G = numTiles` needs 8 GB and the config is unrunnable on this device. Measured
+where it fits (median of 8, same `v2` tile):
+
+| N | split P=1 | split P=4 | stream G=x1 | stream G=x2 |
+|---|---|---|---|---|
+| 256 | 66 | 60 | 22 | 13 |
+| 512 | 123 | 137 | 19 | 10 |
+
+Stream-K is **3–6× slower** than the plain kernel at every size, and worse with
+more over-subscription. The causes are stacked against it on this backend:
+
+- **The inner loop gains a branch.** Each micro-tile may belong to either of
+  two output tiles, so the accumulation is guarded by `if (usingB == 0) … else
+  …`, which both defeats canonical-for and diverges inside the workgroup.
+- **The micro-tile loop replaces the clean tile×K-tile double loop.** Index
+  arithmetic (`tIdx = m / numKTiles`, `tc = tIdx % numTileCols`, …) runs per
+  micro-tile instead of once per tile.
+- **The two-stage reduction is mandatory and large.** Shared output tiles are
+  the *whole point* of Stream-K, and without float atomics each shared tile
+  costs a full `N²` partials plane. The design does not scale to N=1024.
+
+The honest conclusion: **Stream-K needs float atomicAdd to be worth implementing
+on this backend**, and even then the device is occupancy-bound (not
+parallelism-bound) for square matmul, so the load-balancing benefit it buys does
+not apply here. K-splitting in both forms is closed out as a matmul win on this
+iGPU; the win was in the compiler passes (canonical-for + SROA) and in picking
+the small tile shape, both already landed.
 
 
 ---
