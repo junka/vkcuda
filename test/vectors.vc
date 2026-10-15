@@ -34,7 +34,10 @@ __global__ void vecKernel(Result *result) {
   float2 hi = sum.zw;                 // (33, 44)
   float d = dot(a, b);                // 10+40+90+160 = 300
 
-  float4 sw;
+  // The swizzle write touches only .x and .z, so the local must be
+  // zero-initialized before the sum below reads .y/.w -- otherwise the kernel
+  // reads an uninitialized local, which is UB and does NOT reliably give 0.
+  float4 sw = make_float4(0.0, 0.0, 0.0, 0.0);
   sw.xz = float2(lo.x, hi.x);         // sw = (11, 0, 33, 0)
   float swsum = sw.x + sw.y + sw.z + sw.w;  // 11+0+33+0 = 44
 

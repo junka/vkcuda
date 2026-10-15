@@ -5,7 +5,10 @@
 
 #include "vc/Runtime/VCRuntime.h"
 
-#include <vulkan/vulkan.h>
+// VulkanCompat.h picks <vulkan/vulkan_sc_core.h> under VC_VULKAN_SC and
+// <vulkan/vulkan.h> otherwise; the two header sets are source-incompatible, so
+// this is the single point where the choice is made.
+#include "VulkanCompat.h"
 
 #include <atomic>
 #include <cstdint>
@@ -77,6 +80,45 @@ struct VulkanDevice {
   bool storagePushConstant16 = false;    // VkPhysicalDevice16BitStorageFeatures
   bool vulkanMemoryModel = false;        // VkPhysicalDeviceVulkan12Features,
                                          // required by coop-matrix shaders
+#ifdef VC_VULKAN_SC
+  // --- Vulkan SC -----------------------------------------------------------
+  // The SC driver decides what the app is allowed to do at runtime from
+  // VkPhysicalDeviceVulkanSC10Properties. The runtime must not call
+  // vkResetDescriptorPool / vkFreeMemory / vkDestroyPipeline when the matching
+  // property says the memory is managed for it instead. Queried once at
+  // device setup; see setupLogicalDevice.
+  bool scRecycleDescriptorSetMemory = false;
+  bool scRecyclePipelineMemory = false;
+  bool scDeviceDestroyFreesMemory = true;
+  // Whether the profile permits vkResetCommandBuffer at all
+  // (VkPhysicalDeviceVulkanSC10Properties::commandPoolResetCommandBuffer).
+  // False on the Thor SC profile: a second vkResetCommandBuffer on a command
+  // buffer that has already been submitted returns VK_ERROR_VALIDATION_FAILED
+  // (-1000011001), and every command recorded into it afterwards is dropped, so
+  // the frame has to be handed a freshly allocated command buffer instead.
+  bool scCommandPoolResetCommandBuffer = false;
+  uint32_t scMaxCommandPoolCommandBuffers = 0; // 0 = unlimited (VK_UINT32_MAX)
+  VkDeviceSize scMaxCommandBufferSize = 0;     // 0 = unlimited
+  // Resolved VkCommandPoolMemoryReservationCreateInfo values, applied by the
+  // createCommandPool helper at every pool creation. Resolved once here (from
+  // the reservation + VC_SC_* env) so the free function does not have to reach
+  // back into the Runtime singleton.
+  VkDeviceSize scCommandPoolReservedSize = 0;
+  uint32_t scCommandPoolMaxCommandBuffers = 0;
+  // The loaded pipeline cache blob, kept alive for the lifetime of the device:
+  // VkPipelineCacheCreateInfo::pInitialData must stay valid (the driver reads
+  // it lazily on the first offline pipeline lookup, not at create time).
+  std::vector<char> scPipelineCacheData;
+  // The path the cache blob came from, kept for diagnostics: a
+  // VK_ERROR_NO_PIPELINE_MATCH is otherwise indistinguishable from a stale
+  // cache built for a different kernel set.
+  std::string scCachePath;
+  // Must equal the VkPipelineOfflineCreateInfo::poolEntrySize of every offline
+  // pipeline created on this device, and is also what the single reserved
+  // pipeline pool was sized with. Divergence is not reported as such by the
+  // driver, so it is resolved once, in setupLogicalDeviceSc.
+  VkDeviceSize scPipelinePoolEntrySize = 0;
+#endif
   // Per-device default stream. CUDA gives each device its own default stream;
   // vcSetDevice(i) makes resolveStream(NULL) return devices_[i]->defaultStream.
   // unique_ptr because VCStream is forward-declared at this point.
@@ -209,6 +251,10 @@ struct VCKernelDeviceState {
   VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
   VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
   bool layoutBuilt = false;
+  // Offline (Vulkan SC) kernels never create a shader module: the pipeline is
+  // built from the precompiled cache entry. This flag records which path was
+  // taken so getPipeline knows whether the block-dim specialization applies.
+  bool offline = false;
   // Cache: key = packed (blockX, blockY, blockZ) -> pipeline. Pipelines are
   // specialized on workgroup size, so one per distinct block shape.
   std::unordered_map<uint64_t, VkPipeline> pipelines;
@@ -238,6 +284,23 @@ struct VCKernel {
   std::vector<uint32_t> pushConstantOffsets;
   // Per-device state, lazily created on first launch on that device.
   std::unordered_map<int, std::unique_ptr<VCKernelDeviceState>> perDevice;
+
+  // --- Offline (Vulkan SC) kernels -----------------------------------------
+  // Set by vcLoadKernelOffline. An offline kernel has no SPIR-V in this process
+  // at all: the pipeline was precompiled by nvidia-pcc into pipeline_cache.bin
+  // and is selected by `offlineUuid`. The descriptor-set layout and
+  // push-constant range come from the emitted VCScPipelineDesc rather than from
+  // reflection (there is no module to reflect), and they must match the JSON the
+  // tooling fed pcc byte for byte or the driver rejects the create with
+  // -1000011001 / VK_ERROR_NO_PIPELINE_MATCH.
+  bool offline = false;
+  uint8_t offlineUuid[16] = {};
+  // Block dims baked into the SPIR-V (design §1: one binary per distinct block
+  // size, so no specialization constants reach the driver).
+  uint32_t offlineBlockX = 0, offlineBlockY = 0, offlineBlockZ = 0;
+  // Descriptor bindings in API argument order, from the descriptor.
+  std::vector<uint32_t> offlineStorageBufferBindings;
+  std::vector<uint32_t> offlineImageBindings;
 };
 
 /// A recorded command graph (CUDA-Graph-style record/replay). While
@@ -331,6 +394,9 @@ public:
   // endFrame: end recording, submit to the stream's queue with the frame's
   //           fence. Does NOT wait.
   void endFrame(VCStream &s);
+  // Report a frame-boundary/copy VkResult under VC_SC_TRACE=1 (no-op otherwise,
+  // and on the core path the driver already reports these). See the definition.
+  static void scTraceVk(const char *what, VkResult r);
 
   // ---- Dedicated transfer queue (copy engine) routing ----
   // True when async copies issued on `s` should be routed to the device's
@@ -542,6 +608,13 @@ public:
   VCError copyPeer(VCBuffer &dst, int dstDevice, const VCBuffer &src,
                    int srcDevice, size_t bytes);
 
+#ifdef VC_VULKAN_SC
+  // Install the Vulkan SC object reservation. Only legal before init(): the
+  // reservation is consumed by vkCreateDevice and cannot be revised afterwards,
+  // so the setter refuses rather than silently keeping the old one.
+  VCError setScReservation(const VcScReservation *reservation);
+#endif
+
 private:
   // All enumerated Vulkan devices; currentDeviceIdx_ selects the active one
   // (CUDA cudaSetDevice model). Each VulkanDevice owns its own default stream.
@@ -614,6 +687,19 @@ private:
                           const std::vector<VkPhysicalDevice> &deviceGroupMembers = {});
   bool buildLayout(VCKernel &k, int deviceIdx, const VCKernelArg *args,
                     int argCount);
+#ifdef VC_VULKAN_SC
+  // The Vulkan SC reservation in force for this process. Zero-initialized
+  // (every field meaning "use the default") until vcSetScReservation installs
+  // one; the SC device path resolves it against the built-in defaults and the
+  // VC_SC_* environment when it creates the device. Held on the singleton
+  // rather than passed around because vkCreateDevice consumes it before any
+  // kernel or stream exists.
+  VcScReservation scReservation_;
+  // Create the logical device + compute queue for an SC device: reservation,
+  // loaded pipeline cache, no feature chain, no transfer queue. Returns false
+  // if the reservation or the cache file is unusable, with the cause on stderr.
+  bool setupLogicalDeviceSc(VulkanDevice &vd);
+#endif // VC_VULKAN_SC
   // Find a memory type index satisfying `flags` among `reqBits`.
   uint32_t findMemoryType(uint32_t reqBits,
                           VkMemoryPropertyFlags flags) const;

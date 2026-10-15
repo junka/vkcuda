@@ -2066,10 +2066,26 @@ NodePtr Parser::tryParseLaunch(NodePtr &callee) {
   auto [gx, gy] = splitDim3(std::move(grid));
   auto [bx, by] = splitDim3(std::move(block));
 
+  // Fold the block extent here, where the parser's `const int` table is still
+  // in scope, and stamp it on the node (TranslationUnit::launchSites). The
+  // default backends ignore it — their block size is a runtime value — but
+  // Vulkan SC bakes the workgroup size into a pipeline compiled ahead of time,
+  // so `vc -emit=sc` needs the value and must reject a launch whose block size
+  // is not a compile-time constant. Folding at the single point where the node
+  // is built keeps one fold path instead of a second walk over the AST.
+  int64_t blockX = 1, blockY = 1;
+  bool blockIsConst = evalConstInt(bx.get(), blockX) &&
+                      (!by || evalConstInt(by.get(), blockY));
+
   auto *launch = new LaunchExpr(toSourceLoc(openLt), std::move(callee),
                                 std::move(gx), std::move(bx),
                                 std::move(gy), std::move(by), std::move(stream),
                                 std::move(sharedMem));
+  launch->blockX = blockX;
+  launch->blockY = blockY;
+  launch->blockZ = 1; // dim3(a,b) has two components; Z is never spelled.
+  launch->blockIsConst = blockIsConst;
+  tu.launchSites.push_back(launch);
   if (!curTok.is(TokKind::r_paren)) {
     while (true) {
       // parseAssignment: comma is the launch-arg separator, not the operator.

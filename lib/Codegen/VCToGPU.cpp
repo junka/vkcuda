@@ -321,8 +321,15 @@ void rewriteIndexingOps(ModuleOp module, IRRewriter &rw) {
 // push-constant struct in source order, each 4-byte-aligned (the runtime
 // rounds scalar size up to 4 bytes). Pointer bindings count up from 0 over
 // pointer args only.
-static void lowerScalarArgsToPushConstant(gpu::GPUFuncOp gpuFn,
-                                          OpBuilder &builder) {
+// Pointer bindings count up from 0 over pointer args only.
+//
+// Returns the packed size of the push-constant block (0 when the kernel takes no
+// scalars). packKernels records it for the Vulkan SC emitter: offline mode has
+// no module in the process to reflect, so the push-constant range the runtime
+// declares has to come from the compiler — and taking it from the function that
+// laid the struct out makes it exact by construction.
+static uint32_t lowerScalarArgsToPushConstant(gpu::GPUFuncOp gpuFn,
+                                              OpBuilder &builder) {
   // Partition args: which are scalar (to move into the PC block) vs pointer
   // (memref, to keep as interface variables). A by-value vector arg
   // (vector<NxELEM>, e.g. `float4 v` / `__half2 v`) is NOT a pointer — it is
@@ -360,7 +367,7 @@ static void lowerScalarArgsToPushConstant(gpu::GPUFuncOp gpuFn,
                        spirv::getInterfaceVarABIAttr(/*descSet=*/0, slot,
                                                      std::nullopt,
                                                      gpuFn.getContext()));
-    return;
+    return 0;
   }
 
   // Build the push-constant struct type and a module-scope global for it,
@@ -453,6 +460,7 @@ static void lowerScalarArgsToPushConstant(gpu::GPUFuncOp gpuFn,
                      spirv::getInterfaceVarABIAttr(/*descSet=*/0, slot,
                                                    std::nullopt,
                                                    gpuFn.getContext()));
+  return off;
 }
 
 // Replaces the compile-time `gpu.block_dim` (which GPUToSPIRV would lower to a
@@ -559,6 +567,49 @@ static void lowerWorkgroupSizeToSpecConstants(gpu::GPUModuleOp gpuModule,
   }
 }
 
+// Vulkan SC counterpart of lowerWorkgroupSizeToSpecConstants: bake the
+// workgroup size into the module as a literal instead of a run-time
+// specialization constant.
+//
+// SC has no runtime pipeline compilation. The driver compiles one pipeline per
+// (kernel, block size) ahead of time with nvidia-pcc, and at create time
+// validates the application's VkComputePipelineCreateInfo against the cached
+// entry — so a specialization constant here would have to be supplied
+// identically in the pcc JSON *and* at vkCreateComputePipelines, with a
+// mismatch surfacing as VK_ERROR_VALIDATION_FAILED. Baking the size removes the
+// second source of truth entirely.
+//
+// This is much smaller than the spec-constant path because there is nothing to
+// synthesize: the caller already put the real LocalSize into the gpu.func's
+// entry_point_abi attribute (from the `vc.sc.block_dims` module attribute), so
+// all that is left is rewriting each gpu.block_dim read — which the spec path
+// answers with a spec-constant reference — to an integer constant of the same
+// value.
+static void lowerWorkgroupSizeToLiteral(gpu::GPUModuleOp gpuModule,
+                                        int32_t blockX, int32_t blockY,
+                                        int32_t blockZ) {
+  auto literalFor = [&](gpu::Dimension dim) -> int32_t {
+    switch (dim) {
+    case gpu::Dimension::x: return blockX;
+    case gpu::Dimension::y: return blockY;
+    default:                return blockZ; // gpu::Dimension::z
+    }
+  };
+
+  SmallVector<gpu::BlockDimOp> dims;
+  gpuModule.walk([&](gpu::BlockDimOp op) { dims.push_back(op); });
+  for (gpu::BlockDimOp op : dims) {
+    // gpu.block_dim yields `index` (vc.block_dim does, and rewriteIndexingOps
+    // preserves the result type), which is what the spec-constant path casts
+    // its i32 spec constant to — so a ConstantIndexOp is a drop-in.
+    OpBuilder b(op);
+    Value lit = b.create<arith::ConstantOp>(
+        op.getLoc(), b.getIndexAttr(literalFor(op.getDimension())));
+    op.replaceAllUsesWith(lit);
+    op.erase();
+  }
+}
+
 // Packs every vc.kernel (and its target func) into one gpu.module as gpu.func.
 void packKernels(ModuleOp module, IRRewriter &rw) {
   SmallVector<vc::KernelOp> kernels;
@@ -592,6 +643,19 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
   // Which numeric widths the kernels use, computed once over the module: the
   // target env is one attribute on the single gpu.module every kernel lands in.
   SPIRVWidthUse widths = scanWidthUses(module);
+  // Vulkan SC: the driver runs this pipeline once per distinct launch block
+  // size, telling it which block size to bake via `vc.sc.block_dims` — a
+  // 3-element i32 array set by the caller (vc.cpp) *after* translateASTToMLIR
+  // returns, because that step sets its own module attributes at the end. The
+  // attribute is absent on the default path, where the block size stays a
+  // run-time specialization constant (see lowerWorkgroupSizeToSpecConstants),
+  // so nothing about the default build changes.
+  ArrayAttr scDims = module->getAttrOfType<ArrayAttr>("vc.sc.block_dims");
+  bool scLiteralBlock = scDims && scDims.size() == 3;
+  int32_t scBlock[3] = {1, 1, 1};
+  if (scLiteralBlock)
+    for (unsigned i = 0; i < 3; ++i)
+      scBlock[i] = scDims[i].cast<IntegerAttr>().getInt();
   for (vc::KernelOp k : kernels) {
     func::FuncOp fn = module.lookupSymbol<func::FuncOp>(k.getFunction());
     if (!fn) {
@@ -620,16 +684,24 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
     rw.setInsertionPointToStart(gpuModule.getBody());
     auto gpuFn = rw.create<gpu::GPUFuncOp>(k.getLoc(), fn.getName(),
                                            fn.getFunctionType());
-    // Mark the entry point: gpu.kernel + the SPIR-V launch ABI. The workgroup
-    // size here is a placeholder (1x1x1): the actual block size is supplied at
-    // run time via specialization constants (SpecId 0/1/2), wired up by
-    // lowerWorkgroupSizeToSpecConstants + the vc driver's binary patch that
-    // decorates the gl_WorkGroupSize spec-composite BuiltIn. LocalSize is
-    // overridden by that builtin, exactly as in the GLSL backend's shader.
+    // Mark the entry point: gpu.kernel + the SPIR-V launch ABI. On the default
+    // path the workgroup size here is a placeholder (1x1x1): the actual block
+    // size is supplied at run time via specialization constants (SpecId 0/1/2),
+    // wired up by lowerWorkgroupSizeToSpecConstants + the vc driver's binary
+    // patch that decorates the gl_WorkGroupSize spec-composite BuiltIn.
+    // LocalSize is overridden by that builtin, exactly as in the GLSL backend's
+    // shader.
+    //
+    // Under Vulkan SC the attribute carries the real size, and this attribute is
+    // the *only* place the workgroup size is stated: the spirv lowering turns it
+    // into `OpExecutionMode ... LocalSize` and there is no builtin or spec
+    // constant to override it (see lowerWorkgroupSizeToLiteral).
     gpuFn->setAttr(gpu::GPUDialect::getKernelFuncAttrName(), rw.getUnitAttr());
+    SmallVector<int32_t, 3> blockDims = scLiteralBlock
+        ? SmallVector<int32_t, 3>{scBlock[0], scBlock[1], scBlock[2]}
+        : SmallVector<int32_t, 3>{1, 1, 1};
     gpuFn->setAttr(spirv::getEntryPointABIAttrName(),
-                   spirv::getEntryPointABIAttr(module.getContext(),
-                                               {1, 1, 1}));
+                   spirv::getEntryPointABIAttr(module.getContext(), blockDims));
 
     // Move the body over, then rewrite func.return -> gpu.return.
     gpuFn.getBody().takeBody(fn.getBody());
@@ -649,7 +721,18 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
     // StorageBuffer bindings to pointer args in order. Done after takeBody
     // because it rewrites the kernel body (loads scalars from the PC global)
     // and reshapes the gpu.func signature. See lowerScalarArgsToPushConstant.
-    lowerScalarArgsToPushConstant(gpuFn, rw);
+    uint32_t pcSize = lowerScalarArgsToPushConstant(gpuFn, rw);
+
+    // Vulkan SC: stash the push-constant block size on the module, keyed by
+    // kernel symbol, for the driver's offline-pipeline emitter. Offline mode has
+    // no module in the process, so the runtime cannot reflect the range the way
+    // the core path does (see VCRuntime's reflect) — the compiler has to state
+    // it, and stating it from the function that built the struct removes the
+    // chance of the two disagreeing. Recorded only in SC mode so the default
+    // build's IR is untouched.
+    if (scLiteralBlock)
+      module->setAttr("vc.sc.pc_size." + fn.getName().str(),
+                      rw.getI32IntegerAttr(pcSize));
 
     fn.erase();
     k.erase();
@@ -657,9 +740,15 @@ void packKernels(ModuleOp module, IRRewriter &rw) {
 
   // Replace gpu.block_dim with specialization-constant reads so the block size
   // is set at run time (via Vulkan spec constants) rather than baked to the
-  // placeholder LocalSize. Creates the spec constants + rewrites the ops.
-  if (gpuModule)
-    lowerWorkgroupSizeToSpecConstants(gpuModule, rw);
+  // placeholder LocalSize. Creates the spec constants + rewrites the ops. Under
+  // Vulkan SC there is no run time to set them at: the size is already baked
+  // into the entry_point_abi above, so only the block_dim reads need rewriting.
+  if (gpuModule) {
+    if (scLiteralBlock)
+      lowerWorkgroupSizeToLiteral(gpuModule, scBlock[0], scBlock[1], scBlock[2]);
+    else
+      lowerWorkgroupSizeToSpecConstants(gpuModule, rw);
+  }
 
   // Hoist any module-scope workgroup-memory globals into the gpu.module.
   // GPUToSPIRV only legalizes symbols visible inside the gpu.module it clones,

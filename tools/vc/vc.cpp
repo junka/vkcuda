@@ -1,7 +1,7 @@
 //===- vc.cpp - Compiler driver -------------------------------------------===//
 //
 // Usage:
-//   vc <input.vc> [-emit=ast|mlir|spirv|host|full] [-o <out>]
+//   vc <input.vc> [-emit=ast|mlir|spirv|host|full|sc] [-o <out>]
 //
 // Pipeline: lex+parse -> AST -> (Sema) -> MLIR(VC) -> lower -> SPIR-V.
 // The SPIR-V emission reuses MLIR's spirv-to-binary translation.
@@ -44,18 +44,24 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/Support/Path.h"
 
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <functional>
+#include <set>
 #include <string>
+#include <tuple>
 
 using namespace vc;
 using namespace mlir;
 
 namespace {
-enum class EmitKind { AST, MLIR, SPIRV, Host, Full };
+enum class EmitKind { AST, MLIR, SPIRV, Host, Full, SC };
 } // namespace
 
 // Patch the serialized SPIR-V binary to decorate the `gl_WorkGroupSize`
@@ -186,7 +192,15 @@ static void patchWorkgroupSizeBuiltin(SmallVectorImpl<uint32_t> &binary) {
 // that is benign: it only over-allocates (to workgroup-x elements) and accesses
 // that were in-range stay in-range (spirv-val does not bounds-check array
 // indexing). Real static shared arrays have a distinct type (size != 1).
-static void patchDynamicSharedArrays(SmallVectorImpl<uint32_t> &binary) {
+//
+// `literalBlockX > 0` selects the Vulkan SC shape: there the workgroup size is
+// a literal baked into the pipeline, so instead of pointing the array length at
+// a spec constant we synthesize an `OpConstant <int-type> <literalBlockX>` and
+// relocate *that* before the first dynamic-shared array (same forward-reference
+// rule). The int type is borrowed from the placeholder length constant the
+// serializer already emitted, so no type synthesis is needed.
+static void patchDynamicSharedArrays(SmallVectorImpl<uint32_t> &binary,
+                                     int64_t literalBlockX = 0) {
   // Opcodes / word layouts we decode. For ops that have BOTH a result type and
   // a result id, SPIR-V lays out [wc|op, result_type_id, result_id, operands...]
   // (type first, then result). Type-defining ops (TypePointer/TypeArray) have
@@ -197,6 +211,7 @@ static void patchDynamicSharedArrays(SmallVectorImpl<uint32_t> &binary) {
   constexpr uint32_t kOpVariable = 59;             // [wc|op, type_id, result_id, SC, ...]
   constexpr uint32_t kOpSpecConstant = 50;         // [wc|op, type_id, result_id, value...]
   constexpr uint32_t kOpSpecConstantComposite = 51; // [wc|op, type_id, result_id, constituents...]
+  constexpr uint32_t kOpConstant = 43;             // [wc|op, type_id, result_id, value...]
 
   if (binary.size() < 5)
     return;
@@ -224,6 +239,7 @@ static void patchDynamicSharedArrays(SmallVectorImpl<uint32_t> &binary) {
   llvm::DenseMap<uint32_t, TypeDef> typeDefs;
   llvm::DenseMap<uint32_t, uint32_t> varResultType; // var result_id -> type_id
   llvm::DenseMap<uint32_t, size_t> specConstOffsets; // result_id -> offset
+  llvm::DenseMap<uint32_t, size_t> constOffsets;     // OpConstant result_id -> offset
 
   size_t i = 5;
   while (i < binary.size()) {
@@ -253,12 +269,18 @@ static void patchDynamicSharedArrays(SmallVectorImpl<uint32_t> &binary) {
                (opcode == kOpSpecConstantComposite && wordCount >= 3)) {
       // [wc|op, type_id, result_id, ...] — result_id at +2.
       specConstOffsets[binary[i + 2]] = i;
+    } else if (opcode == kOpConstant && wordCount >= 4) {
+      // [wc|op, type_id, result_id, value...] — result_id at +2. Recorded so
+      // the SC literal path can borrow the placeholder length constant's type.
+      constOffsets[binary[i + 2]] = i;
     }
     i += wordCount;
   }
 
-  if (!wgXId || dynVarIds.empty())
+  if (dynVarIds.empty())
     return; // nothing to patch
+  if (!literalBlockX && !wgXId)
+    return; // spec-constant mode needs __vc_wg_x to point the length at
 
   // Collect the candidate OpTypeArray offsets reachable from each dynshared
   // variable (var -> ptr -> first array in the element-type chain).
@@ -292,74 +314,118 @@ static void patchDynamicSharedArrays(SmallVectorImpl<uint32_t> &binary) {
     return;
   size_t firstArray = *std::min_element(arrayOffsets.begin(), arrayOffsets.end());
 
-  // Locate the contiguous spec-constant block to relocate: starts at
-  // __vc_wg_x and extends through the following SpecConstant/
-  // SpecConstantComposite ops up to and including gl_WorkGroupSize.
-  auto wxIt = specConstOffsets.find(*wgXId);
-  if (wxIt == specConstOffsets.end())
-    return;
-  llvm::SmallVector<size_t, 4> specOffsets;
-  specOffsets.push_back(wxIt->second);
-  {
-    size_t cur = wxIt->second;
-    while (true) {
-      uint32_t wc = binary[cur] >> 16;
-      size_t next = cur + wc;
-      if (next >= binary.size())
-        break;
-      uint32_t w = binary[next];
-      uint32_t op = w & 0xFFFF;
-      uint32_t nwc = w >> 16;
-      if (nwc == 0 || (op != kOpSpecConstant && op != kOpSpecConstantComposite))
-        break;
-      specOffsets.push_back(next);
-      cur = next;
-      if (binary[next + 2] == glWgSizeId) // result_id at +2
-        break;
+  // Build the instruction block that defines the array's new length.
+  //
+  // Spec-constant mode: the contiguous spec-constant block starting at
+  // __vc_wg_x and running through gl_WorkGroupSize. SC literal mode: a
+  // synthesized `OpConstant <int-type> <literalBlockX>`, borrowing its integer
+  // type from the placeholder length constant the serializer already emitted
+  // for these arrays (so no type is invented, and the literal always fits — the
+  // placeholder value is 1, and a block size of 0 is not a launch anyone makes).
+  uint32_t lengthId = 0;
+  llvm::SmallVector<uint32_t, 8> blockWords;
+  size_t blkStart = 0, blkEnd = 0;
+  if (literalBlockX) {
+    auto lenIt = constOffsets.find(binary[arrayOffsets.front() + 3]);
+    if (lenIt == constOffsets.end())
+      return; // no placeholder constant to model the integer type on
+    uint32_t lengthTypeId = binary[lenIt->second + 1];
+    uint32_t newId = binary[3]; // SPIR-V bound word: the first unused result id
+    binary[3] = newId + 1;
+    lengthId = newId;
+    blockWords = {(4u << 16) | kOpConstant, lengthTypeId, newId,
+                  static_cast<uint32_t>(literalBlockX)};
+  } else {
+    // Locate the contiguous spec-constant block to relocate: starts at
+    // __vc_wg_x and extends through the following SpecConstant/
+    // SpecConstantComposite ops up to and including gl_WorkGroupSize.
+    auto wxIt = specConstOffsets.find(*wgXId);
+    if (wxIt == specConstOffsets.end())
+      return;
+    llvm::SmallVector<size_t, 4> specOffsets;
+    specOffsets.push_back(wxIt->second);
+    {
+      size_t cur = wxIt->second;
+      while (true) {
+        uint32_t wc = binary[cur] >> 16;
+        size_t next = cur + wc;
+        if (next >= binary.size())
+          break;
+        uint32_t w = binary[next];
+        uint32_t op = w & 0xFFFF;
+        uint32_t nwc = w >> 16;
+        if (nwc == 0 ||
+            (op != kOpSpecConstant && op != kOpSpecConstantComposite))
+          break;
+        specOffsets.push_back(next);
+        cur = next;
+        if (binary[next + 2] == glWgSizeId) // result_id at +2
+          break;
+      }
     }
-  }
-  std::sort(specOffsets.begin(), specOffsets.end());
-  size_t blkStart = specOffsets.front();
-  size_t blkEnd = blkStart;
-  for (size_t off : specOffsets) {
-    uint32_t wc = binary[off] >> 16;
-    blkEnd = std::max(blkEnd, off + wc);
+    std::sort(specOffsets.begin(), specOffsets.end());
+    blkStart = specOffsets.front();
+    blkEnd = blkStart;
+    for (size_t off : specOffsets) {
+      uint32_t wc = binary[off] >> 16;
+      blkEnd = std::max(blkEnd, off + wc);
+    }
+    blockWords.assign(binary.begin() + blkStart, binary.begin() + blkEnd);
+    lengthId = *wgXId;
   }
 
-  // If the block is already before the first array (no relocation needed),
-  // just rewrite the lengths.
-  if (blkEnd <= firstArray) {
-    for (size_t off : arrayOffsets)
-      binary[off + 3] = *wgXId;
+  if (!literalBlockX) {
+    // If the block is already before the first array (no relocation needed),
+    // just rewrite the lengths.
+    if (blkEnd <= firstArray) {
+      for (size_t off : arrayOffsets)
+        binary[off + 3] = lengthId;
+      return;
+    }
+
+    // Relocate: [0..firstArray) + [spec block] + [firstArray..blkStart) +
+    // [blkEnd..end). This moves the spec-constant block to just before the
+    // first dynamic-shared OpTypeArray.
+    SmallVector<uint32_t, 0> out;
+    out.reserve(binary.size());
+    out.insert(out.end(), binary.begin(), binary.begin() + firstArray);
+    out.insert(out.end(), binary.begin() + blkStart, binary.begin() + blkEnd);
+    out.insert(out.end(), binary.begin() + firstArray, binary.begin() + blkStart);
+    out.insert(out.end(), binary.begin() + blkEnd, binary.end());
+    binary.swap(out);
+
+    // Rewrite each candidate array's length operand. Offsets that were in
+    // [firstArray, blkStart) shifted forward by the block length; those at/after
+    // blkEnd shifted back. (firstArray itself is now the start of the relocated
+    // block, so the arrays that were in [firstArray, blkStart) are now at
+    // [firstArray + blkLen, blkStart + blkLen).)
+    ptrdiff_t blkLen = (ptrdiff_t)(blkEnd - blkStart);
+    for (size_t &off : arrayOffsets) {
+      if (off >= blkEnd)
+        off -= blkLen;
+      else // off was in [firstArray, blkStart)
+        off += blkLen;
+    }
+    for (size_t off : arrayOffsets) {
+      if (off + 3 < binary.size())
+        binary[off + 3] = lengthId;
+    }
     return;
   }
 
-  // Relocate: [0..firstArray) + [spec block] + [firstArray..blkStart) +
-  // [blkEnd..end). This moves the spec-constant block to just before the
-  // first dynamic-shared OpTypeArray.
+  // SC literal mode: the block is new, so it is always inserted — and since
+  // firstArray is the minimum offset, every array simply shifts forward by the
+  // block length.
   SmallVector<uint32_t, 0> out;
-  out.reserve(binary.size());
+  out.reserve(binary.size() + blockWords.size());
   out.insert(out.end(), binary.begin(), binary.begin() + firstArray);
-  out.insert(out.end(), binary.begin() + blkStart, binary.begin() + blkEnd);
-  out.insert(out.end(), binary.begin() + firstArray, binary.begin() + blkStart);
-  out.insert(out.end(), binary.begin() + blkEnd, binary.end());
+  out.insert(out.end(), blockWords.begin(), blockWords.end());
+  out.insert(out.end(), binary.begin() + firstArray, binary.end());
   binary.swap(out);
-
-  // Rewrite each candidate array's length operand. Offsets that were in
-  // [firstArray, blkStart) shifted forward by the block length; those at/after
-  // blkEnd shifted back. (firstArray itself is now the start of the relocated
-  // block, so the arrays that were in [firstArray, blkStart) are now at
-  // [firstArray + blkLen, blkStart + blkLen).)
-  ptrdiff_t blkLen = (ptrdiff_t)(blkEnd - blkStart);
-  for (size_t &off : arrayOffsets) {
-    if (off >= blkEnd)
-      off -= blkLen;
-    else // off was in [firstArray, blkStart)
-      off += blkLen;
-  }
+  const size_t blkLen = blockWords.size();
   for (size_t off : arrayOffsets) {
-    if (off + 3 < binary.size())
-      binary[off + 3] = *wgXId;
+    if (off + blkLen + 3 < binary.size())
+      binary[off + blkLen + 3] = lengthId;
   }
 }
 
@@ -1194,13 +1260,485 @@ static bool loadSource(const std::string &path, llvm::SourceMgr &sm) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Vulkan SC emission (-emit=sc)
+//
+// Vulkan SC removed runtime pipeline compilation: every pipeline the
+// application may ever create has to be compiled ahead of time by nvidia-pcc
+// into a pipeline_cache.bin, and the application selects one at create time by a
+// 16-byte UUID. Two consequences shape this emitter.
+//
+//  1. The workgroup size is part of a pipeline's identity, so a kernel launched
+//     with two different block sizes needs two pipelines. Because the block size
+//     is baked into the SPIR-V (there is no run time at which a specialization
+//     constant could be supplied — see lowerWorkgroupSizeToLiteral), the whole
+//     lowering pipeline runs once per distinct block size and each run produces
+//     one binary.
+//  2. There is no module in the process for the runtime to reflect, so the
+//     descriptor-set layout and the push-constant range must be stated
+//     explicitly — both in the pcc JSON and in the host descriptor handed to
+//     vcLoadKernelOffline. Both are written from one table here, so they cannot
+//     disagree; a disagreement would otherwise surface much later as a bare
+//     VK_ERROR_VALIDATION_FAILED (-1000011001) from vkCreateComputePipelines
+//     with no hint of which field differs.
+//
+// Layout of the output directory (-o):
+//   <kernel>.b<X>_<Y>_<Z>.spv   block-size-baked SPIR-V for one kernel
+//   <kernel>.b<X>_<Y>_<Z>.json  the nvidia-pcc descriptor that names it
+//   <stem>_host.cpp             host C++ that loads them via
+//                               vcLoadKernelOffline (no SPIR-V embedded)
+//
+// Feed the whole directory to one nvidia-pcc run (see tools/vksc/
+// build_cache.sh): a partial run produces a cache whose other lookups fail with
+// "no pipeline matches".
+// ---------------------------------------------------------------------------
+
+// Stable 16-byte offline-pipeline identifier for a (kernel, block) pair.
+//
+// pcc copies this UUID into the cache and the runtime looks the pipeline up by
+// it, so it must be deterministic across compilations, distinct per block size
+// (the same kernel at a different workgroup size is a different pipeline), and
+// never all-zero (which the runtime read as "unset"). Two independent FNV-1a
+// mixes of a canonical key give the 16 bytes.
+// The 16-byte pipeline identifier, derived only from `key`.
+//
+// The identifier is what VkPipelineOfflineCreateInfo selects a pipeline with, so
+// two distinct pipelines that hash the same would silently resolve to one
+// another's binary. Callers therefore key it on the *final* SPIR-V bytes plus
+// the entry point and block dims (see emitSc), never on the kernel name alone:
+// two translation units can each define a kernel called `vadd`, and a name-only
+// key would give them the same UUID. Hashing the content also keeps a rebuild of
+// unchanged source byte-identical, so an existing pipeline_cache.bin stays valid
+// — and it does not depend on the source path, so building the same file from a
+// different directory does not invalidate the cache either.
+static void scHashUuid(llvm::StringRef key, uint8_t out[16]) {
+  auto fnv = [](llvm::StringRef s, uint64_t seed) {
+    uint64_t h = seed;
+    for (char ch : s) {
+      h ^= static_cast<uint64_t>(static_cast<unsigned char>(ch));
+      h *= 0x100000001b3ull;
+    }
+    return h;
+  };
+  static const char kPrefix[] = "vc-sc-v1|";
+  uint64_t a = fnv(key, 0xcbf29ce484222325ull ^ fnv(kPrefix, 0xcbf29ce484222325ull));
+  uint64_t b = fnv(key, 0x9e3779b97f4a7c15ull ^ fnv(kPrefix, 0x9e3779b97f4a7c15ull));
+  for (int i = 0; i < 8; ++i) {
+    out[i] = static_cast<uint8_t>((a >> (8 * i)) & 0xFF);
+    out[8 + i] = static_cast<uint8_t>((b >> (8 * i)) & 0xFF);
+  }
+  if (!a && !b) out[0] = 1; // never the all-zero "unset" identifier
+}
+
+// The nvidia-pcc pipeline descriptor for one (kernel, block) pair.
+//
+// The schema is NVIDIA's, not Vulkan's: the vendor samples under
+// /ota/samples/vulkan-sc-samples/data/pipeline/<sample>/ are the reference, and
+// this reproduces the shape of tools/vksc/vk_vadd_pipeline_1.json (the sample
+// used to bring the cache up) with the fields a VC kernel changes:
+//
+//   * pName is the kernel's SPIR-V entry-point name. VC's MLIR backend emits one
+//     OpEntryPoint per kernel, named after the mangled kernel symbol — NOT
+//     "main" (that is the GLSL backend's convention). pcc compiles the entry
+//     point named here, so naming the wrong one yields a cache entry the
+//     application can never match.
+//   * the bindings are one STORAGE_BUFFER per pointer parameter, in parameter
+//     order, then one STORAGE_IMAGE per image parameter — the same order
+//     VCToGPU::lowerScalarArgsToPushConstant and ASTToMLIR::materializeImage
+//     Params assign binding numbers in, which is also the order
+//     VCRuntime::buildLayout describes for an offline kernel.
+//   * pSpecializationInfo is NULL: the workgroup size is baked into the SPIR-V,
+//     so there is nothing left to specialize (and any specialization info the
+//     application supplied would have to match what pcc cached exactly).
+static std::string scPipelineJson(llvm::StringRef spvBasename,
+                                  llvm::StringRef entryPoint,
+                                  const uint8_t uuid[16], uint32_t ssboCount,
+                                  uint32_t imageCount, uint32_t pcSize) {
+  const uint32_t bindingCount = ssboCount + imageCount;
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  const char *kStage = "VK_SHADER_STAGE_COMPUTE_BIT";
+
+  os << "{\n    \"ComputePipelineState\": {\n";
+  os << "        \"YcbcrSamplers\": [],\n";
+  os << "        \"ImmutableSamplers\": [],\n";
+  os << "        \"DescriptorSetLayouts\": [\n            {\n";
+  os << "                \"pSetLayouts_0\": {\n";
+  os << "                    \"sType\": "
+        "\"VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO\",\n";
+  os << "                    \"pNext\": \"NULL\",\n";
+  os << "                    \"flags\": \"0\",\n";
+  os << "                    \"bindingCount\": " << bindingCount << ",\n";
+  os << "                    \"pBindings\": [\n";
+  for (uint32_t i = 0; i < bindingCount; ++i) {
+    os << "                        {\n";
+    os << "                            \"binding\": " << i << ",\n";
+    os << "                            \"descriptorType\": \""
+       << (i < ssboCount ? "VK_DESCRIPTOR_TYPE_STORAGE_BUFFER"
+                         : "VK_DESCRIPTOR_TYPE_STORAGE_IMAGE")
+       << "\",\n";
+    os << "                            \"descriptorCount\": 1,\n";
+    os << "                            \"stageFlags\": \"" << kStage << "\",\n";
+    os << "                            \"pImmutableSamplers\": \"NULL\"\n";
+    os << "                        }" << (i + 1 < bindingCount ? "," : "")
+       << "\n";
+  }
+  os << "                    ]\n";
+  os << "                }\n            }\n        ],\n";
+  os << "        \"PipelineLayout\": {\n";
+  os << "            \"sType\": "
+        "\"VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO\",\n";
+  os << "            \"pNext\": \"NULL\",\n";
+  os << "            \"flags\": 0,\n";
+  os << "            \"setLayoutCount\": 1,\n";
+  os << "            \"pSetLayouts\": [\n                \"pSetLayouts_0\"\n"
+        "            ],\n";
+  if (pcSize) {
+    os << "            \"pushConstantRangeCount\": 1,\n";
+    os << "            \"pPushConstantRanges\": [\n                {\n";
+    os << "                    \"sType\": "
+          "\"VK_STRUCTURE_TYPE_PUSH_CONSTANT_RANGE\",\n";
+    os << "                    \"stageFlags\": \"" << kStage << "\",\n";
+    os << "                    \"offset\": 0,\n";
+    os << "                    \"size\": " << pcSize << "\n";
+    os << "                }\n            ]\n";
+  } else {
+    os << "            \"pushConstantRangeCount\": 0,\n";
+    os << "            \"pPushConstantRanges\": []\n";
+  }
+  os << "        },\n";
+  os << "        \"ComputePipeline\": {\n";
+  os << "            \"sType\": "
+        "\"VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO\",\n";
+  os << "            \"pNext\": \"NULL\",\n";
+  os << "            \"flags\": \"0\",\n";
+  os << "            \"stage\": {\n";
+  os << "                \"sType\": "
+        "\"VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO\",\n";
+  os << "                \"pNext\": \"NULL\",\n";
+  os << "                \"flags\": \"0\",\n";
+  os << "                \"stage\": \"" << kStage << "\",\n";
+  os << "                \"module\": \"\",\n";
+  os << "                \"pName\": \"" << entryPoint << "\",\n";
+  os << "                \"pSpecializationInfo\": \"NULL\"\n";
+  os << "            },\n";
+  os << "            \"layout\": \"\",\n";
+  os << "            \"basePipelineHandle\": \"\",\n";
+  os << "            \"basePipelineIndex\": 0\n";
+  os << "        },\n";
+  os << "        \"ShaderFileNames\": [\n            {\n";
+  os << "                \"stage\": \"" << kStage << "\",\n";
+  os << "                \"filename\": \"" << spvBasename << "\"\n";
+  os << "            }\n        ]\n";
+  os << "    },\n";
+  os << "    \"EnabledExtensions\": [],\n";
+  os << "    \"PipelineUUID\": [\n";
+  for (int i = 0; i < 16; ++i)
+    os << "        " << (unsigned)uuid[i] << (i < 15 ? "," : "") << "\n";
+  os << "    ]\n}\n";
+  return s;
+}
+
+static bool scWriteText(llvm::StringRef path, llvm::StringRef text) {
+  std::error_code ec;
+  llvm::raw_fd_ostream out(path, ec, llvm::sys::fs::OF_None);
+  if (ec) {
+    llvm::errs() << "vc: cannot write " << path << ": " << ec.message() << "\n";
+    return false;
+  }
+  out << text;
+  out.close();
+  return true;
+}
+
+// One offline pipeline: a kernel at one block size, plus everything pcc and the
+// runtime need to agree on.
+struct ScPipelineInfo {
+  std::string kernel;     // mangled device symbol = the OpEntryPoint name
+  int64_t bx = 1, by = 1, bz = 1;
+  uint8_t uuid[16] = {};
+  uint32_t ssboCount = 0, imageCount = 0, pcSize = 0;
+};
+
+// The `-emit=sc` driver. Returns a process exit code.
+static int emitSc(const TranslationUnit &tu, MLIRContext &ctx,
+                  bool warningsAsErrors, bool allowF64MathF32,
+                  const std::string &outDir, const std::string &inputFilename) {
+  using namespace mlir;
+
+  // --- kernels: device symbol -> decl -------------------------------------
+  llvm::StringMap<const FunctionDecl *> kernelBySymbol;
+  std::function<void(const std::vector<NodePtr> &)> collect =
+      [&](const std::vector<NodePtr> &decls) {
+        for (const auto &d : decls) {
+          if (d->getNodeType() == ASTNode::NodeKind::NamespaceDecl) {
+            collect(static_cast<const NamespaceDecl *>(d.get())->decls);
+            continue;
+          }
+          if (d->getNodeType() != ASTNode::NodeKind::FunctionDecl) continue;
+          auto *fn = static_cast<const FunctionDecl *>(d.get());
+          if (fn->deviceAttr != DeviceAttr::Global) continue;
+          kernelBySymbol[deviceMangledName(fn)] = fn;
+        }
+      };
+  collect(tu.decls);
+  if (kernelBySymbol.empty()) {
+    llvm::errs() << "vc: no __global__ kernel found in " << inputFilename
+                 << "\n";
+    return 1;
+  }
+
+  // The launch callee's key: a bare name, or the `::`-scope chain mangled the
+  // same way the host backend's handle key is (they must agree — the handle the
+  // host loads is the one the runtime reads). Mirrors ASTToHost's
+  // launchHandleName.
+  auto calleeKey = [](const ASTNode *callee) -> std::string {
+    if (!callee) return {};
+    if (callee->getNodeType() == ASTNode::NodeKind::DeclRefExpr)
+      return static_cast<const DeclRefExpr *>(callee)->name.str();
+    if (callee->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+      std::vector<std::string> parts;
+      const ASTNode *cur = callee;
+      while (cur && cur->getNodeType() == ASTNode::NodeKind::MemberAccessExpr) {
+        auto *ma = static_cast<const MemberAccessExpr *>(cur);
+        parts.push_back(ma->member.str());
+        cur = ma->base.get();
+      }
+      if (cur && cur->getNodeType() == ASTNode::NodeKind::DeclRefExpr)
+        parts.push_back(static_cast<const DeclRefExpr *>(cur)->name.str());
+      std::reverse(parts.begin(), parts.end());
+      std::string chain;
+      for (auto &p : parts) {
+        if (!chain.empty()) chain += "::";
+        chain += p;
+      }
+      return mangleScopeName(chain);
+    }
+    return {};
+  };
+
+  // --- launch sites -> one pipeline per (kernel, block size) ---------------
+  //
+  // A block size that is not a compile-time constant is fatal here, and it is
+  // worth saying why rather than silently picking one: the workgroup size is
+  // baked into the offline pipeline, so a launch whose size is only known at run
+  // time has no pipeline that could ever match it. The kernel would fail at
+  // dispatch with VK_ERROR_NO_PIPELINE_MATCH; refusing to compile says so early.
+  std::vector<ScPipelineInfo> pipelines;
+  std::set<std::tuple<int64_t, int64_t, int64_t>> blockSizes;
+  std::set<std::pair<std::string, std::tuple<int64_t, int64_t, int64_t>>> seen;
+  unsigned nonConst = 0;
+  for (const LaunchExpr *l : tu.launchSites) {
+    std::string key = calleeKey(l->callee.get());
+    auto kit = kernelBySymbol.find(key);
+    if (kit == kernelBySymbol.end()) continue; // not a kernel we know
+    if (!l->blockIsConst) {
+      llvm::errs() << "vc: kernel '" << key
+                   << "': block size must be constant under Vulkan SC (the "
+                      "workgroup size is baked into the precompiled pipeline)\n";
+      ++nonConst;
+      continue;
+    }
+    std::tuple<int64_t, int64_t, int64_t> bs{l->blockX, l->blockY, l->blockZ};
+    std::string sym = deviceMangledName(kit->second);
+    if (!seen.insert({sym, bs}).second) continue;
+
+    ScPipelineInfo p;
+    p.kernel = sym;
+    std::tie(p.bx, p.by, p.bz) = bs;
+    // p.uuid is filled in once the SPIR-V exists (see the block-size loop).
+    const FunctionDecl *fn = kit->second;
+    for (const ParamDecl *pd : fn->params) {
+      if (!pd->type) continue;
+      if (pd->type->getKind() == TypeKind::Image) ++p.imageCount;
+      else if (pd->type->getKind() == TypeKind::Pointer) ++p.ssboCount;
+    }
+    blockSizes.insert(bs);
+    pipelines.push_back(std::move(p));
+  }
+  if (nonConst) return 1;
+  if (pipelines.empty()) {
+    llvm::errs() << "vc: no kernel launch found in " << inputFilename
+                 << " (nothing to precompile for Vulkan SC)\n";
+    return 1;
+  }
+
+  std::error_code ec;
+  if (std::error_code mkec = llvm::sys::fs::create_directories(outDir)) {
+    llvm::errs() << "vc: cannot create " << outDir << ": " << mkec.message()
+                 << "\n";
+    return 1;
+  }
+
+  // --- one lowering run per distinct block size ---------------------------
+  //
+  // Each run re-translates the AST: the lowering pipeline consumes the module
+  // (it erases the VC ops and repacks them into a gpu.module), so a fresh module
+  // is the clean way to get a second LocalSize out of the same source.
+  for (const auto &bs : blockSizes) {
+    int64_t bx = std::get<0>(bs), by = std::get<1>(bs), bz = std::get<2>(bs);
+    auto module =
+        codegen::translateASTToMLIR(tu, ctx, warningsAsErrors, allowF64MathF32);
+    if (!module) {
+      llvm::errs() << "vc: codegen failed\n";
+      return 1;
+    }
+    // Set *after* translateASTToMLIR: it installs its own module attributes as
+    // its last act, so an attribute set before the call would be overwritten.
+    // (`mod` is a ModuleOp value: attribute access goes through Op's operator->
+    // to the underlying Operation, which is where setAttr/getAttrs live.)
+    ModuleOp mod = *module;
+    SmallVector<Attribute, 3> dims = {IntegerAttr::get(IntegerType::get(&ctx, 32), bx),
+                                      IntegerAttr::get(IntegerType::get(&ctx, 32), by),
+                                      IntegerAttr::get(IntegerType::get(&ctx, 32), bz)};
+    mod->setAttr("vc.sc.block_dims", ArrayAttr::get(&ctx, dims));
+
+    // Cooperative matrix / wmma has no place in an SC pipeline: the runtime
+    // cannot enable the feature (the SC header has no
+    // VkPhysicalDeviceCooperativeMatrixFeaturesKHR and no extension list on
+    // this path), so a pipeline built from wmma SPIR-V would have no device
+    // capability behind it and could only fail at create or dispatch time.
+    // Refusing here — where the source is still in hand, and with the flag the
+    // ASTToMLIR set — is the only point at which the user can act on it.
+    if (mod->hasAttr("vc.uses_coopmatrix")) {
+      llvm::errs() << "vc: Vulkan SC: this translation unit uses cooperative "
+                      "matrix (wmma::), which is not available under Vulkan SC\n";
+      return 1;
+    }
+
+    if (failed(codegen::runLoweringPipeline(*module))) return 1;
+
+    // The push-constant size packKernels recorded (see
+    // lowerScalarArgsToPushConstant) — the only way to know it without a module
+    // in the process at run time.
+    for (NamedAttribute na : mod->getAttrs()) {
+      llvm::StringRef name = na.getName().strref();
+      if (!name.consume_front("vc.sc.pc_size.")) continue;
+      auto size = na.getValue().dyn_cast<IntegerAttr>();
+      if (!size) continue;
+      for (ScPipelineInfo &p : pipelines)
+        if (p.kernel == name && p.bx == bx && p.by == by && p.bz == bz)
+          p.pcSize = (uint32_t)size.getInt();
+    }
+
+    SmallVector<uint32_t, 0> binary;
+    mlir::spirv::ModuleOp spirvModule;
+    module->walk([&](mlir::spirv::ModuleOp m) {
+      if (!spirvModule) spirvModule = m;
+    });
+    if (!spirvModule || failed(mlir::spirv::serialize(spirvModule, binary))) {
+      llvm::errs() << "vc: spirv translation failed\n";
+      return 1;
+    }
+    // No patchWorkgroupSizeBuiltin: it decorates a gl_WorkGroupSize
+    // spec-constant composite that only exists on the spec-constant path. The
+    // dynamic-shared patch still applies, but with the literal block size
+    // instead of a spec-constant reference.
+    patchDynamicSharedArrays(binary, bx);
+    patchImageOps(binary);
+
+    // Identifier, now that the final bytes exist: content + entry point + block
+    // dims. The bytes are the whole module (every kernel in the file), so the
+    // entry point and the block dims are what separate the pipelines that share
+    // one .spv. Every pipeline is read here — `pipelines` and `blockSizes` are
+    // built from the same launch-site walk.
+    {
+      llvm::StringRef bytes(reinterpret_cast<const char *>(binary.data()),
+                            binary.size() * sizeof(uint32_t));
+      for (ScPipelineInfo &p : pipelines) {
+        if (p.bx != bx || p.by != by || p.bz != bz) continue;
+        std::string key = (bytes + "|" + p.kernel + "|" +
+                           std::to_string(bx) + "x" + std::to_string(by) + "x" +
+                           std::to_string(bz))
+                              .str();
+        scHashUuid(key, p.uuid);
+      }
+    }
+    for (const ScPipelineInfo &p : pipelines) {
+      if (p.bx != bx || p.by != by || p.bz != bz) continue;
+      std::string stem = p.kernel + ".b" + std::to_string(bx) + "_" +
+                         std::to_string(by) + "_" + std::to_string(bz);
+      SmallString<256> spvPath(outDir);
+      llvm::sys::path::append(spvPath, stem + ".spv");
+      std::error_code wec;
+      llvm::raw_fd_ostream out(spvPath, wec, llvm::sys::fs::OF_None);
+      if (wec) {
+        llvm::errs() << "vc: cannot write " << spvPath << ": "
+                     << wec.message() << "\n";
+        return 1;
+      }
+      out.write(reinterpret_cast<const char *>(binary.data()),
+                binary.size() * sizeof(uint32_t));
+      out.close();
+
+      SmallString<256> jsonPath(outDir);
+      llvm::sys::path::append(jsonPath, stem + ".json");
+      if (!scWriteText(jsonPath,
+                       scPipelineJson(stem + ".spv", p.kernel, p.uuid,
+                                      p.ssboCount, p.imageCount, p.pcSize)))
+        return 1;
+    }
+  }
+
+  // --- host C++ ------------------------------------------------------------
+  //
+  // The host descriptor table carries the same numbers the JSONs do, and the
+  // launcher loads each pipeline by UUID. No SPIR-V is embedded: on SC the
+  // binary is in pipeline_cache.bin, not in the executable.
+  std::vector<host::HostScPipeline> scTable;
+  for (const ScPipelineInfo &p : pipelines) {
+    host::HostScPipeline h;
+    h.kernelName = p.kernel;
+    h.entryPoint = p.kernel; // MLIR names each OpEntryPoint after the symbol
+    std::memcpy(h.uuid, p.uuid, 16);
+    h.blockX = (uint32_t)p.bx;
+    h.blockY = (uint32_t)p.by;
+    h.blockZ = (uint32_t)p.bz;
+    h.storageBufferBindingCount = p.ssboCount;
+    h.imageBindingCount = p.imageCount;
+    h.pushConstantSize = p.pcSize;
+    scTable.push_back(std::move(h));
+  }
+
+  SmallString<256> hostPath(outDir);
+  llvm::sys::path::append(
+      hostPath, llvm::sys::path::stem(llvm::sys::path::filename(inputFilename)) +
+                    "_host.cpp");
+  {
+    std::string hostSrc;
+    llvm::raw_string_ostream os(hostSrc);
+    if (!host::translateASTToHost(tu, /*modules=*/{}, os, &scTable)) {
+      llvm::errs() << "vc: no host main() found in " << inputFilename << "\n";
+      return 1;
+    }
+    if (!scWriteText(hostPath, hostSrc)) return 1;
+  }
+
+  llvm::errs() << "vc: Vulkan SC: " << pipelines.size() << " offline pipeline"
+               << (pipelines.size() == 1 ? "" : "s") << " into '" << outDir
+               << "' (" << blockSizes.size() << " block "
+               << (blockSizes.size() == 1 ? "size" : "sizes") << "); host "
+               << hostPath << "\n";
+  llvm::errs()
+      << "vc: feed the whole directory to one nvidia-pcc run, then patch the "
+         "cache header:\n"
+      << "      tools/vksc/build_cache.sh " << outDir << "\n"
+      << "vc: the reservation must cover every pipeline; the runtime defaults are "
+         "generous,\n"
+      << "    but to pin them:\n"
+      << "      VcScReservation r{}; vcScReservationDefaults(&r);\n"
+      << "      r.computePipelines = r.pipelineLayouts = r.descriptorSetLayouts = "
+      << pipelines.size() << ";\n";
+  return 0;
+}
+
 int main(int argc, char **argv) {
   llvm::InitLLVM y(argc, argv);
 
   llvm::cl::opt<std::string> inputFilename(llvm::cl::Positional,
       llvm::cl::desc("<input .vc file>"), llvm::cl::Required);
   llvm::cl::opt<std::string> emit("emit",
-      llvm::cl::desc("output kind (ast|mlir|spirv|host|full)"),
+      llvm::cl::desc("output kind (ast|mlir|spirv|host|full|sc)"),
       llvm::cl::init("mlir"));
   llvm::cl::opt<std::string> outputFilename("o",
       llvm::cl::desc("output filename"), llvm::cl::init("-"));
@@ -1219,6 +1757,7 @@ int main(int argc, char **argv) {
   else if (emit == "spirv") kind = EmitKind::SPIRV;
   else if (emit == "host") kind = EmitKind::Host;
   else if (emit == "full") kind = EmitKind::Full;
+  else if (emit == "sc") kind = EmitKind::SC;
   else if (emit != "mlir") {
     llvm::errs() << "unknown -emit=" << emit << "\n";
     return 1;
@@ -1256,6 +1795,25 @@ int main(int argc, char **argv) {
   if (kind == EmitKind::AST) {
     dumpAST(tu, llvm::outs());
     return 0;
+  }
+
+  // Vulkan SC: emits its own outputs (per-block-size SPIR-V + pcc JSON + host
+  // C++) into a directory, so it owns the whole pipeline run and never reaches
+  // the single-module path below. It is dispatched here, after the AST-level
+  // passes above (notably unrollDeviceRecursion) have run, and before the
+  // context setup, since it re-translates the AST once per block size.
+  if (kind == EmitKind::SC) {
+    MLIRContext scCtx;
+    DialectRegistry scRegistry;
+    scRegistry.insert<vc::VCDialect, mlir::spirv::SPIRVDialect,
+                      mlir::func::FuncDialect, mlir::arith::ArithDialect,
+                      mlir::memref::MemRefDialect, mlir::scf::SCFDialect,
+                      mlir::gpu::GPUDialect, mlir::index::IndexDialect>();
+    scCtx.appendDialectRegistry(scRegistry);
+    std::string outDir = outputFilename.getValue();
+    if (outDir.empty() || outDir == "-") outDir = ".";
+    return emitSc(tu, scCtx, warningsAsErrors, allowF64MathF32, outDir,
+                  inputFilename.getValue());
   }
 
   // MLIR / SPIRV

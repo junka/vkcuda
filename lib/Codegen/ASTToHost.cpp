@@ -53,6 +53,11 @@ class HostEmitter {
   // Kernel names referenced by any LaunchExpr in main(). Drives the
   // handle-declaration + vcLoadKernel prologue emitted at the top of main.
   StringSet<> launchedKernels;
+  // Vulkan SC only: bare `__vc_k_<kernel>` names the host source mentions (e.g.
+  // `vcLaunchKernelIndirect(__vc_k_fillIdx, ...)`). Under SC the real handles
+  // are per (kernel, block size), so a bare name is only declared as an alias
+  // when the source actually uses one — see emitScDescriptors.
+  StringSet<> namedHandleRefs;
   // Name -> FunctionDecl for all top-level host functions. Used to complete
   // call sites that omit trailing defaulted parameters (default arguments).
   llvm::StringMap<const FunctionDecl *> hostFuncDecls;
@@ -65,10 +70,23 @@ class HostEmitter {
   // (`texture2D<float> src`). emitLaunch resolves the kernel decl via this map
   // and reads params[idx] to classify each arg by its real device type.
   llvm::StringMap<const FunctionDecl *> kernelDecls;
+  // Vulkan SC: the precompiled pipelines, keyed "kernel|blockX|blockY|blockZ" ->
+  // the file-scope VCScPipelineDesc variable the launch site loads. Null (the
+  // default) means the embed-and-vcLoadKernel path. See emitScDescriptors.
+  const std::vector<host::HostScPipeline> *scPipelines = nullptr;
+  llvm::StringMap<std::string> scDescVarForSite;
 
 public:
-  HostEmitter(raw_ostream &o, const std::vector<host::HostSpirvModule> *mods)
-      : os(o), modules(mods) {
+  HostEmitter(raw_ostream &o, const std::vector<host::HostSpirvModule> *mods,
+              const std::vector<host::HostScPipeline> *sc = nullptr)
+      : os(o), modules(mods), scPipelines(sc) {
+    if (scPipelines) {
+      for (const auto &p : *scPipelines) {
+        std::string key = scSiteKey(p.kernelName, p.blockX, p.blockY, p.blockZ);
+        scDescVarForSite[key] = scDescVarName(p.kernelName, p.blockX, p.blockY,
+                                              p.blockZ);
+      }
+    }
     if (modules) {
       for (const auto &m : *modules) {
         // Empty kernel name = legacy single-module path: embed as the generic
@@ -81,6 +99,35 @@ public:
             m.entryPoint.empty() ? "main" : m.entryPoint;
       }
     }
+  }
+
+  // Key for one (kernel, block size) launch site. The block size is part of the
+  // identity under Vulkan SC: the workgroup size is baked into the precompiled
+  // pipeline, so the same kernel launched with a different block size is a
+  // different pipeline (and gets its own descriptor + cache entry).
+  static std::string scSiteKey(StringRef kernel, uint32_t bx, uint32_t by,
+                               uint32_t bz) {
+    return (kernel.str() + "|" + std::to_string(bx) + "|" + std::to_string(by) +
+            "|" + std::to_string(bz));
+  }
+
+  // File-scope name of the descriptor variable for a (kernel, block size) pair.
+  static std::string scDescVarName(StringRef kernel, uint32_t bx, uint32_t by,
+                                   uint32_t bz) {
+    return ("__vc_sc_" + kernel.str() + "_b" + std::to_string(bx) + "_" +
+            std::to_string(by) + "_" + std::to_string(bz));
+  }
+
+  // File-scope name of the kernel handle for a (kernel, block size) pair. One
+  // per pair, not one per kernel: the handle is what the runtime records the
+  // loaded pipeline in, and two block sizes are two different precompiled
+  // pipelines, so sharing a handle would make the second load look like a repeat
+  // of the first (the `if (!handle)` guard would skip it) and dispatch the
+  // wrong pipeline.
+  static std::string scHandleName(StringRef kernel, uint32_t bx, uint32_t by,
+                                  uint32_t bz) {
+    return ("__vc_k_" + kernel.str() + "_b" + std::to_string(bx) + "_" +
+            std::to_string(by) + "_" + std::to_string(bz));
   }
 
   bool emit(const TranslationUnit &tu) {
@@ -106,7 +153,8 @@ public:
         scanLaunches(kv.second->body.get());
 
     emitPreamble(tu);
-    emitSpirvEmbed();
+    if (scPipelines) emitScDescriptors();
+    else emitSpirvEmbed();
     // Kernel handles live at file scope, not inside main: a launch may sit in a
     // host helper (`runCase(...)`) that main calls, and a helper cannot see a
     // local of main. File scope is also correct for the lazy-load design — the
@@ -275,6 +323,79 @@ private:
           "inline half3 make_half3(_Float16 a,_Float16 b,_Float16 c){return "
           "half3(a,b,c);}inline half4 make_half4(_Float16 a,_Float16 b,"
           "_Float16 c,_Float16 d){return half4(a,b,c,d);}\n\n";
+  }
+
+  // Vulkan SC: instead of embedding SPIR-V, emit one file-scope
+  // VCScPipelineDesc per (kernel, block size). The runtime loads the pipeline
+  // out of the precompiled pipeline cache by UUID — there is no module in this
+  // executable at all.
+  //
+  // The descriptor's layout fields are filled in by the driver from the same
+  // table that produced the pcc JSON, so the layout the runtime hands
+  // vkCreateComputePipelines is by construction the layout pcc compiled
+  // against; a disagreement there is a bare -1000011001 with no hint of which
+  // binding differs.
+  void emitScDescriptors() {
+    if (!scPipelines || scPipelines->empty()) {
+      os << "// no Vulkan SC pipelines (no __global__ kernels)\n\n";
+      return;
+    }
+    os << "// Offline (Vulkan SC) pipelines: one per (kernel, launch block "
+          "size).\n"
+          "// The SPIR-V these were compiled from is not in this executable; "
+          "the\n"
+          "// runtime fetches each pipeline from pipeline_cache.bin by "
+          "UUID.\n";
+    for (const auto &p : *scPipelines) {
+      const std::string var =
+          scDescVarName(p.kernelName, p.blockX, p.blockY, p.blockZ);
+      os << "static const VCScPipelineDesc " << var << " = {\n";
+      os << "  \"" << p.kernelName << "\", \"" << p.entryPoint << "\",\n";
+      os << "  {";
+      for (unsigned i = 0; i < 16; ++i) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "%s0x%02x", i ? ", " : "",
+                      (unsigned)p.uuid[i]);
+        os << buf;
+      }
+      os << "},\n";
+      os << "  " << p.blockX << ", " << p.blockY << ", " << p.blockZ << ",\n";
+      os << "  " << p.storageBufferBindingCount << ", " << p.imageBindingCount
+         << ", " << p.pushConstantSize << ", 0\n";
+      os << "};\n";
+    }
+    os << "\n";
+    // Handles live here rather than in emitKernelHandleDecls (which emits one
+    // per kernel): under SC the identity is the (kernel, block size) pair.
+    os << "// Kernel handles: one per (kernel, block size). A different block "
+          "size is a\n"
+          "// different precompiled pipeline, so it gets its own handle — the "
+          "lazy\n"
+          "// guard below would otherwise treat the second load as a repeat of "
+          "the first.\n";
+    for (const auto &p : *scPipelines)
+      os << "static VCKernelHandle "
+         << scHandleName(p.kernelName, p.blockX, p.blockY, p.blockZ)
+         << " = nullptr;\n";
+    // Host code may name the handle the default backends would declare —
+    // `vcLaunchKernelIndirect(__vc_k_foo, ...)` or
+    // `vcOccupancyMaxPotentialBlockSize(..., __vc_k_foo, ...)`. Under SC a
+    // handle is bound to one baked block size, so a kernel's bare name aliases
+    // its first (source-order) block size; a named use at another block size is
+    // rejected at dispatch with both sizes reported, rather than silently
+    // dispatching the wrong pipeline.
+    StringSet<> aliased;
+    for (const auto &p : *scPipelines) {
+      std::string bare = "__vc_k_" + p.kernelName;
+      if (!namedHandleRefs.count(bare) || !aliased.insert(bare).second) continue;
+      os << "// `" << bare << "` is referenced by name below; under Vulkan SC the\n"
+            "// handle carries its block size (" << p.blockX << "x" << p.blockY
+         << "x" << p.blockZ
+         << ", this kernel's first launch site).\n";
+      os << "static VCKernelHandle &" << bare << " = "
+         << scHandleName(p.kernelName, p.blockX, p.blockY, p.blockZ) << ";\n";
+    }
+    os << "\n";
   }
 
   void emitSpirvEmbed() {
@@ -456,6 +577,15 @@ private:
   void scanLaunches(const ASTNode *n) {
     if (!n) return;
     switch (n->getNodeType()) {
+    case ASTNode::NodeKind::DeclRefExpr: {
+      // Remember bare kernel-handle references: the default backends name the
+      // handle `__vc_k_<kernel>`, and host code that passes one explicitly
+      // (`vcLaunchKernelIndirect`, `vcOccupancyMaxPotentialBlockSize`) keeps
+      // compiling under SC only if that name exists there too.
+      StringRef name = static_cast<const DeclRefExpr *>(n)->name;
+      if (name.starts_with("__vc_k_")) namedHandleRefs.insert(name);
+      return;
+    }
     case ASTNode::NodeKind::LaunchExpr: {
       auto *l = static_cast<const LaunchExpr *>(n);
       if (l->callee)
@@ -623,6 +753,9 @@ private:
   // main calls, and a helper cannot see a local of main. File scope satisfies
   // both. Zero-initialized statics cost nothing at startup.
   void emitKernelHandleDecls() {
+    // SC: one handle per (kernel, block size), emitted with the descriptors
+    // (emitScDescriptors) since only there are the block sizes known.
+    if (scPipelines) return;
     if (launchedKernels.empty()) return;
     os << "// Kernel handles: one per __global__ launched anywhere in this file.\n";
     for (const auto &kv : launchedKernels)
@@ -1092,10 +1225,43 @@ private:
         entryPointForKernel.count(kname)    ? entryPointForKernel[kname]
         : entryPointForKernel.count("")     ? entryPointForKernel[""]
                                             : "main";
+    // The handle this launch site uses: under SC it is per (kernel, block size)
+    // — see scHandleName — otherwise the one-per-kernel file-scope handle.
+    const std::string handleVar =
+        scPipelines ? scHandleName(kname, (uint32_t)l->blockX, (uint32_t)l->blockY,
+                                   (uint32_t)l->blockZ)
+                    : ("__vc_k_" + kname);
     pad(indent + 1);
-    os << "if (!__vc_k_" << kname
-       << ") vcLoadKernel(" << spirvVar << ", " << spirvVar
-       << "_len, \"" << entryPt << "\", &__vc_k_" << kname << ");\n";
+    if (scPipelines) {
+      // Vulkan SC: no module to embed and no entry point to name here — the
+      // descriptor already carries both. Pick the descriptor by block size,
+      // because the workgroup size is baked into the precompiled pipeline: a
+      // launch with a different block is a different pipeline, and one that was
+      // never compiled has no cache entry.
+      //
+      // vcLaunchKernel's block dims must be the descriptor's, or the runtime
+      // rejects the launch before dispatch (getPipeline compares them). Using
+      // the folded literals rather than the launch expression guarantees that,
+      // and the compiler already refused any launch whose block isn't a
+      // compile-time constant (an offline pipeline can't match a runtime value).
+      auto sit = scDescVarForSite.find(scSiteKey(kname, (uint32_t)l->blockX,
+                                                 (uint32_t)l->blockY,
+                                                 (uint32_t)l->blockZ));
+      if (sit == scDescVarForSite.end()) {
+        // Unreachable when the driver built the table from this translation
+        // unit's launch sites; emit a named error rather than a dangling call.
+        os << "#error \"no offline pipeline compiled for kernel " << kname
+           << " at block " << l->blockX << "x" << l->blockY << "x" << l->blockZ
+           << "\"\n";
+      } else {
+        os << "if (!" << handleVar << ") vcLoadKernelOffline(&" << sit->second
+           << ", &" << handleVar << ");\n";
+      }
+    } else {
+      os << "if (!__vc_k_" << kname
+         << ") vcLoadKernel(" << spirvVar << ", " << spirvVar
+         << "_len, \"" << entryPt << "\", &__vc_k_" << kname << ");\n";
+    }
     pad(indent + 1);
     // Spill every scalar (non-pointer) launch arg to a synthetic local before
     // building the __args array. A literal or compound-expression arg is an
@@ -1131,7 +1297,7 @@ private:
     os << "vcLaunchKernel";
     if (is2D) os << "2D";
     if (hasStream) os << "S";
-    os << "(__vc_k_" << kname << ", ";
+    os << "(" << handleVar << ", ";
     emitHostExpr(l->gridDim.get());
     if (is2D) {
       os << ", ";
@@ -1364,8 +1530,9 @@ namespace host {
 
 bool translateASTToHost(const TranslationUnit &tu,
                         const std::vector<HostSpirvModule> &modules,
-                        llvm::raw_ostream &os) {
-  HostEmitter e(os, &modules);
+                        llvm::raw_ostream &os,
+                        const std::vector<HostScPipeline> *scPipelines) {
+  HostEmitter e(os, &modules, scPipelines);
   return e.emit(tu);
 }
 

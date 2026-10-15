@@ -278,6 +278,10 @@ NodePtr cloneExpr(const ASTNode *n);
 // Declarations
 //===----------------------------------------------------------------------===//
 
+/// Forward declaration: TranslationUnit records the file's launch sites as
+/// raw pointers, and LaunchExpr is defined far below with the expression nodes.
+class LaunchExpr;
+
 class TranslationUnit : public ASTNode {
 public:
   std::vector<NodePtr> decls;
@@ -286,6 +290,17 @@ public:
   // verbatim from source. The host C++ backend emits these at the top of the
   // generated .cpp; the device (GLSL) backend ignores them.
   std::vector<std::string> hostPpLines;
+
+  // Every `kernel<<<grid, block>>>(...)` site in the file, in parse order, with
+  // the block extent already constant-folded (see LaunchExpr::blockIsConst).
+  //
+  // The default backends ignore this: their block size is a runtime value
+  // (specialization constants / a launch argument). Vulkan SC bakes the
+  // workgroup size into a pipeline compiled ahead of time by nvidia-pcc, so the
+  // `vc -emit=sc` driver reads this list to decide which (kernel, block) pairs
+  // need an offline binary — and to reject a launch whose block size is not a
+  // compile-time constant, which no offline pipeline could ever match.
+  std::vector<const LaunchExpr *> launchSites;
 
   TranslationUnit(SourceLocation l) : ASTNode(l) {}
   NodeKind getNodeType() const override { return NodeKind::TranslationUnit; }
@@ -800,6 +815,14 @@ public:
   // the 2-arg form.
   NodePtr sharedMemBytes;
   std::vector<NodePtr> args;
+  // The block extent as a compile-time constant, folded by the parser at the
+  // launch site (Y/Z default to 1; `dim3(a,b)` only has two components, so Z is
+  // always 1). `blockIsConst` is false when blockDim is not a foldable integer
+  // expression — a legal runtime value for the default backends, but fatal
+  // under Vulkan SC, where the workgroup size is baked into the precompiled
+  // pipeline. See TranslationUnit::launchSites.
+  int64_t blockX = 1, blockY = 1, blockZ = 1;
+  bool blockIsConst = false;
   LaunchExpr(SourceLocation l, NodePtr c, NodePtr g, NodePtr b,
              NodePtr gy = nullptr, NodePtr by = nullptr, NodePtr s = nullptr,
              NodePtr shm = nullptr)

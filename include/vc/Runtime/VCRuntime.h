@@ -128,6 +128,112 @@ VCError vcInit();
 /// Tear down the runtime and release all device resources.
 VCError vcShutdown();
 
+#ifdef VC_VULKAN_SC
+/// ---------------------------------------------------------------------------
+/// Vulkan SC reservations
+///
+/// Vulkan SC has no dynamic host allocation: every object the application will
+/// ever create must be declared up front in VkDeviceObjectReservationCreateInfo
+/// at vkCreateDevice time, and the driver will fail any create that exceeds the
+/// declared counts. The VC runtime therefore cannot derive the reservation from
+/// the program's runtime behaviour — it must be told, before vcInit().
+///
+/// vcSetScReservation fills in the whole struct for an application whose real
+/// needs differ from the defaults. Every field left at zero in a partially
+/// filled struct keeps its default, so the common case (start from `defaults`,
+/// override one field) needs no bookkeeping. Individual fields may also be
+/// overridden from the environment without recompiling: VC_SC_<FIELD> in upper
+/// snake case, e.g. VC_SC_BUFFERS, VC_SC_COMPUTE_PIPELINES,
+/// VC_SC_COMMAND_POOL_RESERVED_SIZE. Environment overrides are applied on top
+/// of whatever vcSetScReservation last set.
+///
+/// The defaults are the vendor SC samples' numbers scaled by the runtime's
+/// object model (streams x frame ring command buffers/fences, one pipeline per
+/// distinct launch block size, ...) and are deliberately generous: the cost of
+/// an over-large reservation is a slightly larger device-creation allocation,
+/// while the cost of an under-sized one is an unrecoverable failure at the
+/// first vcMalloc. `vc -emit=sc` prints a reservation sized for the program it
+/// just compiled, which is the way to pin this down for a real application.
+/// ---------------------------------------------------------------------------
+struct VcScReservation {
+  // VkDeviceObjectReservationCreateInfo request counts. Zero = use the default.
+  uint32_t pipelineCaches                = 0; // default 1
+  // Separate from pipelineCaches above: that one sets
+  // pipelineCacheCreateInfoCount (the create-infos the device is told about),
+  // this one sets pipelineCacheRequestCount (how many cache objects may exist).
+  // A nonzero create-info count with a zero request count lets vkCreateDevice
+  // succeed and then fails the vkCreatePipelineCache after it with
+  // VK_ERROR_OUT_OF_HOST_MEMORY (-1) — a reservation overrun, not real OOM.
+  uint32_t pipelineCacheRequests         = 0; // default 4
+  uint32_t pipelinePoolSizes             = 0; // default 1
+  uint32_t computePipelines              = 0; // default 64
+  uint32_t graphicsPipelines             = 0; // default 0 (VC is compute-only)
+  uint32_t pipelineLayouts               = 0; // default 64
+  uint32_t descriptorSetLayouts          = 0; // default 64
+  uint32_t descriptorPools               = 0; // default 16
+  uint32_t descriptorSets                = 0; // default 512
+  uint32_t commandPools                  = 0; // default 16
+  uint32_t commandBuffers                = 0; // default 64
+  uint32_t fences                        = 0; // default 64
+  uint32_t semaphores                    = 0; // default 64
+  uint32_t events                        = 0; // default 16
+  uint32_t queryPools                    = 0; // default 16
+  uint32_t buffers                       = 0; // default 256
+  uint32_t bufferViews                   = 0; // default 0 (VC never makes one)
+  uint32_t images                        = 0; // default 32
+  uint32_t imageViews                    = 0; // default 32
+  uint32_t deviceMemoryRequests          = 0; // default 512
+  uint32_t samplerYcbcrConversions       = 0; // default 0
+  uint32_t samplers                      = 0; // default 0
+  uint32_t renderPasses                  = 0; // default 0
+  uint32_t framebuffers                  = 0; // default 0
+  uint32_t surfaces                      = 0; // default 0
+  uint32_t swapchains                    = 0; // default 0
+  uint32_t displayModes                  = 0; // default 0
+  uint32_t subpassDescriptions           = 0; // default 0
+  uint32_t attachmentDescriptions        = 0; // default 0
+  // A real PER-LAYOUT cap, not a total: a descriptor-set layout with more
+  // bindings than this makes vkCreateDescriptorSetLayout itself fail with
+  // VK_ERROR_VALIDATION_FAILED (-1000011001). Default 8.
+  uint32_t descriptorSetLayoutBindingLimit = 0;
+  // The matching TOTAL across all descriptor-set layouts
+  // (descriptorSetLayoutBindingRequestCount). Also a hard cap: exceeding it
+  // fails vkCreateDescriptorSetLayout with VK_ERROR_OUT_OF_HOST_MEMORY.
+  // Default 64 (i.e. descriptorSetLayouts x 1 typical binding).
+  uint32_t descriptorSetLayoutBindingRequests = 0;
+  uint32_t maxImageViewMipLevels         = 0; // default 1
+  uint32_t maxImageViewArrayLayers       = 0; // default 1
+
+  // VkCommandPoolMemoryReservationCreateInfo. SC command pools are a fixed
+  // allocation, sized in bytes, shared by at most commandPoolMaxCommandBuffers
+  // command buffers. Defaults: 64 KiB and maxCommandPoolCommandBuffers (the
+  // device property, i.e. no limit beyond what the driver allows).
+  uint64_t commandPoolReservedSize       = 0;
+  uint32_t commandPoolMaxCommandBuffers  = 0;
+
+  // VkPipelinePoolSize::poolEntrySize — the size of one pipeline pool entry.
+  // Must equal the VkPipelineOfflineCreateInfo::poolEntrySize used when the
+  // pipeline is created, and must be large enough for the driver's pipeline
+  // representation (the vendor samples use 1 MiB). Default 1 MiB.
+  uint64_t pipelinePoolEntrySize         = 0;
+
+  // Path of the precompiled pipeline cache, equivalent to setting
+  // VC_SC_PIPELINE_CACHE. Empty string = use the environment / the default
+  // "./pipeline_cache.bin".
+  const char *pipelineCachePath          = nullptr;
+};
+
+/// Fill in an empty VcScReservation with the runtime's defaults. Use this as
+/// the starting point for a partial override. Must be called before vcInit.
+void vcScReservationDefaults(VcScReservation *out);
+
+/// Install a Vulkan SC reservation to be consumed by the next vcInit. Must be
+/// called before vcInit; calling it after vcInit returns InvalidValue. The
+/// struct is copied, so `reservation` need not outlive the call. This is a
+/// no-op (returning Success) in a non-SC build.
+VCError vcSetScReservation(const VcScReservation *reservation);
+#endif // VC_VULKAN_SC
+
 /// Query the number of available Vulkan devices (every physical device with a
 /// compute queue that VC enumerated at init).
 VCError vcGetDeviceCount(int *count);
@@ -522,6 +628,58 @@ VCError vcLoadKernel(const uint32_t *spirvWords, size_t wordCount,
 /// Load a kernel from a .spv file on disk.
 VCError vcLoadKernelFromFile(const char *path, const char *entryPoint,
                              VCKernelHandle *outKernel);
+
+#if defined(VC_VULKAN_SC) || defined(VC_DOCUMENT_VULKAN_SC)
+/// ---------------------------------------------------------------------------
+/// Offline (precompiled) pipelines
+///
+/// Vulkan SC has no runtime pipeline compilation: there is no VkShaderModule
+/// and no SPIR-V in the process at all. `nvidia-pcc` compiles every pipeline
+/// ahead of time into pipeline_cache.bin, and at runtime the pipeline is
+/// selected from that cache by a 16-byte UUID
+/// (VkPipelineOfflineCreateInfo::pipelineIdentifier) — the same UUID the
+/// compiler wrote into the pcc JSON.
+///
+/// Because there is no module to reflect, the descriptor-set layout and
+/// push-constant range must be described to the runtime explicitly, and they
+/// must match the JSON that produced the cache entry exactly: the SC driver
+/// validates the application-supplied create info against the cached entry and
+/// returns VK_ERROR_VALIDATION_FAILED (-1000011001) on any disagreement in
+/// binding types, binding count, or push-constant ranges.
+///
+/// `vc -emit=sc` writes one VCScPipelineDesc per (kernel, distinct launch block
+/// size) alongside the .spv/.json pair and a `vcLoadKernelOffline` call in the
+/// host code, so the descriptor, the JSON and the cache entry cannot drift.
+/// ---------------------------------------------------------------------------
+struct VCScPipelineDesc {
+  const char *name;       // kernel name, for diagnostics ("sc_vadd")
+  const char *entryPoint; // SPIR-V OpEntryPoint name (the kernel's device
+                          // symbol: VC's MLIR backend emits one entry point per
+                          // kernel, named after the mangled kernel symbol)
+  uint8_t uuid[16];       // the offline pipeline identifier (matches the JSON)
+  // Block dimensions baked into the precompiled SPIR-V. A launch whose block
+  // dims differ from these has no cache entry and fails with
+  // VK_ERROR_NO_PIPELINE_MATCH; the compiler emits one descriptor per distinct
+  // block size, so this is the exact block size to launch with.
+  uint32_t blockX, blockY, blockZ;
+  // Descriptor bindings, in the order the kernel takes its pointer arguments.
+  // `storageBufferBindingCount` bindings of type STORAGE_BUFFER (pointers from
+  // vcMalloc) followed by `imageBindingCount` of type STORAGE_IMAGE (from
+  // vcCreateImage2D), both starting at binding 0 of set 0.
+  uint32_t storageBufferBindingCount;
+  uint32_t imageBindingCount;
+  // One push-constant range of this many bytes at offset 0, holding the packed
+  // scalar arguments. 0 = the kernel takes no scalars.
+  uint32_t pushConstantSize;
+  uint32_t pushConstantOffset; // 0 for VC-emitted pipelines
+};
+
+/// Load a precompiled Vulkan SC pipeline described by `desc`. Only available in
+/// an SC build (VC_VULKAN_SC); the pipeline itself is created lazily at the
+/// first launch. Returns InvalidValue if `desc` is null or malformed.
+VCError vcLoadKernelOffline(const VCScPipelineDesc *desc,
+                            VCKernelHandle *outKernel);
+#endif // VC_VULKAN_SC
 
 /// Release a loaded kernel.
 VCError vcReleaseKernel(VCKernelHandle kernel);

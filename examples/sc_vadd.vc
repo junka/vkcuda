@@ -1,0 +1,87 @@
+// examples/sc_vadd.vc — smallest end-to-end Vulkan SC program.
+//
+// Same single-file shape as examples/singlefile.vc (kernel + host main() +
+// `kernel<<<grid, block>>>(...)` launch), but written for the offline-pipeline
+// flow Vulkan SC requires. Vulkan SC has no runtime pipeline compilation and no
+// SPIR-V in the process: every pipeline the application can create must be built
+// ahead of time by nvidia-pcc into a pipeline_cache.bin and is selected at
+// create time by a 16-byte UUID.
+//
+// Build & run (SC build of the runtime, cross-compiled for the target):
+//   vc -emit=sc examples/sc_vadd.vc -o build/sc
+//   tools/vksc/build_cache.sh build/sc          # nvidia-pcc -> pipeline_cache.bin
+//   <cross-g++> build/sc/sc_vadd_host.cpp -o sc_vadd  (link libVCRuntime + vulkansc)
+//   copy pipeline_cache.bin + sc_vadd to the target and run
+// Expect: "sc_vadd: PASS"
+//
+// `vc -emit=sc` writes, for each (kernel, distinct launch block size) in this
+// file:
+//   vadd.b32_1_1.spv / vadd.b32_1_1.json    block-size-baked kernel + pcc descr.
+//   vadd.b64_1_1.spv / vadd.b64_1_1.json
+// plus sc_vadd_host.cpp, whose launch sites load each pipeline through
+// vcLoadKernelOffline. The pcc JSON and the host descriptor are written from one
+// table, so their UUIDs cannot drift — a drift would show up much later as a
+// bare VK_ERROR_NO_PIPELINE_MATCH at dispatch.
+//
+// The two launches deliberately use the same kernel at two different block
+// sizes: the workgroup size is part of an offline pipeline's identity, so this
+// program needs two precompiled pipelines, not one.
+//
+// The harness needs no configuration because the runtime's default object
+// reservation is sized from this table; `vc -emit=sc` prints what it would pin
+// (call vcSetScReservation before vcInit to do so). This file therefore stays
+// compilable by the default build too (no SC-only API is referenced):
+//   vc -emit=full examples/sc_vadd.vc -o sc_vadd && ./sc_vadd
+
+#include <cstdio>
+#include "vc/Runtime/VCRuntime.h"
+
+__global__ void vadd(float *a, float *b, float *c, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) c[i] = a[i] + b[i];
+}
+
+int main() {
+  // vcInit's result must be checked: under Vulkan SC the device is created from
+  // the precompiled cache and a mandatory object reservation, and either can be
+  // wrong for reasons the runtime names on stderr. Ignoring the result would
+  // turn that diagnostic into a segfault in the first vcMalloc.
+  if (vcInit() != VCError::Success) {
+    printf("sc_vadd: FAIL (vcInit)\n");
+    return 1;
+  }
+  const int N = 64;
+  float hA[64], hB[64], hC[64];
+  for (int i = 0; i < N; i++) { hA[i] = i; hB[i] = i * 2; }
+  void *dA, *dB, *dC;
+  // vcMalloc refuses a zero size, so the harness allocates the buffer it asked
+  // for: four bytes per element, N elements.
+  vcMalloc(&dA, N * 4); vcMalloc(&dB, N * 4); vcMalloc(&dC, N * 4);
+  vcMemcpy(dA, hA, N * 4, VCMemcpyKind::HostToDevice);
+  vcMemcpy(dB, hB, N * 4, VCMemcpyKind::HostToDevice);
+
+  int ok = 1;
+  // gridDim is the element count, not the workgroup count: the runtime divides
+  // it by the block size (so 64 with block 32 is two workgroups).
+  vadd<<<N, 32>>>(dA, dB, dC, N);
+  vcDeviceSynchronize();
+  vcMemcpy(hC, dC, N * 4, VCMemcpyKind::DeviceToHost);
+  for (int i = 0; i < N; i++) if (hC[i] != hA[i] + hB[i]) ok = 0;
+
+  // Poison the output before the second launch. Both launches compute the same
+  // thing, so without this a dispatch that never happened would still read back
+  // the first launch's result and report PASS: the second (block-64) pipeline
+  // is a distinct precompiled binary, and this is what actually checks that it
+  // resolved. 0x7F7F7F7F is 3.4e38, far outside any sum of the inputs, and
+  // vcMemset broadcasts the byte over the buffer.
+  vcMemset(dC, 0x7F, N * 4);
+  vadd<<<N, 64>>>(dA, dB, dC, N);
+  vcDeviceSynchronize();
+  vcMemcpy(hC, dC, N * 4, VCMemcpyKind::DeviceToHost);
+  for (int i = 0; i < N; i++) if (hC[i] != hA[i] + hB[i]) ok = 0;
+
+  printf("sc_vadd: %s\n", ok ? "PASS" : "FAIL");
+  vcFree(dA); vcFree(dB); vcFree(dC);
+  vcShutdown();
+  return ok ? 0 : 1;
+}

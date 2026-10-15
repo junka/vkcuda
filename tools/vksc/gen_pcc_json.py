@@ -22,6 +22,12 @@ Usage:
                   --push-constant offset=0,size=4
                   -o pipeline/vk_vadd_pipeline_1.json
 
+For a VC kernel, also pass ``--entry-point <kernel symbol>``: VC emits one
+OpEntryPoint per kernel named after the mangled symbol, not "main".  (``vc
+-emit=sc`` does not use this script — it writes the same document itself, so the
+UUID in the JSON and the UUID in the host code come from one table — but the two
+have to agree on the key set, and this is the reference for it.)
+
 Then, on an x86-64 host with the driver .run unpacked:
   nvidia-pcc -path <json dir> -prefix <name> -chip gb10b -out pipeline_cache.bin
 and patch the 32-byte cache header (see patch_cache_header.py) before the
@@ -40,7 +46,8 @@ DESC_TYPES = {
 STAGE_COMPUTE = "VK_SHADER_STAGE_COMPUTE_BIT"
 
 
-def build(template_path, spv_basename, uuid_hex, bindings, push_constant):
+def build(template_path, spv_basename, uuid_hex, bindings, push_constant,
+          entry_point="main"):
     with open(template_path) as f:
         doc = json.load(f)
 
@@ -80,6 +87,15 @@ def build(template_path, spv_basename, uuid_hex, bindings, push_constant):
     # --- the SPIR-V module pcc should compile -------------------------------
     state["ShaderFileNames"][0]["filename"] = spv_basename
 
+    # --- entry point ---------------------------------------------------------
+    # The vendor sample (and shaderc's -fentry-point default) names it "main".
+    # VC's MLIR backend does not: it emits one OpEntryPoint per kernel named
+    # after the mangled kernel symbol, so a VC kernel needs its own name here
+    # or pcc compiles an entry point the SPIR-V module does not contain. This
+    # must match VCScPipelineDesc::entryPoint and VkPipelineShaderStageCreateInfo
+    # ::pName at create time (vc -emit=sc writes all three from one table).
+    state["ComputePipeline"]["stage"]["pName"] = entry_point
+
     # --- identity: pcc copies this UUID into the cache; the app looks the
     # pipeline up again with VkPipelineOfflineCreateInfo.pipelineIdentifier --
     doc["PipelineUUID"] = list(bytes.fromhex(uuid_hex))
@@ -98,6 +114,9 @@ def main():
                     help="comma-separated descriptor kinds, e.g. storage,storage,storage")
     ap.add_argument("--push-constant", default="",
                     help="offset=N,size=N (omit for no push constants)")
+    ap.add_argument("--entry-point", default="main",
+                    help="OpEntryPoint name in the .spv (default 'main'; VC "
+                         "kernels use the mangled kernel symbol, e.g. 'vadd')")
     ap.add_argument("-o", "--output", required=True)
     args = ap.parse_args()
 
@@ -109,13 +128,14 @@ def main():
         kv = dict(p.split("=") for p in args.push_constant.split(","))
         pc = (int(kv["offset"]), int(kv["size"]))
 
-    doc = build(args.template, args.spv, args.uuid, bindings, pc)
+    doc = build(args.template, args.spv, args.uuid, bindings, pc,
+                args.entry_point)
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, "w") as f:
         json.dump(doc, f, indent=4)
         f.write("\n")
-    print("%s: %d bindings, push_constant=%s, uuid=%s"
-          % (args.output, len(bindings), pc, args.uuid))
+    print("%s: %d bindings, push_constant=%s, uuid=%s, entry_point=%s"
+          % (args.output, len(bindings), pc, args.uuid, args.entry_point))
 
 
 if __name__ == "__main__":

@@ -17,7 +17,54 @@ endif()
 # Default to position-independent code (needed for shared runtime).
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-find_package(Vulkan REQUIRED)
+# ---------------------------------------------------------------------------
+# Vulkan SC
+#
+# The runtime is built against the *core* Vulkan loader by default.  Vulkan SC
+# is a separate, source-incompatible API (no runtime pipeline compilation, no
+# dynamic host allocation, mandatory object reservations), so it gets its own
+# header set and its own loader rather than a runtime probe.  Turning this on
+# swaps <vulkan/vulkan.h> for <vulkan/vulkan_sc_core.h> and -lvulkan for
+# -lvulkansc; everything SC-specific in the runtime is behind #ifdef
+# VC_VULKAN_SC, so the default build is byte-for-byte unchanged.
+#
+# VC_VULKAN_SC_INCLUDE_DIR is the directory *containing* the VulkanSC/ tree
+# (e.g. <PDK>/include/VulkanSC on the DriveOS PDK, or /usr/include with the
+# VulkanSC-Tools headers installed).  VC_VULKAN_SC_LIB_DIR is where
+# libvulkansc.so lives, for cross builds against a staged target tree.
+# ---------------------------------------------------------------------------
+option(VC_VULKAN_SC "Build the runtime against the Vulkan SC API" OFF)
+set(VC_VULKAN_SC_INCLUDE_DIR ""
+    CACHE PATH "Directory containing the VulkanSC/ include tree")
+set(VC_VULKAN_SC_LIB_DIR ""
+    CACHE PATH "Directory containing libvulkansc (cross builds)")
+if(VC_VULKAN_SC)
+  if(NOT VC_VULKAN_SC_INCLUDE_DIR)
+    message(FATAL_ERROR
+      "VC_VULKAN_SC=ON requires -DVC_VULKAN_SC_INCLUDE_DIR=<dir containing "
+      "VulkanSC/> (e.g. /opt/gwm/nv_sdk/thor/.../drive-linux/include/VulkanSC)")
+  endif()
+  message(STATUS "Vulkan SC build: headers from ${VC_VULKAN_SC_INCLUDE_DIR}")
+endif()
+
+# find_package(Vulkan) locates both the headers and the loader the *default*
+# build needs.  A Vulkan SC build replaces both, so it neither needs nor wants
+# the core-Vulkan package (an SC-only cross build has no libvulkan for the
+# target).  The Vulkan::Vulkan target is emulated below in that case so the
+# rest of the tree can keep linking one name.
+if(NOT VC_VULKAN_SC)
+  find_package(Vulkan REQUIRED)
+else()
+  add_library(VCVulkanSC INTERFACE)
+  target_include_directories(VCVulkanSC SYSTEM INTERFACE
+    ${VC_VULKAN_SC_INCLUDE_DIR})
+  target_compile_definitions(VCVulkanSC INTERFACE VC_VULKAN_SC)
+  if(VC_VULKAN_SC_LIB_DIR)
+    target_link_directories(VCVulkanSC INTERFACE ${VC_VULKAN_SC_LIB_DIR})
+  endif()
+  target_link_libraries(VCVulkanSC INTERFACE vulkansc)
+  add_library(Vulkan::Vulkan ALIAS VCVulkanSC)
+endif()
 
 message(STATUS "Vulkan found: ${Vulkan_FOUND}")
 
@@ -109,6 +156,11 @@ else()
   set(VC_DRIVER_RUNTIME_LIB "$<TARGET_FILE:VCRuntime>")
 endif()
 set(VC_DRIVER_VULKAN_LIBS "-lvulkan")
+if(VC_VULKAN_SC)
+  # vc -emit=full links the generated host code against the loader.  A version
+  # of vc built for SC must hand out the SC loader name, not the core one.
+  set(VC_DRIVER_VULKAN_LIBS "-lvulkansc")
+endif()
 
 enable_testing()
 
@@ -346,13 +398,19 @@ set(CPACK_DEBIAN_PACKAGE_LICENSE "MIT")
 # goes through MLIR's own serializer — so a *-dev package is NOT an
 # install-time requirement of the shipped binaries.
 #   libllvm18 / libmlir-18 — libLLVM.so, libMLIR.so.
-#   libvulkan1 — runtime links Vulkan.
+#   libvulkan1 — runtime links Vulkan (libvulkansc instead for VC_VULKAN_SC).
 #   glslc (shaderc) — vcc invokes it to compile GLSL→SPIR-V.
 #   spirv-tools — SPIR-V validation/disassembly.
 #   g++ + libc6-dev — vcc drives g++ to link user executables at use time,
 #     so the package is only useful where a host toolchain is present.
+set(_vc_vulkan_deb_dep "libvulkan1")
+if(VC_VULKAN_SC)
+  # Vulkan SC is its own loader; the core libvulkan1 would be the wrong
+  # dependency to declare (and is not what the resulting binaries call into).
+  set(_vc_vulkan_deb_dep "libvulkansc1")
+endif()
 set(CPACK_DEBIAN_PACKAGE_DEPENDS
-    "libllvm18, libmlir-18, libvulkan1, glslc, spirv-tools, g++, libc6-dev")
+    "libllvm18, libmlir-18, ${_vc_vulkan_deb_dep}, glslc, spirv-tools, g++, libc6-dev")
 # What a downstream *build* against these headers/libs would additionally
 # need. Not an install-time need of the shipped binaries → Recommends.
 set(CPACK_DEBIAN_PACKAGE_RECOMMENDS

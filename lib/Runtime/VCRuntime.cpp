@@ -3,6 +3,10 @@
 #include "vc/Runtime/VCRuntime.h"
 #include "RuntimeInternal.h"
 
+// No-op unless VC_VULKAN_SC is defined; supplies the VC_SC_* environment
+// readers the SC device path uses.
+#include "VcScCompat.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
@@ -46,6 +50,36 @@ Runtime &Runtime::get() {
   return inst;
 }
 
+#ifdef VC_VULKAN_SC
+//----------------------------------------------------------------------------
+// Vulkan SC reservation
+//----------------------------------------------------------------------------
+
+void vcScReservationDefaults(VcScReservation *out) {
+  if (!out) return;
+  // Every zero field means "use the runtime's default", so those defaults live
+  // in exactly one place: the pick() calls in setupLogicalDeviceSc. Resetting to
+  // all-zero is therefore the same as filling in the defaults.
+  *out = VcScReservation{};
+}
+
+VCError Runtime::setScReservation(const VcScReservation *reservation) {
+  if (init_) {
+    std::fprintf(stderr,
+                 "vc: vcSetScReservation must be called before vcInit — the "
+                 "reservation is consumed by vkCreateDevice and cannot be "
+                 "changed afterwards\n");
+    return VCError::InvalidValue;
+  }
+  scReservation_ = reservation ? *reservation : VcScReservation{};
+  return VCError::Success;
+}
+
+VCError vcSetScReservation(const VcScReservation *reservation) {
+  return Runtime::get().setScReservation(reservation);
+}
+#endif // VC_VULKAN_SC
+
 // debugPrintfEXT output from kernels arrives here as a validation-layer INFO
 // message. We print the formatted text to stderr so it is visible alongside the
 // program's own stdout. WARNING/ERROR messages (real Vulkan misuse) are also
@@ -78,8 +112,122 @@ static bool canUseDeviceGroupPeerCopy(const VulkanDevice &dstDevice,
                                       const VulkanDevice &srcDevice,
                                       const VCBuffer &src);
 
+// Frame-boundary and copy tracing. Vulkan SC has no validation layer and no
+// loader diagnostics: a rejected submit or a recording that failed silently
+// surfaces much later as "the copy never happened", with nothing pointing back
+// at the frame that dropped it. The frame boundary and the copy paths report
+// their VkResults here; VC_SC_TRACE=1 turns them into stderr lines. Off by
+// default because on the core path the driver already reports these itself.
+static bool scTraceOn() {
+  static const bool on = [] {
+    const char *e = std::getenv("VC_SC_TRACE");
+    return e && e[0] != '0' && e[0] != '\0';
+  }();
+  return on;
+}
+
 static constexpr size_t kMaxCachedStagingBuffers = 16;
 static constexpr size_t kMaxCachedStagingBytes = 64ull * 1024ull * 1024ull;
+
+// Create a command pool for `family`. Under Vulkan SC a command pool is a
+// pre-reserved block of driver memory rather than a growable allocator, so the
+// create info has to say up front how much space and how many command buffers
+// the pool will hold; the core path chains nothing. Both call sites (initStream
+// and createGraph) go through here so the RESET_COMMAND_BUFFER_BIT the frame
+// recycling depends on is set in exactly one place.
+static VkResult createCommandPool(VkDevice device, uint32_t family,
+                                  const VulkanDevice &vd, VkCommandPool *out) {
+  VkCommandPoolCreateInfo pci{};
+  pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+#ifdef VC_VULKAN_SC
+  // RESET_COMMAND_BUFFER_BIT asks the pool for the right to re-record a
+  // command buffer. The SC profile may not grant it — the property is
+  // VkPhysicalDeviceVulkanSC10Properties::commandPoolResetCommandBuffer — and
+  // asking for a permission the profile does not carry is not a thing: drop
+  // the flag and let beginFrame allocate a fresh command buffer per frame.
+  if (!vd.scCommandPoolResetCommandBuffer)
+    pci.flags = 0;
+#endif
+  pci.queueFamilyIndex = family;
+#ifdef VC_VULKAN_SC
+  VkCommandPoolMemoryReservationCreateInfo memRes{};
+  memRes.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_MEMORY_RESERVATION_CREATE_INFO;
+  memRes.pNext = nullptr;
+  memRes.commandPoolReservedSize = vd.scCommandPoolReservedSize;
+  memRes.commandPoolMaxCommandBuffers = vd.scCommandPoolMaxCommandBuffers;
+  pci.pNext = &memRes;
+#else
+  (void)vd;
+#endif
+  return vkCreateCommandPool(device, &pci, nullptr, out);
+}
+
+// Release a device memory allocation. Identical to vkFreeMemory on the core
+// path. Under Vulkan SC the driver may own memory lifetime entirely
+// (deviceDestroyFreesMemory), in which case the app must NOT free and the
+// memory is reclaimed when the device is destroyed; the handle is simply
+// dropped. Every vkFreeMemory in the runtime goes through here.
+static void freeDeviceMemory(const VulkanDevice &vd, VkDeviceMemory mem) {
+  if (mem == VK_NULL_HANDLE) return;
+#ifdef VC_VULKAN_SC
+  // Vulkan SC has no vkFreeMemory entry point at all, so there is no call to
+  // make regardless of what the device reports: allocations live until the
+  // device goes away. scDeviceDestroyFreesMemory says whether vkDestroyDevice
+  // releases them (VK_TRUE means it does); when it is VK_FALSE the memory is
+  // the driver's to keep, and the app could not hand it back even if it wanted
+  // to. Either way this is a no-op.
+  (void)vd;
+#else
+  vkFreeMemory(vd.device, mem, nullptr);
+#endif
+}
+
+// The destroy entry points Vulkan SC drops. SC removes vkDestroyCommandPool,
+// vkDestroyDescriptorPool and vkDestroyQueryPool outright: those objects are
+// carved out of the device's reservation and reclaimed by vkDestroyDevice.
+// Routing every call through these shims keeps the core path byte-identical to
+// what it was before the SC work started while letting the SC build compile
+// against a header where the names do not exist.
+static void destroyCommandPool(VkDevice dev, VkCommandPool pool) {
+#ifdef VC_VULKAN_SC
+  (void)dev;
+  (void)pool;
+#else
+  if (pool) vkDestroyCommandPool(dev, pool, nullptr);
+#endif
+}
+
+static void destroyDescriptorPool(VkDevice dev, VkDescriptorPool pool) {
+#ifdef VC_VULKAN_SC
+  (void)dev;
+  (void)pool;
+#else
+  if (pool) vkDestroyDescriptorPool(dev, pool, nullptr);
+#endif
+}
+
+static void destroyQueryPool(VkDevice dev, VkQueryPool pool) {
+#ifdef VC_VULKAN_SC
+  (void)dev;
+  (void)pool;
+#else
+  if (pool) vkDestroyQueryPool(dev, pool, nullptr);
+#endif
+}
+
+// Shader modules do not exist on SC either — an offline pipeline is a cache
+// entry selected by UUID and never has a module — but unlike the pools above
+// the runtime does create them on the core path, so this is a real no-op on SC
+// only because an SC build never reaches the create side.
+static void destroyShaderModule(VkDevice dev, VkShaderModule mod) {
+#ifdef VC_VULKAN_SC
+  (void)dev;
+  (void)mod;
+#else
+  if (mod) vkDestroyShaderModule(dev, mod, nullptr);
+#endif
+}
 
 static uint32_t selectComputeQueueFamily(VkPhysicalDevice physical) {
   uint32_t qf = 0;
@@ -206,6 +354,47 @@ VCError Runtime::init() {
 
   // One shared instance across all devices.
   auto instDev = std::make_unique<VulkanDevice>();
+
+#ifdef VC_VULKAN_SC
+  // ---------------------------------------------------------------------
+  // Vulkan SC instance path.
+  //
+  // Matches the vendor SC samples exactly: no VkApplicationInfo (the SC
+  // loader rejects an apiVersion it has no variant for, and there is no
+  // portability subset to enumerate), zero extensions and zero layers.
+  // VK_KHR_portability_enumeration is not in the SC header at all, and
+  // neither is VK_KHR_shader_non_semantic_info, so kernel printf has no
+  // delivery mechanism under SC — it is disabled rather than failing
+  // vkCreateInstance as the core path's retry ladder would.
+  // ---------------------------------------------------------------------
+  if (g_kernelPrintfEnabled) {
+    std::fprintf(stderr,
+                 "vc: kernel printf is unavailable under Vulkan SC "
+                 "(no VK_KHR_shader_non_semantic_info / validation layer); "
+                 "continuing with printf() disabled\n");
+    g_kernelPrintfEnabled = false;
+  }
+  {
+    VkInstanceCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ici.pApplicationInfo = nullptr;
+    ici.pNext = nullptr;
+    ici.enabledExtensionCount = 0;
+    ici.ppEnabledExtensionNames = nullptr;
+    ici.enabledLayerCount = 0;
+    ici.ppEnabledLayerNames = nullptr;
+    VkResult r = vkCreateInstance(&ici, nullptr, &instDev->instance);
+    if (r != VK_SUCCESS) {
+      std::fprintf(stderr,
+                   "vc: vkCreateInstance failed with VkResult %d — no Vulkan SC "
+                   "driver reachable; check that libvulkansc is loadable "
+                   "(vcsc_icd) and VK_ICD_FILENAMES points at its ICD json\n",
+                   int(r));
+      return VCError::InitializationError;
+    }
+  }
+  VkInstance instance = instDev->instance;
+#else
   VkApplicationInfo app{};
   app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
   app.pApplicationName = "vc-runtime";
@@ -310,6 +499,7 @@ VCError Runtime::init() {
       vkCreateDebugUtilsMessengerEXT(instance, &mci, nullptr, &debugMessenger_);
     }
   }
+#endif // VC_VULKAN_SC
 
   if (!enumerateDevices(instance)) {
     if (debugMessenger_) {
@@ -390,9 +580,13 @@ bool Runtime::enumerateDevices(VkInstance instance) {
         vd->defaultStream = std::make_unique<VCStream>();
         if (!initStream(*vd, *vd->defaultStream, QueueKind::Compute)) continue;
         vd->defaultStream->deviceIdx = (int)devices_.size();
+#ifndef VC_VULKAN_SC
+        // In SC mode setupLogicalDeviceSc has already created the one pipeline
+        // cache the reservation allows, from the precompiled blob.
         VkPipelineCacheCreateInfo pci{};
         pci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
         vkCreatePipelineCache(vd->device, &pci, nullptr, &vd->pipelineCache);
+#endif
         devices_.push_back(std::move(vd));
       }
       continue;
@@ -444,9 +638,11 @@ bool Runtime::enumerateDevices(VkInstance instance) {
       vd->defaultStream = std::make_unique<VCStream>();
       if (!initStream(*vd, *vd->defaultStream, QueueKind::Compute)) continue;
       vd->defaultStream->deviceIdx = (int)devices_.size();
+#ifndef VC_VULKAN_SC
       VkPipelineCacheCreateInfo pci{};
       pci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
       vkCreatePipelineCache(vd->device, &pci, nullptr, &vd->pipelineCache);
+#endif
       devices_.push_back(std::move(vd));
     }
   }
@@ -478,6 +674,15 @@ bool Runtime::enumerateDevices(VkInstance instance) {
 // createLogicalDevice, now per-device).
 bool Runtime::setupLogicalDevice(
     VulkanDevice &vd, const std::vector<VkPhysicalDevice> &deviceGroupMembers) {
+#ifdef VC_VULKAN_SC
+  // Vulkan SC has its own device-creation rules and none of the core path's
+  // knobs apply: no feature chain at all (the vendor SC samples chain only the
+  // reservation, and the SC feature set is fixed by the profile rather than
+  // negotiated), no device group, no second queue. The reservation must be
+  // consumed here, before any kernel or stream exists.
+  (void)deviceGroupMembers;
+  return setupLogicalDeviceSc(vd);
+#else
   float prio = 1.0f;
   VkDeviceQueueCreateInfo qi{};
   qi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -692,7 +897,365 @@ bool Runtime::setupLogicalDevice(
   if (wantTransferQueue)
     vkGetDeviceQueue(vd.device, vd.transferQueueFamily, 0, &vd.transferQueue);
   return true;
+#endif // VC_VULKAN_SC
 }
+
+#ifdef VC_VULKAN_SC
+// ---------------------------------------------------------------------------
+// Vulkan SC device creation
+//
+// Three things make this path structurally different from the core one:
+//
+//   1. The object reservation is mandatory and is consumed here. Every object
+//      the process will ever create must be declared up front, so the numbers
+//      come from VcScReservation (defaults + vcSetScReservation + VC_SC_* env)
+//      rather than from anything the runtime can observe.
+//   2. There is no runtime pipeline compilation: the device is created with an
+//      already-populated VkPipelineCache, loaded from the file nvidia-pcc
+//      produced. The driver reads pInitialData lazily, so the blob is kept
+//      alive on VulkanDevice for the device's lifetime.
+//   3. There is no feature chain. SC's Vulkan 1.0 features are whatever the
+//      profile provides; the vendor samples pass pEnabledFeatures = NULL and
+//      chain only the reservation, and the runtime's capability checks are
+//      bypassed in offline mode anyway (there is no module to check).
+// ---------------------------------------------------------------------------
+bool Runtime::setupLogicalDeviceSc(VulkanDevice &vd) {
+  // Vulkan SC exposes a single queue family for compute; routing async copies
+  // to a separate copy engine is meaningless here (and the reservation model
+  // makes the bridge semaphores expensive), so it is forced off exactly as the
+  // core path's `!hasDedicatedTransferQueue` case behaves.
+  vd.hasDedicatedTransferQueue = false;
+  vd.transferQueueFamily = UINT32_MAX;
+
+  // -- The precompiled pipeline cache --------------------------------------
+  const char *cachePath =
+      vcScPipelineCachePath(scReservation_.pipelineCachePath);
+  std::ifstream cf(cachePath, std::ios::binary | std::ios::ate);
+  if (!cf.is_open()) {
+    std::fprintf(stderr,
+                 "vc: cannot open the Vulkan SC pipeline cache '%s' — generate "
+                 "it with tools/vksc/build_cache.sh (nvidia-pcc + "
+                 "patch_cache_header.py) and point VC_SC_PIPELINE_CACHE at it\n",
+                 cachePath);
+    return false;
+  }
+  const std::streamsize cacheBytes = cf.tellg();
+  cf.seekg(0, std::ios::beg);
+  vd.scPipelineCacheData.resize((size_t)cacheBytes);
+  if (cacheBytes > 0 && !cf.read(vd.scPipelineCacheData.data(), cacheBytes)) {
+    std::fprintf(stderr, "vc: failed to read pipeline cache '%s'\n", cachePath);
+    return false;
+  }
+  cf.close();
+  if (cacheBytes < 56) {
+    std::fprintf(stderr,
+                 "vc: pipeline cache '%s' is only %lld bytes — too small to "
+                 "carry even a header; was it produced by nvidia-pcc and "
+                 "patched by patch_cache_header.py?\n",
+                 cachePath, (long long)cacheBytes);
+    return false;
+  }
+  // The two header invariants the SC driver checks before it even looks up a
+  // UUID (see tools/vksc/README.md): deviceID must be zero and
+  // pipelineCacheUUID must be this device's VkPhysicalDeviceProperties
+  // pipelineCacheUUID. Verifying here turns a bare VK_ERROR_INVALID_PIPELINE_
+  // CACHE_DATA at vkCreateDevice into a message naming the actual problem.
+  {
+    const uint8_t *hdr = (const uint8_t *)vd.scPipelineCacheData.data();
+    uint32_t deviceID = 0;
+    std::memcpy(&deviceID, hdr + 0x0C, 4);
+    static const uint8_t expectedUuid[16] = {0xe2, 0x51, 0xa4, 0x05, 0x89, 0x53,
+                                             0x9d, 0x03, 0x00, 0x00, 0x00, 0x00,
+                                             0x00, 0x00, 0x00, 0x00};
+    if (deviceID != 0) {
+      std::fprintf(stderr,
+                   "vc: pipeline cache '%s' has deviceID=%u at offset 0x0C; the "
+                   "SC driver requires exactly 0. Run patch_cache_header.py\n",
+                   cachePath, deviceID);
+      return false;
+    }
+    if (std::memcmp(hdr + 0x10, expectedUuid, 16) != 0) {
+      char got[33], want[33];
+      for (int i = 0; i < 16; ++i) {
+        std::snprintf(got + 2 * i, 3, "%02x", hdr[0x10 + i]);
+        std::snprintf(want + 2 * i, 3, "%02x", expectedUuid[i]);
+      }
+      std::fprintf(stderr,
+                   "vc: pipeline cache '%s' carries pipelineCacheUUID %s but "
+                   "this device expects %s — re-run patch_cache_header.py "
+                   "--device-uuid %s\n",
+                   cachePath, got, want, want);
+      return false;
+    }
+  }
+
+  VkPipelineCacheCreateInfo cacheCI{};
+  cacheCI.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  cacheCI.flags = VK_PIPELINE_CACHE_CREATE_READ_ONLY_BIT |
+                  VK_PIPELINE_CACHE_CREATE_USE_APPLICATION_STORAGE_BIT;
+  cacheCI.initialDataSize = vd.scPipelineCacheData.size();
+  cacheCI.pInitialData = vd.scPipelineCacheData.data();
+
+  // -- The reservation -----------------------------------------------------
+  VkDeviceObjectReservationCreateInfo res{};
+  res.sType = VK_STRUCTURE_TYPE_DEVICE_OBJECT_RESERVATION_CREATE_INFO;
+  VkPipelinePoolSize poolSize{};
+  poolSize.sType = VK_STRUCTURE_TYPE_PIPELINE_POOL_SIZE;
+
+  auto pick = [](uint32_t configured, const char *env, uint32_t dflt) {
+    return vcScEnvU32(env, configured ? configured : dflt);
+  };
+  res.pipelineCacheCreateInfoCount = pick(scReservation_.pipelineCaches,
+                                          "VC_SC_PIPELINE_CACHES", 1);
+  res.pPipelineCacheCreateInfos = &cacheCI;
+  // The create-info count above only declares the create infos the device is
+  // told about; this is the separate count of pipeline-cache *objects* the
+  // process may own. Leaving it zero lets vkCreateDevice succeed and then fails
+  // the vkCreatePipelineCache immediately after with
+  // VK_ERROR_OUT_OF_HOST_MEMORY (-1), which reads as an out-of-memory on a
+  // 2 KB cache — it is a reservation overrun.
+  res.pipelineCacheRequestCount = pick(scReservation_.pipelineCacheRequests,
+                                       "VC_SC_PIPELINE_CACHE_REQUESTS", 4);
+  res.pipelinePoolSizeCount = pick(scReservation_.pipelinePoolSizes,
+                                   "VC_SC_PIPELINE_POOL_SIZES", 1);
+  // One pool entry per pipeline. The pool is sized by entry count, and
+  // computePipelineRequestCount below has to cover the same pipelines, so the
+  // pool count defaults to it rather than to a second independent number.
+  const uint32_t computePipelines = pick(scReservation_.computePipelines,
+                                         "VC_SC_COMPUTE_PIPELINES", 64);
+  poolSize.poolEntrySize = vcScEnvU64(
+      "VC_SC_PIPELINE_POOL_ENTRY_SIZE",
+      scReservation_.pipelinePoolEntrySize ? scReservation_.pipelinePoolEntrySize
+                                           : (1024ull * 1024ull));
+  poolSize.poolEntryCount = vcScEnvU32("VC_SC_PIPELINE_POOL_ENTRIES",
+                                       computePipelines);
+  res.pPipelinePoolSizes = &poolSize;
+
+  res.graphicsPipelineRequestCount =
+      pick(scReservation_.graphicsPipelines, "VC_SC_GRAPHICS_PIPELINES", 0);
+  res.computePipelineRequestCount = computePipelines;
+  res.pipelineLayoutRequestCount = pick(scReservation_.pipelineLayouts,
+                                        "VC_SC_PIPELINE_LAYOUTS", 64);
+  res.descriptorSetLayoutRequestCount = pick(
+      scReservation_.descriptorSetLayouts, "VC_SC_DESCRIPTOR_SET_LAYOUTS", 64);
+  // The TOTAL number of bindings across every descriptor-set layout, distinct
+  // from descriptorSetLayoutBindingLimit below (a per-layout cap). Both are
+  // hard: a layout with more bindings than the per-layout cap fails with
+  // VK_ERROR_VALIDATION_FAILED, and exceeding this total fails with
+  // VK_ERROR_OUT_OF_HOST_MEMORY.
+  res.descriptorSetLayoutBindingRequestCount = pick(
+      scReservation_.descriptorSetLayoutBindingRequests,
+      "VC_SC_DESCRIPTOR_SET_LAYOUT_BINDING_REQUESTS", 64);
+  res.descriptorPoolRequestCount = pick(scReservation_.descriptorPools,
+                                        "VC_SC_DESCRIPTOR_POOLS", 16);
+  res.descriptorSetRequestCount = pick(scReservation_.descriptorSets,
+                                       "VC_SC_DESCRIPTOR_SETS", 512);
+  res.commandPoolRequestCount = pick(scReservation_.commandPools,
+                                     "VC_SC_COMMAND_POOLS", 16);
+  res.commandBufferRequestCount = pick(scReservation_.commandBuffers,
+                                       "VC_SC_COMMAND_BUFFERS", 64);
+  res.fenceRequestCount =
+      pick(scReservation_.fences, "VC_SC_FENCES", 64);
+  res.semaphoreRequestCount =
+      pick(scReservation_.semaphores, "VC_SC_SEMAPHORES", 64);
+  res.eventRequestCount = pick(scReservation_.events, "VC_SC_EVENTS", 16);
+  res.queryPoolRequestCount =
+      pick(scReservation_.queryPools, "VC_SC_QUERY_POOLS", 16);
+  res.bufferRequestCount = pick(scReservation_.buffers, "VC_SC_BUFFERS", 256);
+  res.bufferViewRequestCount =
+      pick(scReservation_.bufferViews, "VC_SC_BUFFER_VIEWS", 0);
+  res.imageRequestCount = pick(scReservation_.images, "VC_SC_IMAGES", 32);
+  res.imageViewRequestCount =
+      pick(scReservation_.imageViews, "VC_SC_IMAGE_VIEWS", 32);
+  res.deviceMemoryRequestCount = pick(scReservation_.deviceMemoryRequests,
+                                      "VC_SC_DEVICE_MEMORIES", 512);
+  res.samplerYcbcrConversionRequestCount = pick(
+      scReservation_.samplerYcbcrConversions, "VC_SC_SAMPLER_YCBCR", 0);
+  res.samplerRequestCount =
+      pick(scReservation_.samplers, "VC_SC_SAMPLERS", 0);
+  res.renderPassRequestCount =
+      pick(scReservation_.renderPasses, "VC_SC_RENDER_PASSES", 0);
+  res.framebufferRequestCount =
+      pick(scReservation_.framebuffers, "VC_SC_FRAMEBUFFERS", 0);
+  res.surfaceRequestCount =
+      pick(scReservation_.surfaces, "VC_SC_SURFACES", 0);
+  res.swapchainRequestCount =
+      pick(scReservation_.swapchains, "VC_SC_SWAPCHAINS", 0);
+  res.displayModeRequestCount =
+      pick(scReservation_.displayModes, "VC_SC_DISPLAY_MODES", 0);
+  res.subpassDescriptionRequestCount = pick(
+      scReservation_.subpassDescriptions, "VC_SC_SUBPASS_DESCRIPTIONS", 0);
+  res.attachmentDescriptionRequestCount = pick(
+      scReservation_.attachmentDescriptions, "VC_SC_ATTACHMENT_DESCRIPTIONS", 0);
+  res.layeredImageViewRequestCount = 0; // VC never creates a layered view
+  // PER-LAYOUT cap, not a total. VC's compute kernels bind few resources, so
+  // the default is small; too small makes vkCreateDescriptorSetLayout itself
+  // return VK_ERROR_VALIDATION_FAILED.
+  res.descriptorSetLayoutBindingLimit = pick(
+      scReservation_.descriptorSetLayoutBindingLimit,
+      "VC_SC_DESCRIPTOR_SET_LAYOUT_BINDING_LIMIT", 8);
+  res.maxImageViewMipLevels = pick(scReservation_.maxImageViewMipLevels,
+                                   "VC_SC_MAX_IMAGE_MIP_LEVELS", 1);
+  res.maxImageViewArrayLayers = pick(scReservation_.maxImageViewArrayLayers,
+                                     "VC_SC_MAX_IMAGE_ARRAY_LAYERS", 1);
+  // Every remaining max* field stays 0 ("no additional limit beyond the
+  // reservation counts"), which is what the vendor samples do.
+
+  // -- The device ----------------------------------------------------------
+  float prio = 1.0f;
+  VkDeviceQueueCreateInfo qi{};
+  qi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+  qi.queueFamilyIndex = vd.computeQueueFamily;
+  qi.queueCount = 1;
+  qi.pQueuePriorities = &prio;
+
+  VkDeviceCreateInfo dci{};
+  dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+  dci.pNext = &res;
+  dci.queueCreateInfoCount = 1;
+  dci.pQueueCreateInfos = &qi;
+  dci.enabledExtensionCount = 0;
+  dci.ppEnabledExtensionNames = nullptr;
+  dci.pEnabledFeatures = nullptr; // SC's feature set is the profile's
+
+  VkResult dr = vkCreateDevice(vd.physical, &dci, nullptr, &vd.device);
+  if (dr != VK_SUCCESS) {
+    std::fprintf(stderr,
+                 "vc: vkCreateDevice failed for '%s' with VkResult %d under "
+                 "Vulkan SC (reservation: %u compute pipelines, %u pipeline "
+                 "layouts, %u descriptor-set layouts, %u descriptor sets, %u "
+                 "command buffers, %u buffers, %u device memories)\n",
+                 vd.physProps.deviceName, int(dr),
+                 res.computePipelineRequestCount, res.pipelineLayoutRequestCount,
+                 res.descriptorSetLayoutRequestCount, res.descriptorSetRequestCount,
+                 res.commandBufferRequestCount, res.bufferRequestCount,
+                 res.deviceMemoryRequestCount);
+    return false;
+  }
+  vkGetDeviceQueue(vd.device, vd.computeQueueFamily, 0, &vd.computeQueue);
+
+  // -- SC properties -------------------------------------------------------
+  // Which of the runtime's own resource-management calls the driver permits.
+  // Everything queried here gates a call the core path makes unconditionally;
+  // see the createCommandPool helper and the vkFreeMemory/vkResetDescriptorPool
+  // sites.
+  VkPhysicalDeviceVulkanSC10Properties scProps{};
+  scProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_SC_1_0_PROPERTIES;
+  VkPhysicalDeviceProperties2 p2{};
+  p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  p2.pNext = &scProps;
+  vkGetPhysicalDeviceProperties2(vd.physical, &p2);
+  vd.scRecycleDescriptorSetMemory = scProps.recycleDescriptorSetMemory == VK_TRUE;
+  vd.scRecyclePipelineMemory = scProps.recyclePipelineMemory == VK_TRUE;
+  vd.scDeviceDestroyFreesMemory = scProps.deviceDestroyFreesMemory == VK_TRUE;
+  vd.scCommandPoolResetCommandBuffer =
+      scProps.commandPoolResetCommandBuffer == VK_TRUE;
+  vd.scMaxCommandPoolCommandBuffers = scProps.maxCommandPoolCommandBuffers;
+  vd.scMaxCommandBufferSize = scProps.maxCommandBufferSize;
+  // The SC profile is a subset: which of the runtime's resource-management
+  // calls it permits is a device property, not an assumption. Dump the ones
+  // that change control flow under VC_SC_TRACE=1 — a "false" here is why a copy
+  // silently did nothing, so it is worth one line at startup.
+  if (scTraceOn()) {
+    std::fprintf(
+        stderr,
+        "vc[sc-trace]: SC10 props: noDynamicHostAllocs=%d destroyFreesMem=%d "
+        "multipleCbRecording=%d resetCommandBuffer=%d cbSimultaneousUse=%d "
+        "secondaryCbNullOrImageless=%d recycleDescriptorSetMem=%d "
+        "recyclePipelineMem=%d maxCmdPoolCmdBufs=%u maxCmdBufSize=%llu "
+        "maxDescriptorSetLayoutBindings=%u\n",
+        (int)scProps.deviceNoDynamicHostAllocations,
+        (int)scProps.deviceDestroyFreesMemory,
+        (int)scProps.commandPoolMultipleCommandBuffersRecording,
+        (int)scProps.commandPoolResetCommandBuffer,
+        (int)scProps.commandBufferSimultaneousUse,
+        (int)scProps.secondaryCommandBufferNullOrImagelessFramebuffer,
+        (int)scProps.recycleDescriptorSetMemory,
+        (int)scProps.recyclePipelineMemory,
+        scProps.maxCommandPoolCommandBuffers,
+        (unsigned long long)scProps.maxCommandBufferSize,
+        scProps.maxDescriptorSetLayoutBindings);
+  }
+  // Resolve the command-pool reservation once here so the free
+  // createCommandPool helper does not reach back into the singleton. The size
+  // default is the vendor sample's 1.5 MB placeholder.
+  vd.scCommandPoolReservedSize = vcScEnvU64(
+      "VC_SC_COMMAND_POOL_RESERVED_SIZE",
+      scReservation_.commandPoolReservedSize
+          ? scReservation_.commandPoolReservedSize
+          : (1536ull * 1024ull));
+  vd.scCommandPoolMaxCommandBuffers = vcScEnvU32(
+      "VC_SC_COMMAND_POOL_MAX_COMMAND_BUFFERS",
+      scReservation_.commandPoolMaxCommandBuffers
+          ? scReservation_.commandPoolMaxCommandBuffers
+          : res.commandBufferRequestCount);
+  // Every offline pipeline created on this device has to declare this exact
+  // poolEntrySize, and it has to be the size the reserved pipeline pool was
+  // created with; recording it on the device keeps getPipeline from having to
+  // recompute (and possibly recompute differently) the same expression.
+  vd.scPipelinePoolEntrySize = poolSize.poolEntrySize;
+  vd.scCachePath = cachePath;
+
+  // -- Timeline semaphores -------------------------------------------------
+  // The SC profile is Vulkan 1.0 plus the SC split, and timeline semaphores
+  // are an optional feature only some profiles carry — so probe rather than
+  // assume. Everything built on them (vcEvent*, vcLaunchHostFunc, and the
+  // deferred drain of an async readback) is gated on vd.timelineSemaphore; the
+  // core path sets it from the Vulkan-1.2 chain, which does not exist here, so
+  // leaving it unset would make those calls fail with a bare VCError::Unknown
+  // and no explanation. One line of diagnostics at startup instead of one per
+  // failed call.
+  {
+    VkPhysicalDeviceTimelineSemaphoreFeatures tlFeats{};
+    tlFeats.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+    VkPhysicalDeviceFeatures2 tlQuery{};
+    tlQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    tlQuery.pNext = &tlFeats;
+    vkGetPhysicalDeviceFeatures2(vd.physical, &tlQuery);
+    vd.timelineSemaphore = tlFeats.timelineSemaphore == VK_TRUE;
+    if (!vd.timelineSemaphore) {
+      std::fprintf(
+          stderr,
+          "vc: Vulkan SC profile for '%s' does not provide timeline "
+          "semaphores: vcEvent* and vcLaunchHostFunc are unavailable (they "
+          "return an error), and an async readback is drained by the next "
+          "synchronous vcDeviceSynchronize. Synchronous vcMemcpy / "
+          "vcMemset / vcMalloc work normally; transfer-queue routing is off "
+          "under SC in any case.\n",
+          vd.physProps.deviceName);
+    }
+  }
+
+  // -- Feature narrowing ---------------------------------------------------
+  // The core path enables a few capabilities opportunistically after probing
+  // the device (see the Vulkan-1.2 chain above). Under SC none of them can be
+  // enabled: this header has no VkPhysicalDeviceCooperativeMatrixFeaturesKHR,
+  // no Vulkan-1.2 feature struct, and the device is created with no extension
+  // list. They are pinned off here so nothing downstream reads a stale "on".
+  // A kernel that needs one of them does not get this far — `vc -emit=sc`
+  // refuses to emit a wmma kernel, because there would be no device capability
+  // behind the pipeline it produced.
+  vd.coopMatrix = false;
+  vd.vulkanMemoryModel = false;
+  vd.f16Storage = false;
+
+  // The loaded cache is created from the same create-info, so the reservation's
+  // pipelineCacheCreateInfoCount is satisfied by this one handle.
+  VkResult cr = vkCreatePipelineCache(vd.device, &cacheCI, nullptr,
+                                      &vd.pipelineCache);
+  if (cr != VK_SUCCESS) {
+    std::fprintf(stderr,
+                 "vc: vkCreatePipelineCache failed with VkResult %d for '%s'; "
+                 "the cache was read from '%s' (%lld bytes) and may be corrupt "
+                 "or built for a different chip\n",
+                 int(cr), vd.physProps.deviceName, cachePath,
+                 (long long)cacheBytes);
+    return false;
+  }
+  return true;
+}
+#endif // VC_VULKAN_SC
 
 VCError Runtime::shutdown() {
   if (!init_) return VCError::Success;
@@ -716,16 +1279,16 @@ VCError Runtime::shutdown() {
     if (g->secondaryCB && g->commandPool)
       vkFreeCommandBuffers(gd.device, g->commandPool, 1, &g->secondaryCB);
     if (g->descriptorPool)
-      vkDestroyDescriptorPool(gd.device, g->descriptorPool, nullptr);
+      destroyDescriptorPool(gd.device, g->descriptorPool);
     if (g->commandPool)
-      vkDestroyCommandPool(gd.device, g->commandPool, nullptr);
+      destroyCommandPool(gd.device, g->commandPool);
   }
   graphs_.clear();
   for (auto &e : events_) {
     if (!e) continue;
     VulkanDevice &ed = *devices_[e->deviceIdx];
     if (e->semaphore) vkDestroySemaphore(ed.device, e->semaphore, nullptr);
-    if (e->queryPool) vkDestroyQueryPool(ed.device, e->queryPool, nullptr);
+    if (e->queryPool) destroyQueryPool(ed.device, e->queryPool);
   }
   events_.clear();
   for (auto &s : streams_) if (s) teardownStream(*devices_[s->deviceIdx], *s);
@@ -776,12 +1339,7 @@ static bool initStream(VulkanDevice &dev, VCStream &s, QueueKind kind,
   s.frames.resize(frameRing);
   s.frameIdx = 0;
 
-  VkCommandPoolCreateInfo pci{};
-  pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-  // Reset command buffer bit so frames can be vkResetCommandBuffer'd.
-  pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-  pci.queueFamilyIndex = s.queueFamily;
-  if (vkCreateCommandPool(dev.device, &pci, nullptr, &s.commandPool) !=
+  if (createCommandPool(dev.device, s.queueFamily, dev, &s.commandPool) !=
       VK_SUCCESS)
     return false;
 
@@ -830,26 +1388,26 @@ static void teardownStream(VulkanDevice &dev, VCStream &s) {
     for (auto &sb : f.stagingBuffers) {
       if (sb->mapped) vkUnmapMemory(dev.device, sb->memory);
       if (sb->buffer) vkDestroyBuffer(dev.device, sb->buffer, nullptr);
-      if (sb->memory) vkFreeMemory(dev.device, sb->memory, nullptr);
+      if (sb->memory) freeDeviceMemory(dev, sb->memory);
     }
     f.stagingBuffers.clear();
     f.d2hReadbacks.clear();
     if (f.descriptorPool)
-      vkDestroyDescriptorPool(dev.device, f.descriptorPool, nullptr);
+      destroyDescriptorPool(dev.device, f.descriptorPool);
     if (f.fence) vkDestroyFence(dev.device, f.fence, nullptr);
     if (f.cb) cbs.push_back(f.cb);
   }
   for (auto &sb : s.stagingCache) {
     if (sb->mapped) vkUnmapMemory(dev.device, sb->memory);
     if (sb->buffer) vkDestroyBuffer(dev.device, sb->buffer, nullptr);
-    if (sb->memory) vkFreeMemory(dev.device, sb->memory, nullptr);
+    if (sb->memory) freeDeviceMemory(dev, sb->memory);
   }
   s.stagingCache.clear();
   s.stagingCacheBytes = 0;
   if (!cbs.empty() && s.commandPool)
     vkFreeCommandBuffers(dev.device, s.commandPool,
                          static_cast<uint32_t>(cbs.size()), cbs.data());
-  if (s.commandPool) vkDestroyCommandPool(dev.device, s.commandPool, nullptr);
+  if (s.commandPool) destroyCommandPool(dev.device, s.commandPool);
   // Cross-queue bridge semaphores, if this stream ever routed a copy.
   if (s.toCopy) vkDestroySemaphore(dev.device, s.toCopy, nullptr);
   if (s.fromCopy) vkDestroySemaphore(dev.device, s.fromCopy, nullptr);
@@ -925,9 +1483,18 @@ static void drainReadyReadbacks(VulkanDevice &dev, VCStream &s) {
   for (auto &f : s.frames) {
     if (!f.d2hReadbacks.empty() && f.fence != VK_NULL_HANDLE) {
       if (vkGetFenceStatus(dev.device, f.fence) == VK_SUCCESS) {
-        for (auto &rb : f.d2hReadbacks)
+        for (auto &rb : f.d2hReadbacks) {
           std::memcpy(Runtime::get().resolveHostAccess(rb.hostDst),
                       rb.staging->mapped, rb.bytes);
+          if (scTraceOn()) {
+            const uint32_t *w = (const uint32_t *)rb.staging->mapped;
+            std::fprintf(stderr,
+                         "vc[sc-trace]: drain hostDst=%p staging=%p "
+                         "mapped=%p bytes=%zu stage[0..1]=%08x %08x\n",
+                         rb.hostDst, (void *)rb.staging, rb.staging->mapped,
+                         rb.bytes, w[0], w[1]);
+          }
+        }
         f.d2hReadbacks.clear();
       }
     }
@@ -1000,12 +1567,19 @@ VCError Runtime::streamQuery(const VCStream &s, int *done) const {
   return VCError::Success; // query succeeded; *done reflects the state
 }
 
+// Frame-boundary VkResult tracing. See scTraceOn above.
+void Runtime::scTraceVk(const char *what, VkResult r) {
+  if (scTraceOn() && r != VK_SUCCESS)
+    std::fprintf(stderr, "vc[sc-trace]: %s -> %d\n", what, (int)r);
+}
+
 // Wait for the frame we're about to reuse, reset it, begin recording.
 VkCommandBuffer Runtime::beginFrame(VCStream &s) {
   VkDevice dev = devices_[s.deviceIdx]->device;
   StreamFrame &f = s.frames[s.frameIdx];
   // Wait for the GPU to finish with this frame's previous submission.
-  vkWaitForFences(dev, 1, &f.fence, VK_TRUE, UINT64_MAX);
+  scTraceVk("beginFrame/waitForFences",
+            vkWaitForFences(dev, 1, &f.fence, VK_TRUE, UINT64_MAX));
   // The fence just signaled, so every device->staging copy recorded in this
   // frame has executed: deliver deferred D2H readbacks to their host targets.
   // (The caller is responsible for having synchronized before reading.)
@@ -1020,8 +1594,59 @@ VkCommandBuffer Runtime::beginFrame(VCStream &s) {
   f.stagingBuffers.clear();
 
   vkResetFences(dev, 1, &f.fence);
+#ifdef VC_VULKAN_SC
+  // Re-record this frame's command buffer. The core path resets it in place,
+  // and so does an SC device only when the profile carries the
+  // commandPoolResetCommandBuffer property. When it does not (the Thor 581
+  // profile is one of those), vkResetCommandBuffer returns
+  // VK_ERROR_VALIDATION_FAILED and — the part that costs hours — every command
+  // recorded into that buffer afterwards is dropped without an error from
+  // vkBeginCommandBuffer/vkCmdCopyBuffer/vkQueueSubmit. The frame then submits
+  // empty command buffers forever: kernels and copies silently do nothing while
+  // every runtime call still reports success. Freeing the submitted buffer
+  // returns its memory to the pool's reservation and allocating a new one hands
+  // back a buffer that has never been submitted, so re-recording becomes legal
+  // and the peak allocation stays at one buffer per frame.
+  if (devices_[s.deviceIdx]->scCommandPoolResetCommandBuffer) {
+    scTraceVk("beginFrame/resetCommandBuffer", vkResetCommandBuffer(f.cb, 0));
+  } else {
+    VkCommandBuffer submitted = f.cb;
+    VkCommandBuffer fresh = VK_NULL_HANDLE;
+    vkFreeCommandBuffers(dev, s.commandPool, 1, &submitted);
+    VkCommandBufferAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool = s.commandPool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkResult ar = vkAllocateCommandBuffers(dev, &ai, &fresh);
+    scTraceVk("beginFrame/allocateCommandBuffer", ar);
+    if (ar == VK_SUCCESS) {
+      f.cb = fresh;
+    } else {
+      std::fprintf(stderr,
+                   "vc: Vulkan SC: could not allocate a replacement command "
+                   "buffer for stream frame %zu (%d) — the command-pool "
+                   "reservation is exhausted; raise "
+                   "VcScReservation::commandBufferRequestCount (env "
+                   "VC_SC_COMMAND_BUFFERS)\n",
+                   s.frameIdx, (int)ar);
+    }
+  }
+#else
   vkResetCommandBuffer(f.cb, 0);
+#endif
+#ifdef VC_VULKAN_SC
+  // SC only lets the app recycle the memory of a descriptor pool it created
+  // when the device says descriptor-set memory is recyclable. When it is not,
+  // resetting the pool would be undefined; the descriptors allocated this frame
+  // simply stay allocated, and the frame's pool is sized (see initStream) to
+  // cover the frame ring's worth of sets. Exhausting a pool is a real failure
+  // under SC, not a silent fallback — vkAllocateDescriptorSets reports it.
+  if (devices_[s.deviceIdx]->scRecycleDescriptorSetMemory)
+    vkResetDescriptorPool(dev, f.descriptorPool, 0);
+#else
   vkResetDescriptorPool(dev, f.descriptorPool, 0);
+#endif
 
   VkCommandBufferBeginInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1032,14 +1657,14 @@ VkCommandBuffer Runtime::beginFrame(VCStream &s) {
     dgbi.deviceMask = devices_[s.deviceIdx]->groupDeviceMask;
     bi.pNext = &dgbi;
   }
-  vkBeginCommandBuffer(f.cb, &bi);
+  scTraceVk("beginFrame/beginCommandBuffer", vkBeginCommandBuffer(f.cb, &bi));
   return f.cb;
 }
 
 void Runtime::endFrame(VCStream &s) {
   VulkanDevice &vd = *devices_[s.deviceIdx];
   StreamFrame &f = s.frames[s.frameIdx];
-  vkEndCommandBuffer(f.cb);
+  scTraceVk("endFrame/endCommandBuffer", vkEndCommandBuffer(f.cb));
 
   VkSubmitInfo si{};
   si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1113,7 +1738,7 @@ void Runtime::endFrame(VCStream &s) {
   s.pendingWaits.clear();
   s.pendingSignals.clear();
 
-  vkQueueSubmit(s.queue, 1, &si, f.fence);
+  scTraceVk("endFrame/queueSubmit", vkQueueSubmit(s.queue, 1, &si, f.fence));
   s.frameIdx = (s.frameIdx + 1) % s.frames.size();
 }
 
@@ -1370,7 +1995,7 @@ VCError Runtime::mallocBuffer(size_t bytes, VCBuffer &out) {
     return VCError::OutOfMemory;
   }
   if (bindBufferMemoryOn(vd, out.buffer, out.memory) != VK_SUCCESS) {
-    vkFreeMemory(vd.device, out.memory, nullptr);
+    freeDeviceMemory(vd, out.memory);
     vkDestroyBuffer(vd.device, out.buffer, nullptr);
     out = VCBuffer{};
     return VCError::OutOfMemory;
@@ -1408,7 +2033,7 @@ VCError Runtime::mallocHostBufferOn(int deviceIdx, size_t bytes,
     return VCError::OutOfMemory;
   }
   if (bindBufferMemoryOn(vd, out.buffer, out.memory) != VK_SUCCESS) {
-    vkFreeMemory(vd.device, out.memory, nullptr);
+    freeDeviceMemory(vd, out.memory);
     vkDestroyBuffer(vd.device, out.buffer, nullptr);
     out = VCBuffer{};
     return VCError::OutOfMemory;
@@ -1462,7 +2087,7 @@ VCError Runtime::mallocManagedBuffer(size_t bytes, VCBuffer &out) {
     return VCError::OutOfMemory;
   }
   if (bindBufferMemoryOn(vd, out.buffer, out.memory) != VK_SUCCESS) {
-    vkFreeMemory(vd.device, out.memory, nullptr);
+    freeDeviceMemory(vd, out.memory);
     vkDestroyBuffer(vd.device, out.buffer, nullptr);
     out = VCBuffer{};
     return VCError::OutOfMemory;
@@ -1482,7 +2107,7 @@ VCError Runtime::freeBuffer(VCBuffer &buf) {
     buf.mapped = nullptr;
   }
   if (buf.buffer) vkDestroyBuffer(dev, buf.buffer, nullptr);
-  if (buf.memory) vkFreeMemory(dev, buf.memory, nullptr);
+  if (buf.memory) freeDeviceMemory(*devices_[buf.deviceIdx], buf.memory);
   buf = VCBuffer{};
   return VCError::Success;
 }
@@ -1627,7 +2252,7 @@ VCError Runtime::createImage(uint32_t w, uint32_t h, uint32_t depth,
   vci.subresourceRange.layerCount = isArray ? layers : 1;
   if (vkCreateImageView(vd.device, &vci, nullptr, &out.view) != VK_SUCCESS) {
     vkDestroyImage(vd.device, out.image, nullptr);
-    vkFreeMemory(vd.device, out.memory, nullptr);
+    freeDeviceMemory(vd, out.memory);
     out.image = VK_NULL_HANDLE;
     out.memory = VK_NULL_HANDLE;
     return VCError::OutOfMemory;
@@ -1675,7 +2300,7 @@ VCError Runtime::destroyImage(VCImage &img) {
   VkDevice dev = devices_[img.deviceIdx]->device;
   if (img.view) vkDestroyImageView(dev, img.view, nullptr);
   if (img.image) vkDestroyImage(dev, img.image, nullptr);
-  if (img.memory) vkFreeMemory(dev, img.memory, nullptr);
+  if (img.memory) freeDeviceMemory(*devices_[img.deviceIdx], img.memory);
   img = VCImage{};
   return VCError::Success;
 }
@@ -2156,6 +2781,12 @@ VCError Runtime::copyHostToDeviceAsync(VCBuffer &dst, const void *hostSrc,
   VkBufferCopy region{0, 0, bytes};
   vkCmdCopyBuffer(cb, staging->buffer, dst.buffer, 1, &region);
   endFrame(s);
+  if (scTraceOn())
+    std::fprintf(stderr,
+                 "vc[sc-trace]: H2D staging=%p mapped=%p dst=%p bytes=%zu "
+                 "frame=%zu\n",
+                 (void *)staging->buffer, staging->mapped, (void *)dst.buffer,
+                 bytes, submitIdx);
   s.frames[submitIdx].stagingBuffers.push_back(std::move(staging));
   return VCError::Success;
 }
@@ -2208,6 +2839,12 @@ VCError Runtime::copyDeviceToHostAsync(void *hostDst, const VCBuffer &src,
   // Defer the host memcpy: the device copy hasn't run yet. beginFrame will
   // drain this entry when the fence signals.
   VCBuffer *raw = staging.get();
+  if (scTraceOn())
+    std::fprintf(stderr,
+                 "vc[sc-trace]: D2H src=%p staging=%p mapped=%p bytes=%zu "
+                 "frame=%zu\n",
+                 (void *)src.buffer, (void *)staging->buffer, staging->mapped,
+                 bytes, submitIdx);
   s.frames[submitIdx].d2hReadbacks.push_back({hostDst, raw, bytes});
   s.frames[submitIdx].stagingBuffers.push_back(std::move(staging));
   return VCError::Success;
@@ -2236,7 +2873,7 @@ VCError Runtime::synchronize() {
 
 // Size the graph descriptor pool generously: one set per recorded launch that
 // has pointer args, each with up to a handful of SSBO bindings.
-static VkDescriptorPool createGraphDescriptorPool(VkDevice dev) {
+static VkDescriptorPool createGraphDescriptorPool(const VulkanDevice &vd) {
   VkDescriptorPoolSize ps[2]{};
   ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   ps[0].descriptorCount = 1024;
@@ -2248,10 +2885,18 @@ static VkDescriptorPool createGraphDescriptorPool(VkDevice dev) {
   // the pool (allows re-recording).
   dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
   dpci.maxSets = 256;
+#ifdef VC_VULKAN_SC
+  // Without recycleDescriptorSetMemory a reset is undefined and the sets of a
+  // previous recording stay allocated (see resetGraphState), so the pool has to
+  // cover every recording the app makes, not just one. Sixteen recordings is an
+  // arbitrary but generous cap; exceeding it fails loudly at
+  // vkAllocateDescriptorSets rather than silently corrupting anything.
+  if (!vd.scRecycleDescriptorSetMemory) dpci.maxSets *= 16;
+#endif
   dpci.poolSizeCount = 2;
   dpci.pPoolSizes = ps;
   VkDescriptorPool pool = VK_NULL_HANDLE;
-  vkCreateDescriptorPool(dev, &dpci, nullptr, &pool);
+  vkCreateDescriptorPool(vd.device, &dpci, nullptr, &pool);
   return pool;
 }
 
@@ -2261,17 +2906,13 @@ VCError Runtime::createGraph(VCGraphHandle *out) {
   g->deviceIdx = currentDeviceIdx_;
   VulkanDevice &vd = *devices_[currentDeviceIdx_];
 
-  VkCommandPoolCreateInfo pci{};
-  pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-  pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-  pci.queueFamilyIndex = vd.computeQueueFamily;
-  if (vkCreateCommandPool(vd.device, &pci, nullptr, &g->commandPool) !=
+  if (createCommandPool(vd.device, vd.computeQueueFamily, vd, &g->commandPool) !=
       VK_SUCCESS)
     return VCError::Unknown;
 
-  g->descriptorPool = createGraphDescriptorPool(vd.device);
+  g->descriptorPool = createGraphDescriptorPool(vd);
   if (!g->descriptorPool) {
-    vkDestroyCommandPool(vd.device, g->commandPool, nullptr);
+    destroyCommandPool(vd.device, g->commandPool);
     return VCError::Unknown;
   }
 
@@ -2282,8 +2923,8 @@ VCError Runtime::createGraph(VCGraphHandle *out) {
   ai.commandBufferCount = 1;
   if (vkAllocateCommandBuffers(vd.device, &ai, &g->secondaryCB) !=
       VK_SUCCESS) {
-    vkDestroyDescriptorPool(vd.device, g->descriptorPool, nullptr);
-    vkDestroyCommandPool(vd.device, g->commandPool, nullptr);
+    destroyDescriptorPool(vd.device, g->descriptorPool);
+    destroyCommandPool(vd.device, g->commandPool);
     return VCError::Unknown;
   }
 
@@ -2296,9 +2937,50 @@ VCError Runtime::createGraph(VCGraphHandle *out) {
 // re-recording. Frees the secondary command buffer's recorded state by
 // resetting it, resets the descriptor pool, drops staging.
 static void resetGraphState(VulkanDevice &dev, VCGraph &g) {
+#ifdef VC_VULKAN_SC
+  // Same profile restriction as the frame ring (see beginFrame): when the
+  // device does not permit vkResetCommandBuffer, resetting the secondary
+  // command buffer is rejected and every command recorded into it afterwards
+  // is dropped silently, so a re-recorded graph would replay as an empty
+  // command buffer. Free it back to the pool and allocate a fresh one instead.
+  if (g.secondaryCB && g.commandPool && !dev.scCommandPoolResetCommandBuffer) {
+    VkCommandBuffer submitted = g.secondaryCB;
+    VkCommandBuffer fresh = VK_NULL_HANDLE;
+    vkFreeCommandBuffers(dev.device, g.commandPool, 1, &submitted);
+    VkCommandBufferAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool = g.commandPool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+    ai.commandBufferCount = 1;
+    VkResult ar = vkAllocateCommandBuffers(dev.device, &ai, &fresh);
+    Runtime::scTraceVk("resetGraphState/allocateCommandBuffer", ar);
+    if (ar == VK_SUCCESS)
+      g.secondaryCB = fresh;
+    else
+      std::fprintf(stderr,
+                   "vc: Vulkan SC: could not allocate a replacement secondary "
+                   "command buffer for the graph (%d) — the command-pool "
+                   "reservation is exhausted; raise "
+                   "VcScReservation::commandBufferRequestCount (env "
+                   "VC_SC_COMMAND_BUFFERS)\n",
+                   (int)ar);
+  } else if (g.secondaryCB) {
+    vkResetCommandBuffer(g.secondaryCB, 0);
+  }
+#else
   if (g.secondaryCB) vkResetCommandBuffer(g.secondaryCB, 0);
+#endif
+#ifdef VC_VULKAN_SC
+  // Re-recording a graph re-allocates its descriptor sets. If the device does
+  // not allow recycling descriptor-set memory, the previous sets stay
+  // allocated and the pool's maxSets has to cover both passes — see
+  // createGraphDescriptorPool, which is sized for that.
+  if (g.descriptorPool && dev.scRecycleDescriptorSetMemory)
+    vkResetDescriptorPool(dev.device, g.descriptorPool, 0);
+#else
   if (g.descriptorPool)
     vkResetDescriptorPool(dev.device, g.descriptorPool, 0);
+#endif
   g.stagingBuffers.clear();
   g.d2hReadbacks.clear();
   g.recorded = false;
@@ -2317,9 +2999,9 @@ VCError Runtime::destroyGraph(VCGraphHandle graph) {
   if (g->secondaryCB && g->commandPool)
     vkFreeCommandBuffers(gd.device, g->commandPool, 1, &g->secondaryCB);
   if (g->descriptorPool)
-    vkDestroyDescriptorPool(gd.device, g->descriptorPool, nullptr);
+    destroyDescriptorPool(gd.device, g->descriptorPool);
   if (g->commandPool)
-    vkDestroyCommandPool(gd.device, g->commandPool, nullptr);
+    destroyCommandPool(gd.device, g->commandPool);
   for (auto it = graphs_.begin(); it != graphs_.end(); ++it) {
     if (it->get() == g) { graphs_.erase(it); break; }
   }
@@ -2432,8 +3114,7 @@ VCError Runtime::destroyEvent(VCEventHandle event) {
   vkDeviceWaitIdle(dev);
   if (e->semaphore)
     vkDestroySemaphore(dev, e->semaphore, nullptr);
-  if (e->queryPool)
-    vkDestroyQueryPool(dev, e->queryPool, nullptr);
+  if (e->queryPool) destroyQueryPool(dev, e->queryPool);
   for (auto it = events_.begin(); it != events_.end(); ++it) {
     if (it->get() == e) { events_.erase(it); break; }
   }
@@ -3362,11 +4043,41 @@ VCKernelDeviceState *Runtime::getOrCreateKernelDeviceState(VCKernel &k,
                                                            int deviceIdx) {
   auto it = k.perDevice.find(deviceIdx);
   if (it != k.perDevice.end())
+#ifdef VC_VULKAN_SC
+    // An offline kernel never gets a shader module, so its presence cannot mark
+    // success the way it does on the core path: for an offline kernel, being in
+    // the map is itself the marker.
+    return (k.offline || it->second->shaderModule) ? it->second.get() : nullptr;
+#else
     // A cached state with no shader module is a recorded failure: report it once
     // instead of re-running the checks and reprinting on every launch.
     return it->second->shaderModule ? it->second.get() : nullptr;
+#endif
   auto st = std::make_unique<VCKernelDeviceState>();
   VulkanDevice &vd = *devices_[deviceIdx];
+#ifdef VC_VULKAN_SC
+  if (k.offline) {
+    // Offline (Vulkan SC): the pipeline is selected out of the precompiled
+    // cache by UUID, so there is no shader module to build and no capability
+    // set to check against — an SC device exposes only the profile's fixed
+    // feature set. buildLayout takes the layout from the descriptor, not from
+    // reflection. Register the empty state and let the first dispatch drive
+    // buildLayout/getPipeline.
+    auto *raw = st.get();
+    k.perDevice[deviceIdx] = std::move(st);
+    trackKernel(&k);
+    return raw;
+  }
+#endif
+#ifdef VC_VULKAN_SC
+  std::fprintf(stderr,
+               "vc: kernel '%s': the Vulkan SC runtime cannot compile pipelines "
+               "at runtime; load it with vcLoadKernelOffline() from a "
+               "`vc -emit=sc` descriptor\n",
+               k.entryPoint.c_str());
+  k.perDevice[deviceIdx] = std::move(st);
+  return nullptr;
+#else
   if (!checkSpirvCapabilities(k.spirvWords.data(), k.spirvWords.size(),
                               k.entryPoint, vd)) {
     // Cache the empty state: no Vulkan handles to track, and the null module
@@ -3400,6 +4111,7 @@ VCKernelDeviceState *Runtime::getOrCreateKernelDeviceState(VCKernel &k,
   // (a raw local in host main) has no destructor that would do this.
   trackKernel(&k);
   return raw;
+#endif // VC_VULKAN_SC
 }
 
 // Remember `k` so its Vulkan handles can be torn down at shutdown. Deduped: a
@@ -3428,15 +4140,27 @@ void Runtime::releaseKernel(VCKernel &k) {
   if (!init_) { k = VCKernel{}; return; }
   for (auto &kv : k.perDevice) {
     VkDevice dev = devices_[kv.first]->device;
+#ifdef VC_VULKAN_SC
+    // SC reclaims pipeline memory only when the device advertises
+    // recyclePipelineMemory. When it does not, the offline pipelines were
+    // handed out of the reserved pipeline pool and go away with the device.
+    bool reclaimPipeline = devices_[kv.first]->scRecyclePipelineMemory;
+    if (reclaimPipeline) {
+#endif
     for (auto &p : kv.second->pipelines)
       if (p.second) vkDestroyPipeline(dev, p.second, nullptr);
     if (kv.second->pipelineLayout)
       vkDestroyPipelineLayout(dev, kv.second->pipelineLayout, nullptr);
+#ifdef VC_VULKAN_SC
+    }
+#endif
     if (kv.second->descriptorSetLayout)
       vkDestroyDescriptorSetLayout(dev, kv.second->descriptorSetLayout,
                                    nullptr);
+    // An offline kernel never had a module to begin with, so the SC build
+    // reaches this with kV.second->shaderModule already VK_NULL_HANDLE.
     if (kv.second->shaderModule)
-      vkDestroyShaderModule(dev, kv.second->shaderModule, nullptr);
+      destroyShaderModule(dev, kv.second->shaderModule);
   }
   k = VCKernel{};
 }
@@ -3459,6 +4183,34 @@ bool Runtime::buildLayout(VCKernel &k, int deviceIdx,
   uint32_t imageOrdinal = 0;
   uint32_t scalarOrdinal = 0;
   uint32_t pcSize = k.pcSize;
+#ifdef VC_VULKAN_SC
+  if (k.offline) {
+    // Offline (SC): the arrangement is not derived from this launch's args at
+    // all — it was fixed when pcc compiled the pipeline, and the driver compares
+    // the layout handed to vkCreateComputePipelines against the cached entry.
+    // Divergence surfaces as a bare -1000011001 with no hint of which binding
+    // differs, so the arrangement comes from the emitted descriptor, which the
+    // emitter and the pcc JSON share by construction: SSBOs dense from zero,
+    // then storage images immediately after.
+    for (size_t i = 0; i < k.offlineStorageBufferBindings.size(); ++i) {
+      VkDescriptorSetLayoutBinding b{};
+      b.binding = k.offlineStorageBufferBindings[i];
+      b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      b.descriptorCount = 1;
+      b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      bindings.push_back(b);
+    }
+    for (size_t i = 0; i < k.offlineImageBindings.size(); ++i) {
+      VkDescriptorSetLayoutBinding b{};
+      b.binding = k.offlineImageBindings[i];
+      b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      b.descriptorCount = 1;
+      b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      bindings.push_back(b);
+    }
+    pcSize = k.pcSize;
+  } else
+#endif
   for (int i = 0; i < argCount; ++i) {
     if (args[i].kind == VCKernelArg::Pointer) {
       VkDescriptorSetLayoutBinding b{};
@@ -3602,6 +4354,94 @@ VkPipeline Runtime::getPipeline(VCKernel &k, int deviceIdx, unsigned blockX,
   auto it = st->pipelines.find(key);
   if (it != st->pipelines.end()) return it->second;
 
+#ifdef VC_VULKAN_SC
+  if (k.offline) {
+    // Offline (SC): the block size is baked into the precompiled SPIR-V, so a
+    // launch with a block size no binary was compiled for has nothing to match.
+    // Check the block dims against the descriptor before touching the driver:
+    // VK_ERROR_NO_PIPELINE_MATCH does not say which of the create-info fields
+    // differed, and a wrong block size is by far the likeliest way to get one.
+    if (dims[0] != k.offlineBlockX || dims[1] != k.offlineBlockY ||
+        dims[2] != k.offlineBlockZ) {
+      std::fprintf(stderr,
+                   "vc: kernel '%s': launched with block %ux%ux%u but the "
+                   "offline pipeline was compiled for %ux%ux%u; re-run "
+                   "`vc -emit=sc` to produce a binary for this block size\n",
+                   k.entryPoint.c_str(), dims[0], dims[1], dims[2],
+                   k.offlineBlockX, k.offlineBlockY, k.offlineBlockZ);
+      return VK_NULL_HANDLE;
+    }
+    VkPipelineOfflineCreateInfo offlineCI{};
+    offlineCI.sType = VK_STRUCTURE_TYPE_PIPELINE_OFFLINE_CREATE_INFO;
+    offlineCI.pNext = nullptr;
+    std::memcpy(offlineCI.pipelineIdentifier, k.offlineUuid,
+                VK_UUID_SIZE);
+    offlineCI.matchControl =
+        VK_PIPELINE_MATCH_CONTROL_APPLICATION_UUID_EXACT_MATCH;
+    offlineCI.poolEntrySize = devices_[deviceIdx]->scPipelinePoolEntrySize;
+
+    VkComputePipelineCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pci.stage.module = VK_NULL_HANDLE; // no module: the cache has the binary
+    pci.stage.pName = k.entryPoint.c_str();
+    pci.stage.pSpecializationInfo = nullptr; // baked, never specialized
+    pci.layout = st->pipelineLayout;
+    pci.pNext = &offlineCI;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkResult pr = vkCreateComputePipelines(devices_[deviceIdx]->device,
+                                           devices_[deviceIdx]->pipelineCache, 1,
+                                           &pci, nullptr, &pipeline);
+    if (pr != VK_SUCCESS) {
+      if (pr == VK_ERROR_NO_PIPELINE_MATCH)
+        std::fprintf(stderr,
+                     "vc: kernel '%s': no offline pipeline in '%s' matches "
+                     "UUID %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x"
+                     "%02x%02x%02x — the cache is stale or was built without "
+                     "this kernel; re-run `vc -emit=sc` and the cache build\n",
+                     k.entryPoint.c_str(), devices_[deviceIdx]->scCachePath.c_str(),
+                     k.offlineUuid[0], k.offlineUuid[1], k.offlineUuid[2],
+                     k.offlineUuid[3], k.offlineUuid[4], k.offlineUuid[5],
+                     k.offlineUuid[6], k.offlineUuid[7], k.offlineUuid[8],
+                     k.offlineUuid[9], k.offlineUuid[10], k.offlineUuid[11],
+                     k.offlineUuid[12], k.offlineUuid[13], k.offlineUuid[14],
+                     k.offlineUuid[15]);
+      else if (pr == VK_ERROR_VALIDATION_FAILED)
+        std::fprintf(stderr,
+                     "vc: kernel '%s': the driver rejected the offline pipeline "
+                     "create with VK_ERROR_VALIDATION_FAILED (-1000011001). The "
+                     "app-supplied create info does not match the cached entry — "
+                     "the descriptor-set layout or push-constant range differs "
+                     "from the JSON pcc consumed\n",
+                     k.entryPoint.c_str());
+      else if (pr == VK_ERROR_OUT_OF_HOST_MEMORY)
+        // Vulkan SC reports a reservation overrun as OOM: the device was
+        // created with room for fewer pipeline objects (or pipeline-pool
+        // entries) than the app is trying to load. On a 1 MiB pool this is
+        // never real memory pressure, so name the actual cause.
+        std::fprintf(stderr,
+                     "vc: kernel '%s': offline pipeline create returned "
+                     "VK_ERROR_OUT_OF_HOST_MEMORY (-1) (block %u,%u,%u). Under "
+                     "Vulkan SC that is a reservation overrun, not real "
+                     "out-of-memory: the device was created with room for fewer "
+                     "pipelines than the app loads. Raise "
+                     "VcScReservation::computePipelines (which sizes the "
+                     "pipeline pool by default; env VC_SC_COMPUTE_PIPELINES / "
+                     "VC_SC_PIPELINE_POOL_ENTRIES)\n",
+                     k.entryPoint.c_str(), blockX, blockY, blockZ);
+      else
+        std::fprintf(stderr,
+                     "vc: kernel '%s': vkCreateComputePipelines failed with "
+                     "VkResult %d (offline, block %u,%u,%u)\n",
+                     k.entryPoint.c_str(), int(pr), blockX, blockY, blockZ);
+      return VK_NULL_HANDLE;
+    }
+    st->pipelines[key] = pipeline;
+    return pipeline;
+  }
+#endif // VC_VULKAN_SC
+
   // Specialization constants: 0->x, 1->y, 2->z (matches GLSL backend).
   VkSpecializationMapEntry entries[3];
   unsigned data[3] = {blockX ? blockX : 1, blockY ? blockY : 1,
@@ -3656,7 +4496,10 @@ VkPipeline Runtime::bindKernelForDispatch(VkCommandBuffer cb,
                                           unsigned blockZ,
                                           const VCKernelArg *args,
                                           int argCount) {
-  if (k.spirvWords.empty()) {
+  // An offline (Vulkan SC) kernel has no SPIR-V in the process by design: its
+  // pipeline comes from the precompiled cache, selected by UUID. The guard only
+  // means "this kernel was loaded at all" for the embed path.
+  if (!k.offline && k.spirvWords.empty()) {
     std::fprintf(stderr,
                  "vc: kernel '%s': launched with no SPIR-V embedded — the "
                  "compiler emitted no device module for it\n",
@@ -4391,6 +5234,76 @@ VCError vcLoadKernelFromFile(const char *path, const char *entryPoint,
   *outKernel = k;
   return VCError::Success;
 }
+
+#ifdef VC_VULKAN_SC
+VCError vcLoadKernelOffline(const VCScPipelineDesc *desc,
+                            VCKernelHandle *outKernel) {
+  if (!outKernel || !desc) return VCError::InvalidValue;
+  if (!desc->entryPoint || !*desc->entryPoint) {
+    std::fprintf(stderr,
+                 "vc: offline kernel '%s': descriptor has no entry point\n",
+                 desc->name ? desc->name : "?");
+    return VCError::InvalidValue;
+  }
+  // A zero block dimension would become 1 in getPipeline's dims[] and never
+  // match the descriptor's own check, so reject it here where the name is known.
+  if (!desc->blockX || !desc->blockY || !desc->blockZ) {
+    std::fprintf(stderr,
+                 "vc: offline kernel '%s': descriptor has a zero block "
+                 "dimension (%u,%u,%u)\n",
+                 desc->name ? desc->name : "?", desc->blockX, desc->blockY,
+                 desc->blockZ);
+    return VCError::InvalidValue;
+  }
+  // An all-zero UUID is the "unset" value pcc writes for a placeholder; a
+  // lookup for it can never match a real cache entry, and the failure the
+  // driver reports (VK_ERROR_NO_PIPELINE_MATCH) names neither the kernel nor
+  // the UUID, so catch it at load time instead.
+  static const uint8_t zeroUuid[16] = {};
+  if (std::memcmp(desc->uuid, zeroUuid, 16) == 0) {
+    std::fprintf(stderr,
+                 "vc: offline kernel '%s': descriptor carries an all-zero "
+                 "pipeline UUID\n",
+                 desc->name ? desc->name : "?");
+    return VCError::InvalidValue;
+  }
+  auto *k = new VCKernel{};
+  k->offline = true;
+  k->entryPoint = desc->entryPoint;
+  std::memcpy(k->offlineUuid, desc->uuid, 16);
+  k->offlineBlockX = desc->blockX;
+  k->offlineBlockY = desc->blockY;
+  k->offlineBlockZ = desc->blockZ;
+  // Bindings are dense from zero in argument order, matching what the emitter
+  // and gen_pcc_json wrote for pcc: SSBOs at 0..N-1, then storage images at
+  // N..N+M-1. These are absolute binding numbers, not per-kind ordinals — the
+  // two sequences are independent, so an image's binding is its own ordinal
+  // *plus* the SSBO count. Numbering the images from zero instead would collide
+  // with the first SSBO whenever a kernel takes both, and the driver accepts the
+  // resulting layout while the stores go nowhere.
+  //
+  // They go in BOTH the offline lists (buildLayout's offline branch) and the
+  // reflected ones (the descriptor-set write path indexes those). One value per
+  // binding, two readers: a kernel with an SSBO *and* an image is otherwise
+  // exactly the case where the two disagree.
+  for (uint32_t i = 0; i < desc->storageBufferBindingCount; ++i) {
+    k->offlineStorageBufferBindings.push_back(i);
+    k->storageBufferBindings.push_back(i);
+  }
+  for (uint32_t i = 0; i < desc->imageBindingCount; ++i) {
+    uint32_t b = desc->storageBufferBindingCount + i;
+    k->offlineImageBindings.push_back(b);
+    k->imageBindings.push_back(b);
+  }
+  k->pcSize = desc->pushConstantSize;
+  k->pcOffset = desc->pushConstantOffset;
+  // No SPIR-V in this process: the module went to pcc at build time. The
+  // reflection-derived fields stay empty, which is what routes buildLayout to
+  // the offline branch.
+  *outKernel = k;
+  return VCError::Success;
+}
+#endif // VC_VULKAN_SC
 
 VCError vcReleaseKernel(VCKernelHandle kernel) {
   if (!kernel) return VCError::Success;
