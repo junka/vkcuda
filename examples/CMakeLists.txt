@@ -15,7 +15,7 @@ foreach(demo ${VC_SINGLEFILE_DEMOS})
     OUTPUT ${CMAKE_BINARY_DIR}/${demo}_sf
     COMMAND vcc ${CMAKE_SOURCE_DIR}/test/${demo}.vc
             -o ${CMAKE_BINARY_DIR}/${demo}_sf
-    DEPENDS vcc ${CMAKE_SOURCE_DIR}/test/${demo}.vc
+    DEPENDS vcc VCRuntime ${CMAKE_SOURCE_DIR}/test/${demo}.vc
     COMMENT "vcc compiling test/${demo}.vc (single-file CUDA-style)"
     VERBATIM)
   add_custom_target(${demo}_sf ALL
@@ -32,7 +32,7 @@ foreach(example singlefile flash_attn matmul_bench)
     OUTPUT ${CMAKE_BINARY_DIR}/${example}
     COMMAND vcc ${CMAKE_CURRENT_SOURCE_DIR}/${example}.vc
             -o ${CMAKE_BINARY_DIR}/${example}
-    DEPENDS vcc ${CMAKE_CURRENT_SOURCE_DIR}/${example}.vc
+    DEPENDS vcc VCRuntime ${CMAKE_CURRENT_SOURCE_DIR}/${example}.vc
     COMMENT "vcc compiling ${example}.vc (single-file CUDA-style)"
     VERBATIM)
   add_custom_target(${example} ALL
@@ -48,7 +48,7 @@ add_custom_command(
   OUTPUT ${CMAKE_BINARY_DIR}/matmul_coopmat_bench
   COMMAND vc ${CMAKE_CURRENT_SOURCE_DIR}/matmul_coopmat_bench.vc
           -emit=full -o ${CMAKE_BINARY_DIR}/matmul_coopmat_bench
-  DEPENDS vc ${CMAKE_CURRENT_SOURCE_DIR}/matmul_coopmat_bench.vc
+  DEPENDS vc VCRuntime ${CMAKE_CURRENT_SOURCE_DIR}/matmul_coopmat_bench.vc
   COMMENT "vc compiling matmul_coopmat_bench.vc (cooperative-matrix, MLIR backend)"
   VERBATIM)
 add_custom_target(matmul_coopmat_bench ALL
