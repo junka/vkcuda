@@ -49,6 +49,8 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Path.h"
 
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -62,6 +64,29 @@ using namespace mlir;
 
 namespace {
 enum class EmitKind { AST, MLIR, SPIRV, Host, Full, SC };
+} // namespace
+
+namespace {
+// -time-passes: coarse wall-time timer for the driver-side phases (frontend,
+// ASTToMLIR, serialize). Pass-level timing inside the MLIR pipeline is
+// reported by the pipeline itself (see runLoweringPipeline); the phase lines
+// here cover everything around it, including the serialization and binary
+// patches the pass manager never sees. Prints on destruction so early returns
+// (parse failure, emit error) still report the time spent so far.
+struct PhaseTimer {
+  PhaseTimer(const char *name, bool on)
+      : name(name), on(on), t0(std::chrono::steady_clock::now()) {}
+  ~PhaseTimer() {
+    if (!on) return;
+    double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count();
+    std::fprintf(stderr, "vc: %-12s %9.2f ms\n", name, ms);
+  }
+  const char *name;
+  bool on;
+  std::chrono::steady_clock::time_point t0;
+};
 } // namespace
 
 // Patch the serialized SPIR-V binary to decorate the `gl_WorkGroupSize`
@@ -1752,6 +1777,9 @@ int main(int argc, char **argv) {
                      "instead of rejecting them"));
   llvm::cl::ParseCommandLineOptions(argc, argv, "VC compiler\n");
 
+  // -time-passes: phase timers + per-pass report + SPIR-V byte size.
+  const bool timing = codegen::timePassesEnabled();
+
   EmitKind kind = EmitKind::MLIR;
   if (emit == "ast") kind = EmitKind::AST;
   else if (emit == "spirv") kind = EmitKind::SPIRV;
@@ -1770,7 +1798,11 @@ int main(int argc, char **argv) {
   Lexer lex(sm, mainBuf);
   SourceLocation start;
   TranslationUnit tu{start};
+  // parser/sema must stay in main scope: the AST holds StringRefs into
+  // Parser-owned storage (scopedNameStrs for ns:: names, typeNames), which
+  // codegen reads long after this block. Only the timer is scoped.
   Parser parser(lex, sm, tu);
+  std::optional<PhaseTimer> frontendTimer{std::in_place, "frontend", timing};
   if (!parser.parseTranslationUnit()) {
     llvm::errs() << "parse failed\n";
     return 1;
@@ -1789,6 +1821,7 @@ int main(int argc, char **argv) {
     llvm::errs() << "recursion: aborting due to errors\n";
     return 1;
   }
+  frontendTimer.reset(); // frontend phase ends here (prints only under -time-passes)
 
   if (syntaxOnly) return 0;
 
@@ -1853,8 +1886,12 @@ int main(int argc, char **argv) {
     return mlir::success();
   });
 
-  auto module = codegen::translateASTToMLIR(tu, ctx, warningsAsErrors,
-                                            allowF64MathF32);
+  OwningOpRef<ModuleOp> module;
+  {
+    PhaseTimer t("ASTToMLIR", timing);
+    module = codegen::translateASTToMLIR(tu, ctx, warningsAsErrors,
+                                         allowF64MathF32);
+  }
   if (!module) {
     llvm::errs() << "codegen failed\n";
     return 1;
@@ -1865,20 +1902,29 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  // SPIRV: run lowering then translate to binary.
-  if (failed(codegen::runLoweringPipeline(*module)))
-    return 1;
+  // SPIRV: run lowering then translate to binary. The pipeline prints its own
+  // per-pass timing report under -time-passes (stderr); the phase line here
+  // wraps it with the total.
+  SmallVector<uint32_t, 0> binary;
+  {
+    PhaseTimer t("lowering", timing);
+    if (failed(codegen::runLoweringPipeline(*module)))
+      return 1;
+  }
 
   // Serialize the spirv.module to a SPIR-V binary.
-  SmallVector<uint32_t, 0> binary;
   mlir::spirv::ModuleOp spirvModule;
-  module->walk([&](mlir::spirv::ModuleOp m) {
-    if (!spirvModule)
-      spirvModule = m;
-  });
-  if (!spirvModule || failed(mlir::spirv::serialize(spirvModule, binary))) {
-    llvm::errs() << "spirv translation failed\n";
-    return 1;
+  {
+    PhaseTimer t("serialize", timing);
+    module->walk([&](mlir::spirv::ModuleOp m) {
+      if (!spirvModule)
+        spirvModule = m;
+    });
+    if (!spirvModule ||
+        failed(mlir::spirv::serialize(spirvModule, binary))) {
+      llvm::errs() << "spirv translation failed\n";
+      return 1;
+    }
   }
 
   // Decorate the gl_WorkGroupSize spec-composite BuiltIn WorkgroupSize so the
@@ -1903,6 +1949,12 @@ int main(int argc, char **argv) {
   // can't concatenate multiple entry points across kernels, so like the GLSL
   // driver we only write the first kernel's module — but MLIR emits one
   // binary with one OpEntryPoint per kernel, so the whole binary is written.)
+  if (timing) {
+    unsigned entries = 0;
+    spirvModule.walk([&](mlir::spirv::EntryPointOp) { ++entries; });
+    llvm::errs() << "vc: spirv         " << (binary.size() * 4)
+                 << " bytes, " << entries << " entry point(s)\n";
+  }
   if (kind == EmitKind::SPIRV) {
     std::error_code ec;
     auto out = std::make_unique<llvm::ToolOutputFile>(

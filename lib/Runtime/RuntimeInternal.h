@@ -80,6 +80,15 @@ struct VulkanDevice {
   bool storagePushConstant16 = false;    // VkPhysicalDevice16BitStorageFeatures
   bool vulkanMemoryModel = false;        // VkPhysicalDeviceVulkan12Features,
                                          // required by coop-matrix shaders
+#ifndef VC_VULKAN_SC
+  // VK_EXT_debug_utils entry points (object naming + command-buffer labels),
+  // resolved per device in setupLogicalDevice. Null when the loader doesn't
+  // provide them — every use site no-ops on null, so nothing here requires
+  // the extension to actually be present.
+  PFN_vkSetDebugUtilsObjectNameEXT setObjectName = nullptr;
+  PFN_vkCmdBeginDebugUtilsLabelEXT beginLabel = nullptr;
+  PFN_vkCmdEndDebugUtilsLabelEXT endLabel = nullptr;
+#endif
 #ifdef VC_VULKAN_SC
   // --- Vulkan SC -----------------------------------------------------------
   // The SC driver decides what the app is allowed to do at runtime from
@@ -189,6 +198,18 @@ struct StreamFrame {
   // The caller must have synchronized (vcStreamSynchronize) before reading.
   struct D2HReadback { void *hostDst; VCBuffer *staging; size_t bytes; };
   std::vector<D2HReadback> d2hReadbacks;
+
+  // VC_PROFILE=1: GPU-timestamp spans recorded into this frame's command
+  // buffer. Each span is one (start,end) slot pair in a per-frame timestamp
+  // pool; results are read back when the frame is recycled (its fence has
+  // signaled by then — see beginFrame) or at shutdown, and folded into
+  // Runtime's per-name aggregate. Slots are never reset: a full pool is
+  // destroyed after harvest and a fresh one created on demand.
+  struct ProfileSpan { std::string name; uint32_t poolIdx; uint32_t start; };
+  std::vector<ProfileSpan> profileSpans;
+  std::vector<VkQueryPool> profilePools; // 64 timestamp slots per pool
+  uint32_t profileNextSlot = 0;          // next free slot in the last pool
+  int profileDepth = 0;                  // open spans (begin/end pairing)
 };
 
 /// An execution stream: an ordered command queue. Backed by the device's
@@ -397,6 +418,23 @@ public:
   // Report a frame-boundary/copy VkResult under VC_SC_TRACE=1 (no-op otherwise,
   // and on the core path the driver already reports these). See the definition.
   static void scTraceVk(const char *what, VkResult r);
+
+  // ---- Op instrumentation: debug labels + VC_PROFILE spans ----
+  // Wrap one op recorded on stream `s` (kernel dispatch, copy, graph replay)
+  // with a named VK_EXT_debug_utils label — always, so external captures
+  // (RenderDoc, VTune) name the region — and, under VC_PROFILE=1, a GPU
+  // timestamp pair recorded into the stream's current frame. The span is
+  // closed by endOp on the same stream. No-ops when the entry points are
+  // absent (Vulkan SC) or profiling is off.
+  void beginOp(VCStream &s, VkCommandBuffer cb, const std::string &name);
+  void endOp(VCStream &s, VkCommandBuffer cb);
+  // VC_PROFILE: read back one frame's completed timestamp spans and fold them
+  // into the per-name aggregate. Called when the frame is recycled (fence has
+  // signaled, so every query is available) and at shutdown.
+  void harvestFrameProfile(VCStream &s, StreamFrame &f);
+  // VC_PROFILE: print the aggregate collected by harvestFrameProfile. Stderr,
+  // so demo stdout (PASS lines) stays clean.
+  void printProfileSummary();
 
   // ---- Dedicated transfer queue (copy engine) routing ----
   // True when async copies issued on `s` should be routed to the device's
@@ -639,6 +677,19 @@ private:
   // when g_kernelPrintfEnabled is set; destroyed at the top of shutdown() before
   // the instance is torn down. The single shared instance lives on devices_[0].
   VkDebugUtilsMessengerEXT debugMessenger_ = VK_NULL_HANDLE;
+
+  // VC_PROFILE=1 (set in init from the environment): per-op GPU timestamp
+  // profiling, summarized at shutdown.
+  bool profileEnabled_ = false;
+  // Per-name GPU-time aggregate fed by harvestFrameProfile. Guarded: launches
+  // can come from multiple host threads.
+  struct ProfileAgg {
+    uint64_t calls = 0;
+    double totalMs = 0.0;
+    double maxMs = 0.0;
+  };
+  std::unordered_map<std::string, ProfileAgg> profileAgg_;
+  std::mutex profileMu_;
 
   // Registry of live allocations for vcPointerGetAttributes. Maps the buffer
   // handle (the void* VC hands out) to its kind. Mutex-guarded because allocs

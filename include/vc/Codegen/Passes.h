@@ -47,6 +47,12 @@ void lowerVCToGPU(::mlir::ModuleOp module);
 /// driver does not emit a binary it knows to be bad.
 ::mlir::LogicalResult runLoweringPipeline(::mlir::ModuleOp module);
 
+/// True when the driver was given -time-passes: the lowering pipeline then
+/// reports wall time per stage/pass (MLIR's timing manager) and the driver
+/// prints its own phase timers + the SPIR-V byte size. Defined next to the
+/// cl::opt in LoweringPasses.cpp so the driver and the pipeline share one flag.
+bool timePassesEnabled();
+
 } // namespace codegen
 } // namespace vc
 

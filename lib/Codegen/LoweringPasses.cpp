@@ -38,14 +38,26 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/Timing.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
 
 namespace vc::codegen {
+
+// -time-passes is already registered inside libLLVM (llvm::cl, hidden) and
+// flips the exported llvm::TimePassesIsEnabled; re-registering the same name
+// here would abort startup with "Option 'time-passes' registered more than
+// once", so we just read LLVM's flag after command-line parsing. The
+// lowering pipeline reports wall time per stage/pass (MLIR's timing manager)
+// plus the driver's own phase timers. Enabled on demand so the default
+// compile pays no timer overhead.
+bool timePassesEnabled() { return llvm::TimePassesIsEnabled; }
 
 // Rewrite atomics that GPUToSPIRV cannot lower directly. MLIR 18's GPUToSPIRV
 // has no lowering for memref.atomic_rmw 'assign' (atomicExch), so ASTToMLIR
@@ -444,6 +456,8 @@ static void rerunAbortedSPIRVLegality(ModuleOp module) {
   pm.addNestedPass<spirv::ModuleOp>(
       spirv::createSPIRVLowerABIAttributesPass());
   pm.addNestedPass<spirv::ModuleOp>(spirv::createSPIRVUpdateVCEPass());
+  if (timePassesEnabled())
+    pm.enableTiming();
   if (failed(pm.run(module)))
     module.emitError("post-fixup spirv.module legalization failed");
 }
@@ -848,10 +862,26 @@ LogicalResult runLoweringPipeline(ModuleOp module) {
   MLIRContext &ctx = *module.getContext();
   ctx.getOrLoadDialect<mlir::spirv::SPIRVDialect>();
 
+  // -time-passes: one timing tree covering the non-pass stages (VCToGPU, the
+  // post-run fixups) and the PassManager's own per-pass timings (nests its
+  // timers into `root`). With the flag off the manager stays disabled and
+  // every Timer is a tombstone — the scopes below compile away to null checks.
+  mlir::DefaultTimingManager tm;
+  mlir::TimingScope root;
+  if (timePassesEnabled()) {
+    tm.setEnabled(true);
+    tm.setDisplayMode(mlir::DefaultTimingManager::DisplayMode::List);
+    tm.setOutput(llvm::errs());
+    root = tm.getRootScope();
+  }
+
   PassManager pm(&ctx);
 
   // ---- Stage 1: VC -> gpu -------------------------------------------------
-  lowerVCToGPU(module);
+  {
+    auto ts = root.nest("VCToGPU");
+    lowerVCToGPU(module);
+  }
 
   // SPIR-V modules carry device code only. Drop everything at module scope
   // that is not the gpu.module (host main, runtime API stubs, ...); the
@@ -987,12 +1017,18 @@ LogicalResult runLoweringPipeline(ModuleOp module) {
         }
         return failure();
       });
+    if (timePassesEnabled())
+      pm.enableTiming(root);
+    auto ts = root.nest("pm.run");
     (void)failed(pm.run(module));
   }
 
   // Post-conversion rewrite of atomics GPUToSPIRV could not lower directly
   // (atomicExch on SSBO/global, emitted as a marked AtomicIAdd).
-  rewriteMarkedAtomics(module, markedPositions);
+  {
+    auto ts = root.nest("rewriteMarkedAtomics");
+    rewriteMarkedAtomics(module, markedPositions);
+  }
 
   // Narrow f16 SSBOs widened by MemRef→SPIRV back to contiguous f16
   // (rtarray<f16,stride=2>) for the globals an f16 access — cooperative-matrix
@@ -1002,17 +1038,25 @@ LogicalResult runLoweringPipeline(ModuleOp module) {
   // ptr<f16> and reconstructs scalar Loads to yield f16, fixing the malformed
   // `spirv.Store ptr<f32>, %val:f16` the conversion pattern left behind (which
   // aborted the in-pipeline spirv.module passes below). See fixupF16StorageBuffers.
-  fixupF16StorageBuffers(module);
-
   // The narrowing above makes the spirv.module type-consistent, but the
   // in-pipeline spirv-lower-abi-attrs + SPIRVUpdateVCEPass never ran (pm.run
   // aborted on the pre-narrowing store mismatch). Re-run them on a fresh
   // PassManager so the EntryPoint + vce_triple the serializer needs exist.
-  rerunAbortedSPIRVLegality(module);
+  {
+    auto ts = root.nest("fixupF16StorageBuffers");
+    fixupF16StorageBuffers(module);
+  }
+  {
+    auto ts = root.nest("rerunAbortedSPIRVLegality");
+    rerunAbortedSPIRVLegality(module);
+  }
 
   // Cooperative-matrix modules need OpMemoryModel VulkanMemoryModel, which
   // neither the conversion nor the re-run UpdateVCE pass above produces.
-  useVulkanMemoryModelForCooperativeMatrix(module);
+  {
+    auto ts = root.nest("useVulkanMemoryModelForCooperativeMatrix");
+    useVulkanMemoryModelForCooperativeMatrix(module);
+  }
 
   // SPIR-V 1.4+ requires every statically-used interface variable (including
   // StorageBuffer/Uniform descriptor variables) to be listed in the entry
@@ -1023,7 +1067,10 @@ LogicalResult runLoweringPipeline(ModuleOp module) {
   // and pipeline creation. Walk each spirv.func and add the descriptor
   // globals it references (via spirv.mlir.addressof) to its EntryPoint.
   // (No-op below SPIR-V 1.4, where listing StorageBuffer vars is illegal.)
-  populateEntryPointInterfaces(module);
+  {
+    auto ts = root.nest("populateEntryPointInterfaces");
+    populateEntryPointInterfaces(module);
+  }
 
   // The state the serializer sees, after the f16 narrowing and the re-run
   // legalization: the only place where the SSBO element widths, the interface

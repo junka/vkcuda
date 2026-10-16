@@ -229,6 +229,24 @@ static void destroyShaderModule(VkDevice dev, VkShaderModule mod) {
 #endif
 }
 
+// Name a Vulkan object for external captures (RenderDoc, VTune group by these
+// names). No-op unless the device resolved the debug-utils entry point (and
+// always a no-op under SC, which has no debug-utils entry points).
+static void nameObject(VulkanDevice &vd, uint64_t handle, VkObjectType type,
+                       const std::string &name) {
+#ifdef VC_VULKAN_SC
+  (void)vd; (void)handle; (void)type; (void)name;
+#else
+  if (!vd.setObjectName) return;
+  VkDebugUtilsObjectNameInfoEXT ni{};
+  ni.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+  ni.objectType = type;
+  ni.objectHandle = handle;
+  ni.pObjectName = name.c_str();
+  vd.setObjectName(vd.device, &ni);
+#endif
+}
+
 static uint32_t selectComputeQueueFamily(VkPhysicalDevice physical) {
   uint32_t qf = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(physical, &qf, nullptr);
@@ -351,6 +369,13 @@ VCError Runtime::init() {
     if (env && (env[0] == '1' || env[0] == 'y' || env[0] == 'Y'))
       g_kernelPrintfEnabled = true;
   }
+
+  // VC_PROFILE=1: per-op GPU timestamp profiling (kernel dispatches, copies,
+  // graph replays) with a summary table at vcShutdown. Debug labels and object
+  // names are always on (they cost nothing when the extension is absent);
+  // only the timestamp collection is behind the flag.
+  if (const char *env = std::getenv("VC_PROFILE"))
+    profileEnabled_ = (env[0] == '1' || env[0] == 'y' || env[0] == 'Y');
 
   // One shared instance across all devices.
   auto instDev = std::make_unique<VulkanDevice>();
@@ -896,6 +921,18 @@ bool Runtime::setupLogicalDevice(
   vkGetDeviceQueue(vd.device, vd.computeQueueFamily, 0, &vd.computeQueue);
   if (wantTransferQueue)
     vkGetDeviceQueue(vd.device, vd.transferQueueFamily, 0, &vd.transferQueue);
+
+  // VK_EXT_debug_utils entry points for object naming + command-buffer labels
+  // (external profiler/capture support: RenderDoc, VTune). The instance asks
+  // for the extension on the core path; loading these via vkGetDeviceProcAddr
+  // degrades to null when the loader doesn't provide them, and every user
+  // no-ops on null.
+  vd.setObjectName = (PFN_vkSetDebugUtilsObjectNameEXT)vkGetDeviceProcAddr(
+      vd.device, "vkSetDebugUtilsObjectNameEXT");
+  vd.beginLabel = (PFN_vkCmdBeginDebugUtilsLabelEXT)vkGetDeviceProcAddr(
+      vd.device, "vkCmdBeginDebugUtilsLabelEXT");
+  vd.endLabel = (PFN_vkCmdEndDebugUtilsLabelEXT)vkGetDeviceProcAddr(
+      vd.device, "vkCmdEndDebugUtilsLabelEXT");
   return true;
 #endif // VC_VULKAN_SC
 }
@@ -1270,6 +1307,22 @@ VCError Runtime::shutdown() {
   // Reclaim any buffers whose release was deferred by vcFreeAsync — the devices
   // are idle, so they are all safe to free now (avoids leaking them).
   drainPendingFrees();
+  // VC_PROFILE: fold any spans still sitting on frames that were never
+  // recycled (the last few submits) into the aggregate — the devices are idle,
+  // so every timestamp is readable — then print the summary.
+  for (auto &s : streams_)
+    if (s)
+      for (auto &f : s->frames) harvestFrameProfile(*s, f);
+  for (auto &d : devices_) {
+    if (!d) continue;
+    if (d->defaultStream)
+      for (auto &f : d->defaultStream->frames)
+        harvestFrameProfile(*d->defaultStream, f);
+    if (d->transferStream)
+      for (auto &f : d->transferStream->frames)
+        harvestFrameProfile(*d->transferStream, f);
+  }
+  printProfileSummary();
   // Graphs/events/streams each belong to a specific device (their deviceIdx);
   // tear them down with that device's handle.
   for (auto &g : graphs_) {
@@ -1353,24 +1406,55 @@ static bool initStream(VulkanDevice &dev, VCStream &s, QueueKind kind,
   fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   fci.flags = VK_FENCE_CREATE_SIGNALED_BIT; // start signaled so first beginFrame doesn't wait
 
-  VkDescriptorPoolSize ps[2]{};
-  ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  ps[0].descriptorCount = 64;
-  ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-  ps[1].descriptorCount = 16;
-  VkDescriptorPoolCreateInfo dpci{};
-  dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  dpci.maxSets = 32;
-  dpci.poolSizeCount = 2;
-  dpci.pPoolSizes = ps;
+  // Vulkan SC only lets the app recycle a descriptor pool's memory when the
+  // device advertises recycleDescriptorSetMemory. When it does not, beginFrame
+  // skips vkResetDescriptorPool and every launch's set stays allocated for the
+  // life of the process — so this per-frame ring pool is really a lifetime
+  // budget, and a program that launches more kernels than maxSets gets
+  // VK_NULL_HANDLE sets (and, in a benchmark, silently bogus timings for the
+  // launches that failed). Ask for a whole-process pool the way
+  // createGraphDescriptorPool does, and scale the per-type counts with it
+  // (descriptorCount caps the TOTAL descriptors of that type, not per set).
+  // `scSets` is 0 in the non-SC build and whenever the driver does recycle.
+  uint32_t scSets = 0;
+#ifdef VC_VULKAN_SC
+  if (!dev.scRecycleDescriptorSetMemory)
+    scSets = vcScEnvU32("VC_SC_DESCRIPTOR_SETS", 2048);
+#endif
+
+  auto createFrameDescriptorPool = [&](uint32_t sets, VkDescriptorPool *out) {
+    VkDescriptorPoolSize p[2]{};
+    p[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    p[0].descriptorCount = sets ? sets * 4 : 64;
+    p[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    p[1].descriptorCount = sets ? sets : 16;
+    VkDescriptorPoolCreateInfo c{};
+    c.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    c.maxSets = sets ? sets : 32;
+    c.poolSizeCount = 2;
+    c.pPoolSizes = p;
+    return vkCreateDescriptorPool(dev.device, &c, nullptr, out);
+  };
 
   for (auto &f : s.frames) {
     if (vkAllocateCommandBuffers(dev.device, &ai, &f.cb) != VK_SUCCESS)
       return false;
     if (vkCreateFence(dev.device, &fci, nullptr, &f.fence) != VK_SUCCESS)
       return false;
-    if (vkCreateDescriptorPool(dev.device, &dpci, nullptr,
-                               &f.descriptorPool) != VK_SUCCESS)
+    VkResult pr = createFrameDescriptorPool(scSets, &f.descriptorPool);
+    if (pr != VK_SUCCESS && scSets) {
+      // The driver refused the oversized pool; fall back to the usual size
+      // rather than failing device setup, and say why so the (real, later)
+      // launch failure is not mistaken for driver corruption.
+      std::fprintf(stderr,
+                   "vc: Vulkan SC refused a %u-set descriptor pool "
+                   "(VkResult %d); falling back to 32 sets, so a process that "
+                   "launches more than 32 kernels will fail — lower "
+                   "VC_SC_DESCRIPTOR_SETS or raise the reservation\n",
+                   scSets, int(pr));
+      pr = createFrameDescriptorPool(0, &f.descriptorPool);
+    }
+    if (pr != VK_SUCCESS)
       return false;
   }
   return true;
@@ -1586,6 +1670,10 @@ VkCommandBuffer Runtime::beginFrame(VCStream &s) {
   for (auto &rb : f.d2hReadbacks)
     std::memcpy(resolveHostAccess(rb.hostDst), rb.staging->mapped, rb.bytes);
   f.d2hReadbacks.clear();
+  // VC_PROFILE: the fence just signaled, so this frame's timestamp spans are
+  // complete — fold their GPU times into the aggregate before the frame's
+  // slots are reused (spans are never reset; pools are destroyed on harvest).
+  harvestFrameProfile(s, f);
   // Recycle completed staging buffers now that the GPU is done with them.
   for (auto &sb : f.stagingBuffers) {
     if (cacheCompletedStaging(s, sb)) continue;
@@ -1855,6 +1943,120 @@ void Runtime::endTransferCopy(VCStream &computeStream, VCStream &transfer) {
   computeStream.pendingWaits.push_back({computeStream.fromCopy,
                                         computeStream.fromCopyVal});
   computeStream.usedTransfer = true;
+}
+
+//----------------------------------------------------------------------------
+// Op instrumentation: debug labels + VC_PROFILE spans
+//----------------------------------------------------------------------------
+
+// Open a named span around one op recorded on stream `s`: a VK_EXT_debug_utils
+// label (always, so external captures name the region) plus, under VC_PROFILE,
+// a GPU timestamp pair written into the stream's current frame. Closed by
+// endOp on the same stream. Timestamps use the same ALL_COMMANDS stage as the
+// event path's recordEvent (the only work between the two writes is the op
+// itself, so the pair measures the op's GPU time either way).
+void Runtime::beginOp(VCStream &s, VkCommandBuffer cb, const std::string &name) {
+  VulkanDevice &vd = *devices_[s.deviceIdx];
+#ifndef VC_VULKAN_SC
+  if (vd.beginLabel) {
+    VkDebugUtilsLabelEXT li{};
+    li.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    li.pLabelName = name.c_str();
+    vd.beginLabel(cb, &li);
+  }
+#endif
+  if (!profileEnabled_ || !vd.timestampAvailable) return;
+  StreamFrame &f = s.frames[s.frameIdx];
+  constexpr uint32_t kSlotsPerPool = 64;
+  if (f.profilePools.empty() || f.profileNextSlot + 2 > kSlotsPerPool) {
+    VkQueryPoolCreateInfo qci{};
+    qci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qci.queryCount = kSlotsPerPool;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    if (vkCreateQueryPool(vd.device, &qci, nullptr, &pool) != VK_SUCCESS)
+      return; // pool creation failed: skip this span's timestamps
+    f.profilePools.push_back(pool);
+    f.profileNextSlot = 0;
+  }
+  uint32_t poolIdx = static_cast<uint32_t>(f.profilePools.size()) - 1;
+  f.profileSpans.push_back({name, poolIdx, f.profileNextSlot});
+  vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                      f.profilePools[poolIdx], f.profileNextSlot);
+  f.profileNextSlot += 2;
+  f.profileDepth++;
+}
+
+void Runtime::endOp(VCStream &s, VkCommandBuffer cb) {
+  VulkanDevice &vd = *devices_[s.deviceIdx];
+  StreamFrame &f = s.frames[s.frameIdx];
+  if (f.profileDepth > 0) {
+    auto &sp = f.profileSpans.back();
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        f.profilePools[sp.poolIdx], sp.start + 1);
+    f.profileDepth--;
+  }
+#ifndef VC_VULKAN_SC
+  if (vd.endLabel) vd.endLabel(cb);
+#endif
+}
+
+// Read back one frame's completed timestamp spans and fold them into the
+// per-name aggregate. Called when the frame is recycled (its fence signaled in
+// beginFrame, so every query is available without blocking) and at shutdown.
+void Runtime::harvestFrameProfile(VCStream &s, StreamFrame &f) {
+  if (f.profileSpans.empty()) return;
+  VulkanDevice &vd = *devices_[s.deviceIdx];
+  // timestampPeriod is nanoseconds per tick.
+  double period = (double)vd.physProps.limits.timestampPeriod;
+  for (const auto &sp : f.profileSpans) {
+    uint64_t t[2] = {0, 0};
+    VkResult r = vkGetQueryPoolResults(
+        vd.device, f.profilePools[sp.poolIdx], sp.start, 2, sizeof(t), t,
+        sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+    if (r != VK_SUCCESS) continue; // not available: drop the sample
+    double ms = (double)(int64_t)(t[1] - t[0]) * period / 1e6;
+    if (ms < 0.0) ms = 0.0;
+    std::lock_guard<std::mutex> lk(profileMu_);
+    ProfileAgg &a = profileAgg_[sp.name];
+    a.calls++;
+    a.totalMs += ms;
+    if (ms > a.maxMs) a.maxMs = ms;
+  }
+  f.profileSpans.clear();
+  f.profileDepth = 0;
+  for (VkQueryPool p : f.profilePools) destroyQueryPool(vd.device, p);
+  f.profilePools.clear();
+  f.profileNextSlot = 0;
+}
+
+// VC_PROFILE summary: GPU time per operation, worst offenders first. Stderr so
+// demo stdout (PASS lines, benchmark tables) stays machine-readable.
+void Runtime::printProfileSummary() {
+  if (!profileEnabled_) return;
+  std::fprintf(stderr,
+               "== vc profile (VC_PROFILE): GPU time per operation ==\n");
+  if (profileAgg_.empty()) {
+    std::fprintf(stderr,
+                 "  no samples — device has no timestamp support or nothing "
+                 "ran\n");
+    return;
+  }
+  std::vector<const std::pair<const std::string, ProfileAgg> *> rows;
+  rows.reserve(profileAgg_.size());
+  for (const auto &kv : profileAgg_) rows.push_back(&kv);
+  std::sort(rows.begin(), rows.end(), [](auto *a, auto *b) {
+    return a->second.totalMs > b->second.totalMs;
+  });
+  std::fprintf(stderr, "  %-38s %8s %10s %10s %10s\n",
+               "name", "calls", "avg ms", "total ms", "max ms");
+  for (const auto *row : rows) {
+    const auto &a = row->second;
+    double avg = a.calls ? a.totalMs / (double)a.calls : 0.0;
+    std::fprintf(stderr, "  %-38s %8llu %10.3f %10.3f %10.3f\n",
+                 row->first.c_str(), (unsigned long long)a.calls, avg,
+                 a.totalMs, a.maxMs);
+  }
 }
 
 VkDescriptorSet Runtime::allocFrameDescriptorSet(VCStream &s,
@@ -2268,6 +2470,17 @@ VCError Runtime::createImage(uint32_t w, uint32_t h, uint32_t depth,
   out.format = vkfmt;
   out.pformat = fmt; // kept in sync with `format`; copy paths read this
   out.deviceIdx = currentDeviceIdx_;
+#ifndef VC_VULKAN_SC
+  // Name the image + view for external captures (extent + pixel format).
+  {
+    std::string nm = "image " + std::to_string(out.width) + "x" +
+                     std::to_string(out.height);
+    if (out.depth > 1) nm += "x" + std::to_string(out.depth);
+    nameObject(vd, (uint64_t)(uintptr_t)out.image, VK_OBJECT_TYPE_IMAGE, nm);
+    nameObject(vd, (uint64_t)(uintptr_t)out.view, VK_OBJECT_TYPE_IMAGE_VIEW,
+               nm + " view");
+  }
+#endif
   VCStream &s = *vd.defaultStream;
   VkCommandBuffer cb = beginFrame(s);
   VkImageMemoryBarrier b{};
@@ -2447,26 +2660,11 @@ VCError Runtime::memsetBuffer(VCBuffer &buf, int value, size_t bytes,
                               VCStream &s) {
   if (bytes == 0) return VCError::Success;
   if (bytes % 4 != 0) return VCError::InvalidValue; // vkCmdFillBuffer constraint
-  uint32_t fill = (uint32_t)(uint8_t)value * 0x01010101u;
-  if (s.captureTarget) {
-    vkCmdFillBuffer(s.captureTarget->secondaryCB, buf.buffer, 0, bytes, fill);
-    // Make the transfer write visible to subsequent ops in the graph (same
-    // barrier as the D2D copy's capture branch).
-    VkMemoryBarrier mb{};
-    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(s.captureTarget->secondaryCB,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 1, &mb, 0, nullptr, 0, nullptr);
-    return VCError::Success;
-  }
-  VkCommandBuffer cb = beginFrame(s);
-  vkCmdFillBuffer(cb, buf.buffer, 0, bytes, fill);
-  endFrame(s);
+  // Sync wrapper over the async path: the recorded work (capture branch or
+  // fill+submit) is byte-for-byte the async path's, so instrumenting one path
+  // covers both (debug label + VC_PROFILE span live there).
+  VCError e = memsetBufferAsync(buf, value, bytes, s);
+  if (e != VCError::Success) return e;
   streamSynchronize(s); // sync: fill completes before we return
   return VCError::Success;
 }
@@ -2496,13 +2694,18 @@ VCError Runtime::memsetBufferAsync(VCBuffer &buf, int value, size_t bytes,
   VCStream *ts = nullptr;
   VkCommandBuffer tcb = VK_NULL_HANDLE;
   size_t tIdx = 0;
+  std::string opName = "memset " + std::to_string(bytes) + "B";
   if (beginTransferCopy(s, &ts, &tcb, &tIdx)) {
+    beginOp(*ts, tcb, opName);
     vkCmdFillBuffer(tcb, buf.buffer, 0, bytes, fill);
+    endOp(*ts, tcb);
     endTransferCopy(s, *ts);
     return VCError::Success;
   }
   VkCommandBuffer cb = beginFrame(s);
+  beginOp(s, cb, opName);
   vkCmdFillBuffer(cb, buf.buffer, 0, bytes, fill);
+  endOp(s, cb);
   endFrame(s);
   // async: do NOT sync — caller must vcStreamSynchronize before reading.
   return VCError::Success;
@@ -2576,15 +2779,20 @@ VCError Runtime::copy2DAsync(VCBuffer &dst, size_t dpitch, const VCBuffer &src,
   VCStream *ts = nullptr;
   VkCommandBuffer tcb = VK_NULL_HANDLE;
   size_t tIdx = 0;
+  std::string opName = "memcpy2D " + std::to_string(width * height) + "B";
   if (beginTransferCopy(s, &ts, &tcb, &tIdx)) {
+    beginOp(*ts, tcb, opName);
     vkCmdCopyBuffer(tcb, src.buffer, dst.buffer,
                     static_cast<uint32_t>(height), regions.data());
+    endOp(*ts, tcb);
     endTransferCopy(s, *ts);
     return VCError::Success;
   }
   VkCommandBuffer cb = beginFrame(s);
+  beginOp(s, cb, opName);
   vkCmdCopyBuffer(cb, src.buffer, dst.buffer,
                   static_cast<uint32_t>(height), regions.data());
+  endOp(s, cb);
   endFrame(s);
   return VCError::Success;
 }
@@ -2625,8 +2833,10 @@ VCError Runtime::memset2DBufferAsync(VCBuffer &buf, size_t pitch, int value,
     return VCError::Success;
   }
   VkCommandBuffer cb = beginFrame(s);
+  beginOp(s, cb, "memset2D " + std::to_string(width * height) + "B");
   for (size_t r = 0; r < height; ++r)
     vkCmdFillBuffer(cb, buf.buffer, r * pitch, width, fill);
+  endOp(s, cb);
   endFrame(s);
   return VCError::Success;
 }
@@ -2666,15 +2876,20 @@ VCError Runtime::copyDeviceToDevice(VCBuffer &dst, const VCBuffer &src,
   VCStream *ts = nullptr;
   VkCommandBuffer tcb = VK_NULL_HANDLE;
   size_t tIdx = 0;
+  std::string opName = "memcpyD2D " + std::to_string(bytes) + "B";
   if (beginTransferCopy(s, &ts, &tcb, &tIdx)) {
     VkBufferCopy region{0, 0, bytes};
+    beginOp(*ts, tcb, opName);
     vkCmdCopyBuffer(tcb, src.buffer, dst.buffer, 1, &region);
+    endOp(*ts, tcb);
     endTransferCopy(s, *ts);
     return VCError::Success;
   }
   VkCommandBuffer cb = beginFrame(s);
   VkBufferCopy region{0, 0, bytes};
+  beginOp(s, cb, opName);
   vkCmdCopyBuffer(cb, src.buffer, dst.buffer, 1, &region);
+  endOp(s, cb);
   endFrame(s);
   return VCError::Success;
 }
@@ -2767,9 +2982,12 @@ VCError Runtime::copyHostToDeviceAsync(VCBuffer &dst, const void *hostSrc,
   VCStream *ts = nullptr;
   VkCommandBuffer tcb = VK_NULL_HANDLE;
   size_t tIdx = 0;
+  std::string opName = "memcpyH2D " + std::to_string(bytes) + "B";
   if (beginTransferCopy(s, &ts, &tcb, &tIdx)) {
     VkBufferCopy region{0, 0, bytes};
+    beginOp(*ts, tcb, opName);
     vkCmdCopyBuffer(tcb, staging->buffer, dst.buffer, 1, &region);
+    endOp(*ts, tcb);
     ts->frames[tIdx].stagingBuffers.push_back(std::move(staging));
     endTransferCopy(s, *ts);
     return VCError::Success;
@@ -2779,7 +2997,9 @@ VCError Runtime::copyHostToDeviceAsync(VCBuffer &dst, const void *hostSrc,
   size_t submitIdx = s.frameIdx;
   VkCommandBuffer cb = beginFrame(s);
   VkBufferCopy region{0, 0, bytes};
+  beginOp(s, cb, opName);
   vkCmdCopyBuffer(cb, staging->buffer, dst.buffer, 1, &region);
+  endOp(s, cb);
   endFrame(s);
   if (scTraceOn())
     std::fprintf(stderr,
@@ -2822,9 +3042,12 @@ VCError Runtime::copyDeviceToHostAsync(void *hostDst, const VCBuffer &src,
   VCStream *ts = nullptr;
   VkCommandBuffer tcb = VK_NULL_HANDLE;
   size_t tIdx = 0;
+  std::string opName = "memcpyD2H " + std::to_string(bytes) + "B";
   if (beginTransferCopy(s, &ts, &tcb, &tIdx)) {
     VkBufferCopy region{0, 0, bytes};
+    beginOp(*ts, tcb, opName);
     vkCmdCopyBuffer(tcb, src.buffer, staging->buffer, 1, &region);
+    endOp(*ts, tcb);
     VCBuffer *raw = staging.get();
     ts->frames[tIdx].d2hReadbacks.push_back({hostDst, raw, bytes});
     ts->frames[tIdx].stagingBuffers.push_back(std::move(staging));
@@ -2834,7 +3057,9 @@ VCError Runtime::copyDeviceToHostAsync(void *hostDst, const VCBuffer &src,
   size_t submitIdx = s.frameIdx;
   VkCommandBuffer cb = beginFrame(s);
   VkBufferCopy region{0, 0, bytes};
+  beginOp(s, cb, opName);
   vkCmdCopyBuffer(cb, src.buffer, staging->buffer, 1, &region);
+  endOp(s, cb);
   endFrame(s);
   // Defer the host memcpy: the device copy hasn't run yet. beginFrame will
   // drain this entry when the fence signals.
@@ -3056,9 +3281,13 @@ VCError Runtime::endRecord(VCGraph &g) {
 VCError Runtime::launchGraph(VCGraph &g, VCStream &s) {
   if (!g.recorded) return VCError::Unknown;
   // Execute the recorded secondary command buffer inside a primary frame on
-  // the target stream — a single queue submit for the whole graph.
+  // the target stream — a single queue submit for the whole graph. Profile the
+  // replay as one span (per-kernel timestamps inside the secondary cb would be
+  // re-executed into the same query slots on every replay, colliding).
   VkCommandBuffer cb = beginFrame(s);
+  beginOp(s, cb, "graph replay");
   vkCmdExecuteCommands(cb, 1, &g.secondaryCB);
+  endOp(s, cb);
   endFrame(s);
   return VCError::Success;
 }
@@ -4104,6 +4333,9 @@ VCKernelDeviceState *Runtime::getOrCreateKernelDeviceState(VCKernel &k,
     trackKernel(&k);
     return nullptr;
   }
+  // Name the module for external captures (RenderDoc, VTune).
+  nameObject(vd, (uint64_t)(uintptr_t)st->shaderModule,
+             VK_OBJECT_TYPE_SHADER_MODULE, k.entryPoint);
   auto *raw = st.get();
   k.perDevice[deviceIdx] = std::move(st);
   // This kernel now owns Vulkan handles on a device. Register it so shutdown()
@@ -4476,6 +4708,12 @@ VkPipeline Runtime::getPipeline(VCKernel &k, int deviceIdx, unsigned blockX,
                  k.entryPoint.c_str(), int(pr), blockX, blockY, blockZ);
     return VK_NULL_HANDLE;
   }
+  // Name the pipeline for external captures: kernel name + block shape
+  // (pipelines are specialized per block size, so one kernel can have several).
+  nameObject(*devices_[deviceIdx], (uint64_t)(uintptr_t)pipeline,
+             VK_OBJECT_TYPE_PIPELINE,
+             k.entryPoint + " [" + std::to_string(blockX) + "x" +
+                 std::to_string(blockY) + "x" + std::to_string(blockZ) + "]");
   st->pipelines[key] = pipeline;
   return pipeline;
 }
@@ -4707,9 +4945,15 @@ VCError Runtime::dispatch(VCKernel &k, unsigned wgX, unsigned wgY,
                               argCount);
   }
   VkCommandBuffer cb = beginFrame(s);
+  // Name the dispatch (debug label + VC_PROFILE span): kernel + block shape.
+  std::string opName = k.entryPoint + " [" + std::to_string(blockX) + "x" +
+                       std::to_string(blockY) + "x" + std::to_string(blockZ) +
+                       "]";
+  beginOp(s, cb, opName);
   VCError e = recordDispatchInto(cb, s.frames[s.frameIdx].descriptorPool, k,
                                   s.deviceIdx, wgX, wgY, wgZ, blockX, blockY,
                                   blockZ, args, argCount);
+  endOp(s, cb);
   // Submit even when recording failed: beginFrame already reset this frame's
   // fence, and a fence nothing will ever signal makes the next beginFrame on
   // the slot block in vkWaitForFences forever. A failed record leaves the
@@ -4738,10 +4982,16 @@ VCError Runtime::dispatchIndirect(VCKernel &k, const VCBuffer &indirectArgs,
                                       blockX, blockY, blockZ, args, argCount);
   }
   VkCommandBuffer cb = beginFrame(s);
+  // Name the dispatch (debug label + VC_PROFILE span): kernel + " (indirect)".
+  std::string opName = k.entryPoint + " [" + std::to_string(blockX) + "x" +
+                       std::to_string(blockY) + "x" + std::to_string(blockZ) +
+                       "] (indirect)";
+  beginOp(s, cb, opName);
   VCError e = recordDispatchIndirectInto(cb, s.frames[s.frameIdx].descriptorPool,
                                          k, s.deviceIdx, indirectArgs, offset,
                                          blockX, blockY, blockZ, args,
                                          argCount);
+  endOp(s, cb);
   // Submit even when recording failed, as in dispatch: the frame's fence was
   // reset by beginFrame and only endFrame's submit can signal it.
   endFrame(s);
