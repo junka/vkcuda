@@ -1,16 +1,30 @@
 name: release
 
-# On a version tag (v0.1.0), build the Debian package and attach it to a
-# GitHub Release. The .deb bundles both backends (vcc GLSL + vc MLIR) and
-# the public headers + static runtime, built RelWithDebInfo with install
-# paths baked for /usr.
+# On a version tag (v0.1.0), build the release artifacts and attach them to a
+# GitHub Release:
 #
-# Tag convention: v<MAJOR>.<MINOR>.<PATCH> — the version is taken from the
-# tag and must match PROJECT_VERSION in CMakeLists.txt (the workflow checks
-# this and fails otherwise).
+#   - .deb (ubuntu-24.04): bundles both backends (vcc GLSL + vc MLIR) and the
+#     public headers + static runtime, built RelWithDebInfo with install paths
+#     baked for /usr.
 #
-# Runner: ubuntu-24.04 (noble) — see the note in ci.yml; LLVM 18 / MLIR 18
-# and glslc are not packaged for jammy (22.04).
+#   - .tar.gz (macos-15, arm64): same layout (bin/, include/, lib/), install
+#     paths baked for /usr/local. The binaries' only non-system dylib is brew
+#     llvm@18's libLLVM.dylib — MLIR is statically linked into vc — so the
+#     runtime deps mirror the deb's: llvm@18, vulkan-loader, shaderc.
+#
+# Tag convention: v<MAJOR>.<MINOR>.<PATCH> — the version is taken from the tag
+# and must match PROJECT_VERSION in CMakeLists.txt (the build jobs check this
+# and fail otherwise).
+#
+# Runners: ubuntu-24.04 (noble) — see the note in ci.yml; LLVM 18 / MLIR 18
+# and glslc are not packaged for jammy (22.04). macos-15 (arm64) — Homebrew
+# llvm@18 ships the MLIR CMake package and static MLIR archives, and the
+# standard runner fleet no longer offers Intel macOS images.
+#
+# Structure: two build jobs upload artifacts, then a publish job downloads
+# everything and creates the Release in one step (avoids two jobs racing on
+# release creation).
+
 on:
   push:
     tags:
@@ -96,16 +110,120 @@ jobs:
           echo "=== vc -emit=mlir on test/vadd.vc ==="
           /tmp/vc-stage/bin/vc test/vadd.vc -emit=mlir | grep -m1 'vc.kernel'
 
-      - name: Rename artifacts with arch suffix
-        id: artifacts
+      - name: Upload artifacts for publishing
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: |
+            build-pkg/vc_*.deb
+            build-pkg/vc_*.ddeb
+
+  build-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # vulkan-loader pulls in vulkan-headers (find_package(Vulkan) needs both
+      # the headers and the loader); shaderc provides glslc, which vcc invokes
+      # at user-compile time. cmake/ninja are preinstalled on the runner image.
+      - name: Install build dependencies
+        run: |
+          brew install llvm@18 vulkan-loader shaderc
+
+      - name: Resolve version from tag
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches CMake PROJECT_VERSION
+        run: |
+          PV=$(grep -m1 'project(vc' CMakeLists.txt | grep -oE 'VERSION [0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}')
+          TAGV="${{ steps.ver.outputs.version }}"
+          echo "CMake PROJECT_VERSION=$PV"
+          echo "tag version=$TAGV"
+          [ "$PV" = "$TAGV" ] || { echo "ERROR: tag version ($TAGV) != CMake PROJECT_VERSION ($PV)"; exit 1; }
+
+      - name: Configure (install paths baked to /usr/local, RelWithDebInfo)
+        run: |
+          # Hand CMake the brew roots explicitly: on Apple Silicon the kegs
+          # live under /opt/homebrew, which is not reliably on CMake's default
+          # search path, and llvm@18 is keg-only (never linked into the brew
+          # prefix). This bypasses the in-tree Homebrew hint in CMakeLists.txt
+          # — same formula, resolved the same way.
+          cmake -B build-pkg -G Ninja \
+            -DVC_ENABLE_MLIR=ON \
+            -DVC_USE_INSTALL_PATHS=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix llvm@18);$(brew --prefix vulkan-loader);$(brew --prefix vulkan-headers)"
+
+      - name: Build
+        run: cmake --build build-pkg -j"$(sysctl -n hw.ncpu)"
+
+      - name: Build tarball (CPack TGZ)
         run: |
           cd build-pkg
-          DEB=$(ls vc_*.deb | head -1)
-          DDEB=$(ls vc_*.ddeb 2>/dev/null | head -1)
-          cp "$DEB" "/tmp/$DEB"
-          [ -n "$DDEB" ] && cp "$DDEB" "/tmp/$DDEB"
-          echo "deb=/tmp/$DEB" >> "$GITHUB_OUTPUT"
-          echo "ddeb=/tmp/$DDEB" >> "$GITHUB_OUTPUT"
+          cpack -C RelWithDebInfo -G TGZ
+          # CMakeLists names the package vc_<version>_macos-<arch>.tar.gz.
+          ls -la vc_*.tar.gz
+
+      - name: Stage install + smoke-test the packaged drivers
+        run: |
+          # Mirror the deb job's checks, plus the macOS-specific bits: the
+          # baked linker flag for the Vulkan loader and the dylib footprint
+          # (system libs + brew llvm@18's libLLVM.dylib only — that is what
+          # makes `brew install llvm@18` the sole runtime requirement).
+          cmake --install build-pkg --prefix /tmp/vc-stage
+          echo "=== baked paths + linker flags in staged vcc ==="
+          strings /tmp/vc-stage/bin/vcc | grep -E -- '-I|libVCRuntime\.a$|-lvulkan' | head
+          echo "=== vcc --help ==="
+          /tmp/vc-stage/bin/vcc --help | head -1
+          echo "=== vc --help ==="
+          /tmp/vc-stage/bin/vc --help | head -1
+          echo "=== vc -emit=mlir on test/vadd.vc ==="
+          /tmp/vc-stage/bin/vc test/vadd.vc -emit=mlir | grep -m1 'vc.kernel'
+          echo "=== vcc -emit=spirv on test/vadd.vc (glslc) ==="
+          PATH="$(brew --prefix shaderc)/bin:$PATH" \
+            /tmp/vc-stage/bin/vcc test/vadd.vc -emit=spirv -o /tmp/vadd.spv
+          # SPIR-V magic little-endian: 0x07230203.
+          [ "$(xxd -l 4 -p /tmp/vadd.spv)" = "03022307" ] \
+            || { echo "ERROR: /tmp/vadd.spv is not SPIR-V"; exit 1; }
+          echo "=== runtime dylib deps ==="
+          otool -L /tmp/vc-stage/bin/vc /tmp/vc-stage/bin/vcc \
+            | grep dylib | sort -u
+
+      - name: Upload artifact for publishing
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: build-pkg/vc_*_macos-*.tar.gz
+
+  publish:
+    needs: [build-deb, build-macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolve tag
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Artifact names carry the bare version (no leading "v").
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
 
       - name: Create GitHub Release and upload artifacts
         uses: softprops/action-gh-release@v2
@@ -113,6 +231,26 @@ jobs:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ${{ steps.ver.outputs.tag }}
           generate_release_notes: true
-          files: |
-            ${{ steps.artifacts.outputs.deb }}
-            ${{ steps.artifacts.outputs.ddeb }}
+          body: |
+            Install layout: `bin/` (vcc, vc, vc-dump-ast, vc-glsl), `include/vc/`, `lib/` (libVCRuntime.a + backend static libs).
+
+            ## Linux (deb)
+            Install paths are baked for `/usr`:
+
+                sudo apt install ./vc_${{ steps.ver.outputs.version }}_amd64.deb
+
+            ## macOS (tar.gz, arm64)
+            Install paths are baked for `/usr/local`:
+
+                sudo tar -C /usr/local --strip-components=1 -xzf vc_${{ steps.ver.outputs.version }}_macos-arm64.tar.gz
+
+            Runtime dependencies via Homebrew:
+
+                brew install llvm@18 vulkan-loader shaderc
+                # GPU execution additionally needs MoltenVK:
+                brew install molten-vk
+
+            (`llvm@18` provides libLLVM.dylib; `vulkan-loader` provides the
+            loader vcc links user executables against; `shaderc` provides
+            glslc, which vcc invokes on `.vc` compiles.)
+          files: artifacts/*

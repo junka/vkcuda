@@ -156,6 +156,15 @@ else()
   set(VC_DRIVER_RUNTIME_LIB "$<TARGET_FILE:VCRuntime>")
 endif()
 set(VC_DRIVER_VULKAN_LIBS "-lvulkan")
+# Bake the loader's lib dir too. On Apple Silicon, Homebrew's libvulkan.dylib
+# lives under /opt/homebrew/lib, which is NOT in the default linker search
+# path, so a bare -lvulkan would fail when vcc/vc link user executables at
+# -emit=full time. Derived from the Vulkan found above (no hardcoded paths),
+# and a no-op on Linux where the dir is a default search path anyway.
+get_filename_component(_vc_vulkan_libdir "${Vulkan_LIBRARY}" DIRECTORY)
+if(_vc_vulkan_libdir)
+  string(PREPEND VC_DRIVER_VULKAN_LIBS "-L${_vc_vulkan_libdir} ")
+endif()
 if(VC_VULKAN_SC)
   # vc -emit=full links the generated host code against the loader.  A version
   # of vc built for SC must hand out the SC loader name, not the core one.
@@ -418,10 +427,14 @@ set(CPACK_DEBIAN_PACKAGE_RECOMMENDS
 # Keep debug symbols (RelWithDebInfo) — don't strip.
 set(CPACK_STRIP_FILES OFF)
 set(CPACK_DEBIAN_DEBUGINFO_PACKAGE ON)
-# Debian-conformant package filename: vc_<version>_<arch>.deb
-# (Debian uses "amd64" for x86_64; CPack's control field already says amd64,
-#  so match it in the filename too.)
-if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+# Package filename: vc_<version>_<os-arch>.<ext>
+#   Linux .deb — Debian uses "amd64" for x86_64; CPack's control field already
+#   says amd64, so match it in the filename too.
+#   macOS .tar.gz — Apple arch spelling (arm64/x86_64) with a "macos" marker
+#   so darwin artifacts never collide with linux ones.
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set(_vc_deb_arch "macos-${CMAKE_SYSTEM_PROCESSOR}")
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
   set(_vc_deb_arch "amd64")
 else()
   set(_vc_deb_arch "${CMAKE_SYSTEM_PROCESSOR}")
