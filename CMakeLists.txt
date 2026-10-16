@@ -156,14 +156,16 @@ else()
   set(VC_DRIVER_RUNTIME_LIB "$<TARGET_FILE:VCRuntime>")
 endif()
 set(VC_DRIVER_VULKAN_LIBS "-lvulkan")
-# Bake the loader's lib dir too. On Apple Silicon, Homebrew's libvulkan.dylib
-# lives under /opt/homebrew/lib, which is NOT in the default linker search
-# path, so a bare -lvulkan would fail when vcc/vc link user executables at
-# -emit=full time. Derived from the Vulkan found above (no hardcoded paths),
-# and a no-op on Linux where the dir is a default search path anyway.
-get_filename_component(_vc_vulkan_libdir "${Vulkan_LIBRARY}" DIRECTORY)
-if(_vc_vulkan_libdir)
-  string(PREPEND VC_DRIVER_VULKAN_LIBS "-L${_vc_vulkan_libdir} ")
+# Bake the loader's lib dir too (APPLE only). On Apple Silicon, Homebrew's
+# libvulkan.dylib lives under /opt/homebrew/lib, which is NOT in the default
+# linker search path, so a bare -lvulkan would fail when vcc/vc link user
+# executables at -emit=full time. Derived from the Vulkan found above (no
+# hardcoded paths). Linux needs nothing — the loader is a default search path.
+if(APPLE)
+  get_filename_component(_vc_vulkan_libdir "${Vulkan_LIBRARY}" DIRECTORY)
+  if(_vc_vulkan_libdir)
+    string(PREPEND VC_DRIVER_VULKAN_LIBS "-L${_vc_vulkan_libdir} ")
+  endif()
 endif()
 if(VC_VULKAN_SC)
   # vc -emit=full links the generated host code against the loader.  A version

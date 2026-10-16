@@ -85,7 +85,14 @@ int linkHostExecutable(const TranslationUnit &tu,
   args.push_back("-I" VC_INCLUDE_DIR);
   args.push_back(cppPath);
   args.push_back(VC_RUNTIME_LIB);
-  args.push_back(VC_VULKAN_LIBS);
+  // VC_VULKAN_LIBS may carry several space-separated linker flags (e.g.
+  // "-L<libdir> -lvulkan"). Push each one as its own argv element — a single
+  // string with embedded spaces would be read by the linker as one flag whose
+  // tail is the rest of the string, silently dropping -lvulkan.
+  SmallVector<StringRef, 4> vulkanFlags;
+  StringRef(VC_VULKAN_LIBS).split(vulkanFlags, ' ', /*MaxSplit=*/-1,
+                                  /*KeepEmpty=*/false);
+  for (StringRef flag : vulkanFlags) args.push_back(flag);
   args.push_back("-o");
   args.push_back(outputFilename);
 
