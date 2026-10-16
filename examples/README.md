@@ -504,6 +504,108 @@ not apply here. K-splitting in both forms is closed out as a matmul win on this
 iGPU; the win was in the compiler passes (canonical-for + SROA) and in picking
 the small tile shape, both already landed.
 
+### Thor GB10B (Vulkan SC): the square tile is the wrong shape
+
+The same sweep, run on a **NVIDIA Thor GB10B** (aarch64, Vulkan SC offline
+pipelines) instead of the Intel iGPU, reaches the opposite conclusion about
+tile shape — and finds a **2.9× win** the square-only design space cannot
+reach. All numbers below are `C = A·B` fp32, median of 12 GPU-timed launches,
+verified elementwise against a double-precision host reference
+(`maxrelerr ≈ 5e-6`).
+
+**Read the ratios, never the absolutes.** On this device the *same* kernel at
+the *same* size measures anywhere from 184 to 585 GFLOPS depending on the GPU
+clock state when it runs — a 3.2× spread that dwarfs every effect measured
+here. A long sweep lets the clocks decay, a short one does not. Every conclusion
+below therefore comes from a single process running baseline and candidate back
+to back; the two-shape A/B at the bottom reproduced to four significant figures
+across rebuilds and separate runs (583.08/585.16, 583.17/585.14, 583.13/585.10).
+
+Round 1 — square tiles, one workgroup per `TS×TS` output tile:
+
+| shape | TS | BLK | REG | shared | N=1024 | N=2048 |
+|---|---|---|---|---|---|---|
+| **`k16_16_1`** | 16 | 16 | 1 | 2 KB | **583** | **585** |
+| `k32_32_1` | 32 | 32 | 1 | 8 KB | — | 531 |
+| `k32_16_2` | 32 | 16 | 2 | 8 KB | — | 344 |
+| `k48_16_3` | 48 | 16 | 3 | 18 KB | — | 158 |
+| `k64_16_4` | 64 | 16 | 4 | 32 KB | — | 158 |
+
+Two things to note. Padding to break bank conflicts *always* hurt (Thor has no
+A-panel conflict to break), and double buffering the 16×16 kernel changed
+nothing at all — same-process A/B gave 28.0656 ms vs 28.0658 ms, i.e. identical,
+so the kernel is not load-latency bound. **A recorded single-shot "695 GFLOPS"
+for the buffered version was clock drift, not an effect** — the same binary
+re-measured 612 later.
+
+Round 2 — rectangular output tiles. The square tile re-reads a full A
+column-strip and B row-strip for every 16×16 of output; widening the tile to
+`TSROW × W` with the block left at 16×16 reuses each staged A panel across
+`W/16` B columns while shared memory grows by only `TS*W*4` bytes:
+
+| shape | tile | per-thread regs | shared | N=1024 | N=2048 |
+|---|---|---|---|---|---|
+| `strip128` | 16×128 | 1×8 | 9 KB | 791 | 844 |
+| `strip2x128` | 32×128 | 2×8 | 10 KB | 1171 | 1342 |
+| `strip3x128` | 48×128 | 3×8 | 11 KB | 1325 | 1685 |
+| `strip6x64` | 96×64 | 6×4 | 10 KB | 1460 | 1740 |
+| **`strip3x64`** | **48×64** | **3×4** | **7 KB** | **1460** | **1674** |
+
+Round 3 — the decisive same-process A/B, N=2048:
+
+| kernel | N=1024 | N=2048 |
+|---|---|---|
+| `k16_16_1` (square, baseline) | 583.13 | 585.10 |
+| **`strip3x64`** (48×64, 3×4) | **1462.70** | **1674.29** |
+
+**2.86× at N=2048, verified correct** (`maxrelerr` 5.40e-06 against the
+double-precision reference; 4.41e-06 at N=1024). The win is size-dependent —
+only **2.51× at N=1024**, since the per-tile fixed work is a larger share of a
+smaller problem. The mechanism is the shared-load-to-FMA ratio in the inner
+loop, not occupancy or traffic: the square tile loads one
+`av` and one `bv` per FMA (2.0 loads/FMA), while a 3×4 register block loads
+`ROWS + COLS = 7` values per `ROWS·COLS = 12` FMAs (**0.583 loads/FMA**). The
+predicted ratio 2.0/0.583 = 3.4× brackets the measured 2.86×, and the kernel's
+39% of estimated fp32 peak tracks the ~43% that a shared-load-bound inner loop
+would predict. Traffic falls too (8 → 5 bytes per output element), but that is
+secondary: `strip128` alone, with no row blocking, already reaches 844.
+
+Widening further eventually loses — `strip256` 556, `strip384` 305, `strip512`
+315 — as the shared footprint crosses one and two blocks per SM and the
+register block spills. The knee is a small tile with *both* dimensions blocked:
+`48×64` at 7 KB, against the 32 KB `TS=64` square that the Intel section
+correctly rejects for exactly the same reason.
+
+Two Vulkan SC traps shaped the harness, both worth knowing before writing one:
+
+- **The sum of static `__shared__` across every pipeline in one `-emit=sc`
+  cache must stay under `maxComputeSharedMemorySize` (48 KB here).** Exceed it
+  and the first `vkWaitForFences` returns `VK_ERROR_DEVICE_LOST` before any
+  dispatch, with nothing naming the cause. Measured to the byte: 49152 passes,
+  49408 does not. Sweep one shape per process, or partition the shapes.
+- **Query pools and descriptor sets are lifetime budgets, not peaks.**
+  `vcEventDestroy` does not return its query-pool reservation (32 events per
+  process by default → `vcEventElapsedTime` silently returns `NotReady` after
+  event 16), and with `recycleDescriptorSetMemory` false the driver never
+  returns a descriptor set either, so a long-running process exhausts
+  `maxSets` and gets `VK_NULL_HANDLE` sets back. The runtime now sizes the SC
+  descriptor pool for a whole process (`VC_SC_DESCRIPTOR_SETS`, default 2048)
+  and raises `VC_SC_QUERY_POOLS` for the same reason. Both failures are silent
+  in the *numbers* — a failed launch still prints a timing, which is how a
+  bogus 797727 GFLOPS row first showed up.
+
+**Reproducing it.** The sweeps come from a small local generator that emits one
+`.vc` per shape set — a tiled `C = A·B` with the output tile, block size and
+per-thread register block as its parameters — then drives the offline-pipeline
+flow (`vc -emit=sc` → `tools/vksc/build_cache.sh` + `nvidia-pcc` →
+`pipeline_cache.bin`, see [`../tools/vksc/README.md`](../tools/vksc/README.md)),
+cross-compiles the generated host stub against `libVCRuntime.a`, and runs it on
+the device with `VC_SC_QUERY_POOLS` raised. Environment knobs narrow the tables:
+`VC_MM_SHAPES` (comma list of shape names), `VC_MM_SIZES`, and `VC_MM_REF_MAX`
+(the host reference is `O(N³)` in double precision, so it is capped by default
+and only the smaller sizes get an error check). Run **one shape per process** on
+this device — see the 48 KB trap above.
+
 
 ---
 
