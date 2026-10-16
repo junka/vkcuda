@@ -1618,13 +1618,21 @@ static int emitSc(const TranslationUnit &tu, MLIRContext &ctx,
                                       IntegerAttr::get(IntegerType::get(&ctx, 32), bz)};
     mod->setAttr("vc.sc.block_dims", ArrayAttr::get(&ctx, dims));
 
-    // Cooperative matrix / wmma has no place in an SC pipeline: the runtime
-    // cannot enable the feature (the SC header has no
-    // VkPhysicalDeviceCooperativeMatrixFeaturesKHR and no extension list on
-    // this path), so a pipeline built from wmma SPIR-V would have no device
-    // capability behind it and could only fail at create or dispatch time.
-    // Refusing here — where the source is still in hand, and with the flag the
-    // ASTToMLIR set — is the only point at which the user can act on it.
+    // Cooperative matrix / wmma has no place in an SC pipeline because the
+    // device does not offer it: VK_KHR_cooperative_matrix is absent from the
+    // extension list and the SC header has no
+    // VkPhysicalDeviceCooperativeMatrixFeaturesKHR to query it with, so a
+    // pipeline built from wmma SPIR-V would have no capability behind it and
+    // could only fail at create or dispatch time. Refusing here — where the
+    // source is still in hand, and with the flag the ASTToMLIR set — is the
+    // only point at which the user can act on it.
+    //
+    // The reason is the device, not SC's create-info. SC fixes the feature set
+    // in the profile and the runtime hands it no feature chain, yet the
+    // capabilities the profile does provide still work: a kernel whose SPIR-V
+    // declares Float16 + StorageBuffer16BitAccess runs correctly through an
+    // offline pipeline built with the same create-info. Cooperative matrix is
+    // simply not among them, which is why it is the only thing refused here.
     if (mod->hasAttr("vc.uses_coopmatrix")) {
       llvm::errs() << "vc: Vulkan SC: this translation unit uses cooperative "
                       "matrix (wmma::), which is not available under Vulkan SC\n";

@@ -600,11 +600,105 @@ per-thread register block as its parameters — then drives the offline-pipeline
 flow (`vc -emit=sc` → `tools/vksc/build_cache.sh` + `nvidia-pcc` →
 `pipeline_cache.bin`, see [`../tools/vksc/README.md`](../tools/vksc/README.md)),
 cross-compiles the generated host stub against `libVCRuntime.a`, and runs it on
-the device with `VC_SC_QUERY_POOLS` raised. Environment knobs narrow the tables:
+the device with `VC_SC_QUERY_POOLS` raised. The fp16 A/B above comes from a
+second generator that emits the fp32 and fp16 kernels *and* both host
+loops into one process, so the two rows are directly comparable; it uses the
+same offline-pipeline flow. Environment knobs narrow the tables:
 `VC_MM_SHAPES` (comma list of shape names), `VC_MM_SIZES`, and `VC_MM_REF_MAX`
 (the host reference is `O(N³)` in double precision, so it is capped by default
 and only the smaller sizes get an error check). Run **one shape per process** on
 this device — see the 48 KB trap above.
+
+#### fp16, int8 and MMA on this device: what is actually reachable
+
+The fp32 kernel above leaves ~39% of estimated peak on the table, so the
+obvious next question is whether narrower arithmetic buys the rest. Three
+routes were checked; one is reachable and loses, two are closed, and the
+closures are worth recording because two of them are *not* where you would
+expect.
+
+**fp16 runs here today — no runtime change.** The SC path creates the device
+with the reservation struct as its only `pNext` entry and
+`pEnabledFeatures = nullptr`, the way the vendor samples do, and the runtime
+pins `f16Storage = false`. That pin reads like "SC has no f16" and it is not
+that: the profile reports `shaderFloat16`, `shaderInt8`,
+`storageBuffer16BitAccess` and the push-constant variants as supported, and a
+kernel whose SPIR-V declares `Float16` + `StorageBuffer16BitAccess` +
+`SPV_KHR_16bit_storage` runs correctly through an offline pipeline built with
+that exact create-info. The driver honours the capabilities a pipeline
+declares; it does not require them to be enabled in the create-info. So what a
+kernel can use is decided by what `vc -emit=sc` emitted, not by that pin.
+
+**fp16 storage alone does not help.** `strip3x64` with A and B in fp16 global
+memory (converted to float once on the staging path into the same fp32 shared
+panels — 7 staging loads per thread per tile against 192 FMAs, so the convert
+is bookkeeping), A/B quantized to fp16 once on the host, the reference built
+from those same rounded values so a mismatch is a kernel bug rather than
+rounding:
+
+```
+kernel            N      medms     GFLOPS  maxrelerr    n
+s364_f32       1024     1.9449    1104.16   4.41e-06   12  ok
+s364_f16       1024     1.9833    1082.79   4.83e-06   12  ok
+s364_f32       2048    13.5161    1271.07   5.40e-06   12  ok
+s364_f16       2048    14.0956    1218.81   9.11e-06   12  ok
+```
+
+Both kernels in one process, so the ratio is the trustworthy part (the
+absolutes are lower than the table above — clock state again). Halving the
+global input bytes costs **4.1% at N=2048** and 1.9% at N=1024: the inner loop
+is shared-load bound, and halving the *bytes* moves neither the number of
+shared loads per FMA nor the shared footprint. Confirms the fp32 reading that
+traffic is the secondary term. A repeat in a fresh process agrees —
+1268.48 / 1214.76 at N=2048 (−4.2%) and 1105.40 / 1077.92 at N=1024 (−2.5%) —
+so the gap is a property of the kernels, not of one run.
+
+**The fp16 variant that could pay does not lower.** The reason to want fp16 is
+packed `half2` math over a half-width shared panel — that halves the footprint
+*and* the shared loads per FMA, the two things the loop is actually bound by.
+It is not reachable: **`__shared__ __half` does not compile.** Every form
+tried — 1-D or 2-D, inline or hoisted index, constant or computed first index —
+fails in the same place:
+
+```
+'spirv.AccessChain' index must be an integer spirv.Constant to access element
+of spirv.struct, but provided spirv.IAdd
+   (type: !spirv.struct<(!spirv.rtarray<f16, stride=2> [0])>)
+```
+
+Sub-4-byte *workgroup* arrays get the same widening the SSBO path gets, but
+only the SSBO path has a fixup (`fixupF16StorageBuffers` narrows the interface
+back to `rtarray<f16, stride=2>`), so the shared array stays wrapped in a
+one-field struct and the access chain comes out missing its leading struct-0.
+`__shared__ float` fed from an fp16 SSBO is fine — that is the kD-shaped case,
+and it is the only reason the table above exists. fp16 in *global* memory is
+fine; fp16 in *shared* memory is the gap.
+
+Note this also means fp16 cannot be used to buy a wider tile: the same 7 KB of
+shared would hold twice the panel, but the fp32 sweep already answered that
+direction — `strip256`/`strip384`/`strip512` lose to `strip3x64` at 24/32/48 KB,
+so the widening loss is not a shared-capacity limit.
+
+**int8 is not worth attempting.** The device reports `shaderInt8` and 8-bit
+storage, but there is no dot-product path anywhere: no `dp4a` builtin, no
+`OpSDot`/`OpUDot`/`integer_dot` lowering in `lib/`, `include/` or `tools/`, and
+no integer-dot-product extension in the device's 13 extensions. Without
+`dp4a` an int8 "matmul" costs four converts plus four multiplies per four MACs
+— strictly more work than the fp32 FMA it would replace. There is nothing to
+measure.
+
+**MMA / tensor cores are closed, on two independent grounds.** The device
+exposes no `VK_KHR_cooperative_matrix` (13 extensions, none of them it), and
+the SC header has no `VkPhysicalDeviceCooperativeMatrixFeaturesKHR` — grep
+`cooperative` across `vulkan_sc_core.h` returns zero hits. `vc -emit=sc` also
+refuses to emit a wmma kernel, which is the right call: the pipeline would have
+no capability behind it. The winner here is plain SIMT fp32 FMA, and the
+optimization that mattered was the tile shape, not the arithmetic.
+
+Two comments that had been asserting the opposite are corrected in this change:
+the SC device-creation block no longer claims the profile cannot provide f16,
+and the coopmatrix guard now gives the device as its reason rather than the
+create-info.
 
 
 ---

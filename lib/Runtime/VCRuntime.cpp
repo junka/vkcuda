@@ -1265,14 +1265,32 @@ bool Runtime::setupLogicalDeviceSc(VulkanDevice &vd) {
   }
 
   // -- Feature narrowing ---------------------------------------------------
-  // The core path enables a few capabilities opportunistically after probing
-  // the device (see the Vulkan-1.2 chain above). Under SC none of them can be
-  // enabled: this header has no VkPhysicalDeviceCooperativeMatrixFeaturesKHR,
-  // no Vulkan-1.2 feature struct, and the device is created with no extension
-  // list. They are pinned off here so nothing downstream reads a stale "on".
-  // A kernel that needs one of them does not get this far — `vc -emit=sc`
-  // refuses to emit a wmma kernel, because there would be no device capability
-  // behind the pipeline it produced.
+  // The core path turns capabilities on through VkDeviceCreateInfo's pNext
+  // chain after probing the device. This path has no chain to build: the
+  // device is created with the reservation struct as its only pNext entry and
+  // pEnabledFeatures = nullptr, the way the vendor samples do it, because SC
+  // fixes the feature set in the profile instead of letting an app negotiate
+  // it. These flags are pinned off so nothing downstream reads a stale "on"
+  // that no create-info ever asked for.
+  //
+  // That is a statement about what this create-info enables, not about what
+  // the device offers — and the difference matters enough to be explicit,
+  // because it is easy to read the pin as "SC has no f16". Measured on a Thor
+  // GB10B (581.1.0): the profile reports shaderFloat16, shaderInt8 and the
+  // 8/16-bit storage features as supported, and a kernel whose SPIR-V declares
+  // Float16 + StorageBuffer16BitAccess runs correctly through an offline
+  // pipeline built with *this* create-info. The driver honours the
+  // capabilities a pipeline declares; it does not require them to be enabled
+  // here. So what a kernel can use is decided by what `vc -emit=sc` emitted.
+  //
+  // Cooperative matrix is the genuine exception: the SC header has no
+  // VkPhysicalDeviceCooperativeMatrixFeaturesKHR, the device exposes no
+  // VK_KHR_cooperative_matrix, and `vc -emit=sc` refuses to emit a wmma kernel
+  // rather than produce a pipeline with no capability behind it.
+  //
+  // vd.f16Storage therefore stays false even though f16 kernels work: it gates
+  // the *core* path's create-info chain (see the Vulkan-1.2 chain above), which
+  // this path never touches.
   vd.coopMatrix = false;
   vd.vulkanMemoryModel = false;
   vd.f16Storage = false;
